@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Sequence
 import numpy as np
 
 from env.types import GlobalState
+from tasks.reward_context import build_reward_context
 
 
 def validate_team_reward_composers(composers: Dict, *, trainable_ids: Sequence[str],
@@ -23,60 +24,6 @@ def validate_team_reward_composers(composers: Dict, *, trainable_ids: Sequence[s
             or team_return_mode != "joint" or action_repeat != 1):
         raise ValueError("Team race rewards require 2v2 MAPPO with joint team returns, shared_team critic, team_shared reward, and action_repeat=1")
     return True
-
-
-def build_reward_context(
-    *,
-    env: Any,
-    agent_id: str,
-    info_dict: Dict[str, Any],
-    obs_dict: Dict[str, Any],
-    actions: Dict[str, np.ndarray],
-    global_state: Optional[GlobalState] = None,
-) -> Dict[str, Any]:
-    if global_state is None:
-        try:
-            global_state = env.get_global_state()
-        except Exception:
-            global_state = None
-    global_vector = (
-        global_state.vector
-        if global_state is not None
-        else np.zeros(0, dtype=np.float32)
-    )
-
-    trainable_agent_ids = _string_list(getattr(env, "trainable_agents", []) or [])
-    fixed_policy_agent_ids = _string_list(getattr(env, "fixed_policy_agents", []) or [])
-    team_set = set(trainable_agent_ids)
-
-    get_target_id = getattr(env, "get_target_id", None)
-    target_id = get_target_id(agent_id) if callable(get_target_id) else None
-
-    opponent_agent_ids = [aid for aid in fixed_policy_agent_ids if aid != agent_id]
-    if not opponent_agent_ids:
-        opponent_agent_ids = [
-            str(aid)
-            for aid in (info_dict or {})
-            if str(aid) != str(agent_id) and str(aid) not in team_set
-        ]
-
-    return {
-        "agent_id": agent_id,
-        "target_id": target_id,
-        "trainable_agent_ids": trainable_agent_ids,
-        "teammate_ids": [aid for aid in trainable_agent_ids if aid != agent_id],
-        "opponent_agent_ids": opponent_agent_ids,
-        "all_infos": info_dict or {},
-        "all_obs": obs_dict or {},
-        "all_actions": actions or {},
-        "global_state": global_vector,
-        "last_step_facts": getattr(env, "last_step_facts", None),
-        "track_length": getattr(env, "centerline_track_length", None),
-    }
-
-
-def _string_list(values: Sequence[Any]) -> list[str]:
-    return [str(value) for value in values]
 
 
 def transition_lifecycle_fields(

@@ -8,13 +8,14 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 
 from agents.ppo import PPOAgent
-from env.types import GlobalState, TransitionRecord
+from env.types import TransitionRecord
 from metrics.outcomes import determine_outcome
 from training.collector_scheduling import (
     _close_collectors, _report_worker_error, _worker_startup_settings,
 )
 from training.hooks import TrainingHook, transition_record_hooks
-from training.reward_context import build_reward_context, transition_lifecycle_fields
+from training.reward_context import transition_lifecycle_fields
+from tasks import RaceTask, TaskSnapshot
 from wrappers.actions.composer import ActionComposer
 from wrappers.observations.composer import ObservationComposer
 from wrappers.rewards.composer import RewardComposer
@@ -64,6 +65,12 @@ class OnPolicyTrainer:
         self.run_id = run_id
         self.spawn_plan_fn = spawn_plan_fn
         self.collected_steps = 0
+        self.task = RaceTask(
+            env, policy_agents=[rl_agent_id], fixed_controllers=other_agents,
+            obs_composers={rl_agent_id: obs_composer},
+            reward_composers={rl_agent_id: reward_composer},
+            action_composers={rl_agent_id: action_composer}, action_repeat=self.action_repeat,
+        )
 
     def _set_training_progress(self, completed: int, total: int) -> None:
         # Remote collectors own no optimizer; the parent uses global progress.
@@ -263,24 +270,6 @@ class OnPolicyTrainer:
                 else:
                     os.environ[key] = value
 
-    def _build_actions(
-        self,
-        rl_action_phys: np.ndarray,
-        obs_dict: Dict,
-    ) -> Dict[str, np.ndarray]:
-        active = set(getattr(self.env, "agents", obs_dict))
-        actions: Dict[str, np.ndarray] = {}
-        if self.rl_agent_id in active:
-            actions[self.rl_agent_id] = rl_action_phys
-        for aid, other_agent in self.other_agents.items():
-            if aid in active:
-                try:
-                    act = other_agent.act(obs_dict[aid])
-                except Exception:
-                    act = np.zeros(2, dtype=np.float32)
-                actions[aid] = np.asarray(act, dtype=np.float32)
-        return actions
-
     def _episode_id(self, episode: int) -> str:
         return f"{self.run_id}_ep{episode:06d}"
 
@@ -297,29 +286,18 @@ class OnPolicyTrainer:
         spawn_ids = meta.get("spawn_ids", {})
         return spawn_ids.get(self.rl_agent_id) or meta.get("spawn_id")
 
-    def _reset_env(self) -> tuple:
+    def _reset_env(self) -> TaskSnapshot:
         """Reset env, injecting a curriculum spawn plan when one is available."""
         spawn_plan = self.spawn_plan_fn() if self.spawn_plan_fn is not None else None
         options = {"spawn_plan": spawn_plan} if spawn_plan is not None else None
-        return self.env.reset(options=options)
+        return self.task.reset(options=options)
 
-    def _reward_context(
-        self,
-        *,
-        agent_id: str,
-        info_dict: Dict,
-        obs_dict: Dict,
-        actions: Dict[str, np.ndarray],
-        global_state: Optional[GlobalState] = None,
-    ) -> Dict[str, Any]:
-        return build_reward_context(
-            env=self.env,
-            agent_id=agent_id,
-            info_dict=info_dict,
-            obs_dict=obs_dict,
-            actions=actions,
-            global_state=global_state,
-        )
+    def _on_physics_step(self, substep) -> None:
+        if self.render:
+            try:
+                self.task.render()
+            except Exception:
+                pass
 
     def train(self, n_episodes: int = 0, *, total_steps: Optional[int] = None) -> None:
         for _ in self.iter_train(n_episodes, total_steps=total_steps):
@@ -346,19 +324,11 @@ class OnPolicyTrainer:
         self.agent.buffer.clear()
         started_training = time.perf_counter()
         while (collected < total_steps if total_steps is not None else episode < n_episodes):
-            obs_dict, info_dict = self._reset_env()
-            for controller in self.other_agents.values():
-                if hasattr(controller, "reset"):
-                    controller.reset()
-            reset_actions = getattr(self.action_composer, "reset", None)
-            if reset_actions is not None:
-                reset_actions()
-            self.obs_composer.reset()
-            self.reward_composer.reset()
+            snapshot = self._reset_env()
+            info_dict = snapshot.infos
             if total_steps is None:
                 self.agent.buffer.clear()
-
-            obs = self.obs_composer.wrap(obs_dict.get(self.rl_agent_id, {}), info_dict.get(self.rl_agent_id, {}))
+            obs = snapshot.observations[self.rl_agent_id]
             done = False
             episode_reward = 0.0
             episode_truncated = False
@@ -375,81 +345,23 @@ class OnPolicyTrainer:
                         physics=info_dict.get(self.rl_agent_id, {}).get("physics")))
 
             while not done:
-                # Copy before stepping: dataset state and observation describe
-                # the same decision, even if an environment reuses its arrays.
-                global_state = (
-                    np.asarray(self.env.get_global_state().vector, dtype=np.float32).copy()
-                    if self._transition_hooks else None
-                )
                 action_norm, log_prob, value = yield from self._policy_request("act", obs, parallel)
                 raw_batch = getattr(self.agent, "last_raw_actions", None)
                 raw_action = raw_batch[0].copy() if raw_batch is not None else None
-                action_phys = self.action_composer.process(action_norm)
-                actions = self._build_actions(action_phys, obs_dict)
-                acted_agents = set(actions)
-
-                # Accumulate reward across action_repeat sub-steps so
-                # progress-based reward components aren't missed.
-                reward = 0.0
-                rl_term = False
-                rl_trunc = False
-                post_step_global_snapshot: Optional[GlobalState] = None
-                for _ in range(self.action_repeat):
-                    obs_dict, rew_dict, term_dict, trunc_dict, info_dict = self.env.step(actions)
-                    step_facts = getattr(self.env, "last_step_facts", None)
-                    post_step_global_snapshot = getattr(
-                        step_facts, "global_state", None
-                    )
-                    if post_step_global_snapshot is None:
-                        post_step_global_snapshot = self.env.get_global_state()
-                    if self.render:
-                        try:
-                            self.env.render()
-                        except Exception:
-                            pass
-                    rl_term = bool(term_dict.get(self.rl_agent_id, False))
-                    rl_trunc = bool(trunc_dict.get(self.rl_agent_id, False))
-                    sub_done = rl_term or rl_trunc
-                    sub_info = info_dict.get(self.rl_agent_id, {})
-                    sub_step_info = {
-                        "obs": obs,
-                        "next_obs": obs_dict.get(self.rl_agent_id, {}),
-                        "info": sub_info,
-                        "done": sub_done,
-                        "terminated": rl_term,
-                        "truncated": rl_trunc,
-                        "action": action_norm,
-                        "timestep": float(getattr(self.env, "timestep", 0.01)),
-                    }
-                    sub_step_info.update(
-                        self._reward_context(
-                            agent_id=self.rl_agent_id,
-                            info_dict=info_dict,
-                            obs_dict=obs_dict,
-                            actions=actions,
-                            global_state=post_step_global_snapshot,
-                        )
-                    )
-                    sub_reward, _ = self.reward_composer.compute(sub_step_info)
-                    reward += sub_reward
-                    membership_changed = not acted_agents.issubset(
-                        set(getattr(self.env, "agents", []))
-                    )
-                    if sub_done or membership_changed:
-                        done = True
-                        episode_truncated = bool(rl_trunc)
-                        if sub_done:
-                            break
-                        done = False
-                        break
-
-                last_info = info_dict.get(self.rl_agent_id, {})
-                episode_reward += reward
-
-                next_obs = self.obs_composer.wrap(
-                    obs_dict.get(self.rl_agent_id, {}),
-                    last_info,
+                task_step = self.task.step(
+                    {self.rl_agent_id: action_norm}, on_physics_step=self._on_physics_step,
                 )
+                decision = task_step.decisions[self.rl_agent_id]
+                action_phys = decision.action_physical
+                reward = decision.individual_reward
+                rl_term, rl_trunc = decision.terminated, decision.truncated
+                done = rl_term or rl_trunc
+                episode_truncated = bool(rl_trunc) if done else episode_truncated
+                post_step_global_snapshot = task_step.after.global_state
+                global_state = task_step.before.global_state.vector.copy() if self._transition_hooks else None
+                last_info = dict(decision.info)
+                episode_reward += reward
+                next_obs = decision.next_observation
 
                 # --- Emit transition record for dataset hooks ---
                 if self._transition_hooks:
