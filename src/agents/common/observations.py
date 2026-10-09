@@ -1,7 +1,26 @@
 """Per-learner observations with padding confined to batched policy/storage I/O."""
 from collections.abc import Mapping
+from copy import deepcopy
 
 import numpy as np
+
+
+def observation_layout(contract):
+    """Return the driving prefix contract, prefix width, and full input width."""
+    if not isinstance(contract, dict):
+        raise ValueError("Actor transfer requires explicit observation contracts")
+    common = deepcopy(contract)
+    obs = common["observation"]
+    unknown = set(obs) - {"lidar", "frenet_vehicle_track", "frenet_neighbors"}
+    if unknown or not all(obs.get(k, {}).get("enabled") for k in ("lidar", "frenet_vehicle_track")):
+        raise ValueError("Actor transfer requires the LiDAR/Frenet driving layout")
+    driving = int(common["lidar_beams"]) + 10 + 2 * int(obs["frenet_vehicle_track"].get("points", 20))
+    neighbors = obs.pop("frenet_neighbors", {})
+    extra = 0
+    if neighbors.get("enabled"):
+        ids = len(neighbors.get("agent_ids") or [])
+        extra = int(neighbors.get("max_neighbors", 1)) * (5 + int(neighbors.get("include_team", False)) + ids) + ids
+    return common, driving, driving + extra
 
 
 def pack_observations(agent_ids, observations, obs_dims, width):

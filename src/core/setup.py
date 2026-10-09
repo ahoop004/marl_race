@@ -19,15 +19,15 @@ from wrappers.rewards.composer import RewardComposer
 
 
 def build_obs_composer(
-    agent_cfg: Dict, env_config: Dict, scenario_dir: Path, action_dim: int = 2
+    agent_cfg: Dict, env_config: Dict, scenario_dir: Path
 ) -> ObservationComposer:
     """Build one ObservationComposer for a single agent config."""
     obs_ref = agent_cfg.get("observation")
     if isinstance(obs_ref, str):
         obs_path = (scenario_dir / obs_ref).resolve()
-        return ObservationComposer.from_file(str(obs_path), env_config, action_dim=action_dim)
+        return ObservationComposer.from_file(str(obs_path), env_config)
     elif isinstance(obs_ref, dict):
-        return ObservationComposer.from_config(obs_ref, env_config, action_dim=action_dim)
+        return ObservationComposer.from_config(obs_ref, env_config)
     raise ValueError("Agent 'observation' must be a file path or inline config dict.")
 
 
@@ -47,7 +47,6 @@ def build_obs_composers(
     trainable_ids: List[str],
     env_config: Dict,
     scenario_dir: Path,
-    action_dim: int = 2,
 ) -> Dict[str, ObservationComposer]:
     """Build one ObservationComposer per trainable agent.
 
@@ -55,7 +54,7 @@ def build_obs_composers(
     with their ``rl_agent_id``; MAPPO iterates over all entries.
     """
     return {
-        aid: build_obs_composer(agent_configs[aid], env_config, scenario_dir, action_dim)
+        aid: build_obs_composer(agent_configs[aid], env_config, scenario_dir)
         for aid in trainable_ids
     }
 

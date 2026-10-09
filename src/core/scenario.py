@@ -492,15 +492,8 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
         critic_mode = mappo["critic_mode"]
         reduction = mappo["team_reward_reduction"]
         params = {**scenario.get("training_defaults", {}), **agents[trainable_ids[0]].get("params", {})}
-        transfer = params.get("adapter_transfer")
-        if transfer is not None:
-            if (not isinstance(transfer, dict) or set(transfer) != {"checkpoint", "source_agent", "target_agent"}
-                    or any(not isinstance(v, str) or not v for v in transfer.values())
-                    or transfer["target_agent"] not in trainable_ids
-                    or (params.get("lora") or {}).get("mode") != "per_agent"
-                    or not (params.get("lora") or {}).get("per_agent_log_std")
-                    or params.get("pretrained_actor_checkpoint")):
-                raise ScenarioError("adapter_transfer requires checkpoint/source_agent/target_agent, per_agent LoRA/exploration and no separate base checkpoint")
+        if "adapter_transfer" in params:
+            raise ScenarioError("adapter_transfer is no longer supported; use pretrained_actor_checkpoint for PPO actor transfer")
         if not isinstance(params.get("require_pretrained_actor", False), bool):
             raise ScenarioError("require_pretrained_actor must be boolean")
         if mappo["actor_mode"] == "independent" and params.get("lora") is not None:

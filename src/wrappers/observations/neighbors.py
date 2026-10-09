@@ -1,100 +1,11 @@
-"""Target-relative state and nearby-agent Frenet observations."""
+"""Nearby-agent Frenet observations."""
 from __future__ import annotations
 
-import math
 from typing import Dict, Mapping, Sequence
 
 import numpy as np
 
 from wrappers.observations.base import ObservationComponent
-
-
-class TargetStateComponent(ObservationComponent):
-    """Opponent vehicle velocity: [vx, vy, yaw_rate] — 3 dims.
-
-    Requires target_id to be set on the agent in the scenario so the env
-    populates the central_state / target fields in the obs dict.
-    """
-
-    @property
-    def dim(self) -> int:
-        return 3
-
-    def compute_into(self, raw_obs: Dict, info: Dict, out: np.ndarray) -> None:
-        target_vel = raw_obs.get("target_velocity")
-        if target_vel is None:
-            central = raw_obs.get("central_state")
-            if central is not None:
-                arr = np.asarray(central, dtype=np.float32).ravel()
-                if arr.shape[0] >= 6:
-                    target_vel = arr[3:6]
-                elif arr.shape[0] >= 3:
-                    target_vel = arr[:3]
-
-        if target_vel is None:
-            out[:] = 0.0
-            return
-
-        arr = np.asarray(target_vel, dtype=np.float32).ravel()
-        n = min(arr.shape[0], 3)
-        out[0:n] = arr[0:n]
-        if n < 3:
-            out[n:] = 0.0
-
-    def compute(self, raw_obs: Dict, info: Dict) -> np.ndarray:
-        out = np.empty(3, dtype=np.float32)
-        self.compute_into(raw_obs, info, out)
-        return out
-
-
-class RelativePoseComponent(ObservationComponent):
-    """Relative pose from ego to target: [rel_x, rel_y, sin(Δθ), cos(Δθ), dist] — 5 dims.
-
-    Uses ``float32`` throughout (no intermediate float64 conversion) and the
-    ``math`` module for scalar sin/cos/sqrt — ~4× faster than the numpy
-    equivalents for single values.
-    """
-
-    @property
-    def dim(self) -> int:
-        return 5
-
-    def compute_into(self, raw_obs: Dict, info: Dict, out: np.ndarray) -> None:
-        ego_raw = raw_obs.get("pose")
-        tgt_raw = raw_obs.get("target_pose")
-
-        if ego_raw is None:
-            ea = _ZERO_F32
-        else:
-            ea = np.asarray(ego_raw, dtype=np.float32).ravel()
-            if ea.shape[0] < 3:
-                ea = np.pad(ea, (0, 3 - ea.shape[0]))
-
-        if tgt_raw is None:
-            ta = _ZERO_F32
-        else:
-            ta = np.asarray(tgt_raw, dtype=np.float32).ravel()
-            if ta.shape[0] < 3:
-                ta = np.pad(ta, (0, 3 - ta.shape[0]))
-
-        # Scalar arithmetic — avoids numpy ufunc dispatch overhead.
-        rel_x = float(ta[0]) - float(ea[0])
-        rel_y = float(ta[1]) - float(ea[1])
-        delta_theta = float(ta[2]) - float(ea[2])
-
-        out[0] = rel_x
-        out[1] = rel_y
-        out[2] = math.sin(delta_theta)
-        out[3] = math.cos(delta_theta)
-        out[4] = math.sqrt(rel_x * rel_x + rel_y * rel_y)
-
-    def compute(self, raw_obs: Dict, info: Dict) -> np.ndarray:
-        out = np.empty(5, dtype=np.float32)
-        self.compute_into(raw_obs, info, out)
-        return out
-
-
-_ZERO_F32 = np.zeros(3, dtype=np.float32)
 
 
 _FIELDS = ("delta_s", "delta_d", "delta_vs", "delta_vd")
@@ -191,35 +102,4 @@ def _finite_number(value: object) -> float:
     return result if np.isfinite(result) else 0.0
 
 
-__all__ = ["TargetStateComponent", "RelativePoseComponent", "FrenetNeighborsComponent"]
-
-
-class TargetFrenetComponent(ObservationComponent):
-    """Dedicated configured target: normalized [ds, dd, dvs, dvd, present]."""
-
-    def __init__(self, maxima, agent_ids=None):
-        if set(maxima) != set(_FIELDS):
-            raise ValueError("target_frenet requires fixed scales for all four fields")
-        self.scales = np.asarray([maxima[field] for field in _FIELDS], dtype=np.float32)
-        if not np.isfinite(self.scales).all() or (self.scales <= 0).any():
-            raise ValueError("target_frenet scales must be finite and positive")
-        self.agent_ids = tuple(agent_ids or ())
-        if len(set(self.agent_ids)) != len(self.agent_ids):
-            raise ValueError("target_frenet agent_ids must be unique")
-
-    @property
-    def dim(self):
-        return 5 + len(self.agent_ids)
-
-    def compute_into(self, raw_obs, info, out):
-        out.fill(0.0)
-        target = info.get("target_frenet")
-        if target is None:
-            return
-        values = np.asarray([target[field] for field in _FIELDS], dtype=np.float32)
-        if not np.isfinite(values).all():
-            raise ValueError("Target Frenet facts must be finite")
-        out[:4] = values / self.scales
-        out[4] = 1.0
-        if self.agent_ids:
-            out[5 + self.agent_ids.index(target["agent_id"])] = 1.0
+__all__ = ["FrenetNeighborsComponent"]

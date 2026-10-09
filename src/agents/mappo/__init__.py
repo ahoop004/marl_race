@@ -855,15 +855,12 @@ class MAPPOAgent:
             if source_width == width:
                 validate_checkpoint_compatibility(ckpt, {"observation_contract": destination})
             elif source_width < width and self.pretrained_actor_observation_extension == "frenet_neighbors":
-                # Reuse the driving-layout contract parser: only appended neighbor
-                # inputs may extend the solo LiDAR/Frenet prefix.
-                from agents.common.adapter_transfer import observation_layout
-                common, driving, target_start, total, target = observation_layout(source_contract)
-                dest_common, dest_driving, dest_target_start, dest_total, dest_target = observation_layout(destination)
-                if (source_width != driving or total != driving or target_start != driving
-                        or target.get("enabled") or dest_target.get("enabled")
+                # Only appended neighbor inputs may extend the solo driving prefix.
+                from agents.common.observations import observation_layout
+                common, driving, total = observation_layout(source_contract)
+                dest_common, dest_driving, dest_total = observation_layout(destination)
+                if (source_width != driving or total != driving
                         or dest_driving != driving or dest_total != width
-                        or dest_target_start != width
                         or not destination["observation"].get("frenet_neighbors", {}).get("enabled")):
                     raise ValueError(f"Unsupported frenet_neighbors observation extension for {aid}")
                 validate_checkpoint_compatibility({"observation_prefix": common},
@@ -906,10 +903,6 @@ class MAPPOAgent:
             self.actor.load_state_dict(actor_state, strict=True)
         self.pretrained_actor_source = source
         self._lora_ready = True
-
-    def load_pretrained_adapter(self, path, *, source_agent, target_agent):
-        from agents.common.adapter_transfer import import_adapter
-        import_adapter(self, path, source_agent=source_agent, target_agent=target_agent)
 
     def save(self, path: str) -> None:
         self._require_lora_source()

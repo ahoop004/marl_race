@@ -154,7 +154,6 @@ class DeterministicPPOEvaluator:
                         if episode_done:
                             break
 
-                        self.obs_composer.update_prev_action(action_norm)
                         obs = self.obs_composer.wrap(
                             obs_dict.get(self.rl_agent_id, {}),
                             info_dict.get(self.rl_agent_id, {}),

@@ -476,10 +476,6 @@ class MARLTrainer:
                             "team_return_mode": self.team_return_mode,
                         }
                     )
-                    # The next observation must expose the action that produced
-                    # the next environment state. Updating after composition
-                    # leaves PrevActionComponent one decision behind.
-                    self.obs_composers[aid].update_prev_action(actions_norm[aid])
                     next_obs = self.obs_composers[aid].wrap(
                         obs_dict.get(aid, {}), agent_info
                     )

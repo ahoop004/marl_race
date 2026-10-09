@@ -9,25 +9,12 @@ from core.scenario import load_yaml_config
 
 
 _CENTERLINE_OBSERVATIONS = {
-    "centerline_ego_state",
-    "progress",
     "frenet_vehicle_track",
     "frenet_neighbors",
-    "target_frenet",
 }
 _CENTERLINE_REWARDS = {
-    "centerline",
-    "centerline_progress",
-    "centerline_lateral_velocity_penalty",
-    "centerline_deviation_penalty",
     "progress_delta_bonus",
-    "relative_progress_bonus",
-    "team_progress_bonus",
-    "team_relative_progress_bonus",
-    "wrong_way_penalty",
-    "reverse_progress_penalty",
-    "offtrack_penalty",
-    "progress_safety",
+    "team_support",
 }
 
 
@@ -107,9 +94,7 @@ def derive_environment_feature_requirements(
         if "frenet_vehicle_track" in observation_keys:
             vehicle_state.add(agent_id)
             preview.add(agent_id)
-        if "target_frenet" in observation_keys and not agent_config.get("target_id"):
-            raise ValueError("target_frenet observations require an explicit target_id")
-        if observation_keys & {"frenet_neighbors", "target_frenet"}:
+        if "frenet_neighbors" in observation_keys or "team_support" in reward_keys:
             neighbors.add(agent_id)
 
     return EnvironmentFeatureRequirements(

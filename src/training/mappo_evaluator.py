@@ -148,8 +148,6 @@ class DeterministicMAPPOEvaluator:
                                                       for aid in self.env.possible_agents})
                 if not set(physical).issubset(self.env.agents):
                     break
-            for aid in ids:
-                self.obs_composers[aid].update_prev_action(normalized[aid])
             self._report_progress(facts, episode, steps)
             if getattr(self, 'render', False):
                 self.env.render()

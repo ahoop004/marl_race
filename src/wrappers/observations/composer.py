@@ -9,24 +9,18 @@ import numpy as np
 from core.scenario import load_yaml_config
 
 from wrappers.observations.base import ObservationComponent
-from wrappers.observations.ego import LidarComponent, EgoStateComponent, PrevActionComponent
-from wrappers.observations.track import (
-    CenterlineEgoStateComponent,
-    FrenetVehicleTrackComponent,
-    ProgressComponent,
-)
-from wrappers.observations.neighbors import (
-    FrenetNeighborsComponent,
-    TargetFrenetComponent,
-    TargetStateComponent,
-    RelativePoseComponent,
-)
+from wrappers.observations.ego import LidarComponent
+from wrappers.observations.track import FrenetVehicleTrackComponent
+from wrappers.observations.neighbors import FrenetNeighborsComponent
+
+
+COMPONENT_KEYS = frozenset({"lidar", "frenet_vehicle_track", "frenet_neighbors"})
 
 
 class ObservationComposer:
     """Concatenates enabled ObservationComponents into a flat float32 array.
 
-    Built from a config dict (loaded from configs/observations/<policy>.yaml)
+    Built from an inline config dict or a user-supplied YAML file
     and the env config (for lidar_beams, lidar_range).
 
     Each :meth:`wrap` call writes component outputs directly into a
@@ -75,17 +69,11 @@ class ObservationComposer:
             if hasattr(c, "reset"):
                 c.reset()
 
-    def update_prev_action(self, action: np.ndarray) -> None:
-        for c in self._components:
-            if isinstance(c, PrevActionComponent):
-                c.update(action)
-
     @classmethod
     def from_config(
         cls,
         obs_config: Dict,
         env_config: Dict,
-        action_dim: int = 2,
     ) -> "ObservationComposer":
         """Build from a parsed observation config dict and env config.
 
@@ -96,6 +84,9 @@ class ObservationComposer:
         lidar_range = float(env_config.get("lidar_range", 10.0))
 
         obs = obs_config.get("observation", obs_config)
+        unknown = sorted(set(obs) - COMPONENT_KEYS)
+        if unknown:
+            raise ValueError(f"ObservationComposer: unknown observation component(s): {unknown}")
         components: List[ObservationComponent] = []
 
         lidar_cfg = obs.get("lidar", {})
@@ -107,27 +98,6 @@ class ObservationComposer:
                     normalize=bool(lidar_cfg.get("normalize", True)),
                 )
             )
-
-        ego_cfg = obs.get("ego_state", {})
-        if ego_cfg.get("enabled", False):
-            components.append(
-                EgoStateComponent(
-                    include_velocity=bool(ego_cfg.get("include_velocity", True)),
-                    include_pose=bool(ego_cfg.get("include_pose", False)),
-                )
-            )
-
-        tgt_cfg = obs.get("target_state", {})
-        if tgt_cfg.get("enabled", False):
-            components.append(TargetStateComponent())
-
-        rel_cfg = obs.get("relative_pose", {})
-        if rel_cfg.get("enabled", False):
-            components.append(RelativePoseComponent())
-
-        cl_ego_cfg = obs.get("centerline_ego_state", {})
-        if cl_ego_cfg.get("enabled", False):
-            components.append(CenterlineEgoStateComponent())
 
         frenet_cfg = obs.get("frenet_vehicle_track", {})
         if frenet_cfg.get("enabled", False):
@@ -162,19 +132,6 @@ class ObservationComposer:
                 )
             )
 
-        prog_cfg = obs.get("progress", {})
-        if prog_cfg.get("enabled", False):
-            components.append(ProgressComponent())
-
-        pa_cfg = obs.get("prev_action", {})
-        if pa_cfg.get("enabled", False):
-            components.append(PrevActionComponent(action_dim=action_dim))
-
-        target_frenet_cfg = obs.get("target_frenet", {})
-        if target_frenet_cfg.get("enabled", False):
-            components.append(TargetFrenetComponent(target_frenet_cfg.get("maxima", {}),
-                                                   target_frenet_cfg.get("agent_ids")))
-
         if not components:
             raise ValueError("ObservationComposer: no components enabled in obs config.")
 
@@ -190,11 +147,10 @@ class ObservationComposer:
         cls,
         path: str,
         env_config: Dict,
-        action_dim: int = 2,
     ) -> "ObservationComposer":
         """Load from a YAML observation config file path."""
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Observation config not found: {path}")
         obs_config = load_yaml_config(p)
-        return cls.from_config(obs_config, env_config, action_dim=action_dim)
+        return cls.from_config(obs_config, env_config)

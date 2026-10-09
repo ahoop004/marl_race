@@ -443,7 +443,7 @@ def main() -> None:
         trainable_ids = [rl_agent_id]
     # else: trainable_ids already holds the full list from get_trainable_agent_ids()
 
-    obs_composers = build_obs_composers(agent_configs, trainable_ids, env_cfg, scenario_dir, action_dim=2)
+    obs_composers = build_obs_composers(agent_configs, trainable_ids, env_cfg, scenario_dir)
     reward_composers = build_reward_composers(agent_configs, trainable_ids, scenario_dir)
     obs_composer = obs_composers[rl_agent_id]
     reward_composer = reward_composers[rl_agent_id]
@@ -480,13 +480,9 @@ def main() -> None:
                 )
 
     pretrained_actor_path: Optional[Path] = None
-    adapter_transfer = params.get("adapter_transfer")
-    if adapter_transfer and getattr(args, "pretrained_actor", None):
-        raise ValueError("Use training_defaults.adapter_transfer.checkpoint to select an adapter source")
     if getattr(args, "pretrained_actor", None):
         params["pretrained_actor_checkpoint"] = str(resolve_checkpoint_path(args.pretrained_actor))
-    pretrained_actor_value = (adapter_transfer["checkpoint"] if adapter_transfer
-                              else params.get("pretrained_actor_checkpoint"))
+    pretrained_actor_value = params.get("pretrained_actor_checkpoint")
     if algorithm == "mappo" and pretrained_actor_value:
         pretrained_actor_path = _resolve_scenario_relative_path(
             str(pretrained_actor_value), scenario_dir
@@ -583,8 +579,7 @@ def main() -> None:
         provenance["pretrained_actor"] = {
             "path": str(pretrained_actor_path),
             "sha256": hashlib.sha256(pretrained_actor_path.read_bytes()).hexdigest(),
-            "load_scope": "frozen_base_and_selected_adapter" if adapter_transfer else "actor_only",
-            "adapter_transfer": adapter_transfer,
+            "load_scope": "actor_only",
             "observation_extension": params.get("pretrained_actor_observation_extension"),
             "lora": params.get("lora"),
         }
@@ -810,7 +805,7 @@ def _run_eval(
     action_high = action_space.high
     action_dim = len(action_low)
     obs_composers = build_obs_composers(
-        agent_configs, trainable_ids, env_cfg, scenario_dir, action_dim=action_dim
+        agent_configs, trainable_ids, env_cfg, scenario_dir
     )
     reward_composers = build_reward_composers(agent_configs, trainable_ids, scenario_dir)
     params = resolve_training_params(focal_cfg, scenario)
@@ -1105,8 +1100,6 @@ def _run_eval(
                 for aid in trainable_ids:
                     if aid not in getattr(env, "agents", []):
                         continue
-                    if aid in actions_norm:
-                        obs_composers[aid].update_prev_action(actions_norm[aid])
                     wrapped_obs[aid] = obs_composers[aid].wrap(
                         obs_dict.get(aid, {}),
                         info_dict.get(aid, {}),
@@ -1310,7 +1303,6 @@ def _run_on_policy(
             agent_cfg,
             eval_scenario["environment"],
             scenario_dir,
-            action_dim=len(eval_action_space.low),
         )
         if eval_obs_composer.obs_dim != obs_composer.obs_dim:
             raise ValueError("Training and evaluation observation dimensions must match.")
@@ -1468,12 +1460,7 @@ def _run_mappo(
     )
     pretrained_actor = params.get("_resolved_pretrained_actor_checkpoint")
     if pretrained_actor:
-        transfer = params.get("adapter_transfer")
-        if transfer:
-            agent.load_pretrained_adapter(str(pretrained_actor), source_agent=transfer["source_agent"],
-                                         target_agent=transfer["target_agent"])
-        else:
-            agent.load_pretrained_actor(str(pretrained_actor))
+        agent.load_pretrained_actor(str(pretrained_actor))
         console.print_info(
             f"Initialized MAPPO actors from checkpoint: {pretrained_actor}"
         )
