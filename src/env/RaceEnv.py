@@ -626,6 +626,9 @@ class RaceEnv:
     def action_space(self, agent: str):
         return self.action_spaces[agent]
 
+    def observation_space(self, agent: str):
+        return self.observation_spaces[agent]
+
     def _update_state(self, obs_dict):
         self._invalidate_global_state_cache()
         self.state_buffers.update(obs_dict)
@@ -1079,6 +1082,7 @@ class RaceEnv:
                 for aid in obs:
                     if "scans" in obs[aid]:
                         obs[aid]["scans"] = scans[agent_index[aid]]
+                        obs[aid]["lidar"] = obs[aid]["scans"]
             self._inject_frenet_neighbors(infos)
         add_time_limit_info(infos, truncations=truncations)
         for aid, info in infos.items():

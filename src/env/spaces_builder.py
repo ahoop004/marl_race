@@ -43,11 +43,18 @@ def build_observation_spaces(
     y_max: float,
     continuous_laps: bool = False,
 ) -> Dict[str, DictSpaceSpec]:
+    nonlinear = vehicle_params.get("model") == "combined_slip_st"
+    control_params = vehicle_params["wheel_actuators"] if nonlinear else vehicle_params
+    steering_low = float(control_params["steering_min" if nonlinear else "s_min"])
+    steering_high = float(control_params["steering_max" if nonlinear else "s_max"])
+    speed_low = float(control_params["wheel_speed_min" if nonlinear else "v_min"])
+    speed_high = float(control_params["wheel_speed_max" if nonlinear else "v_max"])
+
     pose_low = np.array([x_min, y_min, -np.pi], dtype=np.float32)
     pose_high = np.array([x_max, y_max, np.pi], dtype=np.float32)
     v_min = float(vehicle_params.get("v_min", -5.0))
     v_max = float(vehicle_params.get("v_max", 20.0))
-    if vehicle_params.get("model") == "combined_slip_st":
+    if nonlinear:
         v_min, v_max = -np.inf, np.inf
     vel_low = np.array([v_min, v_min], dtype=np.float32)
     vel_high = np.array([v_max, v_max], dtype=np.float32)
@@ -57,7 +64,7 @@ def build_observation_spaces(
     accel_high = np.array([accel_cap, accel_cap], dtype=np.float32)
 
     ang_cap = float(vehicle_params.get("ang_vel_max", 10.0))
-    if vehicle_params.get("model") == "combined_slip_st":
+    if nonlinear:
         accel_low.fill(-np.inf)
         accel_high.fill(np.inf)
         ang_cap = np.inf
@@ -72,11 +79,16 @@ def build_observation_spaces(
         components: Dict[str, SpaceSpec] = {}
 
         if "lidar" in sensors:
+            # lidar_range is the policy normalization scale. Raw scans use
+            # the scanner's range and additive Gaussian noise, so neither
+            # that scale nor zero is a hard bound on the returned readings.
             components["lidar"] = SpaceSpec(
                 shape=(lidar_beam_count,),
-                low=np.zeros(lidar_beam_count, dtype=np.float32),
-                high=np.full(lidar_beam_count, lidar_range, dtype=np.float32),
+                low=-np.inf,
+                high=np.inf,
             )
+            # Raw observations retain this alias for controller/render consumers.
+            components["scans"] = components["lidar"]
         if "pose" in sensors:
             components["pose"] = SpaceSpec(shape=(3,), low=pose_low, high=pose_high)
         if "velocity" in sensors:
@@ -85,26 +97,47 @@ def build_observation_spaces(
             components["acceleration"] = SpaceSpec(shape=(2,), low=accel_low, high=accel_high)
         if "angular_velocity" in sensors:
             components["angular_velocity"] = SpaceSpec(
-                shape=(1,),
-                low=np.array([-ang_cap], dtype=np.float32),
-                high=np.array([ang_cap], dtype=np.float32),
+                shape=(), low=-ang_cap, high=ang_cap,
             )
         if "target_pose" in sensors:
-            components["target_pose"] = SpaceSpec(shape=(3,), low=pose_low, high=pose_high)
+            # Agents without a configured target return the zero pose, even
+            # when the map's coordinates do not include the origin.
+            components["target_pose"] = SpaceSpec(
+                shape=(3,), low=np.minimum(pose_low, 0.0), high=np.maximum(pose_high, 0.0),
+            )
         if "target_collision" in sensors:
             components["target_collision"] = SpaceSpec(
-                shape=(1,),
-                low=np.zeros(1, dtype=np.float32),
-                high=np.ones(1, dtype=np.float32),
+                shape=(), low=0.0, high=1.0,
             )
         if "lap" in sensors:
             components["lap"] = SpaceSpec(shape=(2,), low=lap_low, high=lap_high)
         if "collision" in sensors:
             components["collision"] = SpaceSpec(
-                shape=(1,),
-                low=np.zeros(1, dtype=np.float32),
-                high=np.ones(1, dtype=np.float32),
+                shape=(), low=0.0, high=1.0,
             )
+
+        # RaceEnv always attaches physical state and command references,
+        # independently of the optional sensor selection. Scalars keep their
+        # existing float32 representation for controllers and composers.
+        components["steering_angle"] = SpaceSpec(
+            shape=(), low=steering_low, high=steering_high,
+        )
+        components["steering_reference"] = SpaceSpec(
+            shape=(), low=steering_low, high=steering_high,
+        )
+        speed_key = "wheel_speed" if nonlinear else "speed"
+        if nonlinear:
+            components["wheel_speed"] = SpaceSpec(
+                shape=(), low=speed_low, high=speed_high,
+            )
+        components[f"{speed_key}_reference"] = SpaceSpec(
+            shape=(), low=speed_low, high=speed_high,
+        )
+        # These are changes in the commanded reference per decision, rather
+        # than the rate-limited actuator's physical acceleration.
+        components[f"{speed_key}_reference_rate"] = SpaceSpec(
+            shape=(), low=-np.inf, high=np.inf,
+        )
 
         components["state"] = SpaceSpec(
             shape=(central_state_dim,),

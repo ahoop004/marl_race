@@ -24,7 +24,7 @@ class SpaceSpec:
             self.high = np.broadcast_to(self.high, self.shape).copy()
 
     def sample(self) -> np.ndarray:
-        return np.random.uniform(self.low, self.high).astype(self.dtype)
+        return np.asarray(np.random.uniform(self.low, self.high), dtype=self.dtype)
 
     @property
     def n(self) -> int:
