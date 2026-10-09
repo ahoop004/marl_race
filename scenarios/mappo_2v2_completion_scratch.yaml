@@ -1,18 +1,4 @@
-# Shared task and scratch baseline; transfer variants include this file.
-# Local: python3 run.py --scenario scenarios/mappo_2v2_completion_scratch.yaml --no-wandb
-# HPC: append --num-envs 64 --num-workers 32 --set training_defaults.device=cuda --wandb
-# Physics/action limits match outputs/pretrain/best_model.pt (8 m/s rolling-speed cap).
-# --total-steps controls aggregate environment decisions; --seed selects a replicate.
-# Local quick run: append --total-steps 2048 --set evaluation.enabled=false
-# Parallel horizon is rollout_steps_per_env; serial buffer size is n_steps.
-# Changing environment count/horizon changes the PPO batch size, so match these across arms.
-# Training/evaluation use the same nine maps; final-test seeds are separate, not held-out maps.
-# For three-lap evaluation: --set evaluation.target_laps=3
-# Signed progress is per lap; collision cost replaces progress on terminal failure.
-# Boundary violations replace progress with -0.05 per step; collisions terminate.
-# Time cost is at most 0.2 over the 800 s timeout, below the 2.0 crash cost.
-# Shared mean local rewards plus a once-only both-finish bonus use joint team returns.
-# rank_bonus=0 disables competition rewards while reusing the existing team-result component.
+
 experiment:
   name: mappo_2v2_completion_scratch
   episodes: 5000
