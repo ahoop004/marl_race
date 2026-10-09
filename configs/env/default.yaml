@@ -1,0 +1,19 @@
+environment:
+  timestep: 0.01
+  lidar_beams: 108
+  lidar_range: 10.0
+  render: false
+  centerline_autoload: false
+  walls_autoload: false
+  track_preview:
+    points: 20
+    spacing: 0.3
+  episode_termination:
+    # End the joint racing episode when any active agent reaches a terminal state.
+    # Use all_agents or all_trainable for independent-survival tasks.
+    mode: any_agent
+  terminal_agents:
+    remain_collidable: true
+    crashed_behavior: stationary
+    finished_behavior: coast_then_stop
+    finish_clearance_steps: 200

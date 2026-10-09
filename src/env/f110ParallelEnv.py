@@ -1,0 +1,1872 @@
+from pathlib import Path
+import hashlib
+from typing import TYPE_CHECKING, Any, Callable, Dict, Mapping, Optional, Tuple, Sequence
+
+
+# base classes
+from physics import Simulator, Integrator
+from physics.dynamic_models import validate_vehicle_params
+# Lazy import to avoid pyglet initialization on HPC without display
+# from render import EnvRenderer  # Moved to render() method
+from env.centerline_state import (
+    CenterlineProgressTracker,
+    CenterlineRuntimeState,
+    LapTracker,
+    apply_centerline_to_renderer,
+    build_relative_frenet_facts,
+    inject_finish_line_info,
+    resolve_finish_line_config,
+    validate_finish_line,
+)
+from env.collision_state import (
+    RaceLifecycle,
+    apply_episode_termination_policy,
+    normalize_episode_termination_mode,
+    update_collision_flags,
+    validate_target_laps,
+)
+from env.info_builder import (
+    add_episode_metadata,
+    add_step_info_fields,
+    add_time_limit_info,
+    build_reset_info_payloads,
+    build_step_facts,
+    filter_info_payloads,
+)
+from env.map_config import normalize_map_identifier, resolve_map_runtime_config
+from env.map_schedule import MapScheduler
+from env.obs_assembly import split_joint_obs
+from env.render_adapter import (
+    build_render_observations,
+    compute_relative_snapshot,
+    flush_render_state,
+)
+from env.spawn_manager import SpawnManager
+from env.friction import copy_friction_metadata
+from env.spaces_builder import build_action_spaces, build_observation_spaces
+from env.state_views import (
+    FrozenSnapshotMapping, build_agent_state, build_global_state, central_state_tensor,
+)
+from utils.track_preview import (
+    TrackPreviewGeometry,
+    TrackPreviewGeometryCache,
+    build_track_preview_cache_key,
+)
+from env.state_buffer import (
+    StateBuffers,
+    TerminalAgentConfig,
+    TerminalVehicleController,
+)
+from env.types import AgentRaceStatus, AgentState, GlobalState, TerminalReason
+from env.respawn import validate_respawn, sample_ahead_pose
+from env.attack import AttackTracker, MultiTargetAttackTracker, attack_geometry, validate_attack
+from env.skills import SkillTracker, validate_skill_task, sample_skill_spawn
+from utils.centerline import project_to_centerline
+from render.render_state import RenderRuntimeState, parse_heatmap_config, parse_overlay_config
+
+# Type checking only imports (don't execute at runtime)
+if TYPE_CHECKING:
+    from render import EnvRenderer
+
+
+GLOBAL_STATE_VECTOR_VERSION = "2.0"
+_CENTERLINE_GLOBAL_STATE_KEYS = (
+    "progress",
+    "d",
+    "vs",
+    "vd",
+    "heading_error",
+)
+
+
+def _default_vehicle_params() -> Dict[str, float]:
+    """Default vehicle dynamics parameters used across experiments."""
+    return {
+        "mu": 1.0489,
+        "C_Sf": 4.718,
+        "C_Sr": 5.4562,
+        "lf": 0.15875,
+        "lr": 0.17145,
+        "h": 0.074,
+        "m": 3.74,
+        "I": 0.04712,
+        "s_min": -0.4189,
+        "s_max": 0.4189,
+        "sv_min": -3.2,
+        "sv_max": 3.2,
+        "v_switch": 7.319,
+        "a_max": 9.51,
+        "v_min": -5.0,
+        "v_max": 10.0,
+        "width": 0.225,
+        "length": 0.32,
+    }
+
+
+# others
+import numpy as np
+import os
+import time
+import logging
+
+# gl - Lazy import for headless system compatibility
+# Pyglet will be imported only when rendering is actually needed
+_PYGLET_AVAILABLE = None
+pyglet = None
+gl = None
+pyg_img = None
+
+def _ensure_pyglet():
+    """Lazy load pyglet modules. Returns True if successful, False if not available."""
+    global _PYGLET_AVAILABLE, pyglet, gl, pyg_img
+    if _PYGLET_AVAILABLE is not None:
+        return _PYGLET_AVAILABLE
+
+    try:
+        import pyglet as _pyglet
+        pyglet = _pyglet
+        pyglet.options['debug_gl'] = False
+        from pyglet import gl as _gl
+        from pyglet import image as _pyg_img
+        gl = _gl
+        pyg_img = _pyg_img
+        _PYGLET_AVAILABLE = True
+        return True
+    except Exception as e:
+        _PYGLET_AVAILABLE = False
+        logger.warning(f"Pyglet not available (headless system?): {e}")
+        logger.warning("Rendering will be disabled. This is normal for HPC/headless systems.")
+        return False
+
+# constants
+
+# rendering
+# VIDEO_W = 600
+# VIDEO_H = 400
+WINDOW_W = 1000
+WINDOW_H = 800
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_vehicle_colors(color_map: Mapping[str, Any]) -> Dict[str, tuple]:
+    """Convert a scenario ``vehicle_colors`` dict to normalized RGBA float tuples.
+
+    Accepted per-agent formats
+    --------------------------
+    - Hex string: ``"#e8503c"`` or ``"#e8503cff"`` (3-byte or 4-byte)
+    - RGB list/tuple: ``[0.91, 0.31, 0.23]`` (values in [0, 1])
+    - RGBA list/tuple: ``[0.91, 0.31, 0.23, 1.0]``
+
+    Returns a dict of ``{agent_id: (r, g, b, a)}`` with floats in ``[0, 1]``.
+    Malformed entries are skipped with a warning.
+    """
+    result: Dict[str, tuple] = {}
+    for aid, raw in color_map.items():
+        try:
+            result[str(aid)] = _color_to_rgba(raw)
+        except (ValueError, TypeError) as exc:
+            logger.warning("vehicle_colors: skipping agent %r — %s", aid, exc)
+    return result
+
+
+def _color_to_rgba(raw: Any) -> tuple:
+    """Convert a single color spec to a normalized (r, g, b, a) float tuple."""
+    if isinstance(raw, str):
+        # Hex string
+        s = raw.strip().lstrip("#")
+        if len(s) == 6:
+            r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+            return (r / 255.0, g / 255.0, b / 255.0, 1.0)
+        if len(s) == 8:
+            r, g, b, a = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16), int(s[6:8], 16)
+            return (r / 255.0, g / 255.0, b / 255.0, a / 255.0)
+        raise ValueError(f"Hex color must be 6 or 8 hex digits, got {len(s)}: {raw!r}")
+    if isinstance(raw, (list, tuple)):
+        if len(raw) == 3:
+            return (float(raw[0]), float(raw[1]), float(raw[2]), 1.0)
+        if len(raw) == 4:
+            return (float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
+        raise ValueError(f"Color list must have 3 (RGB) or 4 (RGBA) elements, got {len(raw)}")
+    raise TypeError(f"Unsupported color type {type(raw).__name__!r}: {raw!r}")
+
+DEFAULT_AGENT_SENSORS = (
+    "lidar",
+    "pose",
+    "velocity",
+    "angular_velocity",
+    "lap",
+    "collision",
+)
+
+class F110ParallelEnv:
+
+    metadata = {"name": "F110ParallelEnv", "render_modes": ["human", "rgb_array"]}
+
+    # rendering
+    def __init__(self, **kwargs):
+        map_data = kwargs.pop("map_data", None)
+        env_config = kwargs.get("env", {})
+        merged = {**env_config, **kwargs}
+        
+        self._configure_rendering(merged)
+        self._configure_basic_environment(merged)
+   
+        self.timestep: float = float(merged.get("timestep", 0.01))
+        self._control_repeat = max(int(merged.get("action_repeat", 1)), 1)
+        self._control_timestep = self.timestep * self._control_repeat
+        self.integrator = self._resolve_integrator(merged)
+
+        self._configure_map_paths(merged, map_data)
+        self._map_split_mode = str(merged.get("map_split_mode", "train")).strip().lower()
+        self._map_scheduler = MapScheduler(merged, rng=self.rng)
+        self._map_bundle_active = self._map_scheduler.active_bundle
+        self.walls = getattr(map_data, "walls", None) if map_data is not None else None
+        self.walls_path = getattr(map_data, "walls_path", None) if map_data is not None else None
+        self._track_mask = getattr(map_data, "track_mask", None) if map_data is not None else None
+        self.info_level = str(merged.get("info_level", "training")).strip().lower()
+        self.last_step_facts = None
+        self.start_poses = np.array(merged.get("start_poses", []),dtype=np.float32)
+
+        self.params = self._configure_vehicle_params(merged)
+        from env.friction import EpisodeFriction, validate_friction_protocol
+        friction = validate_friction_protocol(merged.get("friction"),
+                                             nonlinear=self.params.get("model") == "combined_slip_st")
+        self._episode_physics = None
+        self._friction = (EpisodeFriction(friction, nominal_mu=self.params["mu"], seed=self.seed,
+                                         phase=merged.get("physics_phase", "train"))
+                          if self.params.get("model") == "combined_slip_st" else None)
+
+        limits_cfg = merged.get("track_limits", {}) or {}
+        self.track_limits_enabled = bool(limits_cfg.get("enabled", False))
+        self.terminate_on_track_boundary = bool(limits_cfg.get("terminate", True))
+        if (self.track_limits_enabled and self.terminate_on_track_boundary
+                and self.n_agents != 1 and not merged.get("respawn_agents") and not merged.get("respawn")
+                and not merged.get('skill_task')):
+            raise ValueError("Track-limit time trials require one vehicle")
+        preview_cfg = merged.get("track_preview", {}) or {}
+        self._track_preview_points = max(int(preview_cfg.get("points", 20)), 1)
+        self._track_preview_spacing = max(float(preview_cfg.get("spacing", 0.3)), 1e-3)
+        requirements_cfg = merged.get("feature_requirements")
+        if isinstance(requirements_cfg, Mapping):
+            self._track_preview_agents = frozenset(
+                str(aid) for aid in requirements_cfg.get("track_preview_agents", ())
+            )
+            self._frenet_neighbor_agents = frozenset(
+                str(aid) for aid in requirements_cfg.get("frenet_neighbor_agents", ())
+            )
+        else:
+            # Direct environment construction predates the setup-level feature
+            # contract. Preserve its legacy payload behavior.
+            self._track_preview_agents = frozenset(self.possible_agents)
+            self._frenet_neighbor_agents = frozenset(self.possible_agents)
+        if self.track_limits_enabled:
+            self._track_preview_agents = frozenset(self.possible_agents)
+        self._track_preview_geometry_cache = TrackPreviewGeometryCache(
+            self._map_scheduler.configured_bundle_count
+        )
+        self._track_preview_geometry: Optional[TrackPreviewGeometry] = None
+        self._track_preview_last_indices = {
+            agent_id: -1 for agent_id in self.possible_agents
+        }
+        self._last_control_commands = np.zeros((self.n_agents, 2), dtype=np.float32)
+        self._last_speed_reference_rates = np.zeros(self.n_agents, dtype=np.float32)
+        
+        self.lidar_beams = int(merged.get("lidar_beams", 1080))
+        if self.lidar_beams <= 0:
+            self.lidar_beams = 1080
+        self.lidar_range = float(merged.get("lidar_range", 12.0))
+        self._lidar_beam_count = max(int(self.lidar_beams), 1)
+
+        self.lidar_dist: float = float(merged.get("lidar_dist", 0.0))
+        
+        self.state_buffers = StateBuffers.build(self.n_agents)
+        self._global_state_cache: Optional[GlobalState] = None
+        self._global_state_metadata: Optional[FrozenSnapshotMapping] = None
+        self._bind_state_views()
+
+        default_terminate = bool(merged.get("terminate_on_collision", True))
+        self.terminate_on_collision = {
+            aid: default_terminate for aid in self.possible_agents
+        }
+        episode_termination = merged.get("episode_termination", {}) or {}
+        if not isinstance(episode_termination, Mapping):
+            raise TypeError("environment.episode_termination must be a mapping")
+        legacy_any_done = merged.get("terminate_on_any_done")
+        default_mode = "any_agent" if legacy_any_done is not False else "all_agents"
+        self.episode_termination_mode = normalize_episode_termination_mode(
+            episode_termination.get("mode", default_mode)
+        )
+        self.episode_done = False
+
+        self._agent_sensor_spec: Dict[str, Tuple[str, ...]] = {
+            aid: DEFAULT_AGENT_SENSORS for aid in self.possible_agents
+        }
+        self._agent_target_index: Dict[str, Optional[int]] = {
+            aid: None for aid in self.possible_agents
+        }
+
+        raw_target_laps = merged.get("target_laps", merged.get("laps", 1))
+        self.target_laps = validate_target_laps(raw_target_laps)
+        self.lifecycle = RaceLifecycle(self.possible_agents, self.target_laps,
+                                       finish_on_laps=bool(episode_termination.get("lap_completion", True)),
+                                       lap_finish_agents=episode_termination.get("lap_finish_agents"))
+        recovery = validate_respawn(merged.get("respawn"), self.possible_agents)
+        self._respawn_config = recovery
+        attack = validate_attack(merged.get("attack_task"), self.possible_agents)
+        self._attack_tracker = None
+        skill = validate_skill_task(merged.get('skill_task'), self.possible_agents)
+        self._skill_tracker = SkillTracker(skill) if skill else None
+        self._skill_stages = merged.get('skill_stages', [])
+        self._skill_stage = None
+        self._pending_skill_stage = 0
+        self.skill_spawn = None
+        if skill and not self._skill_stages:
+            raise ValueError('skill_task requires skill_curriculum stages')
+        if attack:
+            tracker_type = MultiTargetAttackTracker if "target_ids" in attack else AttackTracker
+            self._attack_tracker = tracker_type(attack)
+        self.boundary_respawn_agents = set(recovery.get("boundary_agents", []))
+        self.collision_respawn_agents = set(recovery.get("collision_agents", []))
+        self.respawn_agents = set(merged.get("respawn_agents", []))
+        self.respawn_on_vehicle_collision = bool(merged.get("respawn_on_vehicle_collision", False))
+        if not self.respawn_agents <= set(self.possible_agents):
+            raise ValueError("respawn_agents contains unknown agents")
+        self.terminal_agent_config = TerminalAgentConfig.from_mapping(
+            merged.get("terminal_agents")
+        )
+        self._terminal_controller = TerminalVehicleController(
+            self.possible_agents,
+            self.terminal_agent_config,
+        )
+
+        self.current_time = 0.0
+        self._elapsed_steps = 0
+
+        # Episode step counters — also set in reset(); initialised here so
+        # any accidental pre-reset step() call raises a clean error rather
+        # than an AttributeError.
+        self._episode_step_count = 0
+        self._lock_speed_steps = 0
+        self._locked_velocities: Dict[str, float] = {}
+
+        # Persistent collision tracking (like v1)
+        # Once an agent collides, they stay collided for the episode
+        self._collision_flags = np.zeros(self.n_agents, dtype=bool)
+        self._collision_steps = np.full(self.n_agents, -1, dtype=np.int32)
+
+        # Compatibility views backed exclusively by the authoritative
+        # lifecycle/LapTracker contract.
+        self.lap_counts = np.zeros((self.n_agents,), dtype=np.float32)
+        self.lap_times = np.zeros((self.n_agents,), dtype=np.float32)
+
+        # initiate stuff
+        self.sim = Simulator(
+            self.params,
+            self.n_agents,
+            self.seed,
+            time_step=self.timestep,
+            integrator=self.integrator,
+            lidar_dist=self.lidar_dist,
+            num_beams=self._lidar_beam_count,
+            wall_collision_response=(not self.track_limits_enabled
+                                     or any(self.terminate_on_collision.values())),
+        )
+
+        self.sim.set_map(str(self.yaml_path), self.map_ext)
+        meta, img_path, (width, height) = self._load_map_metadata(merged, map_data)
+
+        self.map_meta = meta
+        self.map_image_path = img_path
+        self._map_data = map_data
+        self._spawn_manager = SpawnManager(
+            merged, map_data,
+            possible_agents=self.possible_agents,
+            agent_index=self._agent_id_to_index,
+            rng=self.rng,
+            seed=self.seed,
+            map_split_mode=self._map_split_mode,
+            init_metadata=meta,
+        )
+
+        self._finish_line_override = merged.get("finish_line")
+        lap_counting_cfg = merged.get("lap_counting") or {}
+        if not isinstance(lap_counting_cfg, Mapping):
+            raise TypeError("environment.lap_counting must be a mapping")
+        self._require_finish_line = lap_counting_cfg.get("require_finish_line", False)
+        if not isinstance(self._require_finish_line, bool):
+            raise ValueError("lap_counting.require_finish_line must be boolean")
+        self._count_initial_crossing_as_lap = bool(
+            lap_counting_cfg.get("count_initial_crossing_as_lap", True)
+        )
+        self._finish_line_data: Optional[Dict[str, Any]] = None
+        self._finish_signed_prev = None  # legacy compatibility view
+        self._finish_crossed = np.zeros((self.n_agents,), dtype=bool)
+        self._lap_tracker: Optional[LapTracker] = None
+        self._configure_lap_tracker(meta, map_data=map_data)
+
+        R = float(meta.get("resolution", 1.0))
+        x0, y0, _ = meta.get('origin', (0.0, 0.0, 0.0))
+        x_min = x0
+        x_max = x0 + width * R
+        y_min = y0
+        y_max = y0 + height * R
+
+        self._build_observation_spaces(x_min, x_max, y_min, y_max)
+
+        # stateful observations for rendering
+        default_lidar_skip = int(merged.get("lidar_beams", self._lidar_beam_count))
+        if default_lidar_skip < 0:
+            default_lidar_skip = 0
+        self._render_state = RenderRuntimeState(
+            lidar_skip_default=default_lidar_skip,
+            lidar_skip={aid: default_lidar_skip for aid in self.possible_agents},
+        )
+        overlay = parse_overlay_config(merged)
+        self._render_state.apply_overlay_config(overlay)
+        heatmap = parse_heatmap_config(merged)
+        self._render_state.apply_heatmap_config(heatmap)
+
+        self._single_action_space, self.action_spaces = build_action_spaces(
+            self.possible_agents,
+            self.params,
+        )
+
+        # Centerline progress tracker — computes per-step projection facts when
+        # centerline_features is enabled.  _last_centerline_facts is updated each
+        # step and consumed by get_agent_state() and info injection.
+        self._centerline_progress_tracker = CenterlineProgressTracker(
+            agent_ids=self.possible_agents,
+        )
+        self._last_centerline_facts: Dict[str, Dict[str, float]] = {}
+
+        no_progress = merged.get("no_progress") or {}
+        if not isinstance(no_progress, Mapping):
+            raise ValueError("no_progress must be a mapping")
+        self._no_progress_timeout = float(no_progress.get("timeout_s", 0.0))
+        self._no_progress_distance = float(no_progress.get("min_progress_m", 1.0))
+        if (not np.isfinite(self._no_progress_timeout) or self._no_progress_timeout < 0
+                or not np.isfinite(self._no_progress_distance) or self._no_progress_distance <= 0):
+            raise ValueError("no_progress requires timeout_s >= 0 and min_progress_m > 0")
+        self._no_progress_state = {}
+
+    def _configure_rendering(self, cfg: Mapping[str, Any]) -> None:
+        self.render_mode = cfg.get("render_mode", "human")
+        self.metadata = {"render_modes": ["human", "rgb_array"], "name": "F110ParallelEnv"}
+        self.renderer: Optional["EnvRenderer"] = None
+        headless_env = str(os.environ.get("PYGLET_HEADLESS", "")).lower()
+        if headless_env in {"1", "true", "yes", "on"}:
+            self._headless = True
+        else:
+            if pyglet is None and not _ensure_pyglet():
+                self._headless = True
+            else:
+                self._headless = bool(pyglet.options.get("headless", False)) if pyglet is not None else True
+        mode = (self.render_mode or "").lower()
+        self._collect_render_data = mode == "rgb_array" or (mode == "human" and not self._headless)
+
+        # Parse scenario-level vehicle color overrides from environment.rendering.vehicle_colors
+        rendering_cfg = cfg.get("rendering", {}) or {}
+        self._vehicle_colors: Dict[str, tuple] = _parse_vehicle_colors(
+            rendering_cfg.get("vehicle_colors", {}) or {}
+        )
+
+        self._centerline_state = CenterlineRuntimeState.from_config(cfg)
+
+    def _configure_basic_environment(self, cfg: Mapping[str, Any]) -> None:
+        self.seed = int(cfg.get("seed", 42))
+        self.rng = np.random.default_rng(self.seed)
+        self.max_steps = int(cfg.get("max_steps", 5000))
+        self.n_agents = int(cfg.get("n_agents", 2))
+        self._central_state_keys = (
+            "poses_x",
+            "poses_y",
+            "poses_theta",
+            "linear_vels_x",
+            "linear_vels_y",
+            "ang_vels_z",
+            "collisions",
+        )
+        # Physical state, lifecycle facts, and map-invariant centerline facts.
+        # Keeping the centerline block fixed-size preserves a stable critic
+        # input shape across maps, including environments where the values are
+        # unavailable and therefore represented by zeros.
+        lifecycle_dims = 5  # active, finished, crashed, truncated, completed laps
+        self._central_state_dim = self.n_agents * (
+            len(self._central_state_keys)
+            + lifecycle_dims
+            + len(_CENTERLINE_GLOBAL_STATE_KEYS)
+        )
+        self.possible_agents = [f"car_{i}" for i in range(self.n_agents)]
+        self.physical_agents = tuple(self.possible_agents)
+        self._agent_id_to_index = {aid: idx for idx, aid in enumerate(self.possible_agents)}
+        self.agents = self.possible_agents.copy()
+        self.episode_done = False
+        self.controlled_agents = list(cfg.get("controlled_agents") or self.possible_agents)
+        self.trainable_agents = list(cfg.get("trainable_agents") or [])
+        self.agent_teams = dict(cfg.get("agent_teams") or {})
+        if self.agent_teams and set(self.agent_teams) != set(self.possible_agents):
+            raise ValueError("agent_teams must assign every physical agent to a team")
+        self.fixed_policy_agents = list(cfg.get("fixed_policy_agents") or [])
+
+    @property
+    def decision_agents(self) -> Tuple[str, ...]:
+        """Agents that still require external policy actions."""
+        return tuple(self.agents)
+
+    def _resolve_integrator(self, cfg: Mapping[str, Any]) -> str:
+        integrator_cfg = cfg.get("integrator", Integrator.RK4)
+        if isinstance(integrator_cfg, Integrator):
+            integrator_name = integrator_cfg.value
+        else:
+            integrator_name = str(integrator_cfg)
+        integrator_name = integrator_name.strip()
+        if integrator_name.lower() == "rk4":
+            return "RK4"
+        if integrator_name.lower() == "euler":
+            return "Euler"
+        return "RK4"
+
+    @staticmethod
+    def _normalize_map_identifier(identifier: Optional[Any]) -> Optional[str]:
+        return normalize_map_identifier(identifier)
+
+    def _configure_map_paths(self, cfg: Mapping[str, Any], map_data: Optional[Any]) -> None:
+        runtime = resolve_map_runtime_config(cfg, map_data)
+        self._map_runtime = runtime
+        self.map_dir = runtime.map_dir
+        self.map_ext = runtime.map_ext
+        self.map_name = runtime.map_name
+        self.map_yaml = runtime.map_yaml
+        self.map_path = runtime.map_path
+        self.yaml_path = runtime.yaml_path
+
+    def _configure_vehicle_params(self, cfg: Mapping[str, Any]) -> Dict[str, Any]:
+        base_vehicle_params = _default_vehicle_params()
+        vehicle_params = cfg.get("vehicle_params")
+        if vehicle_params is None:
+            vehicle_params = cfg.get("params")
+        if vehicle_params is not None:
+            if not isinstance(vehicle_params, Mapping):
+                raise TypeError("env.vehicle_params must be a mapping")
+            overrides = validate_vehicle_params(vehicle_params)
+            if overrides.get("model") == "combined_slip_st":
+                return overrides
+            base_vehicle_params.update(overrides)
+        return validate_vehicle_params(base_vehicle_params)
+
+    def _load_map_metadata(
+        self,
+        cfg: Mapping[str, Any],
+        map_data: Optional[Any],
+    ) -> Tuple[Dict[str, Any], Path, Tuple[int, int]]:
+        runtime = getattr(self, "_map_runtime", None)
+        if runtime is None:
+            runtime = resolve_map_runtime_config(cfg, map_data)
+            self._map_runtime = runtime
+        return runtime.metadata, runtime.image_path, runtime.image_size
+
+    def _apply_map_data(
+        self,
+        map_data: Any,
+        bundle: Optional[str] = None,
+        *,
+        keep_centerline: bool = False,
+    ) -> None:
+        """Apply a loaded MapData object to the env, sim, and renderer.
+
+        Parameters
+        ----------
+        map_data:
+            Populated map-data object from :class:`~utils.map_loader.MapLoader`.
+        bundle:
+            Bundle name to record as the active bundle (when cycling maps).
+        keep_centerline:
+            When ``True``, preserve the existing in-memory centerline rather
+            than loading the new map's centerline.  Used by :meth:`update_map`
+            which hot-swaps the map surface but keeps the loaded centerline.
+        """
+        if map_data is None:
+            return
+        self._map_data = map_data
+        self.map_dir = Path(map_data.yaml_path).parent
+        self.map_ext = map_data.image_path.suffix or ".png"
+        self.map_name = map_data.yaml_path.name
+        self.map_yaml = map_data.yaml_path.name
+        self.map_path = map_data.yaml_path
+        self.yaml_path = map_data.yaml_path
+        self.map_meta = dict(map_data.metadata)
+        self.map_image_path = map_data.image_path
+        self._track_mask = map_data.track_mask
+        self.walls = map_data.walls
+        self.walls_path = map_data.walls_path
+        self._spawn_manager.update_map_data(map_data, self.map_meta)
+        self._configure_lap_tracker(self.map_meta, map_data=map_data)
+
+        # Update simulation + renderer
+        self.sim.set_map(str(self.yaml_path), self.map_ext)
+        if self.renderer is not None:
+            self.renderer.update_map(
+                str(self.yaml_path.with_suffix("")),
+                self.map_ext,
+                map_meta=self.map_meta,
+                map_image_path=self.map_image_path,
+            )
+
+        # Update centerline
+        if keep_centerline:
+            # Preserve in-memory centerline; re-apply to new renderer surface.
+            self._track_preview_geometry = self._build_track_preview_geometry(
+                self.centerline_points
+            )
+            for agent_id in self.possible_agents:
+                self._track_preview_last_indices[agent_id] = -1
+            self._update_renderer_centerline()
+        else:
+            self.set_centerline(map_data.centerline, path=map_data.centerline_path)
+
+        # Update observation bounds based on new map
+        width, height = map_data.image_size
+        R = float(self.map_meta.get("resolution", 1.0))
+        x0, y0, _ = self.map_meta.get("origin", (0.0, 0.0, 0.0))
+        self._build_observation_spaces(x0, x0 + width * R, y0, y0 + height * R)
+
+        if bundle is not None:
+            self._map_bundle_active = bundle
+            self._map_scheduler.active_bundle = bundle
+        self._global_state_metadata = None
+        self._invalidate_global_state_cache()
+
+    def _maybe_cycle_map(self) -> None:
+        bundle = self._map_scheduler.select_next_bundle(self._map_split_mode)
+        if bundle is None or bundle == self._map_scheduler.active_bundle:
+            return
+        map_data = self._map_scheduler.load_bundle(
+            bundle,
+            map_ext=self.map_ext,
+            centerline_render=self.centerline_render_enabled,
+            centerline_features=self.centerline_features_enabled,
+        )
+        self._apply_map_data(map_data, bundle=bundle)
+
+    def action_space(self, agent: str):
+        return self.action_spaces[agent]
+
+    def _update_state(self, obs_dict):
+        self._invalidate_global_state_cache()
+        self.state_buffers.update(obs_dict)
+
+    def _refresh_render_observations(self, obs: Dict[str, Dict[str, Any]]) -> None:
+        if not self._collect_render_data:
+            self._render_state.render_obs = {}
+            return
+        self._render_state.render_obs = build_render_observations(
+            [aid for aid in self.agents if self.sim.collidable_mask[self._agent_id_to_index[aid]]],
+            obs,
+            agent_index=self._agent_id_to_index,
+            agent_target_index=self._agent_target_index,
+            poses_x=self.poses_x,
+            poses_y=self.poses_y,
+            poses_theta=self.poses_theta,
+            linear_vels_x=self.linear_vels_x_curr,
+            linear_vels_y=self.linear_vels_y_curr,
+            lap_times=self.lap_times,
+            lap_counts=self.lap_counts,
+            collisions=self.collisions,
+            render_state=self._render_state,
+        )
+
+    def update_render_metrics(
+        self,
+        phase: str,
+        metrics: Mapping[str, Any],
+        *,
+        step: Optional[float] = None,
+    ) -> None:
+        """
+        Cache the latest logger metrics so the renderer HUD can surface them.
+        """
+        if not phase or metrics is None:
+            return
+        try:
+            snapshot = dict(metrics)
+        except Exception:
+            return
+        payload: Dict[str, Any] = {
+            "phase": str(phase).strip().lower(),
+            "metrics": snapshot,
+            "timestamp": time.time(),
+        }
+        if step is not None:
+            payload["step"] = float(step)
+        self._render_state.metrics_payload = payload
+        self._render_state.metrics_dirty = True
+
+    def update_render_wrapped_observations(self, wrapped: Mapping[str, np.ndarray]) -> None:
+        self._render_state.set_wrapped_observations(wrapped)
+
+    def append_render_ticker(
+        self,
+        agent_id: str,
+        *,
+        step: int,
+        reward: float,
+        components: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        snapshot = compute_relative_snapshot(
+            agent_id,
+            agent_index=self._agent_id_to_index,
+            agent_target_index=self._agent_target_index,
+            poses_x=self.poses_x,
+            poses_y=self.poses_y,
+            poses_theta=self.poses_theta,
+            reward_ring_config=self._render_state.reward_ring_config,
+        )
+        if snapshot is None:
+            return
+
+        relative_reward = None
+        if components:
+            value = components.get("relative_position")
+            try:
+                relative_reward = float(value)
+            except (TypeError, ValueError):
+                relative_reward = None
+
+        total_reward = float(reward)
+        distance = snapshot["distance"]
+        sector_code = snapshot.get("sector_code", "--")
+        sector_active = snapshot.get("sector_active", False)
+        in_ring = snapshot.get("in_ring", False)
+        reward_sector = snapshot.get("reward_sector", False)
+
+        rel_text = f"{relative_reward:+.3f}" if relative_reward is not None else "--"
+        line = (
+            f"{int(step):04d} {agent_id} "
+            f"r={total_reward:+.3f} "
+            f"rel={rel_text} "
+            f"d={distance:.2f} "
+            f"{sector_code:<2} "
+            f"S={1 if sector_active else 0} "
+            f"R={1 if in_ring else 0} "
+            f"W={1 if reward_sector else 0}"
+        )
+
+        self._render_state.append_ticker_line(line)
+
+    def configure_reward_ring(self, config: Optional[Dict[str, Any]], *, agent_id: Optional[str] = None) -> None:
+        self._render_state.configure_reward_ring(config, agent_id=agent_id)
+
+    def update_reward_ring_target(self, agent_id: str, target_id: Optional[str]) -> None:
+        self._render_state.update_reward_ring_target(agent_id, target_id)
+
+    def update_reward_ring_markers(self, agent_id: str, states: Optional[Sequence[bool]]) -> None:
+        self._render_state.update_reward_ring_markers(agent_id, states)
+
+    def configure_agent_targets(self, target_mapping: Dict[str, str]) -> None:
+        """Configure which agent is the target of which other agent.
+
+        Args:
+            target_mapping: Dict mapping agent_id -> target_agent_id
+                           For example: {'car_0': 'car_1'} means car_0 is targeting car_1
+        """
+        for agent_id, target_id in target_mapping.items():
+            if agent_id not in self._agent_id_to_index:
+                continue
+            if target_id not in self._agent_id_to_index:
+                continue
+
+            target_idx = self._agent_id_to_index[target_id]
+            self._agent_target_index[agent_id] = target_idx
+
+    def get_target_id(self, agent_id: str) -> Optional[str]:
+        """Return the configured target agent ID for *agent_id*, if any."""
+
+        target_idx = self._agent_target_index.get(agent_id)
+        if target_idx is None:
+            return None
+        if target_idx < 0 or target_idx >= len(self.possible_agents):
+            return None
+        return self.possible_agents[target_idx]
+
+    def update_reward_overlays(
+        self,
+        overlays: Optional[Sequence[Mapping[str, Any]]],
+        *,
+        enabled: Optional[bool] = None,
+        alpha: Optional[float] = None,
+        value_scale: Optional[float] = None,
+        segments: Optional[int] = None,
+    ) -> None:
+        """Update translucent circle overlays used to visualise reward regions."""
+        self._render_state.update_reward_overlays(
+            overlays,
+            enabled=enabled,
+            alpha=alpha,
+            value_scale=value_scale,
+            segments=segments,
+        )
+
+    def update_reward_heatmap(
+        self,
+        heatmap: Optional[Mapping[str, Any]],
+        *,
+        enabled: Optional[bool] = None,
+        alpha: Optional[float] = None,
+        value_scale: Optional[float] = None,
+        extent_m: Optional[float] = None,
+        cell_size_m: Optional[float] = None,
+    ) -> None:
+        """Update the cached potential-field heatmap renderer state."""
+        self._render_state.update_reward_heatmap(
+            heatmap,
+            enabled=enabled,
+            alpha=alpha,
+            value_scale=value_scale,
+            extent_m=extent_m,
+            cell_size_m=cell_size_m,
+        )
+
+    def _update_start_from_poses(self, poses: np.ndarray):
+        if poses is None or poses.size == 0:
+            return
+        self.start_poses = np.asarray(poses, dtype=np.float32)
+
+    def set_skill_stage(self, index):
+        """Queue a curriculum change; never alter an episode already in flight."""
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(self._skill_stages):
+            raise ValueError('Invalid skill stage index')
+        self._pending_skill_stage = index
+
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        """Reset; seeded map cycles restart unless map_episode_index is supplied."""
+        map_episode_index = (options or {}).get("map_episode_index", 0)
+        if (
+            isinstance(map_episode_index, bool)
+            or not isinstance(map_episode_index, (int, np.integer))
+            or map_episode_index < 0
+            or (seed is None and "map_episode_index" in (options or {}))
+        ):
+            raise ValueError("map_episode_index requires an explicit seed and a nonnegative integer")
+        spawn_episode_index = (options or {}).get('spawn_episode_index')
+        if 'spawn_episode_index' in (options or {}) and (seed is None
+                or isinstance(spawn_episode_index, bool)
+                or not isinstance(spawn_episode_index, (int, np.integer))
+                or spawn_episode_index < 0):
+            raise ValueError('spawn_episode_index requires an explicit seed and a nonnegative integer')
+        if self._skill_tracker is not None:
+            if 'skill_stage' in (options or {}):
+                self.set_skill_stage(options['skill_stage'])
+            if self._skill_stage != self._pending_skill_stage:
+                self._skill_stage = self._pending_skill_stage
+                self._map_scheduler.set_bundles(self._skill_stages[self._skill_stage]['maps'],
+                    split='eval' if self._map_split_mode == 'eval' else 'train')
+        self._invalidate_global_state_cache()
+        self._global_state_metadata = None
+        self.last_step_facts = None
+        if seed is not None:
+            seed_value = int(seed)
+            self.seed = seed_value
+            self.rng = np.random.default_rng(seed_value)
+            self._map_scheduler.reseed(self.rng)
+            self._map_scheduler.seek_episode(self._map_split_mode, map_episode_index)
+            reseed_sim = getattr(self.sim, "reseed", None)
+            if callable(reseed_sim):
+                reseed_sim(seed_value)
+            self._spawn_manager.reseed(seed_value, self.rng)
+            if self._friction is not None:
+                self._friction.reseed(seed_value)
+        self._maybe_cycle_map()
+        self.agents = self.possible_agents.copy()
+        self.episode_done = False
+        self._elapsed_steps = 0
+        self.current_time = 0.0
+
+        # Reset persistent collision tracking
+        self._collision_flags.fill(False)
+        self._collision_steps.fill(-1)
+        self.lifecycle.reset()
+        if self._attack_tracker is not None:
+            self._attack_tracker.reset()
+        self._terminal_controller.reset()
+
+        self.lap_counts.fill(0.0)
+        self.lap_times.fill(0.0)
+        self.state_buffers.reset()
+        self._render_state.reset_episode()
+        self._spawn_manager.reset_episode()
+        self._last_centerline_facts = {}
+        self._centerline_progress_tracker.reset()
+        self._no_progress_state = {aid: [0.0, 0.0, 0.0] for aid in self.possible_agents}
+        for agent_id in self.possible_agents:
+            self._track_preview_last_indices[agent_id] = -1
+        # Zero is the defined pre-episode reference, so the first command has
+        # a meaningful rate relative to reset.
+        self._last_control_commands.fill(0.0)
+        self._last_speed_reference_rates.fill(0.0)
+
+        # Speed locking for curriculum
+        self._lock_speed_steps = 0
+        self._locked_velocities = {}
+        self._episode_step_count = 0
+        if self.renderer is not None:
+            self.renderer.reset_state()
+            self._update_renderer_centerline()
+            self._render_state.reset_renderer_payloads()
+
+        # Extract a deterministic SpawnPlan if provided via options (e.g. curriculum).
+        _spawn_plan = None
+        if isinstance(options, dict) and "spawn_plan" in options:
+            _spawn_plan = options["spawn_plan"]
+
+        if self._skill_tracker is not None:
+            if any(key in (options or {}) for key in ('spawn_plan', 'poses', 'velocities')):
+                raise ValueError('Skill starts are configured through skill_curriculum stages')
+            poses, velocities, self.skill_spawn = sample_skill_spawn(
+                geometry=self._centerline_progress_tracker.prepare_geometry(self.centerline_points), walls=self.walls,
+                rng=self.rng, stage=self._skill_stages[self._skill_stage],
+                task=self._skill_tracker.config, agent_ids=self.possible_agents,
+                length=self.params['length'], width=self.params['width'])
+            self.skill_spawn['stage_index'] = self._skill_stage
+            options = {**(options or {}), 'poses': poses, 'velocities': velocities}
+
+        spawn_result = self._spawn_manager.resolve(
+            options,
+            centerline=self.centerline_points,
+            walls=self.walls,
+            start_poses=getattr(self, "start_poses", None),
+            spawn_plan=_spawn_plan,
+        )
+        poses = spawn_result.poses
+        velocities = spawn_result.velocities
+        spawn_mapping = dict(spawn_result.spawn_mapping)
+        self._locked_velocities = dict(spawn_result.locked_velocities)
+        self._lock_speed_steps = int(spawn_result.lock_speed_steps)
+        if self.params.get("model") == "combined_slip_st" and self._lock_speed_steps:
+            raise ValueError("combined_slip_st supports rolling starts, not repeated chassis-speed locking")
+        if spawn_result.update_start_poses and poses is not None:
+            self._update_start_from_poses(poses)
+            poses = self.start_poses
+
+        # options: (N,3) poses (x,y,theta). If None, caller must set internally.
+        # poses = options if options is not None else np.zeros((self.n_agents, 3), dtype=np.float32)
+        self._episode_physics = self._friction.sample() if self._friction is not None else None
+        obs_joint = self.sim.reset(poses, velocities=velocities,
+                                   **({"friction_mu": self._episode_physics["mu"]} if self._episode_physics else {}))
+        if self.params.get("model") == "combined_slip_st":
+            for index, car in enumerate(self.sim.agents):
+                self._last_control_commands[index] = car.control_reference
+        obs = self._split_obs(obs_joint)
+        self._update_state(obs_joint)
+        self._reset_finish_line_tracking()
+
+        infos = build_reset_info_payloads(
+            agent_ids=self.agents,
+            map_bundle=self._map_bundle_active,
+            spawn_mapping=spawn_mapping,
+            spawn_metadata=self._spawn_manager.last_spawn_metadata,
+            protocol_metadata=self.map_protocol_metadata,
+            finish_line_data=self._finish_line_data,
+            finish_crossed=self._finish_crossed,
+            agent_id_to_index=self._agent_id_to_index,
+            info_level=self.info_level,
+        )
+        self._update_centerline_observation_facts(infos)
+        if self._skill_tracker is not None:
+            ego = self._skill_tracker.config['ego_id']
+            lead = -infos[ego]['target_frenet']['delta_s'] if self._skill_tracker.config.get('target_id') else 0.
+            self._skill_tracker.reset(lead, opponent_speed=self.skill_spawn.get('opponent_speed'))
+            infos[ego]['skill'] = self._skill_tracker.facts()
+            infos[ego]['skill'].update(stage_index=self._skill_stage, stage=self.skill_spawn['stage'])
+            infos[ego]['skill_spawn'] = dict(self.skill_spawn)
+        self._attach_physics_metadata(infos)
+        self._attach_central_state(obs)
+        self._refresh_render_observations(obs)
+        return obs, infos
+
+    def step(self, actions: Dict[str, np.ndarray]):
+
+        joint = np.zeros((self.n_agents, 2), dtype=np.float32)
+        agent_index = self._agent_id_to_index
+        active_before_step = tuple(self.agents)
+        attack_ego = self._attack_tracker.config["ego_id"] if self._attack_tracker else None
+        acted_target = self.get_target_id(attack_ego) if attack_ego else None
+        for aid in active_before_step:
+            if aid in actions:
+                joint[agent_index[aid]] = np.asarray(actions[aid], dtype=np.float32)
+
+        if self.params.get("model") == "combined_slip_st":
+            if not np.all(np.isfinite(joint)):
+                raise ValueError("Wheel-reference actions must be finite")
+            space = self.action_space(self.possible_agents[0])
+            np.clip(joint, space.low, space.high, out=joint)
+
+        self._record_control_commands(joint, active_before_step)
+
+        self._terminal_controller.apply(
+            joint,
+            agent_index=agent_index,
+            simulator=self.sim,
+            step=self._elapsed_steps,
+        )
+        if getattr(self, 'record_applied_commands', False):
+            # Capture the actual simulator input after clipping and terminal control.
+            self._recorded_applied_commands = joint.copy()
+
+
+        # Increment episode step counter
+        self._episode_step_count += 1
+
+        obs_joint = self.sim.step(joint)
+
+        # Apply speed locking AFTER simulation step (restore locked velocities)
+        if self._lock_speed_steps > 0 and self._episode_step_count <= self._lock_speed_steps:
+            for agent_id, locked_vel in self._locked_velocities.items():
+                if agent_id in agent_index:
+                    idx = agent_index[agent_id]
+                    self.sim.set_agent_speed(idx, float(locked_vel))
+            # set_agent_speed updates both body-frame velocity components;
+            # refresh the copied observation returned by sim.step accordingly.
+            obs_joint = self.sim.current_observation()
+
+        obs = self._split_obs(obs_joint)
+        self._update_state(obs_joint)
+        self.current_time += self.timestep
+        infos = {aid: {} for aid in self.possible_agents}
+        self._update_centerline_observation_facts(infos)
+        skip_laps = {aid for aid in active_before_step
+                     if (aid in self.boundary_respawn_agents
+                         and infos[aid].get("track_limits", {}).get("exceeded"))
+                     or (aid in self.collision_respawn_agents
+                         and obs_joint["collisions"][agent_index[aid]])}
+        if self._lap_tracker is not None:
+            lap_crossings = self._lap_tracker.update(
+                self.poses_x,
+                self.poses_y,
+                self.linear_vels_x_curr,
+                self.linear_vels_y_curr,
+                step=self._elapsed_steps, skip_agents=skip_laps,
+            )
+        else:
+            self.lifecycle.begin_step()
+            lap_crossings = {aid: False for aid in self.possible_agents}
+        self._sync_lifecycle_lap_views(lap_crossings)
+        # simple per-step reward (customize as needed)
+        rewards = {aid: float(self.timestep * 0.0) for aid in self.agents}
+
+        # Boundary facts above describe the physical step before any relocation.
+        respawn = set()
+        recovery_reasons = {}
+        boundary_events = {aid for aid in active_before_step
+                           if infos[aid].get("track_limits", {}).get("exceeded")}
+        for aid in boundary_events & self.boundary_respawn_agents:
+            recovery_reasons[aid] = "track_boundary"
+        if self.track_limits_enabled and self.terminate_on_track_boundary:
+            for aid in active_before_step:
+                if infos[aid]["track_limits"]["exceeded"]:
+                    if aid in self.boundary_respawn_agents:
+                        continue
+                    if aid in self.respawn_agents:
+                        respawn.add(aid)
+                    else:
+                        self.lifecycle.record_track_boundary(aid, step=self._elapsed_steps)
+
+        # terminations/truncations
+        collisions = obs_joint["collisions"]
+
+        update_collision_flags(
+            self.possible_agents,
+            collisions,
+            self._collision_flags,
+            self._collision_steps,
+            self._elapsed_steps,
+        )
+        collision_array = np.asarray(collisions)
+        if self._attack_tracker is not None and attack_ego in active_before_step:
+            self._attack_tracker.update(time=self.current_time, infos=infos,
+                collisions=dict(zip(self.possible_agents, map(bool, collision_array))),
+                **({"active_target": acted_target} if isinstance(self._attack_tracker, MultiTargetAttackTracker)
+                   else {"geometry": attack_geometry(
+                       self.sim.agent_poses[self._agent_id_to_index[attack_ego]],
+                       self.sim.agent_poses[self._agent_id_to_index[self._attack_tracker.config["target_id"]]],
+                       self.walls, self.sim.params["length"], self.sim.params["width"])}))
+            ego_id = self._attack_tracker.config["ego_id"]
+            ego_record = self.lifecycle.records[ego_id]
+            infos[ego_id]["attack"].update(
+                horizon_steps=self.max_steps,
+                target_laps=ego_record.target_laps if ego_record.finish_on_laps else 0,
+            )
+        for idx, agent_id in enumerate(self.possible_agents):
+            if agent_id not in active_before_step:
+                continue
+            collision_event = idx < collision_array.size and bool(collision_array[idx])
+            if collision_event and self.terminate_on_collision.get(agent_id, True):
+                if agent_id in self.collision_respawn_agents:
+                    recovery_reasons[agent_id] = "collision"
+                elif agent_id in self.respawn_agents and (
+                    self.sim.collision_idx[idx] < 0 or self.respawn_on_vehicle_collision
+                ):
+                    respawn.add(agent_id)
+                else:
+                    self.lifecycle.record_collision(agent_id, step=self._elapsed_steps)
+
+        # Preserve the legacy pursuit protocol. Explicit per-event recovery also
+        # runs when another car terminates on this step.
+        if not all(self.lifecycle.records[a].is_active for a in active_before_step):
+            respawn.clear()
+        recovery_reasons = {aid: reason for aid, reason in recovery_reasons.items()
+                            if self.lifecycle.records[aid].is_active}
+        respawn.update(recovery_reasons)
+        if respawn:
+            obs_joint = self._respawn_on_centerline(respawn)
+            obs = self._split_obs(obs_joint)
+            previous_velocities = [getattr(self.state_buffers, name).copy() for name in
+                                   ("linear_vels_x_prev", "linear_vels_y_prev", "angular_vels_prev")]
+            self._update_state(obs_joint)
+            for name, values in zip(("linear_vels_x_prev", "linear_vels_y_prev", "angular_vels_prev"),
+                                    previous_velocities):
+                getattr(self.state_buffers, name)[:] = values
+            saved_deltas = {a: f["centerline"]["progress_delta"] for a, f in infos.items()
+                            if "centerline" in f}
+            self._update_centerline_observation_facts(infos)
+            for aid, delta in saved_deltas.items():
+                infos[aid]["centerline"]["progress_delta"] = 0.0 if aid in respawn else delta
+            for aid in self.possible_agents:
+                target = self._agent_target_index.get(aid)
+                infos[aid]["target_respawned"] = (target is not None and
+                    self.possible_agents[target] in respawn)
+
+        for aid, reason in recovery_reasons.items():
+            infos[aid].update(respawned=True, respawn_reason=reason)
+        for aid in boundary_events:
+            infos[aid]["boundary_event"] = True
+
+        trunc_flag = self.max_steps > 0 and self._elapsed_steps + 1 >= self.max_steps
+        no_progress_stop = False
+        if self._no_progress_timeout > 0:
+            if not self.centerline_features_enabled or self.centerline_track_length <= 0:
+                raise ValueError("no_progress requires centerline features and a valid centerline")
+            active = set(self.lifecycle.active_agents)
+            relevant = active.intersection(self.trainable_agents) or active
+            for aid in active:
+                state = self._no_progress_state[aid]
+                # Signed, wrap-corrected distance; reversing and retracing cannot reset the timer.
+                state[0] += infos[aid]["centerline"]["progress_delta"] * self.centerline_track_length
+                if state[0] >= state[1] + self._no_progress_distance:
+                    state[1] = state[0]
+                    state[2] = self.current_time
+            no_progress_stop = bool(relevant) and all(
+                self.current_time - self._no_progress_state[aid][2] + 1e-9
+                >= self._no_progress_timeout for aid in relevant)
+        if self._skill_tracker is not None:
+            ego = self._skill_tracker.config['ego_id']
+            facts = self._skill_tracker.update(time=self.current_time, infos=infos,
+                collisions=dict(zip(self.possible_agents, map(bool, collision_array))),
+                track_length=self.centerline_track_length, timed_out=trunc_flag)
+            infos[ego]['skill'] = facts
+            facts.update(stage_index=self._skill_stage, stage=self.skill_spawn['stage'])
+            infos[ego]['skill_spawn'] = dict(self.skill_spawn)
+            if facts['done'] and facts['outcome'] != 'timeout':
+                self.lifecycle.complete_skill(success=facts['success'], step=self._elapsed_steps)
+            elif facts['done']:
+                trunc_flag = True
+        if trunc_flag or no_progress_stop:
+            self.lifecycle.truncate_active(
+                step=self._elapsed_steps,
+                reason=TerminalReason.TIME_LIMIT if trunc_flag else TerminalReason.NO_PROGRESS)
+
+        terminations = {
+            aid: self.lifecycle.records[aid].status
+            in {AgentRaceStatus.FINISHED, AgentRaceStatus.CRASHED, AgentRaceStatus.TASK_COMPLETE}
+            for aid in self.possible_agents
+        }
+        truncations = {
+            aid: self.lifecycle.records[aid].status is AgentRaceStatus.TRUNCATED
+            for aid in self.possible_agents
+        }
+
+        if self.episode_termination_mode == "all_agents":
+            self.episode_done = self.lifecycle.episode_done
+        else:
+            # Preserve the historical early-ending policies for existing
+            # scenarios. P8 race scenarios explicitly use ``all_agents``.
+            terminations, self.episode_done = apply_episode_termination_policy(
+                terminations,
+                truncations,
+                active_agents=active_before_step,
+                possible_agents=self.possible_agents,
+                trainable_agents=self.trainable_agents,
+                mode=self.episode_termination_mode,
+            )
+
+        for aid in active_before_step:
+            record = self.lifecycle.records[aid]
+            if not record.is_active and record.terminal_step == self._elapsed_steps:
+                self._terminal_controller.capture(
+                    aid,
+                    status=record.status,
+                    terminal_step=self._elapsed_steps,
+                    action=joint[agent_index[aid]],
+                    vehicle_state=self.sim.agents[agent_index[aid]].physics_state,
+                )
+        # Apply zero-clearance removals to the returned state too, not just the
+        # next decision. Their terminal facts remain available for one final reward.
+        if self._terminal_controller.config.remove_after_clearance:
+            previous_visibility = self.sim.collidable_mask.copy()
+            self._terminal_controller.apply(joint, agent_index=agent_index, simulator=self.sim,
+                                            step=self._elapsed_steps)
+            if not np.array_equal(previous_visibility, self.sim.collidable_mask):
+                self.sim.refresh_scans()
+                scans = self.sim.current_observation()["scans"]
+                for aid in obs:
+                    if "scans" in obs[aid]:
+                        obs[aid]["scans"] = scans[agent_index[aid]]
+            self._inject_frenet_neighbors(infos)
+        add_time_limit_info(infos, truncations=truncations)
+        for aid, info in infos.items():
+            if self.lifecycle.records[aid].terminal_reason is TerminalReason.NO_PROGRESS:
+                info["time_limit"] = False
+                info["idle_truncation"] = True
+        self._inject_finish_line_info(infos)
+        add_episode_metadata(
+            infos,
+            map_bundle=self._map_bundle_active,
+            spawn_metadata=self._spawn_manager.last_spawn_metadata,
+            protocol_metadata=self.map_protocol_metadata,
+        )
+
+        add_step_info_fields(
+            infos,
+            possible_agents=self.possible_agents,
+            agent_target_index=self._agent_target_index,
+            collision_flags=self._collision_flags,
+            collision_events=collision_array,
+            finish_crossed=self._finish_crossed,
+            lifecycle_records=self.lifecycle.records,
+            locked_velocities=self._locked_velocities,
+            lock_speed_steps=self._lock_speed_steps,
+            episode_step_count=self._episode_step_count,
+        )
+
+        self._refresh_render_observations(obs)
+
+        infos = filter_info_payloads(infos, info_level=self.info_level)
+        self._attach_physics_metadata(infos)
+
+        # Advance and cull before freezing the authoritative post-step state so
+        # active masks agree with the public environment state returned here.
+        self._elapsed_steps += 1
+        self.agents = list(self.lifecycle.active_agents)
+        if self.episode_done:
+            self.agents = []
+        self._attach_central_state(obs)
+        post_step_global_state = self.get_global_state()
+        self.last_step_facts = build_step_facts(
+            agent_ids=self.possible_agents,
+            agent_states={
+                agent_id: self.get_agent_state(agent_id)
+                for agent_id in self.possible_agents
+            },
+            global_state=post_step_global_state,
+            collision_flags=self._collision_flags,
+            terminations=terminations,
+            truncations=truncations,
+            infos=infos,
+        )
+
+        return obs, rewards, terminations, truncations, infos
+
+    def _respawn_on_centerline(self, agent_ids):
+        """Recover at the nearest clear point, or a configured random gap ahead."""
+        points = np.asarray(self.centerline_points)[:, :2]
+        poses = self.sim.agent_poses.copy()
+        indices = []
+        ahead = self._respawn_config.get("random_ahead")
+        for aid in sorted(agent_ids):
+            idx = self._agent_id_to_index[aid]
+            others = poses[[i for i in range(self.n_agents) if i != idx and self.sim.collidable_mask[i]], :2]
+            geometry = self._centerline_progress_tracker._geometry
+            if ahead:
+                poses[idx] = sample_ahead_pose(geometry=geometry,
+                    ego_pose=poses[self._agent_id_to_index[ahead["ego_id"]]],
+                    other_positions=others, rng=self.rng, config=ahead, walls=self.walls,
+                    length=self.sim.params["length"], width=self.sim.params["width"])
+            else:
+                order = np.argsort(np.sum((points - poses[idx, :2]) ** 2, axis=1))
+                clearance = 2.0 * float(self.sim.params["length"])
+                valid = order[np.all(np.linalg.norm(points[order, None] - others[None], axis=2)
+                                     > clearance, axis=1)]
+                if not len(valid):
+                    raise RuntimeError("No unoccupied centerline respawn point")
+                position = points[int(valid[0])]
+                projection = project_to_centerline(geometry, position, 0.0)
+                poses[idx] = [*position, projection.tangent_heading]
+            indices.append(idx)
+            self._collision_flags[idx] = False
+            self._collision_steps[idx] = -1
+            self._last_control_commands[idx] = 0.0
+            self._last_speed_reference_rates[idx] = 0.0
+            self._centerline_progress_tracker._last_indices[aid] = -1
+            self._centerline_progress_tracker._prev_progress[aid] = -1.0
+            self._track_preview_last_indices.pop(aid, None)
+            if self._lap_tracker is not None:
+                self._lap_tracker.relocate(aid, poses[idx, :2])
+        obs = self.sim.reset(poses, agent_indices=indices,
+                            velocities=np.full(self.n_agents, ahead["speed"]) if ahead else None)
+        if ahead:
+            for idx in indices:
+                self._last_control_commands[idx] = self.sim.agents[idx].control_reference
+        return obs
+
+    # ------------------------------------------------------------------
+    # Finish line helpers
+    # ------------------------------------------------------------------
+    def _configure_lap_tracker(
+        self,
+        metadata: Mapping[str, Any],
+        *,
+        map_data: Optional[Any] = None,
+    ) -> None:
+        config = resolve_finish_line_config(self._finish_line_override, metadata)
+        if config is None:
+            if self._require_finish_line:
+                raise ValueError(f"Lap counting requires a finish_line annotation or override: {self.yaml_path}")
+            self._finish_line_data = None
+            self._lap_tracker = None
+            self._finish_crossed.fill(False)
+            try:
+                map_hash = hashlib.sha256(Path(self.yaml_path).read_bytes()).hexdigest()[:16]
+            except OSError:
+                map_hash = None
+            self.map_protocol_metadata = {
+                "map_hash": map_hash,
+                "finish_line_version": None,
+            }
+            return
+
+        annotations = metadata.get("annotations", {})
+        spawn_items = annotations.get("spawn_points", []) if isinstance(annotations, Mapping) else []
+        spawn_poses = None
+        if isinstance(spawn_items, Sequence):
+            poses = [item.get("pose") for item in spawn_items if isinstance(item, Mapping)]
+            if poses:
+                spawn_poses = np.asarray(poses, dtype=np.float32)
+        centerline = getattr(map_data, "centerline", None) if map_data is not None else None
+        self._finish_line_data = validate_finish_line(
+            config,
+            centerline=centerline,
+            spawn_poses=spawn_poses,
+        )
+        self._lap_tracker = LapTracker(
+            self.possible_agents,
+            self._finish_line_data,
+            self.lifecycle,
+            count_initial_crossing_as_lap=self._count_initial_crossing_as_lap,
+        )
+        self._finish_crossed.fill(False)
+        try:
+            map_hash = hashlib.sha256(Path(self.yaml_path).read_bytes()).hexdigest()[:16]
+        except OSError:
+            map_hash = None
+        self.map_protocol_metadata = {
+            "map_hash": map_hash,
+            "finish_line_version": int(config.get("version", 1)),
+            "count_initial_crossing_as_lap": self._count_initial_crossing_as_lap,
+        }
+
+    def _sync_lifecycle_lap_views(self, crossings: Mapping[str, bool]) -> None:
+        for idx, agent_id in enumerate(self.possible_agents):
+            record = self.lifecycle.records[agent_id]
+            self.lap_counts[idx] = float(record.lap_count)
+            self._finish_crossed[idx] = bool(crossings.get(agent_id, False))
+            if self._finish_crossed[idx]:
+                self.lap_times[idx] = float(self.current_time)
+
+    def _reset_finish_line_tracking(self) -> None:
+        if self._lap_tracker is not None:
+            self._lap_tracker.reset(self.poses_x, self.poses_y)
+        else:
+            self.lifecycle.reset()
+        self._sync_lifecycle_lap_views({})
+
+    def _inject_finish_line_info(self, infos: Mapping[str, Dict[str, Any]]) -> None:
+        inject_finish_line_info(
+            self._finish_line_data,
+            self._finish_crossed,
+            self._agent_id_to_index,
+            infos,
+        )
+
+    def update_map(self, map_path: str, map_ext: str) -> None:
+        """Hot-swap the map at runtime (public API, legacy compatible).
+
+        Preserves the in-memory centerline — the map surface (image, YAML)
+        and simulator state are updated but the loaded centerline is kept.
+        """
+        map_data = self._map_scheduler.load_from_path(map_path, map_ext)
+        self._apply_map_data(map_data, keep_centerline=True)
+
+    def update_params(self, params, index=-1):
+
+        self.sim.update_params(params, agent_idx=index)
+
+    def render(self):
+        assert self.render_mode in ["human", "rgb_array"]
+
+        if self._headless and self.render_mode == "human":
+            # Nothing to do when headless; keep API contract intact.
+            return None
+
+        # Check if pyglet is available before rendering
+        if not _ensure_pyglet():
+            logger.warning("Cannot render: pyglet not available (headless system)")
+            return None
+
+        self._collect_render_data = True
+
+        if self.renderer is None:
+            # Lazy import to avoid pyglet initialization when rendering disabled
+            from render import EnvRenderer
+
+            self.renderer = EnvRenderer(WINDOW_W, WINDOW_H,
+                                        lidar_fov=4.7,
+                                        max_range=30.0,
+                                        lidar_offset=self.lidar_dist)
+            # Apply scenario-configurable vehicle color overrides
+            if self._vehicle_colors:
+                self.renderer.set_agent_colors(self._vehicle_colors)
+            # use self.map_path (without extension) and self.map_ext
+            self.renderer.update_map(
+                str(self.map_path.with_suffix("")),
+                self.map_ext,
+                map_meta=self.map_meta,
+                map_image_path=self.map_image_path,
+                centerline_points=(
+                    self._centerline_state.render_points
+                    if self._centerline_state.render_enabled
+                    else None
+                ),
+                centerline_connect=self.centerline_render_connect,
+            )
+            self._render_state.reward_ring_dirty = True
+            self._render_state.reward_ring_target_dirty = True
+
+        flush_render_state(self.renderer, self._render_state, _logger=logger)
+
+        self.renderer.dispatch_events()
+        self.renderer.on_draw()
+        self.renderer.flip()
+
+        if self.render_mode == "rgb_array":
+            buf = pyg_img.get_buffer_manager().get_color_buffer()
+            w, h = buf.width, buf.height
+            img = buf.get_image_data()
+            # Pyglet's RGBA -> RGB conversion uses a regex for every pixel.
+            # Read the color buffer's native layout and let NumPy drop alpha
+            # and flip bottom-up OpenGL rows into a detached RGB frame.
+            data = img.get_data("RGBA", w * 4)
+            frame = np.frombuffer(data, dtype=np.uint8).reshape(h, w, 4)[::-1, :, :3].copy()
+            return frame
+
+    def add_render_callback(self, callback: Callable[["EnvRenderer"], None]) -> None:
+        if not callable(callback):
+            raise TypeError("Render callback must be callable")
+        self._render_state.add_callback(callback)
+
+    def clear_render_callbacks(self) -> None:
+        self._render_state.callbacks.clear()
+
+    def _build_render_centerline_points(self) -> Optional[np.ndarray]:
+        return self._centerline_state.build_render_points()
+
+    def _update_renderer_centerline(self) -> None:
+        apply_centerline_to_renderer(self.renderer, self._centerline_state)
+
+    def register_centerline_usage(self, *, require_render: bool = False, require_features: bool = False) -> None:
+        if self._centerline_state.register_usage(
+            require_render=require_render,
+            require_features=require_features,
+        ):
+            self._update_renderer_centerline()
+
+    def set_centerline(self, centerline: Optional[np.ndarray], *, path: Optional[Path] = None) -> None:
+        self._invalidate_global_state_cache()
+        self._centerline_state.set_centerline(centerline, path=path)
+        self._track_preview_geometry = self._build_track_preview_geometry(centerline)
+        for agent_id in self.possible_agents:
+            self._track_preview_last_indices[agent_id] = -1
+        self._update_renderer_centerline()
+
+    def _build_track_preview_geometry(
+        self, centerline: Optional[np.ndarray]
+    ) -> Optional[TrackPreviewGeometry]:
+        if not self._track_preview_agents:
+            return None
+        cache_key = build_track_preview_cache_key(
+            map_identity=self.yaml_path,
+            centerline=centerline,
+            walls=self.walls,
+            spacing=self._track_preview_spacing,
+        )
+        return self._track_preview_geometry_cache.get_or_build(
+            cache_key,
+            centerline,
+            self.walls,
+        )
+
+    @property
+    def centerline_points(self) -> Optional[np.ndarray]:
+        return self._centerline_state.points
+
+    @property
+    def centerline_path(self) -> Optional[Path]:
+        return self._centerline_state.path
+
+    @property
+    def centerline_render_enabled(self) -> bool:
+        return self._centerline_state.render_enabled
+
+    @property
+    def centerline_features_enabled(self) -> bool:
+        return self._centerline_state.features_enabled
+
+    @property
+    def track_preview_available(self) -> bool:
+        """Whether valid immutable preview geometry exists for the active map."""
+        return self._track_preview_geometry is not None
+
+    @property
+    def centerline_track_length(self) -> float:
+        """Arc length of the active centerline used by Frenet features."""
+        return self._centerline_progress_tracker.track_length
+
+    @property
+    def centerline_render_connect(self) -> bool:
+        return self._centerline_state.render_connect
+    
+    def close(self):
+        if self.renderer is not None:
+            self.renderer.close()
+            self.renderer = None
+
+    def _build_observation_spaces(self, x_min: float, x_max: float, y_min: float, y_max: float) -> None:
+        self.observation_spaces = build_observation_spaces(
+            possible_agents=self.possible_agents,
+            agent_sensor_spec=self._agent_sensor_spec,
+            default_sensors=DEFAULT_AGENT_SENSORS,
+            central_state_dim=self._central_state_dim,
+            lidar_beam_count=self._lidar_beam_count,
+            lidar_range=self.lidar_range,
+            vehicle_params=self.params,
+            target_laps=getattr(self, "target_laps", 1),
+            continuous_laps=any(not record.finish_on_laps for record in self.lifecycle.records.values()),
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+        )
+
+    def _bind_state_views(self) -> None:
+        """Expose state buffer arrays as legacy attributes expected by callers."""
+        buffers = self.state_buffers
+        self.poses_x = buffers.poses_x
+        self.poses_y = buffers.poses_y
+        self.poses_theta = buffers.poses_theta
+        self.collisions = buffers.collisions
+        self.linear_vels_x_prev = buffers.linear_vels_x_prev
+        self.linear_vels_y_prev = buffers.linear_vels_y_prev
+        self.angular_vels_prev = buffers.angular_vels_prev
+        self.linear_vels_x_curr = buffers.linear_vels_x_curr
+        self.linear_vels_y_curr = buffers.linear_vels_y_curr
+        self.angular_vels_curr = buffers.angular_vels_curr
+
+    def _central_state_tensor(self, joint: Dict[str, np.ndarray]) -> np.ndarray:
+        physical = central_state_tensor(
+            joint,
+            n_agents=self.n_agents,
+            central_state_keys=self._central_state_keys,
+        )
+        lifecycle = getattr(self, "lifecycle", None)
+        if lifecycle is None:
+            active = np.ones(self.n_agents, dtype=np.float32)
+            terminal = np.zeros((3, self.n_agents), dtype=np.float32)
+            lap_progress = np.zeros(self.n_agents, dtype=np.float32)
+        else:
+            statuses = [lifecycle.records[aid].status for aid in self.possible_agents]
+            active = np.asarray([s == AgentRaceStatus.ACTIVE for s in statuses], dtype=np.float32)
+            terminal = np.asarray(
+                [[s == wanted for s in statuses] for wanted in (
+                    AgentRaceStatus.FINISHED,
+                    AgentRaceStatus.CRASHED,
+                    AgentRaceStatus.TRUNCATED,
+                )],
+                dtype=np.float32,
+            )
+            lap_progress = np.asarray(
+                [
+                    min(lifecycle.records[aid].lap_count / self.target_laps, 1.0)
+                    for aid in self.possible_agents
+                ],
+                dtype=np.float32,
+            )
+
+        centerline = np.zeros(
+            (len(_CENTERLINE_GLOBAL_STATE_KEYS), self.n_agents), dtype=np.float32
+        )
+        for agent_index, agent_id in enumerate(self.possible_agents):
+            facts = self._last_centerline_facts.get(agent_id, {})
+            for field_index, field in enumerate(_CENTERLINE_GLOBAL_STATE_KEYS):
+                try:
+                    value = float(facts.get(field, 0.0))
+                except (TypeError, ValueError):
+                    value = 0.0
+                centerline[field_index, agent_index] = (
+                    value if np.isfinite(value) else 0.0
+                )
+
+        return np.concatenate(
+            (physical, active, *terminal, lap_progress, *centerline)
+        ).astype(
+            np.float32, copy=False
+        )
+
+    def _attach_central_state(self, obs: Dict[str, Dict[str, np.ndarray]]) -> None:
+        # Observations stay writable without exposing the immutable snapshot.
+        central_state = self.get_global_state().vector.copy()
+        for aid in self.possible_agents:
+            if aid in obs:
+                obs[aid]["state"] = central_state
+
+    def get_agent_state(self, agent_id: str) -> AgentState:
+        if agent_id not in self._agent_id_to_index:
+            raise KeyError(f"unknown agent_id: {agent_id}")
+        return build_agent_state(
+            agent_id,
+            agent_index=self._agent_id_to_index,
+            poses_x=self.poses_x,
+            poses_y=self.poses_y,
+            poses_theta=self.poses_theta,
+            linear_vels_x=self.linear_vels_x_curr,
+            linear_vels_y=self.linear_vels_y_curr,
+            angular_vels=self.angular_vels_curr,
+            collision_flags=self._collision_flags,
+            lap_counts=self.lap_counts,
+            lap_times=self.lap_times,
+            finish_crossed=self._finish_crossed,
+            centerline_facts=self._last_centerline_facts.get(agent_id),
+            lifecycle=self.lifecycle.records[agent_id],
+            metadata={
+                "map_bundle": self._map_bundle_active,
+                **({"physics_model": "combined_slip_st",
+                    "wheel_speed": float(self.sim.agents[self._agent_id_to_index[agent_id]].physics_state[7])}
+                   if self.params.get("model") == "combined_slip_st" else {}),
+                **self._spawn_manager.last_spawn_metadata,
+            },
+        )
+
+    def get_global_state(self) -> GlobalState:
+        if self._global_state_cache is not None:
+            return self._global_state_cache
+        joint = self.sim.current_observation(include_scans=False)
+        central = self._central_state_tensor(joint)
+        if self._global_state_metadata is None:
+            # Map, spawn plan and sampled friction stay fixed within an episode.
+            # Detach once; public info dictionaries retain their independent copies.
+            self._global_state_metadata = FrozenSnapshotMapping({
+                "map_bundle": self._map_bundle_active,
+                **({"physics": self._episode_physics} if self._episode_physics else {}),
+                "vector_contract_version": GLOBAL_STATE_VECTOR_VERSION,
+                "centerline_fields": _CENTERLINE_GLOBAL_STATE_KEYS,
+                **self._spawn_manager.last_spawn_metadata,
+            })
+        self._global_state_cache = build_global_state(
+            possible_agents=self.possible_agents,
+            active_agents=self.agents,
+            central_vector=central,
+            controlled_agents=self.controlled_agents,
+            trainable_agents=self.trainable_agents,
+            lifecycle_records=self.lifecycle.records,
+            metadata=self._global_state_metadata,
+        )
+        return self._global_state_cache
+
+    def _attach_physics_metadata(self, infos) -> None:
+        if self._episode_physics is not None:
+            for info in infos.values():
+                info["physics"] = copy_friction_metadata(self._episode_physics)
+
+    def _invalidate_global_state_cache(self) -> None:
+        """Invalidate the immutable snapshot after any environment mutation."""
+        self._global_state_cache = None
+
+    def apply_initial_speeds(self, speed_map: Mapping[str, float]) -> Optional[Dict[str, Dict[str, np.ndarray]]]:
+        """Adjust simulator state to honour per-agent initial speed requests."""
+        if not speed_map:
+            return None
+        updated = False
+        for agent_id, raw_value in speed_map.items():
+            idx = self._agent_id_to_index.get(agent_id)
+            if idx is None:
+                continue
+            try:
+                speed = float(raw_value)
+            except (TypeError, ValueError):
+                speed = 0.0
+            self.sim.set_agent_speed(idx, speed)
+            updated = True
+        if not updated:
+            return None
+
+        joint = self.sim.current_observation()
+        self._update_state(joint)
+        obs = self._split_obs(joint)
+        centerline_infos: Dict[str, Dict[str, Any]] = {
+            agent_id: {} for agent_id in self.possible_agents
+        }
+        self._update_centerline_observation_facts(centerline_infos)
+        self._attach_central_state(obs)
+        self._refresh_render_observations(obs)
+        return obs
+
+    # helper: joint->per-agent dicts expected by PZ Parallel API
+    def _split_obs(self, joint: Dict[str, np.ndarray]) -> Dict[str, Dict[str, np.ndarray]]:
+        observations = split_joint_obs(
+            joint,
+            possible_agents=self.possible_agents,
+            agent_sensor_spec=self._agent_sensor_spec,
+            agent_target_index=self._agent_target_index,
+            default_sensors=DEFAULT_AGENT_SENSORS,
+            lidar_beam_count=self._lidar_beam_count,
+            timestep=self.timestep,
+            lap_counts=self.lap_counts,
+            lap_times=self.lap_times,
+            prev_vels_x=self.linear_vels_x_curr,
+            prev_vels_y=self.linear_vels_y_curr,
+            velocity_initialized=self.state_buffers.velocity_initialized,
+            fallback_collisions=self.collisions,
+        )
+        for index, agent_id in enumerate(self.possible_agents):
+            agent_obs = observations[agent_id]
+            simulator_agent = self.sim.agents[index]
+            agent_obs["steering_angle"] = np.float32(simulator_agent.state[2])
+            agent_obs["steering_reference"] = np.float32(self._last_control_commands[index, 0])
+            agent_obs["speed_reference"] = np.float32(self._last_control_commands[index, 1])
+            agent_obs["speed_reference_rate"] = np.float32(
+                self._last_speed_reference_rates[index]
+            )
+            if simulator_agent.nonlinear:
+                agent_obs["wheel_speed"] = np.float32(simulator_agent.physics_state[7])
+                agent_obs["wheel_speed_reference"] = agent_obs.pop("speed_reference")
+                agent_obs["wheel_speed_reference_rate"] = agent_obs.pop("speed_reference_rate")
+        return observations
+
+    def _record_control_commands(
+        self,
+        joint: np.ndarray,
+        active_agents: Sequence[str],
+    ) -> None:
+        """Retain physical command references and their latest change rate."""
+        for agent_id in active_agents:
+            index = self._agent_id_to_index[agent_id]
+            command = joint[index]
+            delta_speed = float(command[1] - self._last_control_commands[index, 1])
+            # A held reference at the next decision means zero acceleration.
+            # Within action_repeat, retain the decision's derivative so the
+            # final observation still describes the action just executed.
+            if self._episode_step_count % self._control_repeat == 0 or abs(delta_speed) > 1e-8:
+                self._last_speed_reference_rates[index] = delta_speed / self._control_timestep
+            self._last_control_commands[index] = command
+
+    def _inject_track_previews(self, infos: Dict[str, Dict[str, Any]]) -> None:
+        geometry = self._track_preview_geometry
+        if geometry is None or not self._track_preview_agents:
+            return
+        for agent_id in self.possible_agents:
+            if agent_id not in self._track_preview_agents:
+                continue
+            index = self._agent_id_to_index[agent_id]
+            position = np.array(
+                [self.poses_x[index], self.poses_y[index]], dtype=np.float32
+            )
+            # Progress facts use the original map centerline, while previews
+            # use a uniformly resampled polyline. Their indices and continuous
+            # arc lengths are not exactly interchangeable, especially near
+            # seams and off track, so keep this preview-specific cursor/search.
+            preview_index = geometry.nearest_index(
+                position,
+                last_index=self._track_preview_last_indices.get(agent_id, -1),
+            )
+            self._track_preview_last_indices[agent_id] = preview_index
+            preview = geometry.preview(
+                position,
+                self._track_preview_points,
+                start_index=preview_index,
+            )
+            infos.setdefault(agent_id, {})["track_preview"] = preview
+            if self.track_limits_enabled:
+                half_width = 0.5 * preview["current_width"]
+                distance = max(abs(preview["current_lateral_error"]) - half_width, 0.0)
+                infos[agent_id]["track_limits"] = {
+                    "half_width": half_width,
+                    "lateral_error": preview["current_lateral_error"],
+                    "offtrack_distance": distance,
+                    "exceeded": distance > 0.0,
+                }
+
+    def _inject_frenet_neighbors(
+        self,
+        infos: Dict[str, Dict[str, Any]],
+    ) -> None:
+        if not self._frenet_neighbor_agents:
+            return
+        relative = build_relative_frenet_facts(
+            {aid: facts for aid, facts in self._last_centerline_facts.items()
+             if self.sim.collidable_mask[self.possible_agents.index(aid)]}
+            if self._terminal_controller.config.remove_after_clearance else self._last_centerline_facts,
+            track_length=self._centerline_progress_tracker.track_length,
+            closed=self._centerline_progress_tracker.closed,
+            agent_teams=self.agent_teams,
+        )
+        for agent_id, neighbors in relative.items():
+            if agent_id not in self._frenet_neighbor_agents:
+                continue
+            infos.setdefault(agent_id, {})["frenet_neighbors"] = neighbors
+            infos[agent_id]["agent_id"] = agent_id
+            if (isinstance(self._attack_tracker, MultiTargetAttackTracker)
+                    and agent_id == self._attack_tracker.config["ego_id"]):
+                candidates = [n for n in neighbors if n["agent_id"] in self._attack_tracker.config["target_ids"]
+                              and self.lifecycle.records[n["agent_id"]].is_active and n["delta_s"] > 0]
+                nearest = min(candidates, key=lambda n: (n["delta_s"], n["agent_id"]), default=None)
+                self._agent_target_index[agent_id] = (self._agent_id_to_index[nearest["agent_id"]]
+                                                      if nearest else None)
+            target_index = self._agent_target_index.get(agent_id)
+            target_id = self.possible_agents[target_index] if target_index is not None else None
+            infos[agent_id]["target_id"] = target_id
+            infos[agent_id]["target_frenet"] = next(
+                (neighbor for neighbor in neighbors if neighbor["agent_id"] == target_id), None)
+
+
+    def _update_centerline_observation_facts(
+        self,
+        infos: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Populate Frenet facts for the initial observation after reset."""
+        if self.track_limits_enabled and (not self.centerline_features_enabled
+                                          or self._track_preview_geometry is None or not self.walls):
+            raise ValueError("Track limits require centerline features and wall geometry")
+        if not self.centerline_features_enabled or self.centerline_points is None:
+            self._last_centerline_facts = {}
+            return
+        self._last_centerline_facts = self._centerline_progress_tracker.update(
+            self.centerline_points,
+            self.poses_x,
+            self.poses_y,
+            self.poses_theta,
+            self.linear_vels_x_curr,
+            self.linear_vels_y_curr,
+            self._agent_id_to_index,
+        )
+        for agent_id, facts in self._last_centerline_facts.items():
+            infos.setdefault(agent_id, {})["centerline"] = facts
+        self._inject_frenet_neighbors(infos)
+        self._inject_track_previews(infos)

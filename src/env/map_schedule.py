@@ -1,0 +1,272 @@
+"""Per-episode map bundle selection and loading.
+
+``MapScheduler`` owns all map-cycling state that was previously scattered
+across ``F110ParallelEnv.__init__``, ``_select_map_bundle``, and
+``_maybe_cycle_map``.  It also centralises the map-load config assembly,
+which is the *centerline autoload policy*: the decision about which
+centerline/walls config keys to forward to ``MapLoader.load()``.
+
+The env coordinator calls :meth:`select_next_bundle` at the start of each
+episode reset and :meth:`load_bundle` when a new bundle has been selected.
+``active_bundle`` is updated by the env after ``_apply_map_data`` succeeds.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+import numpy as np
+
+from utils.map_loader import MapData, MapLoader
+
+
+class MapScheduler:
+    """Owns per-episode map bundle selection and data loading.
+
+    Parameters
+    ----------
+    cfg:
+        The merged environment config dict (same one passed to
+        ``F110ParallelEnv.__init__``).
+    rng:
+        The environment's random-number generator.  Passed in so the
+        scheduler shares the same RNG stream as the env (deterministic
+        replay depends on this).
+    """
+
+    def __init__(self, cfg: Mapping[str, Any], *, rng: np.random.Generator) -> None:
+        self._rng = rng
+
+        # Resolved map root directory
+        self._map_root = Path(
+            cfg.get("map_dir") or cfg.get("map_root") or Path.cwd()
+        ).resolve()
+
+        # Cycling policy
+        self._cycle_mode = str(cfg.get("map_cycle", "")).strip().lower()
+        self._pick_mode = str(cfg.get("map_pick", "first")).strip().lower()
+        self._epoch_shuffle = bool(cfg.get("epoch_shuffle", False))
+
+        # Bundle lists
+        bundles_all = list(cfg.get("map_bundles") or [])
+        bundles_train = list(cfg.get("map_bundles_train") or [])
+        bundles_eval = list(cfg.get("map_bundles_eval") or [])
+        if not bundles_train and bundles_all:
+            bundles_train = list(bundles_all)
+        # eval stays empty unless explicitly configured
+
+        self._initial_order: Dict[str, List[str]] = {
+            "train": bundles_train,
+            "eval": bundles_eval,
+        }
+        configured = [*bundles_all, *bundles_train, *bundles_eval]
+        self.reseed(rng)
+
+        # Active bundle tracking
+        self._active_bundle: Optional[str] = (
+            cfg.get("map_bundle_active") or cfg.get("map_bundle") or None
+        )
+        if self._active_bundle is not None:
+            configured.append(str(self._active_bundle))
+        self._configured_bundles = tuple(dict.fromkeys(map(str, configured)))
+
+        # Static map-load config (centerline / walls autoload policy)
+        self._map_ext: str = str(cfg.get("map_ext", ".png"))
+        self._centerline_csv: Optional[str] = cfg.get("centerline_csv") or None
+        self._walls_autoload: bool = bool(cfg.get("walls_autoload", True))
+        self._walls_csv: Optional[str] = cfg.get("walls_csv") or None
+        self._track_threshold: Optional[float] = cfg.get("track_threshold")
+        self._track_inverted: bool = bool(cfg.get("track_inverted", False))
+
+        self._loader = MapLoader(base_dir=Path.cwd())
+
+        # In-memory cache: (bundle, map_ext, centerline_render, centerline_features) → MapData.
+        # Avoids re-parsing YAML/image/centerline when the same bundle is cycled back.
+        self._cache: Dict[Tuple, MapData] = {}
+
+    # ------------------------------------------------------------------
+    # Active bundle
+    # ------------------------------------------------------------------
+
+    @property
+    def active_bundle(self) -> Optional[str]:
+        """The map bundle currently in use."""
+        return self._active_bundle
+
+    @active_bundle.setter
+    def active_bundle(self, value: Optional[str]) -> None:
+        self._active_bundle = value
+
+    @property
+    def configured_bundle_count(self) -> int:
+        """Number of unique configured maps that may need cached geometry."""
+        return max(len(self._configured_bundles), 1)
+
+    # ------------------------------------------------------------------
+    # Bundle selection
+    # ------------------------------------------------------------------
+
+    def reseed(self, rng: np.random.Generator) -> None:
+        """Restart from configured order using the environment's new RNG."""
+        self._rng = rng
+        self._cycle_order = {key: list(order) for key, order in self._initial_order.items()}
+        self._cycle_indices = {"train": 0, "eval": 0}
+        if self._epoch_shuffle:
+            for order in self._cycle_order.values():
+                if order:
+                    self._rng.shuffle(order)
+
+    @property
+    def training_bundles(self) -> Tuple[str, ...]:
+        """Current training order, including curriculum sampling weights."""
+        return tuple(self._initial_order["train"])
+
+    def set_training_bundles(self, bundles: List[str]) -> None:
+        """Replace the training schedule; apply at the next episode reset."""
+        self.set_bundles(bundles, split='train')
+
+    def set_bundles(self, bundles: List[str], *, split: str) -> None:
+        """Replace a curriculum's train or evaluation schedule before reset."""
+        if split not in {'train', 'eval'}:
+            raise ValueError('Map split must be train or eval')
+        if not bundles or any(name not in self._configured_bundles for name in bundles):
+            raise ValueError("Training schedule must contain configured map bundles")
+        self._initial_order[split] = list(bundles)
+        self._cycle_order[split] = list(bundles)
+        self._cycle_indices[split] = 0
+
+    def seek_episode(self, split_mode: str, episode_index: int) -> None:
+        """Advance a freshly seeded schedule to an explicit evaluation episode.
+
+        Replaying selection also reproduces random picks and epoch shuffles.
+        This avoids depending on previous evaluations or sizing resets.
+        """
+        for _ in range(episode_index):
+            self.select_next_bundle(split_mode)
+
+    def select_next_bundle(self, split_mode: str) -> Optional[str]:
+        """Return the bundle to use for the next episode, or ``None``.
+
+        Returns ``None`` when cycling is disabled (``map_cycle`` is not
+        ``"per_episode"``), or when no bundles are configured for the
+        current split.
+
+        Parameters
+        ----------
+        split_mode:
+            ``"train"`` or ``"eval"``; selects which bundle list to use.
+        """
+        if self._cycle_mode != "per_episode":
+            return None
+        mode = "eval" if split_mode == "eval" else "train"
+        bundles = self._cycle_order.get(mode) or []
+        if not bundles:
+            return None
+
+        if self._pick_mode == "random":
+            return bundles[int(self._rng.integers(0, len(bundles)))]
+        if self._pick_mode == "first":
+            return bundles[0]
+
+        # Round-robin
+        idx = int(self._cycle_indices.get(mode, 0))
+        bundle = bundles[idx % len(bundles)]
+        idx += 1
+        if idx >= len(bundles):
+            if self._epoch_shuffle:
+                self._rng.shuffle(bundles)
+            idx = 0
+        self._cycle_indices[mode] = idx
+        return bundle
+
+    # ------------------------------------------------------------------
+    # Map-load config assembly (centerline autoload policy)
+    # ------------------------------------------------------------------
+
+    def build_load_config(
+        self,
+        bundle: str,
+        *,
+        map_ext: str,
+        centerline_render: bool,
+        centerline_features: bool,
+    ) -> Dict[str, Any]:
+        """Build the config dict for ``MapLoader.load()`` for *bundle*.
+
+        This method centralises the *centerline autoload policy*: the
+        decision to forward ``centerline_autoload``, ``centerline_csv``,
+        render/feature flags, and walls config to the loader.
+        """
+        return {
+            "map_dir": str(self._map_root),
+            "map_bundle": bundle,
+            "map_ext": map_ext,
+            # Centerline autoload policy
+            "centerline_autoload": True,
+            "centerline_csv": self._centerline_csv,
+            "centerline_render": centerline_render,
+            "centerline_features": centerline_features,
+            # Walls
+            "walls_autoload": self._walls_autoload,
+            "walls_csv": self._walls_csv,
+            # Track mask
+            "track_threshold": self._track_threshold,
+            "track_inverted": self._track_inverted,
+        }
+
+    def load_bundle(
+        self,
+        bundle: str,
+        *,
+        map_ext: str,
+        centerline_render: bool,
+        centerline_features: bool,
+    ) -> MapData:
+        """Load *bundle* and return a populated :class:`~utils.map_loader.MapData`.
+
+        ``MapLoader`` performs the underlying parsed-data caching and source
+        mtime validation. Re-enter it on every revisit so changed centerline
+        or wall sources cannot be hidden by this scheduler-level cache.
+        """
+        cache_key = (bundle, map_ext, centerline_render, centerline_features)
+        cfg = self.build_load_config(
+            bundle,
+            map_ext=map_ext,
+            centerline_render=centerline_render,
+            centerline_features=centerline_features,
+        )
+        result = self._loader.load(cfg)
+        self._cache[cache_key] = result
+        return result
+
+    def invalidate_cache(self, bundle: Optional[str] = None) -> None:
+        """Clear cached map data.
+
+        Parameters
+        ----------
+        bundle:
+            When given, removes only entries for that bundle.  When ``None``,
+            clears the entire cache.
+        """
+        if bundle is None:
+            self._cache.clear()
+        else:
+            keys_to_remove = [k for k in self._cache if k[0] == bundle]
+            for key in keys_to_remove:
+                del self._cache[key]
+
+    def load_from_path(self, map_path: str, map_ext: str) -> MapData:
+        """Load map data from a raw YAML path without bundle-config context.
+
+        Used by ``F110ParallelEnv.update_map`` for runtime map hot-swaps.
+        Does not load centerline or walls (those remain in-memory on the env).
+        Result is **not** cached since hot-swap paths are one-off.
+        """
+        path = Path(map_path).resolve()
+        cfg: Dict[str, Any] = {
+            "map_dir": str(path.parent),
+            "map_yaml": path.name,
+            "map": path.name,
+            "map_ext": map_ext,
+        }
+        return self._loader.load(cfg)
