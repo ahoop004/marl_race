@@ -9,7 +9,7 @@ import numpy as np
 
 from core.map_selection import relative_yaml_name
 from core.spawn_config import normalize_spawn_config
-from env import RaceEnv
+from env.RaceEnv import RaceEnv
 from env.spawn import load_spawn_points_from_map
 from utils.map_loader import MapLoader
 

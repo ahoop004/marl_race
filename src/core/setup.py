@@ -2,7 +2,7 @@
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from env import RaceEnv
+from env.RaceEnv import RaceEnv
 from core.agent_builder import (
     build_fixed_policy_agents,
     get_fixed_agent_ids,

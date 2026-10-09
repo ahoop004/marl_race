@@ -5,7 +5,6 @@ and per-episode/rolling metrics logging.
 """
 
 from typing import Dict, Any, Optional
-import wandb
 
 from loggers.metric_policy import AXES, MetricPolicy
 
@@ -77,11 +76,14 @@ class WandbLogger:
         self.wandb_url: Optional[str] = None
 
         if self.enabled:
+            import wandb
+            self._wandb = wandb
+
             # Flatten nested config for W&B
             flat_config = self._flatten_config(config) if config else {}
 
             # Initialize W&B
-            self.run = wandb.init(
+            self.run = self._wandb.init(
                 project=project,
                 config=flat_config,
                 name=name,
@@ -103,14 +105,14 @@ class WandbLogger:
                     try:
                         logging_payload = {"wandb_logging": self.logging_config}
                         flat_logging = self._flatten_config(logging_payload)
-                        wandb.config.update(flat_logging, allow_val_change=True)
+                        self._wandb.config.update(flat_logging, allow_val_change=True)
                     except Exception:
                         pass
                 if self.should_log("define_metrics"):
                     try:
                         for namespace, axis in AXES.items():
-                            wandb.define_metric(axis)
-                            wandb.define_metric(f"{namespace}/*", step_metric=axis)
+                            self._wandb.define_metric(axis)
+                            self._wandb.define_metric(f"{namespace}/*", step_metric=axis)
                     except Exception:
                         pass
         else:
@@ -143,12 +145,12 @@ class WandbLogger:
         metrics = self._filter_metrics(metrics)
         if not metrics:
             return
-        wandb.log(metrics, step=step)
+        self._wandb.log(metrics, step=step)
 
     def finish(self):
         """Finish the W&B run."""
         if self.enabled and self.run is not None:
-            wandb.finish()
+            self._wandb.finish()
 
     @staticmethod
     def _flatten_config(config: Dict[str, Any], parent_key: str = '', sep: str = '/') -> Dict[str, Any]:
