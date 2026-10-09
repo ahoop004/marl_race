@@ -1,0 +1,282 @@
+"""Shared grip, explicit fixed-controller units, and episode provenance."""
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
+import json
+
+import numpy as np
+import pytest
+
+from core.agent_builder import build_fixed_policy_agents, get_trainable_agent_ids
+from core.config import register_builtin_agents
+from core.provenance import physics_contract
+from core.scenario import load_and_expand_scenario, validate_scenario, ScenarioError
+from core.setup import create_training_setup
+from env.friction import EpisodeFriction, copy_friction_metadata, validate_friction_protocol
+from training.hooks import PhysicsEpisodeHook
+from wrappers.actions.composer import WheelReferenceAdapter
+from wrappers.observations.composer import ObservationComposer
+
+
+@pytest.fixture
+def scenario():
+    config = load_and_expand_scenario('scenarios/ppo_lap_completion_pretrain.yaml')
+    config['environment'].pop('spawn')
+    # This fixture exercises annotated multi-car spawns, unlike the L-map's
+    # centerline-relative pretraining spawn. Declare its own map explicitly.
+    for key in ('map_bundles', 'map_bundles_train', 'map_bundles_eval'):
+        config['environment'][key] = ['circle_map']
+    config['environment'].pop('track_limits', None)
+    config['environment']['terminate_on_collision'] = True
+    config['environment']['episode_termination']['lap_completion'] = True
+    config['environment']['friction'] = {
+        'version': 1, 'scope': 'shared',
+        'train': {'mode': 'uniform', 'low': .8, 'high': 1.1},
+        'eval': {'mode': 'grid', 'values': [.8, .95, 1.1]},
+    }
+    config['agents']['car_1'] = {'algorithm': 'ftg', 'trainable': False,
+        'params': {}, 'action_adapter': 'rolling_speed_to_wheel_v1'}
+    return config
+
+
+@pytest.mark.parametrize('protocol', [
+    {'mode': 'fixed', 'mu': .9},
+    {'mode': 'uniform', 'low': .8, 'high': 1.1},
+    {'mode': 'grid', 'values': [.8, .95, 1.1]},
+])
+def test_fast_metadata_copy_matches_deepcopy_and_detaches_containers(protocol):
+    phase = 'eval' if protocol['mode'] == 'grid' else 'train'
+    config = {'version': 1, 'scope': 'shared',
+              'train': {'mode': 'fixed', 'mu': 1}, 'eval': {'mode': 'fixed', 'mu': 1}}
+    config[phase] = protocol
+    sample = EpisodeFriction(config, nominal_mu=1, seed=42, phase=phase).sample()
+    expected = deepcopy(sample)
+    first, second = copy_friction_metadata(sample), copy_friction_metadata(sample)
+    assert first == second == expected
+    first['mu'] = -1
+    first['protocol']['mode'] = 'changed'
+    if 'values' in first['protocol']:
+        first['protocol']['values'][0] = -1
+    assert sample == second == expected
+
+
+@pytest.mark.parametrize('algorithm', ['ftg', 'pure_pursuit', 'stanley', 'hybrid_pp_ftg', 'kinematic_mpc'])
+def test_controller_adapter_preserves_output_and_episode_reset(scenario, algorithm):
+    register_builtin_agents()
+    config = {'car_1': {'algorithm': algorithm, 'params': {}, 'action_adapter': 'rolling_speed_to_wheel_v1'}}
+    wrapper = build_fixed_policy_agents(config, vehicle_params=scenario['environment']['vehicle_params'])['car_1']
+    assert get_trainable_agent_ids(config) == []
+    env, _, _ = create_training_setup(scenario, scenario_dir=Path('scenarios'))
+    try:
+        obs, _ = env.reset(seed=42)
+        if hasattr(wrapper, 'set_env'):
+            wrapper.set_env(env)
+        wrapper.reset()
+        expected = np.array(wrapper.controller.act(obs['car_1']), copy=True)
+        expected[1] /= .05
+        wrapper.reset()
+        actual = wrapper.act(obs['car_1'])
+        np.testing.assert_allclose(actual, np.clip(expected, wrapper.low, wrapper.high), atol=1e-6)
+        assert actual.shape == (2,) and np.isfinite(actual).all()
+        wrapper.reset()
+        np.testing.assert_allclose(wrapper.act(obs['car_1']), actual)
+    finally:
+        env.close()
+
+
+def test_adapter_conversion_negative_speed_clipping_and_no_input_mutation(scenario):
+    values = np.array([.2, -2.])
+    controller = SimpleNamespace(act=lambda obs: values, set_action_space=lambda space: setattr(controller, 'space', space))
+    adapter = WheelReferenceAdapter(controller, scenario['environment']['vehicle_params']['wheel_actuators'])
+    np.testing.assert_allclose(adapter.act({}), [.2, -40])
+    np.testing.assert_array_equal(values, [.2, -2])
+    values[:] = [2, 30]
+    np.testing.assert_allclose(adapter.act({}), [.4189, 400])
+    adapter.set_action_space(SimpleNamespace(low=np.array([-.4, -400]), high=np.array([.4, 400])))
+    np.testing.assert_allclose(controller.space.high, [.4, 20])
+    values[1] = np.nan
+    with pytest.raises(ValueError, match='finite'):
+        adapter.act({})
+
+
+def test_randomization_is_shared_constant_and_does_not_leak_to_actor(scenario):
+    env, _, _ = create_training_setup(scenario, scenario_dir=Path('scenarios'))
+    composer = ObservationComposer.from_file('configs/observations/rl_racer_simulated_wheel.yaml', scenario['environment'])
+    try:
+        obs, infos = env.reset(seed=42)
+        metadata = infos['car_0']['physics']
+        assert .8 <= metadata['mu'] < 1.1
+        assert infos['car_1']['physics'] == metadata
+        assert metadata['mu'] != env.params['mu']  # nominal config is not mutated
+        for car in env.sim.agents:
+            assert car._physics.params['mu'] == metadata['mu']
+        assert env.get_global_state().metadata['physics']['mu'] == metadata['mu']
+        assert 'physics' not in obs['car_0'] and 'mu' not in obs['car_0']
+        wrapped = composer.wrap(obs['car_0'], infos['car_0'])
+        changed = deepcopy(infos['car_0']); changed['physics']['mu'] = 100
+        np.testing.assert_array_equal(composer.wrap(obs['car_0'], changed), wrapped)
+        infos['car_0']['physics']['mu'] = 100
+        assert env.get_global_state().metadata['physics']['mu'] != 100
+        for _ in range(5):
+            _, _, _, _, infos = env.step({'car_0': [0, 20], 'car_1': [0, 20]})
+        assert infos['car_0']['physics']['mu'] == env.sim.agents[0]._physics.params['mu']
+        assert infos['car_0']['physics']['draw'] == 0
+    finally:
+        env.close()
+
+
+def test_rng_reproducibility_and_independence(scenario):
+    cfg = scenario['environment']['friction']
+    a = EpisodeFriction(cfg, nominal_mu=1, seed=42, phase='train')
+    b = EpisodeFriction(cfg, nominal_mu=1, seed=42, phase='train')
+    sequence = [a.sample()['mu'] for _ in range(20)]
+    np.random.seed(999)
+    np.random.random(1000)
+    assert [b.sample()['mu'] for _ in range(20)] == sequence
+    a.reseed(42)
+    assert a.sample()['mu'] == sequence[0]
+    a.reseed(43)
+    assert a.sample()['mu'] != sequence[0]
+    assert len(set(sequence)) == len(sequence)
+
+
+def test_cached_snapshot_refreshes_friction_without_mutating_history(scenario):
+    env, _, _ = create_training_setup(scenario, scenario_dir=Path('scenarios'))
+    try:
+        _, infos = env.reset(seed=42)
+        before = env.get_global_state()
+        mu = before.metadata['physics']['mu']
+        infos['car_0']['physics']['protocol']['mode'] = 'changed'
+        assert infos['car_1']['physics']['protocol']['mode'] == 'uniform'
+        assert before.metadata['physics']['protocol']['mode'] == 'uniform'
+        env.step({'car_0': [0, 20], 'car_1': [0, 20]})
+        assert env.get_global_state().metadata is before.metadata
+        _, infos = env.reset(seed=43)
+        after = env.get_global_state()
+        assert after.metadata['physics']['mu'] == infos['car_0']['physics']['mu']
+        assert after.metadata['physics']['mu'] != mu
+        assert before.metadata['physics']['mu'] == mu
+    finally:
+        env.close()
+
+
+def test_reset_and_eval_grid_reproduce_without_changing_spawn(scenario):
+    train, _, _ = create_training_setup(scenario, scenario_dir=Path('scenarios'))
+    evaluation, _, _ = create_training_setup(scenario, mode='eval', scenario_dir=Path('scenarios'))
+    try:
+        observed = []
+        for seed in range(42, 45):
+            left, ti = train.reset(seed=seed)
+            right, ei = evaluation.reset(seed=seed)
+            np.testing.assert_array_equal(left['car_0']['pose'], right['car_0']['pose'])
+            np.testing.assert_array_equal(left['car_0']['lidar'], right['car_0']['lidar'])
+            observed.append(ei['car_0']['physics']['mu'])
+            assert ei['car_0']['physics']['phase'] == 'eval'
+            assert ti['car_0']['physics']['protocol']['mode'] == 'uniform'
+        assert observed == [.8, .95, 1.1]
+        _, first = train.reset(seed=42)
+        train.reset()
+        _, again = train.reset(seed=42)
+        assert first['car_0']['physics'] == again['car_0']['physics']
+    finally:
+        train.close(); evaluation.close()
+
+
+def test_zero_grip_spin_uses_sampled_force_parameter(scenario):
+    config = deepcopy(scenario)
+    config['environment']['friction']['train'] = {'mode': 'fixed', 'mu': 0}
+    env, _, _ = create_training_setup(config, scenario_dir=Path('scenarios'))
+    try:
+        env.reset(seed=42)
+        before = env.sim.agents[0].physics_state
+        for _ in range(5):
+            env.step({'car_0': [0, 100]})
+        after = env.sim.agents[0].physics_state
+        np.testing.assert_array_equal(before[:6], after[:6])
+        assert after[7] > 0
+        np.testing.assert_array_equal(env.sim.agents[0].physics_diagnostics()['tire_forces'][:,:2], np.zeros((2,2)))
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize('mutation', ['eval_random', 'missing_eval', 'scope', 'negative', 'bounds', 'empty_grid', 'legacy'])
+def test_invalid_protocol_fails_before_setup(scenario, mutation):
+    config = deepcopy(scenario)
+    protocol = config['environment']['friction']
+    if mutation == 'eval_random': protocol['eval'] = protocol['train']
+    elif mutation == 'missing_eval': del protocol['eval']
+    elif mutation == 'scope': protocol['scope'] = 'independent'
+    elif mutation == 'negative': protocol['train']['low'] = -1
+    elif mutation == 'bounds': protocol['train']['low'] = 2
+    elif mutation == 'empty_grid': protocol['eval']['values'] = []
+    else: config['environment']['vehicle_params'] = {'model': 'legacy_st'}
+    with pytest.raises(ScenarioError):
+        validate_scenario(config)
+
+
+def test_episode_log_deduplicates_agents_and_rejects_changing_grip(tmp_path, scenario):
+    hook = PhysicsEpisodeHook(tmp_path)
+    sample = EpisodeFriction(scenario['environment']['friction'], nominal_mu=1, seed=42, phase='train').sample()
+    record = SimpleNamespace(episode_id='worker0_ep0', map_id='circle', info={'physics': sample})
+    hook.on_step(record); hook.on_step(record)
+    record.episode_id = 'worker1_ep0'
+    hook.on_step(record)
+    rows = [json.loads(line) for line in hook.path.read_text().splitlines()]
+    assert len(rows) == 2
+    assert rows[0]['physics']['mu'] == sample['mu']
+    record.info = {'physics': {**sample, 'mu': .5}}
+    with pytest.raises(ValueError, match='within an episode'):
+        hook.on_step(record)
+
+
+def test_protocol_is_part_of_checkpoint_identity(scenario):
+    first = physics_contract(scenario['environment'])
+    changed = deepcopy(scenario['environment'])
+    changed['friction']['eval']['values'] = [.1]
+    assert first != physics_contract(changed)
+    assert 'friction_protocol' in first
+
+
+def test_legacy_adapter_and_missing_opt_in_rejected(scenario):
+    config = deepcopy(scenario)
+    del config['agents']['car_1']['action_adapter']
+    with pytest.raises(ScenarioError, match='adapter'):
+        validate_scenario(config)
+    legacy = load_and_expand_scenario('scenarios/legacy/ppo.yaml')
+    legacy['agents']['car_1']['action_adapter'] = 'rolling_speed_to_wheel_v1'
+    with pytest.raises(ScenarioError, match='adapter'):
+        validate_scenario(legacy)
+
+
+def test_gaussian_friction_is_multiplicative_seeded_and_not_clipped():
+    from env.friction import FRICTION_STREAM
+    config = {'version': 1, 'scope': 'shared',
+              'train': {'mode': 'gaussian', 'relative_std': .02},
+              'eval': {'mode': 'fixed', 'mu': 1.2}}
+    sampler = EpisodeFriction(config, nominal_mu=1.2, seed=42, phase='train')
+    expected_rng = np.random.default_rng(np.random.SeedSequence([42, FRICTION_STREAM]))
+    expected = 1.2 * expected_rng.normal(1, .02, 1000)
+    actual = np.array([sampler.sample()['mu'] for _ in range(1000)])
+    np.testing.assert_array_equal(actual, expected)
+    assert actual.std() == pytest.approx(.024, rel=.1)
+    sampler.reseed(42)
+    assert sampler.sample()['mu'] == expected[0]
+    assert EpisodeFriction(config, nominal_mu=1.2, seed=42, phase='eval').sample()['mu'] == 1.2
+    config['eval'] = config['train']
+    with pytest.raises(ValueError, match='Evaluation'):
+        validate_friction_protocol(config, nonlinear=True)
+
+
+def test_gaussian_runtime_uses_sample_for_every_axle_and_preserves_nominal(scenario):
+    scenario['environment']['friction']['train'] = {'mode': 'gaussian', 'relative_std': .02}
+    env, _, _ = create_training_setup(scenario, scenario_dir=Path('scenarios'))
+    try:
+        _, info = env.reset(seed=42)
+        sampled = info['car_0']['physics']['mu']
+        assert sampled != env.params['mu']
+        assert all(car._physics.params['mu'] == sampled for car in env.sim.agents)
+        assert all(car._physics._dynamics_params[5] == sampled for car in env.sim.agents)
+        _, _, _, _, info2 = env.step({'car_0': [0, 40], 'car_1': [0, 40]})
+        assert info2['car_0']['physics']['mu'] == sampled
+    finally:
+        env.close()

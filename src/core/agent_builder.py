@@ -1,0 +1,166 @@
+"""Build fixed-policy agents and normalize trainable/fixed roles.
+
+Agent role resolution
+---------------------
+Each agent config may declare its training role explicitly::
+
+    agents:
+      car_0:
+        algorithm: ppo
+        trainable: true      # explicit — takes priority
+
+      car_1:
+        algorithm: ftg
+        trainable: false     # explicit — takes priority
+
+When ``trainable`` is absent the role is inferred from ``algorithm``:
+
+- Algorithms in :data:`PYTORCH_RL_ALGOS` → trainable.
+- Algorithms in :data:`HEURISTIC_ALGOS` → fixed.
+- Unknown algorithms are rejected instead of being treated as fixed policies.
+
+``fixed_policy_agents`` may also be listed on ``environment:`` in the
+scenario; the env uses that list to set up masks.  The agent-config-level
+field is the canonical source for training setup.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Mapping, Tuple
+
+from core.config import AgentFactory
+
+logger = logging.getLogger(__name__)
+
+
+PYTORCH_RL_ALGOS: frozenset[str] = frozenset({"ppo", "mappo"})
+
+HEURISTIC_ALGOS: frozenset[str] = frozenset({
+    "ftg",
+    "follow_gap",
+    "gap_follow",
+    "followthegap",
+    "pure_pursuit",
+    "stanley",
+    "hybrid_pp_ftg",
+    "cbf_mpc",
+    "defensive_mpc",
+    "kinematic_mpc",
+    "mpcc",
+    "obstacle_aware_mpc",
+    "racing_mpc",
+})
+
+
+# ---------------------------------------------------------------------------
+# Single-agent role query
+# ---------------------------------------------------------------------------
+
+def is_trainable_agent(agent_cfg: Mapping[str, Any]) -> bool:
+    """Return True when *agent_cfg* represents a trainable (RL) agent.
+
+    Checks the explicit ``trainable`` boolean first; falls back to
+    algorithm-name inference when the field is absent.
+
+    Parameters
+    ----------
+    agent_cfg:
+        A single agent's config dict (one entry under ``scenario["agents"]``).
+    """
+    algo = str(agent_cfg.get("algorithm", "")).strip().lower()
+    if algo not in PYTORCH_RL_ALGOS | HEURISTIC_ALGOS:
+        raise ValueError(f"Unsupported algorithm {algo!r}; supported RL algorithms: {sorted(PYTORCH_RL_ALGOS)}.")
+    explicit = agent_cfg.get("trainable")
+    if explicit is not None:
+        return bool(explicit)
+    return algo in PYTORCH_RL_ALGOS
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent role split
+# ---------------------------------------------------------------------------
+
+def get_trainable_agent_ids(agent_configs: Mapping[str, Mapping[str, Any]]) -> List[str]:
+    """Return agent IDs whose role resolves to trainable.
+
+    Parameters
+    ----------
+    agent_configs:
+        The full ``scenario["agents"]`` mapping.
+    """
+    return [aid for aid, cfg in agent_configs.items() if is_trainable_agent(cfg)]
+
+
+def get_fixed_agent_ids(agent_configs: Mapping[str, Mapping[str, Any]]) -> List[str]:
+    """Return agent IDs whose role resolves to fixed/heuristic.
+
+    Parameters
+    ----------
+    agent_configs:
+        The full ``scenario["agents"]`` mapping.
+    """
+    return [aid for aid, cfg in agent_configs.items() if not is_trainable_agent(cfg)]
+
+
+def split_agent_roles(
+    agent_configs: Mapping[str, Mapping[str, Any]],
+) -> Tuple[List[str], List[str]]:
+    """Split agents into (trainable_ids, fixed_ids).
+
+    Returns
+    -------
+    trainable_ids, fixed_ids:
+        Two lists in ``agent_configs`` iteration order.
+    """
+    trainable, fixed = [], []
+    for aid, cfg in agent_configs.items():
+        (trainable if is_trainable_agent(cfg) else fixed).append(aid)
+    return trainable, fixed
+
+
+# ---------------------------------------------------------------------------
+# Agent construction
+# ---------------------------------------------------------------------------
+
+def build_fixed_policy_agents(agent_configs: Mapping[str, Mapping[str, Any]], *, vehicle_params=None) -> Dict[str, Any]:
+    """Instantiate heuristic/fixed-policy agents only.
+
+    Pure PyTorch RL agents are instantiated by ``run.py``, not here.
+
+    Parameters
+    ----------
+    agent_configs:
+        The full ``scenario["agents"]`` mapping.
+
+    Returns
+    -------
+    Dict[str, Any]
+        ``{agent_id: heuristic_policy_instance}`` for all fixed-role agents.
+    """
+    agents: Dict[str, Any] = {}
+    for agent_id, agent_config in agent_configs.items():
+        if is_trainable_agent(agent_config):
+            continue
+        algorithm = str(agent_config.get("algorithm", "")).strip().lower()
+        if algorithm in HEURISTIC_ALGOS:
+            heuristic_kwargs = dict(agent_config.get("params", {}))
+            if algorithm == "racing_mpc":
+                heuristic_kwargs["agent_id"] = agent_id
+            agents[agent_id] = AgentFactory.create(algorithm, heuristic_kwargs)
+            adapter = agent_config.get("action_adapter")
+            nonlinear = (vehicle_params or {}).get("model") == "combined_slip_st"
+            if nonlinear:
+                if adapter != "rolling_speed_to_wheel_v1":
+                    raise ValueError("Nonlinear fixed controllers require action_adapter: rolling_speed_to_wheel_v1")
+                from wrappers.actions.composer import WheelReferenceAdapter
+                agents[agent_id] = WheelReferenceAdapter(agents[agent_id], vehicle_params["wheel_actuators"])
+            elif adapter is not None:
+                raise ValueError("Wheel-command adapter requires combined_slip_st physics")
+        else:
+            logger.warning(
+                "Agent '%s' has algorithm '%s' which is neither a known RL algo "
+                "nor a known heuristic — skipping instantiation.",
+                agent_id,
+                algorithm,
+            )
+    return agents

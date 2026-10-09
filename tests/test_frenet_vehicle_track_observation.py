@@ -1,0 +1,1025 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from core.scenario import load_and_expand_scenario
+from core.env_builder import (
+    build_env_kwargs,
+    create_environment,
+    validate_environment_feature_requirements,
+)
+from core.agent_builder import get_trainable_agent_ids
+from core.feature_requirements import derive_environment_feature_requirements
+from core.map_selection import apply_map_split
+from core.setup import create_training_setup
+from env.centerline_state import (
+    CenterlineProgressTracker,
+    build_relative_frenet_facts,
+)
+from env.f110ParallelEnv import F110ParallelEnv
+from physics.simulaton import Simulator
+from utils.track_preview import TrackPreviewGeometry
+from training.reward_context import build_reward_context
+from wrappers.observations.composer import ObservationComposer
+from wrappers.observations.ego import EgoStateComponent
+from wrappers.observations.neighbors import FrenetNeighborsComponent
+from wrappers.observations.track import FrenetVehicleTrackComponent
+from wrappers.rewards.composer import RewardComposer
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ({"velocity": [2.0, -0.3], "angular_velocity": 0.7}, [2.0, -0.3, 0.7]),
+    ({"velocity": [2.0, -0.3], "angular_velocity": -0.7}, [2.0, -0.3, -0.7]),
+    ({"velocity": [2.0, -0.3, 99.0], "angular_velocity": 0.7}, [2.0, -0.3, 0.7]),
+    ({"angular_velocity": 0.7}, [0.0, 0.0, 0.7]),
+    ({"velocity": [2.0]}, [2.0, 0.0, 0.0]),
+    ({"velocity": [], "angular_velocity": None}, [0.0, 0.0, 0.0]),
+    ({}, [0.0, 0.0, 0.0]),
+])
+def test_ego_motion_reads_separate_yaw_sensor_and_overwrites_buffer(raw, expected):
+    component = EgoStateComponent(include_pose=True)
+    output = np.full(component.dim, 99.0, dtype=np.float32)
+    component.compute_into({**raw, "pose": [4.0, 5.0, 0.2]}, {}, output)
+    np.testing.assert_allclose(output, [*expected, 4.0, 5.0, 0.2])
+    np.testing.assert_array_equal(component.compute({**raw, "pose": [4.0, 5.0, 0.2]}, {}), output)
+    component.compute_into({}, {}, output)
+    np.testing.assert_array_equal(output, np.zeros(6))
+
+
+def test_pose_only_ego_observation_keeps_its_layout():
+    component = EgoStateComponent(include_velocity=False, include_pose=True)
+    assert component.dim == 3
+    np.testing.assert_allclose(
+        component.compute({"pose": [4.0, 5.0, 0.2], "angular_velocity": 0.7}, {}),
+        [4.0, 5.0, 0.2],
+    )
+
+
+@pytest.mark.parametrize("mode", ["train", "eval"])
+def test_pretraining_yaw_rate_and_vehicle_contract_in_environment(mode):
+    path = Path("scenarios/ppo_lap_completion_pretrain.yaml").resolve()
+    scenario = load_and_expand_scenario(str(path))
+    assert "vehicle_params" not in scenario
+    scenario["environment"]["max_steps"] = 32
+    composer = ObservationComposer.from_config(
+        scenario["agents"]["car_0"]["observation"], scenario["environment"])
+    assert composer.obs_dim == 158
+    env, _, _ = create_training_setup(scenario, mode=mode, scenario_dir=path.parent)
+    try:
+        assert env.params['model_version'] == 2
+        assert env.params['tire_model'] == 'mf61_planar'
+        np.testing.assert_allclose(env.action_spaces["car_0"].low, [-.4189, -400])
+        np.testing.assert_allclose(env.action_spaces["car_0"].high, [.4189, 400])
+        observations, infos = env.reset(seed=42)
+        wrapped = composer.wrap(observations["car_0"], infos["car_0"])[108:]
+        np.testing.assert_array_equal(wrapped[[0, 1, 4]], np.zeros(3))
+        for _ in range(10):
+            observations, _, _, _, infos = env.step({"car_0": np.array([0.1, 40.0], dtype=np.float32)})
+        raw = observations["car_0"]
+        wrapped = composer.wrap(raw, infos["car_0"])[108:]
+        assert abs(float(raw["angular_velocity"])) > 1e-4
+        np.testing.assert_allclose(wrapped[:2], np.asarray(raw["velocity"]) / 20.)
+        assert wrapped[4] == pytest.approx(raw["angular_velocity"] / 10.)
+        observations, infos = env.reset(seed=42)
+        composer.reset()
+        assert composer.wrap(observations["car_0"], infos["car_0"])[108 + 4] == 0.0
+    finally:
+        env.close()
+
+
+def _circle(radius: float, count: int = 240) -> np.ndarray:
+    angle = np.linspace(0.0, 2.0 * np.pi, count, endpoint=False)
+    return np.column_stack((radius * np.cos(angle), radius * np.sin(angle))).astype(
+        np.float32
+    )
+
+
+def test_track_preview_is_uniform_ahead_and_uses_track_geometry_maxima() -> None:
+    geometry = TrackPreviewGeometry.build(
+        _circle(10.0),
+        {0: _circle(9.0), 1: _circle(11.0)},
+        spacing=0.3,
+    )
+
+    assert geometry is not None
+    preview = geometry.preview(np.array([10.0, 0.0], dtype=np.float32), 8)
+    assert np.asarray(preview["curvature"]).shape == (8,)
+    assert np.asarray(preview["width"]).shape == (8,)
+    assert np.mean(np.abs(preview["curvature"])) == pytest.approx(0.1, abs=0.025)
+    assert np.mean(preview["width"]) == pytest.approx(2.0, abs=0.12)
+    assert preview["curvature_max"] >= np.max(np.abs(preview["curvature"]))
+    assert preview["width_max"] >= np.max(preview["width"])
+
+    near_seam = geometry.nearest_index(
+        np.array([10.0, -0.05], dtype=np.float32)
+    )
+    wrapped = geometry.nearest_index(
+        np.array([10.0, 0.05], dtype=np.float32),
+        last_index=near_seam,
+        search_window=3,
+    )
+    assert wrapped < 3
+
+
+def test_frenet_vehicle_track_observation_order_and_normalization() -> None:
+    component = FrenetVehicleTrackComponent(
+        points=2,
+        wheel_radius=0.5,
+        maxima={key: 2.0 for key in (
+            "vx", "vy", "u", "n", "r", "delta", "delta_ref",
+            "omega_ref_dot", "omega_ref", "omega",
+        )},
+    )
+    raw = {
+        "velocity": np.array([1.0, -1.0], dtype=np.float32),
+        "angular_velocity": 1.0,
+        "steering_angle": 1.0,
+        "steering_reference": -1.0,
+        "speed_reference_rate": 0.5,
+        "speed_reference": 0.5,
+    }
+    info = {
+        "centerline": {"heading_error": 1.0, "d": -1.0},
+        "track_preview": {
+            "curvature": np.array([1.0, -2.0], dtype=np.float32),
+            "width": np.array([2.0, 4.0], dtype=np.float32),
+            "curvature_max": 2.0,
+            "width_max": 4.0,
+        },
+    }
+
+    observation = component.compute(raw, info)
+
+    assert observation == pytest.approx(
+        [
+            0.5, -0.5, 0.5, -0.5, 0.5, 0.5, -0.5,
+            0.5, 0.5, 1.0, 0.5, -1.0, 0.5, 1.0,
+        ]
+    )
+
+
+def test_fixed_track_scales_preserve_geometry_across_maps():
+    component = FrenetVehicleTrackComponent(points=2, wheel_radius=.05,
+        track_maxima={'curvature': 1., 'width': 1.})
+    preview = {'curvature': [.2, -.4], 'width': [1., 2.],
+               'curvature_max': .4, 'width_max': 2.}
+    first = component.compute({}, {'track_preview': preview})
+    other_map = {**preview, 'curvature_max': 2., 'width_max': 10.}
+    np.testing.assert_array_equal(first, component.compute({}, {'track_preview': other_map}))
+    np.testing.assert_allclose(first[10:], [.2, -.4, 1., 2.])
+    wider = {**preview, 'width': [2., 4.]}
+    np.testing.assert_allclose(component.compute({}, {'track_preview': wider})[-2:], [2., 4.])
+
+
+@pytest.mark.parametrize('scales', [{}, {'width': 1.}, {'curvature': 0., 'width': 1.},
+    {'curvature': float('nan'), 'width': 1.}, {'curvature': 1., 'width': -1.},
+    {'curvature': True, 'width': 1.}, {'curvature': 1., 'width': '1'}])
+def test_fixed_track_scales_reject_invalid_configuration(scales):
+    with pytest.raises(ValueError, match='track_maxima'):
+        FrenetVehicleTrackComponent(points=2, wheel_radius=.05, track_maxima=scales)
+
+
+def test_frenet_velocity_uses_body_frame_and_is_rotation_invariant() -> None:
+    tracker = CenterlineProgressTracker(["car_0"])
+    agent_index = {"car_0": 0}
+    v_long = np.array([4.0], dtype=np.float32)
+    v_lat = np.array([1.0], dtype=np.float32)
+
+    horizontal = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    facts_horizontal = tracker.update(
+        horizontal,
+        np.array([1.0]),
+        np.array([0.0]),
+        np.array([0.0]),
+        v_long,
+        v_lat,
+        agent_index,
+    )["car_0"]
+
+    tracker.reset()
+    vertical = np.array(
+        [
+            [0.0, 0.0, np.pi / 2.0],
+            [0.0, 1.0, np.pi / 2.0],
+            [0.0, 2.0, np.pi / 2.0],
+        ],
+        dtype=np.float32,
+    )
+    facts_vertical = tracker.update(
+        vertical,
+        np.array([0.0]),
+        np.array([1.0]),
+        np.array([np.pi / 2.0]),
+        v_long,
+        v_lat,
+        agent_index,
+    )["car_0"]
+
+    assert facts_horizontal["vs"] == pytest.approx(4.0)
+    assert facts_horizontal["vd"] == pytest.approx(1.0)
+    assert facts_vertical["vs"] == pytest.approx(facts_horizontal["vs"])
+    assert facts_vertical["vd"] == pytest.approx(facts_horizontal["vd"])
+
+
+def test_simulator_slip_velocity_flows_into_frenet_components() -> None:
+    speed = 5.0
+    slip_angle = 0.4
+    state = np.zeros(7, dtype=np.float64)
+    state[6] = slip_angle
+    simulator = Simulator.__new__(Simulator)
+    simulator.num_agents = 1
+    simulator.agents = [SimpleNamespace(state=state)]
+    simulator._linear_vels_x = np.zeros(1, dtype=np.float32)
+    simulator._linear_vels_y = np.zeros(1, dtype=np.float32)
+    simulator._ang_vels_z = np.zeros(1, dtype=np.float32)
+    simulator.set_agent_speed(0, speed)
+    v_long = float(simulator._linear_vels_x[0])
+    v_lat = float(simulator._linear_vels_y[0])
+
+    tracker = CenterlineProgressTracker(["car_0"])
+    facts = tracker.update(
+        np.array([[0.0, 0.0], [2.0, 0.0]], dtype=np.float32),
+        np.array([1.0], dtype=np.float32),
+        np.array([0.0], dtype=np.float32),
+        np.array([0.0], dtype=np.float32),
+        np.array([v_long], dtype=np.float32),
+        np.array([v_lat], dtype=np.float32),
+        {"car_0": 0},
+    )["car_0"]
+
+    assert v_long == pytest.approx(speed * np.cos(slip_angle))
+    assert v_lat == pytest.approx(speed * np.sin(slip_angle))
+    assert facts["vs"] == pytest.approx(speed * np.cos(slip_angle))
+    assert facts["vd"] == pytest.approx(speed * np.sin(slip_angle))
+
+    # The dynamics use a no-slip kinematic model below 0.5 m/s, even if the
+    # slip-angle state still contains its previous dynamic-model value.
+    simulator.set_agent_speed(0, 0.25)
+    assert simulator._linear_vels_x[0] == pytest.approx(0.25)
+    assert simulator._linear_vels_y[0] == pytest.approx(0.0)
+
+
+def test_lidar_and_frenet_track_composer_dimension() -> None:
+    composer = ObservationComposer.from_config(
+        {
+            "observation": {
+                "lidar": {"enabled": True, "normalize": True},
+                "frenet_vehicle_track": {
+                    "enabled": True,
+                    "points": 3,
+                    "wheel_radius": 0.05,
+                },
+            }
+        },
+        {"lidar_beams": 4, "lidar_range": 10.0},
+    )
+    assert composer.obs_dim == 4 + 10 + 2 * 3
+
+
+def test_relative_frenet_neighbors_wrap_sort_and_normalize() -> None:
+    relative = build_relative_frenet_facts(
+        {
+            "car_0": {"s": 98.0, "d": 0.5, "vs": 4.0, "vd": 0.5},
+            "car_1": {"s": 2.0, "d": -0.5, "vs": 6.0, "vd": 1.5},
+            "car_2": {"s": 80.0, "d": 1.5, "vs": 3.0, "vd": -0.5},
+        },
+        track_length=100.0,
+        closed=True,
+    )
+
+    assert [item["agent_id"] for item in relative["car_0"]] == ["car_1", "car_2"]
+    assert relative["car_0"][0] == {
+        "agent_id": "car_1",
+        "delta_s": pytest.approx(4.0),
+        "delta_d": pytest.approx(-1.0),
+        "delta_vs": pytest.approx(2.0),
+        "delta_vd": pytest.approx(1.0),
+    }
+
+    component = FrenetNeighborsComponent(
+        max_neighbors=3,
+        maxima={
+            "delta_s": 20.0,
+            "delta_d": 5.0,
+            "delta_vs": 10.0,
+            "delta_vd": 5.0,
+        },
+    )
+    observation = component.compute({}, {"frenet_neighbors": relative["car_0"]})
+    assert observation == pytest.approx(
+        [
+            0.2, -0.2, 0.2, 0.2, 1.0,
+            -0.9, 0.2, -0.1, -0.2, 1.0,
+            0.0, 0.0, 0.0, 0.0, 0.0,
+        ]
+    )
+
+
+def test_latest_speed_reference_rate_survives_repeated_physics_actions() -> None:
+    env = F110ParallelEnv.__new__(F110ParallelEnv)
+    env._agent_id_to_index = {"car_0": 0}
+    env._control_timestep = 0.02
+    env._last_control_commands = np.zeros((1, 2), dtype=np.float32)
+    env._last_speed_reference_rates = np.zeros(1, dtype=np.float32)
+    env._control_repeat = 2
+    env._episode_step_count = 0
+
+    command = np.array([[0.1, 1.0]], dtype=np.float32)
+    env._record_control_commands(command, ("car_0",))
+    assert env._last_speed_reference_rates[0] == pytest.approx(50.0)
+
+    # action_repeat sends the same command again; preserve the latest policy
+    # change rather than replacing it with a misleading zero derivative.
+    env._episode_step_count = 1
+    env._record_control_commands(command, ("car_0",))
+    assert env._last_speed_reference_rates[0] == pytest.approx(50.0)
+    env._episode_step_count = 2
+    env._record_control_commands(command, ("car_0",))
+    assert env._last_speed_reference_rates[0] == 0.0
+
+
+def test_complete_4_frenet_scenario_is_opt_in() -> None:
+    scenario = load_and_expand_scenario("scenarios/legacy/complete_4.yaml", overrides=['wandb.group="complete4-vehicle-track-frenet-v1"',
+         'wandb.tags=["mappo","racing","completion","4car","lidar","frenet","track-preview"]',
+         'wandb.notes="LiDAR plus normalized vehicle/Frenet state and 0.3 m curvature/width preview"',
+         'experiment.name="complete_4_frenet"',
+         'agents.car_0.observation.observation.ego_state=!delete',
+         'agents.car_0.observation.observation.progress=!delete',
+         'agents.car_0.observation.observation.prev_action=!delete',
+         'agents.car_0.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+         'agents.car_1.observation.observation.ego_state=!delete',
+         'agents.car_1.observation.observation.progress=!delete',
+         'agents.car_1.observation.observation.prev_action=!delete',
+         'agents.car_1.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+         'agents.car_2.observation.observation.ego_state=!delete',
+         'agents.car_2.observation.observation.progress=!delete',
+         'agents.car_2.observation.observation.prev_action=!delete',
+         'agents.car_2.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+         'agents.car_3.observation.observation.ego_state=!delete',
+         'agents.car_3.observation.observation.progress=!delete',
+         'agents.car_3.observation.observation.prev_action=!delete',
+         'agents.car_3.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}'])
+    assert scenario["experiment"]["name"] == "complete_4_frenet"
+    assert scenario["environment"]["track_preview"] == {
+        "points": 20,
+        "spacing": 0.3,
+    }
+    for config in scenario["agents"].values():
+        assert config["observation"]["observation"]["frenet_vehicle_track"]["enabled"]
+    composer = ObservationComposer.from_config(
+        scenario["agents"]["car_0"]["observation"],
+        scenario["environment"],
+    )
+    assert composer.obs_dim == 108 + 10 + 2 * 20
+
+    env_kwargs = build_env_kwargs(
+        {**scenario["environment"], "map": "dummy.yaml"},
+        scenario["agents"],
+        seed=42,
+    )
+    assert env_kwargs["track_preview"] == {"points": 20, "spacing": 0.3}
+    assert env_kwargs["action_repeat"] == 2
+
+
+def test_pretraining_entry_points_share_mf61_physics_and_control():
+    baseline = load_and_expand_scenario("scenarios/ppo_lap_completion_pretrain.yaml", overrides=['experiment.num_envs=400', 'experiment.num_workers=100'])
+    assert baseline['experiment']['num_envs'] == 400
+    for scenario_path, overrides in [('scenarios/ppo_lap_completion_transfer.yaml', []),
+ ('scenarios/ppo_lap_completion_transfer.yaml',
+  ['environment.episode_termination.lap_completion=true',
+   'environment.map_bundles=["Budapest_map","circle_map","Melbourne_map","Montreal_map","Shanghai_map","Silverstone_map","Spa_map","Spielberg_map"]',
+   'environment.map_bundles_train=["Budapest_map","circle_map","Melbourne_map","Montreal_map","Shanghai_map","Silverstone_map","Spa_map","Spielberg_map"]',
+   'environment.map_bundles_eval=["Budapest_map","circle_map","Melbourne_map","Montreal_map","Shanghai_map","Silverstone_map","Spa_map","Spielberg_map"]',
+   'environment.target_laps=3',
+   'environment.max_steps=16000',
+   'wandb.group="ppo-lap-completion-transfer-3lap"',
+   'wandb.tags=["ppo","single-agent","three-lap","track-transfer","current-pretrain-physics"]',
+   'wandb.notes="Three-lap Budapest transfer from the current L-map pretraining run; shared '
+   'physics and fixed track scaling. Actor and critic loaded with a fresh optimizer."',
+   'experiment.name="ppo_lap_completion_transfer_budapest_3lap"',
+   'experiment.checkpoint="../outputs/L_map_pretrain/best_model.pt"',
+   'evaluation.target_laps=3',
+   'evaluation.selection_strategy="completion_progress"',
+   'evaluation.terminate_on_track_limit=true',
+   'evaluation.terminate_on_collision=true']),
+ ('scenarios/ppo_lap_completion_pretrain.yaml',
+  ['environment.map_bundles=["L_map","circle_map","Budapest_map"]',
+   'environment.map_bundles_eval=["L_map","circle_map","Budapest_map"]',
+   'wandb.job_type="transfer-validation"',
+   'experiment.name="ppo_lap_completion_validate"',
+   'experiment.evaluation_only=true',
+   'experiment.checkpoint=null',
+   'evaluation.enabled=false',
+   'evaluation.episodes=12',
+   'evaluation.target_laps=3',
+   'evaluation.seed=30042',
+   'evaluation.final_test.episodes=30',
+   'evaluation.final_test.seed=40042',
+   'evaluation.terminate_on_track_limit=true',
+   'evaluation.terminate_on_collision=true'])]:
+        variant = load_and_expand_scenario(scenario_path, overrides=overrides)
+        assert variant['environment']['vehicle_params'] == baseline['environment']['vehicle_params']
+        actor = variant['agents']['car_0']
+        for key in ('observation', 'reward', 'action_constraints'):
+            assert actor[key] == baseline['agents']['car_0'][key]
+        assert actor['action_constraints']['speed_control'] == 'wheel_acceleration'
+
+
+@pytest.mark.parametrize("mode", ["train", "eval"])
+def test_ppo_frenet_pretraining_receives_real_track_preview(mode):
+    path = Path("scenarios/ppo_lap_completion_pretrain.yaml").resolve()
+    scenario = load_and_expand_scenario(str(path))
+    composer = ObservationComposer.from_config(
+        scenario["agents"]["car_0"]["observation"],
+        scenario["environment"],
+    )
+    assert composer.obs_dim == 158
+    env, _, _ = create_training_setup(scenario, mode=mode, scenario_dir=path.parent)
+    try:
+        assert env.track_preview_available
+        observations, infos = env.reset(seed=10042)
+        for step in range(3):
+            raw, info = observations["car_0"], infos["car_0"]
+            observation = composer.wrap(raw, info)
+            assert observation.shape == (158,)
+            assert np.isfinite(observation).all()
+            np.testing.assert_allclose(observation[:108], np.minimum(raw['lidar'] / 10., 1.), atol=1e-7)
+            assert np.any(observation[:108] > 0.)
+            preview = info["track_preview"]
+            assert len(preview["curvature"]) == len(preview["width"]) == 20
+            assert np.all(np.asarray(preview["width"]) > 0.0)
+            # Check the actor receives geometry, rather than zero-filled slots
+            # due to a missing feature request or an incomplete info payload.
+            np.testing.assert_allclose(observation[118:138], preview['curvature'], atol=1e-6)
+            np.testing.assert_allclose(observation[138:158], preview['width'], atol=1e-6)
+            if step:
+                assert raw["wheel_speed_reference"] == pytest.approx(2.0)
+                assert observation[108 + 8] == pytest.approx(2.0 / 400.0)
+            observations, _, _, _, infos = env.step({
+                "car_0": np.array([0.1, 2.0], dtype=np.float32),
+            })
+    finally:
+        env.close()
+
+
+def test_complete_4_frenet_neighbors_is_a_separate_privileged_arm() -> None:
+    scenario = load_and_expand_scenario(
+        "scenarios/legacy/complete_4.yaml"
+    , overrides=['wandb.group="complete4-frenet-neighbors-v1"',
+         'wandb.tags=["mappo","racing","completion","4car","lidar","frenet","track-preview","privileged-neighbors"]',
+         'wandb.notes="Frenet baseline plus normalized relative Frenet states for the three other racers"',
+         'experiment.name="complete_4_frenet_neighbors"',
+         'agents.car_0.observation.observation.ego_state=!delete',
+         'agents.car_0.observation.observation.progress=!delete',
+         'agents.car_0.observation.observation.prev_action=!delete',
+         'agents.car_0.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+         'agents.car_0.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}',
+         'agents.car_1.observation.observation.ego_state=!delete',
+         'agents.car_1.observation.observation.progress=!delete',
+         'agents.car_1.observation.observation.prev_action=!delete',
+         'agents.car_1.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+         'agents.car_1.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}',
+         'agents.car_2.observation.observation.ego_state=!delete',
+         'agents.car_2.observation.observation.progress=!delete',
+         'agents.car_2.observation.observation.prev_action=!delete',
+         'agents.car_2.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+         'agents.car_2.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}',
+         'agents.car_3.observation.observation.ego_state=!delete',
+         'agents.car_3.observation.observation.progress=!delete',
+         'agents.car_3.observation.observation.prev_action=!delete',
+         'agents.car_3.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+         'agents.car_3.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}'])
+    assert scenario["experiment"]["name"] == "complete_4_frenet_neighbors"
+    assert "privileged-neighbors" in scenario["wandb"]["tags"]
+    composer = ObservationComposer.from_config(
+        scenario["agents"]["car_0"]["observation"],
+        scenario["environment"],
+    )
+    assert composer.obs_dim == 108 + 10 + 2 * 20 + 5 * 3
+
+
+@pytest.mark.parametrize('scenario_path,preview,neighbors,overrides', [('scenarios/legacy/complete_4.yaml', (), (), []),
+ ('scenarios/legacy/complete_4.yaml',
+  ('car_0', 'car_1', 'car_2', 'car_3'),
+  (),
+  ['wandb.group="complete4-vehicle-track-frenet-v1"',
+   'wandb.tags=["mappo","racing","completion","4car","lidar","frenet","track-preview"]',
+   'wandb.notes="LiDAR plus normalized vehicle/Frenet state and 0.3 m curvature/width preview"',
+   'experiment.name="complete_4_frenet"',
+   'agents.car_0.observation.observation.ego_state=!delete',
+   'agents.car_0.observation.observation.progress=!delete',
+   'agents.car_0.observation.observation.prev_action=!delete',
+   'agents.car_0.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_1.observation.observation.ego_state=!delete',
+   'agents.car_1.observation.observation.progress=!delete',
+   'agents.car_1.observation.observation.prev_action=!delete',
+   'agents.car_1.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_2.observation.observation.ego_state=!delete',
+   'agents.car_2.observation.observation.progress=!delete',
+   'agents.car_2.observation.observation.prev_action=!delete',
+   'agents.car_2.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_3.observation.observation.ego_state=!delete',
+   'agents.car_3.observation.observation.progress=!delete',
+   'agents.car_3.observation.observation.prev_action=!delete',
+   'agents.car_3.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}']),
+ ('scenarios/legacy/complete_4.yaml',
+  ('car_0', 'car_1', 'car_2', 'car_3'),
+  ('car_0', 'car_1', 'car_2', 'car_3'),
+  ['wandb.group="complete4-frenet-neighbors-v1"',
+   'wandb.tags=["mappo","racing","completion","4car","lidar","frenet","track-preview","privileged-neighbors"]',
+   'wandb.notes="Frenet baseline plus normalized relative Frenet states for the three other '
+   'racers"',
+   'experiment.name="complete_4_frenet_neighbors"',
+   'agents.car_0.observation.observation.ego_state=!delete',
+   'agents.car_0.observation.observation.progress=!delete',
+   'agents.car_0.observation.observation.prev_action=!delete',
+   'agents.car_0.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_0.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}',
+   'agents.car_1.observation.observation.ego_state=!delete',
+   'agents.car_1.observation.observation.progress=!delete',
+   'agents.car_1.observation.observation.prev_action=!delete',
+   'agents.car_1.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_1.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}',
+   'agents.car_2.observation.observation.ego_state=!delete',
+   'agents.car_2.observation.observation.progress=!delete',
+   'agents.car_2.observation.observation.prev_action=!delete',
+   'agents.car_2.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_2.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}',
+   'agents.car_3.observation.observation.ego_state=!delete',
+   'agents.car_3.observation.observation.progress=!delete',
+   'agents.car_3.observation.observation.prev_action=!delete',
+   'agents.car_3.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_3.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}'])])
+def test_complete_4_feature_requirements_match_observation_arms(
+    scenario_path: str,
+    preview: tuple[str, ...],
+    neighbors: tuple[str, ...], overrides,
+) -> None:
+    scenario = load_and_expand_scenario(scenario_path, overrides=overrides)
+    requirements = derive_environment_feature_requirements(
+        scenario["agents"],
+        scenario_dir=Path(scenario_path).resolve().parent,
+        centerline_render=scenario["environment"].get("centerline_render", False),
+    )
+
+    assert requirements.centerline_progress_agents == (
+        "car_0", "car_1", "car_2", "car_3"
+    )
+    assert requirements.track_preview_agents == preview
+    assert requirements.frenet_neighbor_agents == neighbors
+
+
+def test_feature_requirements_aggregate_heterogeneous_agents(tmp_path: Path) -> None:
+    requirements = derive_environment_feature_requirements(
+        {
+            "car_0": {
+                "observation": {
+                    "observation": {"progress": {"enabled": True}}
+                }
+            },
+            "car_1": {
+                "observation": {
+                    "observation": {
+                        "frenet_vehicle_track": {"enabled": True}
+                    }
+                }
+            },
+            "car_2": {
+                "observation": {
+                    "observation": {"frenet_neighbors": {"enabled": True}}
+                }
+            },
+            "car_3": {
+                "reward": {
+                    "reward": {"wrong_way_penalty": {"enabled": True}}
+                }
+            },
+        },
+        scenario_dir=tmp_path,
+    )
+
+    assert requirements.centerline_progress_agents == (
+        "car_0", "car_1", "car_2", "car_3"
+    )
+    assert requirements.frenet_vehicle_state_agents == ("car_1",)
+    assert requirements.track_preview_agents == ("car_1",)
+    assert requirements.frenet_neighbor_agents == ("car_2",)
+
+
+def _geometry_env(
+    *,
+    centerline: bool = True,
+    features: bool = True,
+    preview: bool = True,
+    render: bool = True,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        centerline_points=np.zeros((3, 2), dtype=np.float32) if centerline else None,
+        centerline_features_enabled=features,
+        track_preview_available=preview,
+        centerline_render_enabled=render,
+    )
+
+
+def test_feature_setup_rejects_missing_centerline_for_reward_consumer() -> None:
+    with pytest.raises(ValueError, match=r"centerline facts for agents \('car_0',\)"):
+        validate_environment_feature_requirements(
+            _geometry_env(centerline=False),
+            {"centerline_progress_agents": ["car_0"]},
+        )
+
+
+def test_feature_setup_rejects_disabled_centerline_facts() -> None:
+    with pytest.raises(ValueError, match="centerline_features: true"):
+        validate_environment_feature_requirements(
+            _geometry_env(features=False),
+            {"centerline_progress_agents": ["car_0", "car_2"]},
+        )
+
+
+def test_feature_setup_rejects_unconstructable_preview_geometry() -> None:
+    with pytest.raises(ValueError, match=r"track-preview geometry.*\('car_1',\)"):
+        validate_environment_feature_requirements(
+            _geometry_env(preview=False),
+            {"track_preview_agents": ["car_1"]},
+        )
+
+
+def test_feature_setup_rejects_disabled_neighbor_facts() -> None:
+    with pytest.raises(ValueError, match=r"Frenet-neighbor agents \('car_2',\)"):
+        validate_environment_feature_requirements(
+            _geometry_env(features=False),
+            {"frenet_neighbor_agents": ["car_2"]},
+        )
+
+
+def test_feature_setup_rejects_unavailable_centerline_rendering() -> None:
+    with pytest.raises(ValueError, match="centerline rendering"):
+        validate_environment_feature_requirements(
+            _geometry_env(render=False),
+            {"centerline_render": True},
+        )
+
+
+def test_feature_setup_accepts_all_available_geometry() -> None:
+    validate_environment_feature_requirements(
+        _geometry_env(),
+        {
+            "centerline_progress_agents": ["car_0"],
+            "track_preview_agents": ["car_1"],
+            "frenet_neighbor_agents": ["car_2"],
+            "centerline_render": True,
+        },
+    )
+
+
+def test_setup_enables_centerline_facts_required_by_inherited_reward() -> None:
+    scenario_path = Path("scenarios/legacy/ppo.yaml").resolve()
+    scenario = load_and_expand_scenario(str(scenario_path))
+    assert scenario["environment"]["centerline_autoload"] is False
+
+    env, _, _ = create_training_setup(
+        scenario,
+        mode="train",
+        scenario_dir=scenario_path.parent,
+    )
+    try:
+        assert env.centerline_points is not None
+        assert env.centerline_features_enabled
+        _, infos = env.reset(seed=42)
+        assert "centerline" in infos["car_0"]
+    finally:
+        env.close()
+
+
+def test_gated_frenet_payloads_match_direct_geometry_computation() -> None:
+    geometry = TrackPreviewGeometry.build(
+        _circle(10.0),
+        {0: _circle(9.0), 1: _circle(11.0)},
+        spacing=0.3,
+    )
+    assert geometry is not None
+
+    env = F110ParallelEnv.__new__(F110ParallelEnv)
+    env.track_limits_enabled = False
+    env._track_preview_geometry = geometry
+    env._track_preview_agents = frozenset({"car_0"})
+    env._frenet_neighbor_agents = frozenset({"car_0"})
+    env._terminal_controller = SimpleNamespace(config=SimpleNamespace(remove_after_clearance=False))
+    env._agent_target_index = {}
+    env._track_preview_points = 8
+    env._track_preview_last_indices = {"car_0": -1, "car_1": -1}
+    env.possible_agents = ["car_0", "car_1"]
+    env.agent_teams = {}
+    env._agent_id_to_index = {"car_0": 0, "car_1": 1}
+    env.poses_x = np.array([10.0, 0.0], dtype=np.float32)
+    env.poses_y = np.array([0.0, 10.0], dtype=np.float32)
+    env._last_centerline_facts = {
+        "car_0": {"s": 0.0, "d": 0.0, "vs": 4.0, "vd": 0.0},
+        "car_1": {"s": 3.0, "d": 0.5, "vs": 5.0, "vd": -0.5},
+    }
+    env._centerline_progress_tracker = SimpleNamespace(
+        track_length=geometry.projection_geometry.total_length,
+        closed=geometry.closed,
+    )
+
+    infos = {"car_0": {}, "car_1": {}}
+    env._inject_track_previews(infos)
+    env._inject_frenet_neighbors(infos)
+
+    direct_index = geometry.nearest_index(np.array([10.0, 0.0], dtype=np.float32))
+    direct_preview = geometry.preview(
+        np.array([10.0, 0.0], dtype=np.float32),
+        8,
+        start_index=direct_index,
+    )
+    assert infos["car_0"]["track_preview"]["curvature"] == pytest.approx(
+        direct_preview["curvature"]
+    )
+    assert infos["car_0"]["track_preview"]["width"] == pytest.approx(
+        direct_preview["width"]
+    )
+    direct_neighbors = build_relative_frenet_facts(
+        env._last_centerline_facts,
+        track_length=geometry.projection_geometry.total_length,
+        closed=geometry.closed,
+    )
+    assert infos["car_0"]["frenet_neighbors"] == direct_neighbors["car_0"]
+    assert "track_preview" not in infos["car_1"]
+    assert "frenet_neighbors" not in infos["car_1"]
+
+
+@pytest.mark.parametrize('scenario_path,has_preview,has_neighbors,overrides', [('scenarios/legacy/complete_4.yaml', False, False, []),
+ ('scenarios/legacy/complete_4.yaml',
+  True,
+  False,
+  ['wandb.group="complete4-vehicle-track-frenet-v1"',
+   'wandb.tags=["mappo","racing","completion","4car","lidar","frenet","track-preview"]',
+   'wandb.notes="LiDAR plus normalized vehicle/Frenet state and 0.3 m curvature/width preview"',
+   'experiment.name="complete_4_frenet"',
+   'agents.car_0.observation.observation.ego_state=!delete',
+   'agents.car_0.observation.observation.progress=!delete',
+   'agents.car_0.observation.observation.prev_action=!delete',
+   'agents.car_0.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_1.observation.observation.ego_state=!delete',
+   'agents.car_1.observation.observation.progress=!delete',
+   'agents.car_1.observation.observation.prev_action=!delete',
+   'agents.car_1.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_2.observation.observation.ego_state=!delete',
+   'agents.car_2.observation.observation.progress=!delete',
+   'agents.car_2.observation.observation.prev_action=!delete',
+   'agents.car_2.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_3.observation.observation.ego_state=!delete',
+   'agents.car_3.observation.observation.progress=!delete',
+   'agents.car_3.observation.observation.prev_action=!delete',
+   'agents.car_3.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}']),
+ ('scenarios/legacy/complete_4.yaml',
+  True,
+  True,
+  ['wandb.group="complete4-frenet-neighbors-v1"',
+   'wandb.tags=["mappo","racing","completion","4car","lidar","frenet","track-preview","privileged-neighbors"]',
+   'wandb.notes="Frenet baseline plus normalized relative Frenet states for the three other '
+   'racers"',
+   'experiment.name="complete_4_frenet_neighbors"',
+   'agents.car_0.observation.observation.ego_state=!delete',
+   'agents.car_0.observation.observation.progress=!delete',
+   'agents.car_0.observation.observation.prev_action=!delete',
+   'agents.car_0.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_0.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}',
+   'agents.car_1.observation.observation.ego_state=!delete',
+   'agents.car_1.observation.observation.progress=!delete',
+   'agents.car_1.observation.observation.prev_action=!delete',
+   'agents.car_1.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_1.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}',
+   'agents.car_2.observation.observation.ego_state=!delete',
+   'agents.car_2.observation.observation.progress=!delete',
+   'agents.car_2.observation.observation.prev_action=!delete',
+   'agents.car_2.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_2.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}',
+   'agents.car_3.observation.observation.ego_state=!delete',
+   'agents.car_3.observation.observation.progress=!delete',
+   'agents.car_3.observation.observation.prev_action=!delete',
+   'agents.car_3.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_3.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}'])])
+def test_complete_4_reset_emits_only_required_frenet_payloads(
+    scenario_path: str,
+    has_preview: bool,
+    has_neighbors: bool, overrides,
+) -> None:
+    scenario = load_and_expand_scenario(scenario_path, overrides=overrides)
+    scenario_dir = Path(scenario_path).resolve().parent
+    env, _, _ = create_training_setup(
+        scenario,
+        mode="train",
+        scenario_dir=scenario_dir,
+    )
+    try:
+        _, infos = env.reset(seed=42)
+        for agent_id in env.possible_agents:
+            assert "centerline" in infos[agent_id]
+            assert ("track_preview" in infos[agent_id]) is has_preview
+            assert ("frenet_neighbors" in infos[agent_id]) is has_neighbors
+        assert (env._track_preview_geometry is not None) is has_preview
+        assert len(env._track_preview_geometry_cache) == int(has_preview)
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize('scenario_path,overrides', [('scenarios/legacy/complete_4.yaml', []),
+ ('scenarios/legacy/complete_4.yaml',
+  ['wandb.group="complete4-vehicle-track-frenet-v1"',
+   'wandb.tags=["mappo","racing","completion","4car","lidar","frenet","track-preview"]',
+   'wandb.notes="LiDAR plus normalized vehicle/Frenet state and 0.3 m curvature/width preview"',
+   'experiment.name="complete_4_frenet"',
+   'agents.car_0.observation.observation.ego_state=!delete',
+   'agents.car_0.observation.observation.progress=!delete',
+   'agents.car_0.observation.observation.prev_action=!delete',
+   'agents.car_0.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_1.observation.observation.ego_state=!delete',
+   'agents.car_1.observation.observation.progress=!delete',
+   'agents.car_1.observation.observation.prev_action=!delete',
+   'agents.car_1.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_2.observation.observation.ego_state=!delete',
+   'agents.car_2.observation.observation.progress=!delete',
+   'agents.car_2.observation.observation.prev_action=!delete',
+   'agents.car_2.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_3.observation.observation.ego_state=!delete',
+   'agents.car_3.observation.observation.progress=!delete',
+   'agents.car_3.observation.observation.prev_action=!delete',
+   'agents.car_3.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}']),
+ ('scenarios/legacy/complete_4.yaml',
+  ['wandb.group="complete4-frenet-neighbors-v1"',
+   'wandb.tags=["mappo","racing","completion","4car","lidar","frenet","track-preview","privileged-neighbors"]',
+   'wandb.notes="Frenet baseline plus normalized relative Frenet states for the three other '
+   'racers"',
+   'experiment.name="complete_4_frenet_neighbors"',
+   'agents.car_0.observation.observation.ego_state=!delete',
+   'agents.car_0.observation.observation.progress=!delete',
+   'agents.car_0.observation.observation.prev_action=!delete',
+   'agents.car_0.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_0.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}',
+   'agents.car_1.observation.observation.ego_state=!delete',
+   'agents.car_1.observation.observation.progress=!delete',
+   'agents.car_1.observation.observation.prev_action=!delete',
+   'agents.car_1.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_1.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}',
+   'agents.car_2.observation.observation.ego_state=!delete',
+   'agents.car_2.observation.observation.progress=!delete',
+   'agents.car_2.observation.observation.prev_action=!delete',
+   'agents.car_2.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_2.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}',
+   'agents.car_3.observation.observation.ego_state=!delete',
+   'agents.car_3.observation.observation.progress=!delete',
+   'agents.car_3.observation.observation.prev_action=!delete',
+   'agents.car_3.observation.observation.frenet_vehicle_track={"enabled":true,"points":20,"wheel_radius":0.05,"clip":true,"maxima":{"vx":20.0,"vy":20.0,"u":3.141592653589793,"n":5.0,"r":10.0,"delta":0.46,"delta_ref":0.46,"omega_ref_dot":20000.0,"omega_ref":400.0,"omega":400.0}}',
+   'agents.car_3.observation.observation.frenet_neighbors={"enabled":true,"max_neighbors":3,"clip":true,"maxima":{"delta_s":20.0,"delta_d":5.0,"delta_vs":20.0,"delta_vd":10.0}}'])])
+def test_complete_4_feature_gating_preserves_fixed_trajectory(
+    scenario_path: str, overrides,
+) -> None:
+    """Compare gated payload work with the legacy all-payload execution path."""
+
+    scenario = load_and_expand_scenario(scenario_path, overrides=overrides)
+    scenario_dir = Path(scenario_path).resolve().parent
+    scenario["environment"]["max_steps"] = 5
+    scenario["environment"]["target_laps"] = 1_000_000
+    scenario["environment"]["terminate_on_collision"] = False
+    scenario["environment"]["episode_termination"] = {"mode": "all_agents"}
+    agent_ids = get_trainable_agent_ids(scenario["agents"])
+
+    gated_env, _, _ = create_training_setup(
+        scenario,
+        mode="train",
+        scenario_dir=scenario_dir,
+    )
+    legacy_config = apply_map_split(
+        scenario["environment"], scenario["experiment"], "train"
+    )
+    legacy_config = dict(legacy_config)
+    legacy_config["trainable_agents"] = agent_ids
+    legacy_config.pop("feature_requirements", None)
+    legacy_env = create_environment(legacy_config, scenario["agents"], seed=42)
+
+    def composers() -> tuple[
+        dict[str, ObservationComposer], dict[str, RewardComposer]
+    ]:
+        observations = {
+            agent_id: ObservationComposer.from_config(
+                scenario["agents"][agent_id]["observation"],
+                scenario["environment"],
+            )
+            for agent_id in agent_ids
+        }
+        rewards = {
+            agent_id: RewardComposer.from_config(
+                scenario["agents"][agent_id]["reward"]
+            )
+            for agent_id in agent_ids
+        }
+        return observations, rewards
+
+    gated_observations, gated_rewards = composers()
+    legacy_observations, legacy_rewards = composers()
+    gated_reward_totals = {agent_id: 0.0 for agent_id in agent_ids}
+    legacy_reward_totals = {agent_id: 0.0 for agent_id in agent_ids}
+    try:
+        gated_raw, gated_info = gated_env.reset(seed=42)
+        legacy_raw, legacy_info = legacy_env.reset(seed=42)
+        for agent_id in agent_ids:
+            np.testing.assert_array_equal(
+                gated_observations[agent_id].wrap(
+                    gated_raw[agent_id], gated_info[agent_id]
+                ),
+                legacy_observations[agent_id].wrap(
+                    legacy_raw[agent_id], legacy_info[agent_id]
+                ),
+            )
+
+        for step in range(5):
+            actions = {
+                agent_id: np.array(
+                    [0.03 * ((index + step) % 3 - 1), 1.0 + 0.1 * index],
+                    dtype=np.float32,
+                )
+                for index, agent_id in enumerate(agent_ids)
+            }
+            gated_step = gated_env.step(actions)
+            legacy_step = legacy_env.step(actions)
+            gated_raw, _, gated_term, gated_trunc, gated_info = gated_step
+            legacy_raw, _, legacy_term, legacy_trunc, legacy_info = legacy_step
+
+            assert gated_term == legacy_term
+            assert gated_trunc == legacy_trunc
+            np.testing.assert_array_equal(
+                gated_env.get_global_state().vector,
+                legacy_env.get_global_state().vector,
+            )
+            for mask_name, gated_mask in gated_env.get_global_state().masks.items():
+                np.testing.assert_array_equal(
+                    gated_mask, legacy_env.get_global_state().masks[mask_name]
+                )
+
+            for agent_id in agent_ids:
+                np.testing.assert_array_equal(
+                    gated_observations[agent_id].wrap(
+                        gated_raw[agent_id], gated_info[agent_id]
+                    ),
+                    legacy_observations[agent_id].wrap(
+                        legacy_raw[agent_id], legacy_info[agent_id]
+                    ),
+                )
+                for key in (
+                    "centerline",
+                    "lap_crossed",
+                    "lap_count",
+                    "race_completed",
+                    "status",
+                    "terminal_reason",
+                ):
+                    assert gated_info[agent_id].get(key) == legacy_info[agent_id].get(key)
+
+                def reward_result(env, info, raw, composer):
+                    step_info = {
+                        "obs": {},
+                        "next_obs": raw[agent_id],
+                        "info": info[agent_id],
+                        "done": gated_term[agent_id] or gated_trunc[agent_id],
+                        "terminated": gated_term[agent_id],
+                        "truncated": gated_trunc[agent_id],
+                        "action": actions[agent_id],
+                        "timestep": env.timestep,
+                    }
+                    step_info.update(
+                        build_reward_context(
+                            env=env,
+                            agent_id=agent_id,
+                            info_dict=info,
+                            obs_dict=raw,
+                            actions=actions,
+                        )
+                    )
+                    return composer.compute(step_info)
+
+                gated_total, gated_breakdown = reward_result(
+                    gated_env, gated_info, gated_raw, gated_rewards[agent_id]
+                )
+                legacy_total, legacy_breakdown = reward_result(
+                    legacy_env, legacy_info, legacy_raw, legacy_rewards[agent_id]
+                )
+                assert gated_total == legacy_total
+                assert gated_breakdown == legacy_breakdown
+                gated_reward_totals[agent_id] += gated_total
+                legacy_reward_totals[agent_id] += legacy_total
+
+        assert gated_env.episode_done == legacy_env.episode_done
+        assert gated_env.lifecycle.records == legacy_env.lifecycle.records
+        assert gated_reward_totals == legacy_reward_totals
+    finally:
+        gated_env.close()
+        legacy_env.close()

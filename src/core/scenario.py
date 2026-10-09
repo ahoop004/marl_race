@@ -1,0 +1,784 @@
+"""Scenario configuration system for v2 training pipeline.
+
+Provides shared YAML include loading and scenario validation
+for algorithms, rewards, and observations. Scenarios define complete
+training setups in a concise, readable format.
+"""
+
+from typing import Dict, Any, Optional
+import copy
+import math
+import yaml
+from pathlib import Path
+
+
+
+class ScenarioError(Exception):
+    """Exception raised for scenario configuration errors."""
+    pass
+
+
+_MPC_ALGORITHMS = {
+    "racing_mpc", "kinematic_mpc", "obstacle_aware_mpc",
+    "defensive_mpc", "cbf_mpc", "mpcc",
+}
+
+
+def resolve_max_speed(scenario: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply an optional shared forward speed limit to learners and MPCs.
+
+    The shared limit takes precedence over individual forward limits. With nonlinear
+    physics it limits rolling-speed references, not the slipping chassis speed.
+    Reverse bounds, acceleration limits and observation scales stay unchanged.
+    """
+    speed = scenario.get("environment", {}).get("max_speed")
+    if speed is None:
+        return scenario
+    if (isinstance(speed, bool) or not isinstance(speed, (int, float))
+            or not math.isfinite(speed) or speed <= 0):
+        raise ScenarioError("environment.max_speed must be a positive finite number in m/s")
+
+    result = copy.deepcopy(scenario)
+    environment = result["environment"]
+    vehicle = environment.setdefault("vehicle_params", {})
+    if vehicle.get("model") == "combined_slip_st":
+        actuators = vehicle.get("wheel_actuators", {})
+        radius = actuators.get("wheel_radius")
+        if (isinstance(radius, bool) or not isinstance(radius, (int, float))
+                or not math.isfinite(radius) or radius <= 0):
+            raise ScenarioError("environment.max_speed requires a positive finite wheel_radius")
+        actuators["wheel_speed_max"] = float(speed) / radius
+    else:
+        vehicle["v_max"] = float(speed)
+    for agent in result.get("agents", {}).values():
+        if str(agent.get("algorithm", "")).strip().lower() in _MPC_ALGORITHMS:
+            agent.setdefault("params", {})["max_speed"] = float(speed)
+    return result
+
+
+MAPPO_DEFAULTS: Dict[str, str] = {
+    "actor_mode": "shared",
+    "reward_mode": "individual",
+    "critic_mode": "agent_conditioned",
+    "team_reward_reduction": "mean",
+}
+
+
+def resolve_mappo_config(scenario: Dict[str, Any]) -> Dict[str, str]:
+    """Return the normalized MAPPO reward/critic experiment contract."""
+    raw = scenario.get("mappo", {}) or {}
+    if not isinstance(raw, dict):
+        raise ScenarioError("'mappo' must be a dictionary when provided.")
+    unknown = sorted(set(raw) - set(MAPPO_DEFAULTS))
+    if unknown:
+        raise ScenarioError(f"Unknown MAPPO config field(s): {unknown}.")
+    config = dict(MAPPO_DEFAULTS)
+    config.update({key: str(value).strip().lower() for key, value in raw.items()})
+    return config
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Deep-merge two dictionaries (override wins)."""
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _load_yaml_file(path_obj: Path) -> Dict[str, Any]:
+    """Load a YAML file and ensure it returns a dict."""
+    if not path_obj.exists():
+        raise FileNotFoundError(f"Config file not found: {path_obj}")
+
+    try:
+        with open(path_obj, 'r') as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ValueError(f"Invalid YAML in config {path_obj}: {e}") from e
+
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Config must be a YAML dictionary: {path_obj}")
+    return data
+
+
+def load_yaml_config(path_obj: Path, visited: Optional[set] = None) -> Dict[str, Any]:
+    """Load YAML includes relative to each file; later values override earlier ones."""
+    path_obj = Path(path_obj).resolve()
+    visited = visited or set()
+    if path_obj in visited:
+        raise ValueError(f"Include cycle detected at: {path_obj}")
+    visited.add(path_obj)
+
+    data = _load_yaml_file(path_obj)
+    includes = data.pop('includes', None)
+
+    merged: Dict[str, Any] = {}
+    if includes:
+        if isinstance(includes, (str, Path)):
+            includes = [includes]
+        if not isinstance(includes, list):
+            raise ValueError("'includes' must be a list of file paths")
+        for include_path in includes:
+            if not isinstance(include_path, (str, Path)):
+                raise ValueError("'includes' entries must be file paths")
+            include_obj = (path_obj.parent / include_path).resolve()
+            merged = _deep_merge(merged, load_yaml_config(include_obj, visited))
+
+    merged = _deep_merge(merged, data)
+    visited.remove(path_obj)
+    return merged
+
+
+def apply_parameter_overrides(scenario: Dict[str, Any], overrides) -> Dict[str, Any]:
+    """Apply explicit dotted KEY=YAML choices; !delete removes an optional key.
+
+    A YAML list can group assignment strings for sweeps. Mapping values replace
+    the selected subtree. No scenario files are loaded.
+    The caller validates the resulting configuration after other CLI overrides.
+    """
+    result = copy.deepcopy(scenario)
+    assignments = []
+    for item in overrides or ():
+        if not isinstance(item, str):
+            raise ScenarioError("Parameter overrides must be KEY=YAML strings")
+        if item.lstrip().startswith("["):
+            try:
+                group = yaml.safe_load(item)
+            except yaml.YAMLError as exc:
+                raise ScenarioError("Invalid YAML override list") from exc
+            if not isinstance(group, list) or any(not isinstance(value, str) for value in group):
+                raise ScenarioError("An override list must contain KEY=YAML strings")
+            assignments.extend(group)
+        else:
+            assignments.append(item)
+    for item in assignments:
+        key, separator, raw = item.partition("=")
+        parts = key.split(".")
+        if not separator or any(not part or not part.replace("_", "").isalnum() for part in parts):
+            raise ScenarioError(f"Expected --set KEY=YAML with a dotted parameter name: {item!r}")
+        target = result
+        for part in parts[:-1]:
+            if part not in target:
+                target[part] = {}
+            if not isinstance(target[part], dict):
+                raise ScenarioError(f"Cannot set {key!r}: {part!r} is not a mapping")
+            target = target[part]
+        if raw.strip() == "!delete":
+            target.pop(parts[-1], None)
+        else:
+            try:
+                target[parts[-1]] = yaml.safe_load(raw)
+            except yaml.YAMLError as exc:
+                raise ScenarioError(f"Invalid YAML value for {key!r}: {raw!r}") from exc
+    return result
+
+
+def load_scenario(path: str) -> Dict[str, Any]:
+    """Load scenario from YAML file.
+
+    Args:
+        path: Path to YAML scenario file
+
+    Returns:
+        Scenario configuration dict
+
+    Raises:
+        ScenarioError: If file not found or invalid YAML
+
+    Example:
+        >>> scenario = load_scenario('scenarios/legacy/ppo.yaml')
+        >>> scenario['experiment']['name']
+        'gaplock_ppo'
+    """
+    path_obj = Path(path)
+
+    try:
+        return load_yaml_config(path_obj)
+    except (OSError, ValueError) as exc:
+        raise ScenarioError(str(exc)) from exc
+
+
+def resolve_evaluation_protocol(scenario: Dict[str, Any], protocol: str) -> Dict[str, Any]:
+    """Resolve fixed selection/final seeds without mutating training config."""
+    evaluation = scenario.get("evaluation", {}) or {}
+    if not isinstance(evaluation, dict):
+        raise ScenarioError("'evaluation' must be a dictionary.")
+    if evaluation.get("selection_strategy", "completion_safety") not in {"skill", "racer_attack", "attack", "asymmetric_support", "map_curriculum", "completion_safety", "completion_progress", "lap_time", "team_completion", "team_combined", "team_first_place", "team_sweep", "team_combined_penalties", "two_team_completion"}:
+        raise ScenarioError("Unknown evaluation.selection_strategy.")
+    if evaluation.get("selection_strategy") == "attack" and not scenario.get("environment", {}).get("attack_task"):
+        raise ScenarioError("attack checkpoint selection requires environment.attack_task")
+    if evaluation.get('selection_strategy') == 'skill' and not scenario.get('skill_curriculum'):
+        raise ScenarioError('skill checkpoint selection requires skill_curriculum')
+    if evaluation.get("selection_strategy") == "racer_attack":
+        attack = scenario.get("environment", {}).get("attack_task") or {}
+        racer = evaluation.get("progress_agent_id")
+        if ("target_ids" not in attack or racer == attack.get("ego_id")
+                or not scenario.get("agents", {}).get(racer, {}).get("trainable")):
+            raise ScenarioError("racer_attack selection requires a separate racer and dynamic attacker")
+    if evaluation.get("selection_strategy") == "asymmetric_support":
+        progress_id = evaluation.get("progress_agent_id")
+        config = scenario.get("agents", {}).get(progress_id, {})
+        if not config.get("trainable", False) or config.get("algorithm") != "mappo":
+            raise ScenarioError("asymmetric_support requires evaluation.progress_agent_id naming a MAPPO learner")
+    for key in ("terminate_on_track_limit", "terminate_on_collision", "lap_completion"):
+        if key in evaluation and not isinstance(evaluation[key], bool):
+            raise ScenarioError(f"evaluation.{key} must be boolean")
+    for key in ("target_laps", "every_steps", "every_episodes"):
+        value = evaluation.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+            raise ScenarioError(f"evaluation.{key} must be a positive integer")
+    if protocol not in {"selection", "final"}:
+        raise ScenarioError(f"Unknown evaluation protocol: {protocol!r}.")
+    selection = {
+        "seed": evaluation.get("seed", int(scenario["experiment"].get("seed", 0) or 0) + 10_000),
+        "episodes": evaluation.get("episodes", 8),
+    }
+    final = evaluation.get("final_test")
+    if final is not None and (not isinstance(final, dict) or not {"seed", "episodes"} <= final.keys()):
+        raise ScenarioError("'evaluation.final_test' requires explicit seed and episodes.")
+    if final is not None and set(final) - {"seed", "episodes", "target_laps", "max_steps"}:
+        raise ScenarioError("'evaluation.final_test' accepts seed, episodes, target_laps and max_steps.")
+    for key in ("target_laps", "max_steps"):
+        value = (final or {}).get(key)
+        minimum = 0 if key == "max_steps" else 1
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < minimum):
+            raise ScenarioError(f"evaluation.final_test.{key} must be an integer >= {minimum}")
+    for name, config in (("selection", selection), ("final", final)):
+        if config is None:
+            continue
+        for key, minimum in (("seed", 0), ("episodes", 1)):
+            value = config[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ScenarioError(f"Evaluation {name} {key} must be an integer >= {minimum}.")
+        if config["seed"] + config["episodes"] > 2**32:
+            raise ScenarioError(f"Evaluation {name} seeds exceed the NumPy seed range.")
+    if final is not None and max(selection["seed"], final["seed"]) < min(
+        selection["seed"] + selection["episodes"], final["seed"] + final["episodes"]
+    ):
+        raise ScenarioError("Checkpoint-selection and final-test seed ranges must be disjoint.")
+    if protocol == "final" and final is None:
+        raise ScenarioError("--eval-protocol final requires evaluation.final_test.")
+    config = selection if protocol == "selection" else final
+    # Final evaluation may override the horizon; otherwise inherit selection.
+    max_steps = evaluation.get("max_steps")
+    if max_steps is None:
+        max_steps = scenario["environment"].get("max_steps", 5000)
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 0:
+        raise ScenarioError("Evaluation max_steps must be a nonnegative integer.")
+    result = {"name": protocol, "seed": config["seed"], "episodes": config["episodes"],
+              "max_steps": config.get("max_steps", max_steps)}
+    target_laps = config.get("target_laps")
+    if target_laps is not None:
+        result["target_laps"] = target_laps
+    return result
+
+
+def _validate_attack_episode_limit(termination, max_steps, ego, phase):
+    """Keep the target driving and require a time or learner-lap episode bound."""
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 0:
+        raise ScenarioError(f"attack_task {phase} max_steps must be a nonnegative integer")
+    if termination.get("mode") != "all_trainable":
+        raise ScenarioError(f"attack_task {phase} requires all_trainable termination")
+    lap_completion = termination.get("lap_completion", True)
+    if not isinstance(lap_completion, bool):
+        raise ScenarioError(f"attack_task {phase} lap_completion must be boolean")
+    finishers = [ego] if isinstance(ego, str) else list(ego)
+    if lap_completion and termination.get("lap_finish_agents") != finishers:
+        raise ScenarioError(f"attack_task {phase} lap_finish_agents must contain only {ego}")
+    if max_steps == 0 and not lap_completion:
+        raise ScenarioError(f"attack_task {phase} requires a finite horizon or learner lap completion")
+
+
+def validate_scenario(scenario: Dict[str, Any]) -> None:
+    """Validate scenario configuration before env construction.
+
+    Checks
+    ------
+    - Required top-level sections: ``experiment``, ``environment``, ``agents``.
+    - ``experiment.name`` present.
+    - ``environment`` has at least one map field.
+    - Each agent config is a dict with an ``algorithm`` field.
+    - Each agent's ``algorithm`` is a known RL or heuristic algorithm.
+    - Each trainable (RL) agent has ``observation`` and ``reward`` config.
+
+    Raises
+    ------
+    ScenarioError
+        On the first validation failure found.
+    """
+    from core.agent_builder import (
+        HEURISTIC_ALGOS,
+        PYTORCH_RL_ALGOS,
+        is_trainable_agent,
+    )
+
+    _ALL_KNOWN_ALGOS = PYTORCH_RL_ALGOS | HEURISTIC_ALGOS
+
+    # --- Required top-level sections ---
+    for section in ("experiment", "environment", "agents"):
+        if section not in scenario:
+            raise ScenarioError(f"Scenario must have a '{section}' section.")
+
+    experiment = scenario["experiment"]
+    if "name" not in experiment:
+        raise ScenarioError("'experiment' section must have a 'name' field.")
+    if "evaluation_only" in experiment and not isinstance(experiment["evaluation_only"], bool):
+        raise ScenarioError("experiment.evaluation_only must be boolean.")
+    checkpoint = experiment.get("checkpoint")
+    if checkpoint is not None and (not isinstance(checkpoint, str) or not checkpoint.strip()):
+        raise ScenarioError("'experiment.checkpoint' must be a nonempty path string or null.")
+    total_steps = experiment.get("total_steps")
+    if total_steps is not None and (isinstance(total_steps, bool)
+            or not isinstance(total_steps, int) or total_steps <= 0):
+        raise ScenarioError("'experiment.total_steps' must be a positive integer or null.")
+
+    environment = scenario["environment"]
+    from training.skill_curriculum import validate_skill_curriculum
+    try:
+        validate_skill_curriculum(scenario)
+    except ValueError as exc:
+        raise ScenarioError(str(exc)) from exc
+    if any(key in block for block in (scenario, environment)
+           for key in ("wheel_actuators", "combined_slip_vehicle")):
+        raise ScenarioError(
+            "wheel_actuators/combined_slip_vehicle is a component development profile, not a training "
+            "configuration; configure environment.vehicle_params explicitly."
+        )
+    from physics.dynamic_models import validate_vehicle_params
+    vehicle_params = environment.get("vehicle_params", environment.get("params", {}))
+    if vehicle_params is not None:
+        try:
+            validate_vehicle_params(vehicle_params)
+        except ValueError as exc:
+            raise ScenarioError(str(exc)) from exc
+    if scenario.get("evaluation"):
+        resolve_evaluation_protocol(scenario, "selection")
+    _MAP_KEYS = {"map", "maps", "map_bundle", "map_bundles"}
+    if not _MAP_KEYS.intersection(environment):
+        raise ScenarioError(
+            "Environment must declare a map via one of: "
+            + ", ".join(f"'{k}'" for k in sorted(_MAP_KEYS))
+        )
+    if "target_laps" in environment:
+        target_laps = environment["target_laps"]
+        if isinstance(target_laps, bool) or not isinstance(target_laps, int) or target_laps <= 0:
+            raise ScenarioError("'environment.target_laps' must be a positive integer.")
+
+    agents = scenario["agents"]
+    from env.friction import validate_friction_protocol
+    try:
+        validate_friction_protocol(environment.get("friction"),
+                                   nonlinear=(vehicle_params or {}).get("model") == "combined_slip_st")
+    except ValueError as exc:
+        raise ScenarioError(str(exc)) from exc
+    if not isinstance(agents, dict) or not agents:
+        raise ScenarioError("'agents' must be a non-empty dictionary.")
+
+    teams = environment.get("agent_teams")
+    if teams is not None and (not isinstance(teams, dict) or set(teams) != set(agents)
+                              or any(not isinstance(team, str) or not team.strip() for team in teams.values())):
+        raise ScenarioError("environment.agent_teams must assign every physical agent a nonempty team name.")
+
+    # --- Per-agent checks ---
+    for agent_id, agent_cfg in agents.items():
+        if not isinstance(agent_cfg, dict):
+            raise ScenarioError(
+                f"Agent '{agent_id}' config must be a dictionary, got {type(agent_cfg).__name__}."
+            )
+
+        algo = str(agent_cfg.get("algorithm", "")).strip().lower()
+        if not algo:
+            raise ScenarioError(
+                f"Agent '{agent_id}' is missing required 'algorithm' field."
+            )
+
+        if algo not in _ALL_KNOWN_ALGOS:
+            raise ScenarioError(
+                f"Agent '{agent_id}' has unknown algorithm '{algo}'. "
+                f"Known RL algorithms: {sorted(PYTORCH_RL_ALGOS)}. "
+                f"Known heuristic algorithms: {sorted(HEURISTIC_ALGOS)}."
+            )
+
+        nonlinear = (vehicle_params or {}).get("model") == "combined_slip_st"
+        action_mode = agent_cfg.get("action_constraints", {}).get("speed_control", "direct")
+        if nonlinear and algo not in PYTORCH_RL_ALGOS:
+            if agent_cfg.get("action_adapter") != "rolling_speed_to_wheel_v1":
+                raise ScenarioError("Nonlinear fixed controllers require action_adapter: rolling_speed_to_wheel_v1")
+            if action_mode != "direct":
+                raise ScenarioError("Fixed wheel adapters require physical controller commands, not policy action constraints")
+        elif agent_cfg.get("action_adapter") is not None:
+            raise ScenarioError("action_adapter is supported only for nonlinear fixed controllers")
+        if algo in PYTORCH_RL_ALGOS and nonlinear != (action_mode in {"wheel_speed", "wheel_acceleration"}):
+            raise ScenarioError("combined_slip_st requires wheel_speed or wheel_acceleration actions; legacy uses vehicle-speed actions")
+        if nonlinear and algo in PYTORCH_RL_ALGOS:
+            from wrappers.actions.composer import ActionComposer
+            constraints = agent_cfg.get("action_constraints", {})
+            if constraints.get("speed_index", 1) != 1:
+                raise ScenarioError("Wheel command must use speed_index 1")
+            try:
+                ActionComposer.contract_from_config(constraints,
+                    float(environment.get("timestep", .01)) * int(environment.get("action_repeat", 1)))
+            except ValueError as exc:
+                raise ScenarioError(str(exc)) from exc
+
+        explicit = agent_cfg.get("trainable")
+        if explicit is not None and not isinstance(explicit, bool):
+            raise ScenarioError(f"Agent '{agent_id}' trainable must be a boolean.")
+        if explicit is not None and explicit != (algo in PYTORCH_RL_ALGOS):
+            raise ScenarioError(
+                f"Agent '{agent_id}': algorithm '{algo}' does not support trainable={explicit}. "
+                "PPO/MAPPO are trainable; fixed opponents must use a registered controller."
+            )
+
+        # Trainable agents need observation and reward configs
+        if is_trainable_agent(agent_cfg):
+            for required_key in ("observation", "reward"):
+                if required_key not in agent_cfg:
+                    raise ScenarioError(
+                        f"Trainable agent '{agent_id}' (algorithm='{algo}') "
+                        f"is missing required '{required_key}' config."
+                    )
+
+    trainable_ids = [aid for aid, cfg in agents.items() if is_trainable_agent(cfg)]
+    trainable_algos = {
+        str(agents[aid]["algorithm"]).strip().lower() for aid in trainable_ids
+    }
+    if len(trainable_algos) > 1:
+        raise ScenarioError("Mixed trainable algorithms are unsupported; use one PPO agent or a MAPPO team.")
+    if trainable_algos == {"ppo"} and len(trainable_ids) > 1:
+        raise ScenarioError("PPO requires exactly one trainable agent; use MAPPO for a trainable team.")
+    if total_steps is not None and trainable_algos not in ({"ppo"}, {"mappo"}):
+        raise ScenarioError("A total_steps budget requires PPO or MAPPO.")
+    lap_counting = environment.get("lap_counting", {}) or {}
+    if not isinstance(lap_counting, dict):
+        raise ScenarioError("environment.lap_counting must be a mapping")
+    if "require_finish_line" in lap_counting and not isinstance(lap_counting["require_finish_line"], bool):
+        raise ScenarioError("lap_counting.require_finish_line must be boolean")
+    limits = environment.get("track_limits", {}) or {}
+    if not isinstance(limits, dict) or set(limits) - {"enabled", "terminate"}:
+        raise ScenarioError("track_limits accepts enabled and terminate booleans")
+    if any(not isinstance(v, bool) for v in limits.values()):
+        raise ScenarioError("track_limits values must be booleans")
+    from env.respawn import validate_respawn
+    try:
+        recovery = validate_respawn(environment.get("respawn"), agents)
+    except ValueError as exc:
+        raise ScenarioError(str(exc)) from exc
+    if recovery:
+        if environment.get("respawn_agents"):
+            raise ScenarioError("Use either respawn or legacy respawn_agents")
+        if not limits.get("enabled"):
+            raise ScenarioError("respawn requires track_limits.enabled")
+        if set(recovery.get("collision_agents", [])) & set(trainable_ids):
+            raise ScenarioError("respawn.collision_agents must be fixed-policy agents")
+    respawn_agents = environment.get("respawn_agents", [])
+    if (not isinstance(respawn_agents, list) or
+            any(aid not in agents or aid in trainable_ids for aid in respawn_agents)):
+        raise ScenarioError("respawn_agents must list fixed-policy agent IDs")
+    if respawn_agents and (len(agents) < 2 or len(trainable_ids) != 1 or
+                           not limits.get("enabled") or not limits.get("terminate") or
+                           not environment.get("terminate_on_collision", True)):
+        raise ScenarioError("Opponent respawning requires one learner with boundary and collision termination")
+    if not isinstance(environment.get("respawn_on_vehicle_collision", False), bool):
+        raise ScenarioError("respawn_on_vehicle_collision must be boolean")
+    if environment.get("respawn_on_vehicle_collision", False) and not respawn_agents:
+        raise ScenarioError("respawn_on_vehicle_collision requires respawn_agents")
+    from env.attack import validate_attack
+    try:
+        attack = validate_attack(environment.get("attack_task"), agents)
+    except ValueError as exc:
+        raise ScenarioError(str(exc)) from exc
+    if attack and "target_ids" in attack:
+        ego, targets = attack["ego_id"], attack["target_ids"]
+        if (len(agents) != 4 or len(trainable_ids) != 2 or ego not in trainable_ids
+                or set(targets) != set(agents) - set(trainable_ids)
+                or any(agents[a].get("algorithm") != "racing_mpc" for a in targets)
+                or any(agents[a].get("algorithm") != "mappo" for a in trainable_ids)):
+            raise ScenarioError("Dynamic attack_task requires two MAPPO learners and two racing_mpc opponents")
+        if (set(recovery.get("boundary_agents", [])) != set(targets)
+                or set(recovery.get("collision_agents", [])) != set(targets)
+                or recovery.get("collision_placement") != "nearest_centerline"):
+            raise ScenarioError("Dynamic attack_task requires opponent-only nearest-centerline respawn")
+        if (not limits.get("terminate") or environment.get("terminate_on_collision") is not True
+                or environment.get("action_repeat", 1) != 1):
+            raise ScenarioError("Dynamic attack_task requires learner failure termination and action_repeat=1")
+        terminal = environment.get("terminal_agents", {})
+        if (not terminal.get("remove_after_clearance") or terminal.get("crash_clearance_steps") != 0
+                or terminal.get("finish_clearance_steps") != 0):
+            raise ScenarioError("Dynamic attack_task requires immediate terminal vehicle removal")
+        termination = environment.get("episode_termination", {})
+        _validate_attack_episode_limit(termination, environment.get("max_steps", 5000), trainable_ids, "training")
+        evaluation = scenario.get("evaluation", {}) or {}
+        if evaluation:
+            if not evaluation.get("terminate_on_track_limit") or not evaluation.get("terminate_on_collision"):
+                raise ScenarioError("Dynamic attack evaluation requires learner failure termination")
+            eval_term = {**termination, "mode": evaluation.get("episode_termination_mode", termination.get("mode")),
+                         "lap_completion": evaluation.get("lap_completion", True)}
+            for phase in (["selection", "final"] if evaluation.get("final_test") else ["selection"]):
+                _validate_attack_episode_limit(eval_term, resolve_evaluation_protocol(scenario, phase)["max_steps"],
+                                               trainable_ids, f"evaluation.{phase}")
+    if attack and "target_id" in attack:
+        ego, target = attack["ego_id"], attack["target_id"]
+        if (len(agents) != 2 or trainable_ids != [ego] or agents[target].get("algorithm") != "racing_mpc"
+                or agents[ego].get("target_id") != target):
+            raise ScenarioError("attack_task requires one learner targeting one fixed racing_mpc")
+        if (set(recovery.get("boundary_agents", [])) != {target}
+                or set(recovery.get("collision_agents", [])) != {target}
+                or recovery.get("collision_placement") != "random_ahead"
+                or recovery.get("random_ahead", {}).get("ego_id") != ego):
+            raise ScenarioError("attack_task requires target-only random-ahead boundary and collision respawn")
+        termination = environment.get("episode_termination", {})
+        if (not limits.get("terminate") or environment.get("terminate_on_collision") is not True
+                or environment.get("action_repeat", 1) != 1):
+            raise ScenarioError("attack_task requires ego crash termination and action_repeat=1")
+        _validate_attack_episode_limit(termination, environment.get("max_steps", 5000), ego, "training")
+        evaluation = scenario.get("evaluation", {}) or {}
+        if evaluation:
+            # Track-limit evaluation enables lap finishing by default in setup;
+            # an explicit lap_completion setting takes precedence.
+            eval_termination = {**termination,
+                "mode": evaluation.get("episode_termination_mode", termination.get("mode")),
+                "lap_completion": evaluation.get("lap_completion", True)}
+            protocols = ["selection", "final"] if evaluation.get("final_test") else ["selection"]
+            for protocol in protocols:
+                resolved = resolve_evaluation_protocol(scenario, protocol)
+                _validate_attack_episode_limit(eval_termination, resolved["max_steps"], ego,
+                                               f"evaluation.{protocol}")
+    # Multi-car races can request boundary facts for rewards without enabling
+    # the single-car time-trial boundary-reset protocol.
+    if (limits.get("enabled") and limits.get("terminate", True) and not respawn_agents and not recovery and not environment.get('skill_task')
+            and (len(agents) != 1 or environment.get("terminate_on_collision", True))):
+        raise ScenarioError("Track-limit time trials require one vehicle and terminate_on_collision: false")
+    evaluation_mode = scenario.get("evaluation", {}).get("episode_termination_mode")
+    if evaluation_mode is not None and evaluation_mode not in {"any_agent", "all_agents", "all_trainable"}:
+        raise ScenarioError("evaluation.episode_termination_mode must be any_agent, all_agents, or all_trainable")
+    if experiment.get("collector_scheduling", "synchronous") not in {"synchronous", "ready"}:
+        raise ScenarioError("experiment.collector_scheduling must be synchronous or ready")
+    eval_workers = scenario.get("evaluation", {}).get("num_workers", 1)
+    if eval_workers != 'auto' and (isinstance(eval_workers, bool)
+            or not isinstance(eval_workers, int) or eval_workers < 1):
+        raise ScenarioError("evaluation.num_workers must be a positive integer or auto")
+    num_envs = experiment.get("num_envs", 1)
+    for name in ("num_envs", "num_workers", "torch_threads", "worker_startup_batch_size",
+                 "worker_startup_timeout_s", "worker_response_timeout_s"):
+        value = experiment.get(name, 1)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ScenarioError(f"'experiment.{name}' must be a positive integer.")
+    if scenario.get("map_curriculum") is not None:
+        from training.map_curriculum import validate_map_curriculum
+        try:
+            validate_map_curriculum(scenario)
+        except ValueError as exc:
+            raise ScenarioError(str(exc)) from exc
+    elif scenario.get("evaluation", {}).get("selection_strategy") == "map_curriculum":
+        raise ScenarioError("map_curriculum selection requires map_curriculum configuration")
+    if num_envs > 1:
+        if trainable_algos not in ({"ppo"}, {"mappo"}):
+            raise ScenarioError("Parallel environments require PPO or MAPPO.")
+        if environment.get("render") or scenario.get("curriculum"):
+            raise ScenarioError("Parallel training requires headless training without curriculum.")
+        seed = experiment.get("seed")
+        env_seed = environment.get("seed", seed)
+        if env_seed is None:
+            env_seed = seed
+        if any(isinstance(v, bool) or not isinstance(v, int) or not 0 <= v < 2 ** 32
+               for v in (seed, env_seed)):
+            raise ScenarioError("Parallel training requires explicit integer seeds in [0, 2**32).")
+        if total_steps is not None and total_steps < num_envs:
+            raise ScenarioError("Parallel training total_steps must be at least num_envs")
+        if total_steps is None and int(experiment.get("episodes", 1000)) < num_envs:
+            raise ScenarioError("Parallel training requires at least num_envs total episodes.")
+        params = {**scenario.get("training_defaults", {}), **agents[trainable_ids[0]].get("params", {})}
+        n_steps = params.get("n_steps", 2048)
+        if trainable_algos == {"ppo"} and (isinstance(n_steps, bool) or not isinstance(n_steps, int)
+                or n_steps < num_envs or n_steps % num_envs):
+            raise ScenarioError("Parallel PPO n_steps must be a positive multiple of num_envs.")
+        if trainable_algos == {"mappo"}:
+            horizon = scenario.get("training_defaults", {}).get("rollout_steps_per_env", 256)
+            if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1:
+                raise ScenarioError("MAPPO rollout_steps_per_env must be a positive integer")
+    trainable_mappo = trainable_ids if trainable_algos == {"mappo"} else []
+    if trainable_mappo:
+        if scenario.get("curriculum"):
+            raise ScenarioError("MAPPO does not yet support scenario curriculum; use PPO curriculum experiments.")
+        mappo = resolve_mappo_config(scenario)
+        if mappo["actor_mode"] not in {"shared", "independent"}:
+            raise ScenarioError("mappo.actor_mode must be shared or independent")
+        reward_mode = mappo["reward_mode"]
+        critic_mode = mappo["critic_mode"]
+        reduction = mappo["team_reward_reduction"]
+        params = {**scenario.get("training_defaults", {}), **agents[trainable_ids[0]].get("params", {})}
+        transfer = params.get("adapter_transfer")
+        if transfer is not None:
+            if (not isinstance(transfer, dict) or set(transfer) != {"checkpoint", "source_agent", "target_agent"}
+                    or any(not isinstance(v, str) or not v for v in transfer.values())
+                    or transfer["target_agent"] not in trainable_ids
+                    or (params.get("lora") or {}).get("mode") != "per_agent"
+                    or not (params.get("lora") or {}).get("per_agent_log_std")
+                    or params.get("pretrained_actor_checkpoint")):
+                raise ScenarioError("adapter_transfer requires checkpoint/source_agent/target_agent, per_agent LoRA/exploration and no separate base checkpoint")
+        if not isinstance(params.get("require_pretrained_actor", False), bool):
+            raise ScenarioError("require_pretrained_actor must be boolean")
+        if mappo["actor_mode"] == "independent" and params.get("lora") is not None:
+            raise ScenarioError("Independent actors use full training; per-agent LoRA requires actor_mode=shared")
+        team_return_mode = params.get("team_return_mode", "per_agent")
+        if team_return_mode not in {"per_agent", "joint"}:
+            raise ScenarioError("team_return_mode must be per_agent or joint")
+        if team_return_mode == "joint" and (
+            reward_mode != "team_shared" or critic_mode != "shared_team"
+            or int(environment.get("action_repeat", 1)) != 1
+            or (environment.get("episode_termination", {}) or {}).get("mode") not in {"all_agents", "all_trainable"}
+        ):
+            raise ScenarioError("Joint team returns require team_shared/shared_team, action_repeat=1, and all_agents/all_trainable termination")
+        if reward_mode not in {"individual", "team_shared"}:
+            raise ScenarioError(
+                "'mappo.reward_mode' must be 'individual' or 'team_shared'."
+            )
+        if critic_mode not in {"shared_team", "agent_conditioned"}:
+            raise ScenarioError(
+                "'mappo.critic_mode' must be 'shared_team' or 'agent_conditioned'."
+            )
+        if reduction not in {"mean", "sum"}:
+            raise ScenarioError(
+                "'mappo.team_reward_reduction' must be 'mean' or 'sum'."
+            )
+        if reward_mode == "individual" and critic_mode == "shared_team":
+            raise ScenarioError(
+                "MAPPO individual rewards require critic_mode='agent_conditioned'; "
+                "a shared team critic cannot represent distinct per-agent returns."
+            )
+
+        if scenario.get("two_team", {}).get("enabled", False):
+            from training.two_team import resolve_teams
+            try:
+                resolve_teams(scenario)
+            except ValueError as exc:
+                raise ScenarioError(str(exc)) from exc
+            if (team_return_mode != "joint" or reduction != "sum"
+                    or environment.get("episode_termination", {}).get("mode") != "all_agents"
+                    or not environment.get("episode_termination", {}).get("lap_completion", True)
+                    or int(environment.get("max_steps", 0)) <= 0):
+                raise ScenarioError("Two-team training requires joint/sum rewards, all_agents, and finite laps/deadline")
+
+        # One MAPPO object owns one shared actor and optimizer. Per-agent
+        # reward configs may differ, but policy inputs, action processing, and
+        # optimizer/model parameters must not depend on which agent happened
+        # to be selected as the focal agent in run.py.
+        reference_id = trainable_mappo[0]
+        reference = agents[reference_id]
+        shared_fields = (("params", "action_constraints") if (params.get("lora") or {}).get("mode") == "per_agent"
+                         else ("observation", "params", "action_constraints"))
+        for agent_id in trainable_mappo[1:]:
+            for field in shared_fields:
+                if agents[agent_id].get(field, {}) != reference.get(field, {}):
+                    raise ScenarioError(
+                        "Shared MAPPO agents require identical "
+                        f"'{field}' configuration; agents '{reference_id}' and "
+                        f"'{agent_id}' differ."
+                    )
+
+
+def resolve_target_ids(scenario: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve target_id for agents based on roles.
+
+    For adversarial tasks, automatically resolves which agent is the target
+    for each attacker based on explicit roles.
+
+    Args:
+        scenario: Scenario configuration
+
+    Returns:
+        Scenario with target_id resolved for each agent
+
+    Example:
+        >>> scenario = {
+        ...     'agents': {
+        ...         'car_0': {'role': 'attacker', 'algorithm': 'ppo'},
+        ...         'car_1': {'role': 'defender', 'algorithm': 'ftg'},
+        ...     }
+        ... }
+        >>> resolved = resolve_target_ids(scenario)
+        >>> resolved['agents']['car_0']['target_id']
+        'car_1'
+    """
+    scenario = copy.deepcopy(scenario)
+
+    if 'agents' not in scenario:
+        return scenario
+
+    agents = scenario['agents']
+
+    # Find agents by role
+    attackers = []
+    defenders = []
+
+    for agent_id, agent_config in agents.items():
+        role = agent_config.get('role', None)
+        if role == 'attacker':
+            attackers.append(agent_id)
+        elif role == 'defender':
+            defenders.append(agent_id)
+
+    # For each attacker, set target_id to first defender
+    # (Simple 1v1 case, can be extended for multi-agent)
+    if attackers and defenders:
+        for attacker_id in attackers:
+            if 'target_id' not in agents[attacker_id]:
+                agents[attacker_id]['target_id'] = defenders[0]
+
+    return scenario
+
+
+def load_and_expand_scenario(path: str, validate: bool = True, *, overrides=None) -> Dict[str, Any]:
+    """Load and validate a scenario, then resolve agent targets.
+
+    The historical entry-point name is retained for callers.
+
+    Args:
+        path: Path to scenario YAML file
+        validate: Whether to validate the scenario (default: True)
+        overrides: Optional dotted KEY=YAML parameter choices, applied before validation.
+
+    Returns:
+        Fully expanded and validated scenario
+
+    Raises:
+        ScenarioError: If scenario is invalid
+
+    Example:
+        >>> scenario = load_and_expand_scenario('scenarios/legacy/ppo.yaml')
+        >>> # Ready to use for training
+    """
+    # Load raw scenario
+    scenario = resolve_max_speed(apply_parameter_overrides(load_scenario(path), overrides))
+
+    # Validate before resolving targets
+    if validate:
+        validate_scenario(scenario)
+
+    # Resolve target IDs for adversarial tasks
+    scenario = resolve_target_ids(scenario)
+
+    return scenario
+
+
+__all__ = [
+    'ScenarioError',
+    'load_scenario',
+    'apply_parameter_overrides',
+    'resolve_max_speed',
+    'load_yaml_config',
+    'validate_scenario',
+    'resolve_mappo_config',
+    'resolve_target_ids',
+    'load_and_expand_scenario',
+]

@@ -1,0 +1,200 @@
+"""ObservationComposer — assembles components into a flat numpy array."""
+from __future__ import annotations
+
+from pathlib import Path
+from copy import deepcopy
+from typing import Dict, List, Optional
+
+import numpy as np
+from core.scenario import load_yaml_config
+
+from wrappers.observations.base import ObservationComponent
+from wrappers.observations.ego import LidarComponent, EgoStateComponent, PrevActionComponent
+from wrappers.observations.track import (
+    CenterlineEgoStateComponent,
+    FrenetVehicleTrackComponent,
+    ProgressComponent,
+)
+from wrappers.observations.neighbors import (
+    FrenetNeighborsComponent,
+    TargetFrenetComponent,
+    TargetStateComponent,
+    RelativePoseComponent,
+)
+
+
+class ObservationComposer:
+    """Concatenates enabled ObservationComponents into a flat float32 array.
+
+    Built from a config dict (loaded from configs/observations/<policy>.yaml)
+    and the env config (for lidar_beams, lidar_range).
+
+    Each :meth:`wrap` call writes component outputs directly into a
+    pre-allocated internal buffer via :meth:`~ObservationComponent.compute_into`,
+    then returns a copy.  This eliminates the intermediate per-component array
+    allocations and the final :func:`numpy.concatenate` call.
+    """
+
+    def __init__(self, components: List[ObservationComponent]) -> None:
+        self._components = components
+        self.contract = None
+        # Pre-allocate assembly buffer and slice boundaries once.
+        self._obs_dim: int = sum(c.dim for c in components)
+        self._buf = np.zeros(self._obs_dim, dtype=np.float32)
+        offsets = []
+        offset = 0
+        for c in components:
+            offsets.append(offset)
+            offset += c.dim
+        self._offsets: List[int] = offsets
+
+    @property
+    def obs_dim(self) -> int:
+        return self._obs_dim
+
+    @property
+    def components(self) -> List[ObservationComponent]:
+        return self._components
+
+    def wrap(self, raw_obs: Dict, info: Optional[Dict] = None) -> np.ndarray:
+        """Assemble and return a fresh float32 observation vector.
+
+        Each component writes directly into a pre-allocated internal buffer
+        (zero intermediate allocations for components that implement
+        :meth:`~ObservationComponent.compute_into`).  Returns ``buf.copy()``
+        so the caller owns the data independently.
+        """
+        info = info or {}
+        buf = self._buf
+        for c, start in zip(self._components, self._offsets):
+            c.compute_into(raw_obs, info, buf[start : start + c.dim])
+        return buf.copy()
+
+    def reset(self) -> None:
+        for c in self._components:
+            if hasattr(c, "reset"):
+                c.reset()
+
+    def update_prev_action(self, action: np.ndarray) -> None:
+        for c in self._components:
+            if isinstance(c, PrevActionComponent):
+                c.update(action)
+
+    @classmethod
+    def from_config(
+        cls,
+        obs_config: Dict,
+        env_config: Dict,
+        action_dim: int = 2,
+    ) -> "ObservationComposer":
+        """Build from a parsed observation config dict and env config.
+
+        obs_config: the 'observation:' block from the YAML file
+        env_config: the 'environment:' block (provides lidar_beams, lidar_range)
+        """
+        n_beams = int(env_config.get("lidar_beams", 108))
+        lidar_range = float(env_config.get("lidar_range", 10.0))
+
+        obs = obs_config.get("observation", obs_config)
+        components: List[ObservationComponent] = []
+
+        lidar_cfg = obs.get("lidar", {})
+        if lidar_cfg.get("enabled", False):
+            components.append(
+                LidarComponent(
+                    n_beams=n_beams,
+                    lidar_range=lidar_range,
+                    normalize=bool(lidar_cfg.get("normalize", True)),
+                )
+            )
+
+        ego_cfg = obs.get("ego_state", {})
+        if ego_cfg.get("enabled", False):
+            components.append(
+                EgoStateComponent(
+                    include_velocity=bool(ego_cfg.get("include_velocity", True)),
+                    include_pose=bool(ego_cfg.get("include_pose", False)),
+                )
+            )
+
+        tgt_cfg = obs.get("target_state", {})
+        if tgt_cfg.get("enabled", False):
+            components.append(TargetStateComponent())
+
+        rel_cfg = obs.get("relative_pose", {})
+        if rel_cfg.get("enabled", False):
+            components.append(RelativePoseComponent())
+
+        cl_ego_cfg = obs.get("centerline_ego_state", {})
+        if cl_ego_cfg.get("enabled", False):
+            components.append(CenterlineEgoStateComponent())
+
+        frenet_cfg = obs.get("frenet_vehicle_track", {})
+        if frenet_cfg.get("enabled", False):
+            vehicle = env_config.get("vehicle_params", {})
+            nonlinear = vehicle.get("model") == "combined_slip_st"
+            source = frenet_cfg.get("wheel_speed_source", "rolling_estimate")
+            if nonlinear != (source == "simulated_v1"):
+                raise ValueError("combined_slip_st requires simulated_v1 wheel observations; legacy requires rolling_estimate")
+            radius = float(frenet_cfg.get("wheel_radius", 0.05))
+            if nonlinear and radius != float(vehicle["wheel_actuators"]["wheel_radius"]):
+                raise ValueError("Observation wheel_radius must match physical wheel_radius")
+            components.append(
+                FrenetVehicleTrackComponent(
+                    points=int(frenet_cfg.get("points", 20)),
+                    wheel_radius=float(frenet_cfg.get("wheel_radius", 0.05)),
+                    maxima=frenet_cfg.get("maxima", {}),
+                    clip=bool(frenet_cfg.get("clip", False)),
+                    wheel_speed_source=source,
+                    track_maxima=frenet_cfg.get("track_maxima"),
+                )
+            )
+
+        neighbors_cfg = obs.get("frenet_neighbors", {})
+        if neighbors_cfg.get("enabled", False):
+            components.append(
+                FrenetNeighborsComponent(
+                    max_neighbors=int(neighbors_cfg.get("max_neighbors", 1)),
+                    maxima=neighbors_cfg.get("maxima", {}),
+                    clip=bool(neighbors_cfg.get("clip", False)),
+                    include_team=bool(neighbors_cfg.get("include_team", False)),
+                    agent_ids=neighbors_cfg.get("agent_ids"),
+                )
+            )
+
+        prog_cfg = obs.get("progress", {})
+        if prog_cfg.get("enabled", False):
+            components.append(ProgressComponent())
+
+        pa_cfg = obs.get("prev_action", {})
+        if pa_cfg.get("enabled", False):
+            components.append(PrevActionComponent(action_dim=action_dim))
+
+        target_frenet_cfg = obs.get("target_frenet", {})
+        if target_frenet_cfg.get("enabled", False):
+            components.append(TargetFrenetComponent(target_frenet_cfg.get("maxima", {}),
+                                                   target_frenet_cfg.get("agent_ids")))
+
+        if not components:
+            raise ValueError("ObservationComposer: no components enabled in obs config.")
+
+        composer = cls(components)
+        if env_config.get("vehicle_params", {}).get("model") == "combined_slip_st":
+            composer.contract = {"version": 1, "observation": deepcopy(obs),
+                                 "lidar_beams": n_beams, "lidar_range": lidar_range,
+                                 "track_preview": deepcopy(env_config.get("track_preview", {}))}
+        return composer
+
+    @classmethod
+    def from_file(
+        cls,
+        path: str,
+        env_config: Dict,
+        action_dim: int = 2,
+    ) -> "ObservationComposer":
+        """Load from a YAML observation config file path."""
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Observation config not found: {path}")
+        obs_config = load_yaml_config(p)
+        return cls.from_config(obs_config, env_config, action_dim=action_dim)

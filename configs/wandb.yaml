@@ -1,0 +1,10 @@
+wandb:
+  logging:
+    # auto selects compact attack, lap-completion, or racing metrics; debug includes diagnostics.
+    profile: auto
+    groups:
+      train: true
+      eval: true
+      performance: true
+      curriculum: true
+      # collector and reward_components default off; debug enables both.

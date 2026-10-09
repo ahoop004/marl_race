@@ -1,0 +1,11 @@
+includes:
+  - rl_racer_simulated_wheel.yaml
+observation:
+  frenet_neighbors:
+    enabled: true
+    max_neighbors: 3
+    include_team: true
+    clip: false
+# This composer produces 176 values for MAPPO versus MPC.
+# The self-play two-team trainer additionally appends time remaining and own remaining lap fractions.
+# Neighbor state is simulator-provided; this is privileged traffic sensing.

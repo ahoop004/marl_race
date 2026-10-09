@@ -1,0 +1,978 @@
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from core.env_builder import build_env_kwargs, create_environment
+from core.map_selection import apply_map_split
+from core.scenario import ScenarioError, load_and_expand_scenario, validate_scenario
+from env.collision_state import RaceLifecycle
+from env.state_buffer import TerminalAgentConfig, TerminalVehicleController
+from env.state_views import build_global_state
+from env.types import AgentRaceStatus, TransitionRecord
+from metrics.racing_eval import (
+    aggregate_eval_episodes,
+    create_episode_facts,
+    finalize_episode_facts,
+    update_agent_step_facts,
+)
+from replay.dataset_writer import DatasetWriter, detect_dataset_schema
+from wrappers.rewards.events import (
+    CollisionRewardComponent,
+    TargetFinishComponent,
+    TimeoutPenaltyComponent,
+)
+from wrappers.rewards.completion import (
+    LapCompletionComponent,
+    PerLapBonusComponent,
+    FinishAheadBonusComponent,
+    TeamRaceResultComponent,
+)
+
+
+@pytest.mark.parametrize("positions,expected", [
+    ([1, 2], (11/6, 2, 2)),
+    ([1, 4], (1.5, 2, 0)),
+    ([2, 3], (1.5, 0, 0)),
+    ([3, 4], (7/6, 0, 0)),
+    ([1, None], (.5, 2, 0)),
+    ([None, None], (0, 0, 0)),
+])
+def test_team_result_rewards_cover_rank_ties_dnfs_and_sweeps(positions, expected):
+    from metrics.racing_eval import team_finish_result
+    team, opponents = ["red", "blue"], ["green", "yellow"]
+    infos = {aid: {"terminal_reason": "time_limit"} for aid in [*team, *opponents]}
+    context = {"all_infos": infos, "trainable_agent_ids": team, "opponent_agent_ids": opponents}
+    for objective, bonus in zip(("combined", "first_place", "sweep"), expected):
+        component = TeamRaceResultComponent({"objective": objective, "rank_bonus": 1, "both_finish_bonus": 1, "win_bonus": 2})
+        for aid in team:
+            infos[aid] = {"terminal_reason": "time_limit"}
+        assert component.compute(context) == {}
+        total = 0.0
+        for aid, position in zip(team, positions):
+            if position is not None:
+                infos[aid] = {"terminal_reason": "race_complete", "finish_position": position}
+            total += sum(component.compute(context).values())
+        assert total == pytest.approx(bonus)
+        assert component.compute(context) == {}  # completed cars remain in infos
+        component.reset()
+        assert sum(component.compute(context).values()) == pytest.approx(bonus)
+    result = team_finish_result(infos, team, opponents)
+    assert result["both_finished"] == float(None not in positions)
+    with pytest.raises(ValueError, match="all four"):
+        team_finish_result({}, team, opponents)
+
+
+@pytest.mark.parametrize("objective", ["combined", "first_place", "sweep"])
+def test_2v2_reward_presets_preserve_every_frenet_ppo_term(objective):
+    from core.scenario import load_yaml_config
+    from wrappers.rewards.composer import RewardComposer
+    path = f"configs/reward/tasks/race_team_2v2_{objective}.yaml"
+    reference = load_yaml_config("configs/reward/tasks/race_team_completion.yaml")
+    preset = load_yaml_config(path)
+    shared = preset["reward"].pop("team_race_result")
+    assert shared["objective"] == objective
+    assert preset["reward"] == reference["reward"]
+    reference_composer = RewardComposer.from_config(reference)
+    composer = RewardComposer.from_file(path)
+    for delta, reason in [(.01, None), (-.01, None), (.04, None), (0, "collision"), (0, "time_limit")]:
+        context = {"timestep": .05, "info": {"centerline": {"progress_delta": delta}, "terminal_reason": reason}}
+        assert composer.compute(context) == reference_composer.compute(context)
+
+
+def test_terminal_vehicle_controller_is_deterministic() -> None:
+    simulator = SimpleNamespace(
+        agents=[SimpleNamespace(state=np.array([0, 0, 0, 2, 0, 1, 0.2], dtype=float))]
+    )
+    controller = TerminalVehicleController(
+        ["car_0"], TerminalAgentConfig(finish_clearance_steps=4)
+    )
+    controller.capture(
+        "car_0",
+        status=AgentRaceStatus.FINISHED,
+        terminal_step=10,
+        action=np.array([0.2, 2.0], dtype=np.float32),
+        vehicle_state=simulator.agents[0].state,
+    )
+    assert controller.states["car_0"].last_vehicle_state[3] == 2.0
+    actions = np.zeros((1, 2), dtype=np.float32)
+    controller.apply(actions, agent_index={"car_0": 0}, simulator=simulator, step=12)
+    assert actions[0] == pytest.approx([0.1, 1.0])
+
+    controller.apply(actions, agent_index={"car_0": 0}, simulator=simulator, step=14)
+    assert actions[0] == pytest.approx([0.0, 0.0])
+    assert simulator.agents[0].state[[3, 5, 6]].tolist() == [0.0, 0.0, 0.0]
+
+
+def test_cause_based_reward_attribution_is_agent_specific() -> None:
+    intermediate = {"info": {"lap_crossed": True, "race_completed": False}}
+    completed = {
+        "terminated": True,
+        "info": {
+            "lap_crossed": True,
+            "race_completed": True,
+            "terminal_reason": "race_complete",
+            "finish_position": 1,
+            "target_finish_position": None,
+            "collision": False,
+        },
+    }
+    assert PerLapBonusComponent({"bonus": 5}).compute(intermediate) == {
+        "per_lap/bonus": 5.0
+    }
+    assert LapCompletionComponent({"bonus": 20}).compute(intermediate) == {}
+    assert LapCompletionComponent({"bonus": 20}).compute(completed) == {
+        "lap_completion/bonus": 20.0
+    }
+    assert FinishAheadBonusComponent({"bonus": 7}).compute(completed) == {
+        "finish_ahead/bonus": 7.0
+    }
+    assert CollisionRewardComponent({"penalty": -9}).compute(completed) == {}
+    assert TimeoutPenaltyComponent({"penalty": -11}).compute(completed) == {}
+
+
+def test_target_finish_penalty_is_emitted_once() -> None:
+    component = TargetFinishComponent({"penalty": -10})
+    step = {"info": {"target_race_completed": True, "collision": False}}
+    assert component.compute(step) == {"target_finish/penalty": -10.0}
+    assert component.compute(step) == {}
+    component.reset()
+    assert component.compute(step) == {"target_finish/penalty": -10.0}
+
+
+def test_dataset_v2_round_trip_and_old_schema_detection(tmp_path) -> None:
+    output = tmp_path / "v2"
+    writer = DatasetWriter(output)
+    finished = TransitionRecord(
+        obs=np.array([1], dtype=np.float32),
+        action_norm=np.array([0, 1], dtype=np.float32),
+        action_phys=np.array([0, 2], dtype=np.float32),
+        reward=3.0,
+        reward_components={},
+        next_obs=np.array([2], dtype=np.float32),
+        terminated=True,
+        truncated=False,
+        info={},
+        global_state=np.array([4], dtype=np.float32),
+        map_id="map",
+        spawn_id="spawn",
+        episode_id="ep",
+        step_idx=5,
+        agent_id="car_0",
+        lap_crossed=True,
+        lap_count=3,
+        target_laps=3,
+        race_completed=True,
+        terminal_reason="race_complete",
+        lifecycle_status="finished",
+        finish_position=1,
+        lifecycle_masks={
+            "active_mask": np.array([False, True]),
+            "finished_mask": np.array([True, False]),
+        },
+    )
+    writer.add(finished)
+    writer.add(
+        replace(
+            finished,
+            agent_id="car_1",
+            lap_crossed=False,
+            lap_count=2,
+            race_completed=False,
+            terminal_reason="collision",
+            lifecycle_status="crashed",
+            finish_position=None,
+        )
+    )
+    writer.add(
+        replace(
+            finished,
+            agent_id="car_2",
+            lap_crossed=False,
+            lap_count=1,
+            race_completed=False,
+            terminal_reason="time_limit",
+            lifecycle_status="truncated",
+            finish_position=None,
+        )
+    )
+    writer.close()
+
+    assert detect_dataset_schema(output) == "2.0"
+    assert json.loads((output / "metadata.json").read_text())["complete"] is True
+    original = {path.name: path.read_bytes() for path in output.iterdir()}
+    with pytest.raises(FileExistsError, match="must be empty"):
+        DatasetWriter(output, chunk_size=1)
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == original
+    chunk = np.load(output / "transitions_000000.npz", allow_pickle=True)
+    assert chunk["lap_count"].tolist() == [3, 2, 1]
+    assert chunk["terminal_reason"].tolist() == [
+        "race_complete",
+        "collision",
+        "time_limit",
+    ]
+    assert chunk["lifecycle_masks"].shape == (3, 4, 2)
+
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "metadata.json").write_text(json.dumps({"schema_version": "1.0"}))
+    assert detect_dataset_schema(old) == "1.0"
+
+
+def test_dataset_reserves_empty_directory_before_first_transition(tmp_path):
+    output = tmp_path / "reserved"
+    output.mkdir()
+    writer = DatasetWriter(output)
+    assert json.loads((output / "metadata.json").read_text())["complete"] is False
+    with pytest.raises(FileExistsError):
+        DatasetWriter(output)
+    writer.close()
+    writer.close()
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata["complete"] is True
+    assert metadata["total_transitions"] == 0
+
+
+def test_dataset_rejects_unrelated_files_without_modifying_them(tmp_path):
+    marker = tmp_path / "keep.txt"
+    marker.write_text("keep")
+    with pytest.raises(FileExistsError):
+        DatasetWriter(tmp_path)
+    assert list(tmp_path.iterdir()) == [marker]
+    assert marker.read_text() == "keep"
+
+
+def test_2v2_scenario_expands_explicit_race_contract() -> None:
+    scenario = load_and_expand_scenario("scenarios/legacy/mappo_2v2.yaml", overrides=['environment.centerline_autoload=true',
+         'environment.walls_autoload=true',
+         'environment.episode_termination.mode="all_agents"',
+         'environment.maps=!delete',
+         'environment.max_steps=250000',
+         'environment.vehicle_params.v_max=3.0',
+         'environment.map_bundles=["Budapest_map","circle_map","Melbourne_map","Montreal_map","Shanghai_map","Silverstone_map","Spa_map","Spielberg_map"]',
+         'environment.map_bundles_train=["Budapest_map","circle_map","Melbourne_map","Montreal_map","Shanghai_map","Spielberg_map"]',
+         'environment.map_bundles_eval=["Silverstone_map","Spa_map"]',
+         'environment.target_laps=3',
+         'environment.centerline_features=true',
+         'wandb.enabled=false',
+         'wandb.project="marl-f110"',
+         'wandb.entity="ahoop004-old-dominion-university"',
+         'wandb.name=null',
+         'wandb.group="racing_baselines"',
+         'wandb.job_type="mappo_2v2_vs_hybrid_pp_ftg"',
+         'wandb.tags=["mappo","racing","hybrid_pp_ftg","2v2"]',
+         'wandb.notes="Three-lap MAPPO 2v2 race with independent lifecycle and collidable terminal '
+         'vehicles"',
+         'wandb.mode="online"',
+         'experiment.name="mappo_2v2_vs_hybrid_pp_ftg"',
+         'agents.car_0.role="racer"',
+         'agents.car_0.observation.observation.target_state=!delete',
+         'agents.car_0.observation.observation.relative_pose=!delete',
+         'agents.car_0.observation.observation.progress={"enabled":true}',
+         'agents.car_0.reward.reward.target_proximity=!delete',
+         'agents.car_0.reward.reward.target_edge_pressure=!delete',
+         'agents.car_0.reward.reward.centerline_progress.weight=0.1',
+         'agents.car_0.reward.reward.centerline_progress.normalize_by_track_length=true',
+         'agents.car_0.reward.reward.centerline_progress.reference_length=400.0',
+         'agents.car_0.reward.reward.centerline_lateral_velocity_penalty.normalize_by_track_length=true',
+         'agents.car_0.reward.reward.centerline_lateral_velocity_penalty.reference_length=400.0',
+         'agents.car_0.reward.reward.centerline_deviation_penalty.weight=0.01',
+         'agents.car_0.reward.reward.steering_penalty.weight=0.03',
+         'agents.car_0.reward.reward.collision.penalty=-250.0',
+         'agents.car_0.reward.reward.target_crash_bonus=!delete',
+         'agents.car_0.reward.reward.timeout_penalty.penalty=-50.0',
+         'agents.car_0.reward.reward.self_crash_penalty.penalty=-125.0',
+         'agents.car_0.reward.reward.progress_delta_bonus={"enabled":true,"weight":100.0,"positive_only":true}',
+         'agents.car_0.reward.reward.relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false}',
+         'agents.car_0.reward.reward.team_progress_bonus={"enabled":true,"weight":100.0,"positive_only":true,"aggregation":"mean"}',
+         'agents.car_0.reward.reward.team_relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false,"aggregation":"mean"}',
+         'agents.car_0.reward.reward.wrong_way_penalty={"enabled":true,"penalty":-2.0}',
+         'agents.car_0.reward.reward.reverse_progress_penalty={"enabled":true,"weight":5.0}',
+         'agents.car_0.reward.reward.offtrack_penalty={"enabled":true,"max_abs_d":1.5,"penalty":-1.0}',
+         'agents.car_0.reward.reward.lap_completion={"enabled":true,"bonus":150.0,"require_clean":true}',
+         'agents.car_0.reward.reward.per_lap_bonus={"enabled":true,"bonus":25.0,"include_final_lap":false}',
+         'agents.car_0.reward.reward.finish_ahead_bonus={"enabled":true,"bonus":100.0,"require_clean":true}',
+         'agents.car_0.reward.reward.target_finish={"enabled":true,"penalty":-100.0}',
+         'agents.car_0.reward.reward.step_time_penalty={"enabled":true,"penalty":-0.01,"apply_on_terminal":true}',
+         'agents.car_0.reward.task.name="race_team_2v2_completion"',
+         'agents.car_0.reward.task.description="Conservative 2v2 racing with local completion pressure '
+         'until team facts are available."',
+         'agents.car_0.trainable=true',
+         'agents.car_1.role="racer"',
+         'agents.car_1.observation.observation.target_state=!delete',
+         'agents.car_1.observation.observation.relative_pose=!delete',
+         'agents.car_1.observation.observation.progress={"enabled":true}',
+         'agents.car_1.reward.reward.target_proximity=!delete',
+         'agents.car_1.reward.reward.target_edge_pressure=!delete',
+         'agents.car_1.reward.reward.centerline_progress.weight=0.1',
+         'agents.car_1.reward.reward.centerline_progress.normalize_by_track_length=true',
+         'agents.car_1.reward.reward.centerline_progress.reference_length=400.0',
+         'agents.car_1.reward.reward.centerline_lateral_velocity_penalty.normalize_by_track_length=true',
+         'agents.car_1.reward.reward.centerline_lateral_velocity_penalty.reference_length=400.0',
+         'agents.car_1.reward.reward.centerline_deviation_penalty.weight=0.01',
+         'agents.car_1.reward.reward.steering_penalty.weight=0.03',
+         'agents.car_1.reward.reward.collision.penalty=-250.0',
+         'agents.car_1.reward.reward.target_crash_bonus=!delete',
+         'agents.car_1.reward.reward.timeout_penalty.penalty=-50.0',
+         'agents.car_1.reward.reward.self_crash_penalty.penalty=-125.0',
+         'agents.car_1.reward.reward.progress_delta_bonus={"enabled":true,"weight":100.0,"positive_only":true}',
+         'agents.car_1.reward.reward.relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false}',
+         'agents.car_1.reward.reward.team_progress_bonus={"enabled":true,"weight":100.0,"positive_only":true,"aggregation":"mean"}',
+         'agents.car_1.reward.reward.team_relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false,"aggregation":"mean"}',
+         'agents.car_1.reward.reward.wrong_way_penalty={"enabled":true,"penalty":-2.0}',
+         'agents.car_1.reward.reward.reverse_progress_penalty={"enabled":true,"weight":5.0}',
+         'agents.car_1.reward.reward.offtrack_penalty={"enabled":true,"max_abs_d":1.5,"penalty":-1.0}',
+         'agents.car_1.reward.reward.lap_completion={"enabled":true,"bonus":150.0,"require_clean":true}',
+         'agents.car_1.reward.reward.per_lap_bonus={"enabled":true,"bonus":25.0,"include_final_lap":false}',
+         'agents.car_1.reward.reward.finish_ahead_bonus={"enabled":true,"bonus":100.0,"require_clean":true}',
+         'agents.car_1.reward.reward.target_finish={"enabled":true,"penalty":-100.0}',
+         'agents.car_1.reward.reward.step_time_penalty={"enabled":true,"penalty":-0.01,"apply_on_terminal":true}',
+         'agents.car_1.reward.task.name="race_team_2v2_completion"',
+         'agents.car_1.reward.task.description="Conservative 2v2 racing with local completion pressure '
+         'until team facts are available."',
+         'agents.car_1.trainable=true',
+         'agents.car_2.role="opponent"',
+         'agents.car_2.params.lookahead=2.0',
+         'agents.car_2.params.min_speed=0.8',
+         'agents.car_2.params.max_speed=2.5',
+         'agents.car_2.params.max_steer=0.35',
+         'agents.car_2.params.blend_distance=2.0',
+         'agents.car_2.params.full_ftg_distance=0.75',
+         'agents.car_2.params.ftg.window_size=6',
+         'agents.car_2.params.ftg.max_steer=0.3',
+         'agents.car_2.params.ftg.min_speed=0.8',
+         'agents.car_2.params.ftg.max_speed=2.5',
+         'agents.car_2.params.ftg.steering_gain=0.2',
+         'agents.car_2.params.ftg.steer_smooth=0.7',
+         'agents.car_2.params.ftg.wall_avoid_kick=0.01',
+         'agents.car_2.params.ftg.disparity_threshold=0.35',
+         'agents.car_2.params.wheelbase=0.3302',
+         'agents.car_2.params.curvature_slowdown_threshold=0.2',
+         'agents.car_2.params.speed_horizon=3.0',
+         'agents.car_2.trainable=false',
+         'agents.car_2.target_id="car_0"',
+         'agents.car_3.role="opponent"',
+         'agents.car_3.params.lookahead=2.0',
+         'agents.car_3.params.min_speed=0.8',
+         'agents.car_3.params.max_speed=2.5',
+         'agents.car_3.params.max_steer=0.35',
+         'agents.car_3.params.blend_distance=2.0',
+         'agents.car_3.params.full_ftg_distance=0.75',
+         'agents.car_3.params.ftg.window_size=6',
+         'agents.car_3.params.ftg.max_steer=0.3',
+         'agents.car_3.params.ftg.min_speed=0.8',
+         'agents.car_3.params.ftg.max_speed=2.5',
+         'agents.car_3.params.ftg.steering_gain=0.2',
+         'agents.car_3.params.ftg.steer_smooth=0.7',
+         'agents.car_3.params.ftg.wall_avoid_kick=0.01',
+         'agents.car_3.params.ftg.disparity_threshold=0.35',
+         'agents.car_3.params.wheelbase=0.3302',
+         'agents.car_3.params.curvature_slowdown_threshold=0.2',
+         'agents.car_3.params.speed_horizon=3.0',
+         'agents.car_3.trainable=false',
+         'agents.car_3.target_id="car_1"'])
+    env = apply_map_split(scenario["environment"], scenario["experiment"], "train")
+    kwargs = build_env_kwargs(env, scenario["agents"], seed=42)
+
+    assert env["target_laps"] == 3
+    assert env["episode_termination"]["mode"] == "all_agents"
+    assert env["map_bundles_train"]
+    assert env["map_bundles_eval"]
+    assert kwargs["target_laps"] == 3
+    assert kwargs["terminal_agents"]["remain_collidable"] is True
+    assert all(
+        agent["reward"]["task"]["name"] == "race_team_2v2_completion"
+        for agent in (scenario["agents"]["car_0"], scenario["agents"]["car_1"])
+    )
+
+
+@pytest.mark.parametrize('scenario_path,reward_mode,critic_mode,overrides', [('scenarios/legacy/complete_4.yaml',
+  'individual',
+  'agent_conditioned',
+  ['wandb.tags=["mappo","racing","completion","4car","individual_reward","agent_conditioned_critic"]',
+   'wandb.notes="One-full-circuit four-racer MAPPO with individual rewards and V_i(s)"',
+   'experiment.name="complete_4_individual"']),
+ ('scenarios/legacy/complete_4.yaml',
+  'team_shared',
+  'shared_team',
+  ['mappo.reward_mode="team_shared"',
+   'mappo.critic_mode="shared_team"',
+   'wandb.job_type="train-team-shared"',
+   'wandb.tags=["mappo","racing","completion","4car","team_reward","shared_team_critic"]',
+   'wandb.notes="One-full-circuit four-racer MAPPO with a fixed-denominator shared team reward and '
+   'V(s)"',
+   'experiment.name="complete_4_team_shared"']),
+ ('scenarios/legacy/mappo_2v2.yaml',
+  'individual',
+  'agent_conditioned',
+  ['environment.centerline_autoload=true',
+   'environment.walls_autoload=true',
+   'environment.episode_termination.mode="all_agents"',
+   'environment.maps=!delete',
+   'environment.max_steps=250000',
+   'environment.vehicle_params.v_max=3.0',
+   'environment.map_bundles=["Budapest_map","circle_map","Melbourne_map","Montreal_map","Shanghai_map","Silverstone_map","Spa_map","Spielberg_map"]',
+   'environment.map_bundles_train=["Budapest_map","circle_map","Melbourne_map","Montreal_map","Shanghai_map","Spielberg_map"]',
+   'environment.map_bundles_eval=["Silverstone_map","Spa_map"]',
+   'environment.target_laps=3',
+   'environment.centerline_features=true',
+   'wandb.enabled=false',
+   'wandb.project="marl-f110"',
+   'wandb.entity="ahoop004-old-dominion-university"',
+   'wandb.name=null',
+   'wandb.group="racing_baselines"',
+   'wandb.job_type="mappo_2v2_individual"',
+   'wandb.tags=["mappo","racing","hybrid_pp_ftg","2v2","individual_reward","agent_conditioned_critic"]',
+   'wandb.notes="Three-lap 2v2 MAPPO with individual rewards and V_i(s)"',
+   'wandb.mode="online"',
+   'experiment.name="mappo_2v2_individual"',
+   'agents.car_0.role="racer"',
+   'agents.car_0.observation.observation.target_state=!delete',
+   'agents.car_0.observation.observation.relative_pose=!delete',
+   'agents.car_0.observation.observation.progress={"enabled":true}',
+   'agents.car_0.reward.reward.target_proximity=!delete',
+   'agents.car_0.reward.reward.target_edge_pressure=!delete',
+   'agents.car_0.reward.reward.centerline_progress.weight=0.1',
+   'agents.car_0.reward.reward.centerline_progress.normalize_by_track_length=true',
+   'agents.car_0.reward.reward.centerline_progress.reference_length=400.0',
+   'agents.car_0.reward.reward.centerline_lateral_velocity_penalty.normalize_by_track_length=true',
+   'agents.car_0.reward.reward.centerline_lateral_velocity_penalty.reference_length=400.0',
+   'agents.car_0.reward.reward.centerline_deviation_penalty.weight=0.01',
+   'agents.car_0.reward.reward.steering_penalty.weight=0.03',
+   'agents.car_0.reward.reward.collision.penalty=-250.0',
+   'agents.car_0.reward.reward.target_crash_bonus=!delete',
+   'agents.car_0.reward.reward.timeout_penalty.penalty=-50.0',
+   'agents.car_0.reward.reward.self_crash_penalty.penalty=-125.0',
+   'agents.car_0.reward.reward.progress_delta_bonus={"enabled":true,"weight":100.0,"positive_only":true}',
+   'agents.car_0.reward.reward.relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false}',
+   'agents.car_0.reward.reward.team_progress_bonus={"enabled":true,"weight":100.0,"positive_only":true,"aggregation":"mean"}',
+   'agents.car_0.reward.reward.team_relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false,"aggregation":"mean"}',
+   'agents.car_0.reward.reward.wrong_way_penalty={"enabled":true,"penalty":-2.0}',
+   'agents.car_0.reward.reward.reverse_progress_penalty={"enabled":true,"weight":5.0}',
+   'agents.car_0.reward.reward.offtrack_penalty={"enabled":true,"max_abs_d":1.5,"penalty":-1.0}',
+   'agents.car_0.reward.reward.lap_completion={"enabled":true,"bonus":150.0,"require_clean":true}',
+   'agents.car_0.reward.reward.per_lap_bonus={"enabled":true,"bonus":25.0,"include_final_lap":false}',
+   'agents.car_0.reward.reward.finish_ahead_bonus={"enabled":true,"bonus":100.0,"require_clean":true}',
+   'agents.car_0.reward.reward.target_finish={"enabled":true,"penalty":-100.0}',
+   'agents.car_0.reward.reward.step_time_penalty={"enabled":true,"penalty":-0.01,"apply_on_terminal":true}',
+   'agents.car_0.reward.task.name="race_team_2v2_completion"',
+   'agents.car_0.reward.task.description="Conservative 2v2 racing with local completion pressure '
+   'until team facts are available."',
+   'agents.car_0.trainable=true',
+   'agents.car_1.role="racer"',
+   'agents.car_1.observation.observation.target_state=!delete',
+   'agents.car_1.observation.observation.relative_pose=!delete',
+   'agents.car_1.observation.observation.progress={"enabled":true}',
+   'agents.car_1.reward.reward.target_proximity=!delete',
+   'agents.car_1.reward.reward.target_edge_pressure=!delete',
+   'agents.car_1.reward.reward.centerline_progress.weight=0.1',
+   'agents.car_1.reward.reward.centerline_progress.normalize_by_track_length=true',
+   'agents.car_1.reward.reward.centerline_progress.reference_length=400.0',
+   'agents.car_1.reward.reward.centerline_lateral_velocity_penalty.normalize_by_track_length=true',
+   'agents.car_1.reward.reward.centerline_lateral_velocity_penalty.reference_length=400.0',
+   'agents.car_1.reward.reward.centerline_deviation_penalty.weight=0.01',
+   'agents.car_1.reward.reward.steering_penalty.weight=0.03',
+   'agents.car_1.reward.reward.collision.penalty=-250.0',
+   'agents.car_1.reward.reward.target_crash_bonus=!delete',
+   'agents.car_1.reward.reward.timeout_penalty.penalty=-50.0',
+   'agents.car_1.reward.reward.self_crash_penalty.penalty=-125.0',
+   'agents.car_1.reward.reward.progress_delta_bonus={"enabled":true,"weight":100.0,"positive_only":true}',
+   'agents.car_1.reward.reward.relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false}',
+   'agents.car_1.reward.reward.team_progress_bonus={"enabled":true,"weight":100.0,"positive_only":true,"aggregation":"mean"}',
+   'agents.car_1.reward.reward.team_relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false,"aggregation":"mean"}',
+   'agents.car_1.reward.reward.wrong_way_penalty={"enabled":true,"penalty":-2.0}',
+   'agents.car_1.reward.reward.reverse_progress_penalty={"enabled":true,"weight":5.0}',
+   'agents.car_1.reward.reward.offtrack_penalty={"enabled":true,"max_abs_d":1.5,"penalty":-1.0}',
+   'agents.car_1.reward.reward.lap_completion={"enabled":true,"bonus":150.0,"require_clean":true}',
+   'agents.car_1.reward.reward.per_lap_bonus={"enabled":true,"bonus":25.0,"include_final_lap":false}',
+   'agents.car_1.reward.reward.finish_ahead_bonus={"enabled":true,"bonus":100.0,"require_clean":true}',
+   'agents.car_1.reward.reward.target_finish={"enabled":true,"penalty":-100.0}',
+   'agents.car_1.reward.reward.step_time_penalty={"enabled":true,"penalty":-0.01,"apply_on_terminal":true}',
+   'agents.car_1.reward.task.name="race_team_2v2_completion"',
+   'agents.car_1.reward.task.description="Conservative 2v2 racing with local completion pressure '
+   'until team facts are available."',
+   'agents.car_1.trainable=true',
+   'agents.car_2.role="opponent"',
+   'agents.car_2.params.lookahead=2.0',
+   'agents.car_2.params.min_speed=0.8',
+   'agents.car_2.params.max_speed=2.5',
+   'agents.car_2.params.max_steer=0.35',
+   'agents.car_2.params.blend_distance=2.0',
+   'agents.car_2.params.full_ftg_distance=0.75',
+   'agents.car_2.params.ftg.window_size=6',
+   'agents.car_2.params.ftg.max_steer=0.3',
+   'agents.car_2.params.ftg.min_speed=0.8',
+   'agents.car_2.params.ftg.max_speed=2.5',
+   'agents.car_2.params.ftg.steering_gain=0.2',
+   'agents.car_2.params.ftg.steer_smooth=0.7',
+   'agents.car_2.params.ftg.wall_avoid_kick=0.01',
+   'agents.car_2.params.ftg.disparity_threshold=0.35',
+   'agents.car_2.params.wheelbase=0.3302',
+   'agents.car_2.params.curvature_slowdown_threshold=0.2',
+   'agents.car_2.params.speed_horizon=3.0',
+   'agents.car_2.trainable=false',
+   'agents.car_2.target_id="car_0"',
+   'agents.car_3.role="opponent"',
+   'agents.car_3.params.lookahead=2.0',
+   'agents.car_3.params.min_speed=0.8',
+   'agents.car_3.params.max_speed=2.5',
+   'agents.car_3.params.max_steer=0.35',
+   'agents.car_3.params.blend_distance=2.0',
+   'agents.car_3.params.full_ftg_distance=0.75',
+   'agents.car_3.params.ftg.window_size=6',
+   'agents.car_3.params.ftg.max_steer=0.3',
+   'agents.car_3.params.ftg.min_speed=0.8',
+   'agents.car_3.params.ftg.max_speed=2.5',
+   'agents.car_3.params.ftg.steering_gain=0.2',
+   'agents.car_3.params.ftg.steer_smooth=0.7',
+   'agents.car_3.params.ftg.wall_avoid_kick=0.01',
+   'agents.car_3.params.ftg.disparity_threshold=0.35',
+   'agents.car_3.params.wheelbase=0.3302',
+   'agents.car_3.params.curvature_slowdown_threshold=0.2',
+   'agents.car_3.params.speed_horizon=3.0',
+   'agents.car_3.trainable=false',
+   'agents.car_3.target_id="car_1"']),
+ ('scenarios/legacy/mappo_2v2.yaml',
+  'team_shared',
+  'shared_team',
+  ['environment.centerline_autoload=true',
+   'environment.walls_autoload=true',
+   'environment.episode_termination.mode="all_agents"',
+   'environment.maps=!delete',
+   'environment.max_steps=250000',
+   'environment.vehicle_params.v_max=3.0',
+   'environment.map_bundles=["Budapest_map","circle_map","Melbourne_map","Montreal_map","Shanghai_map","Silverstone_map","Spa_map","Spielberg_map"]',
+   'environment.map_bundles_train=["Budapest_map","circle_map","Melbourne_map","Montreal_map","Shanghai_map","Spielberg_map"]',
+   'environment.map_bundles_eval=["Silverstone_map","Spa_map"]',
+   'environment.target_laps=3',
+   'environment.centerline_features=true',
+   'mappo.reward_mode="team_shared"',
+   'mappo.critic_mode="shared_team"',
+   'wandb.enabled=false',
+   'wandb.project="marl-f110"',
+   'wandb.entity="ahoop004-old-dominion-university"',
+   'wandb.name=null',
+   'wandb.group="racing_baselines"',
+   'wandb.job_type="mappo_2v2_team_shared"',
+   'wandb.tags=["mappo","racing","hybrid_pp_ftg","2v2","team_reward","shared_team_critic"]',
+   'wandb.notes="Three-lap 2v2 MAPPO with a fixed-denominator shared team reward and V(s)"',
+   'wandb.mode="online"',
+   'experiment.name="mappo_2v2_team_shared"',
+   'agents.car_0.role="racer"',
+   'agents.car_0.observation.observation.target_state=!delete',
+   'agents.car_0.observation.observation.relative_pose=!delete',
+   'agents.car_0.observation.observation.progress={"enabled":true}',
+   'agents.car_0.reward.reward.target_proximity=!delete',
+   'agents.car_0.reward.reward.target_edge_pressure=!delete',
+   'agents.car_0.reward.reward.centerline_progress.weight=0.1',
+   'agents.car_0.reward.reward.centerline_progress.normalize_by_track_length=true',
+   'agents.car_0.reward.reward.centerline_progress.reference_length=400.0',
+   'agents.car_0.reward.reward.centerline_lateral_velocity_penalty.normalize_by_track_length=true',
+   'agents.car_0.reward.reward.centerline_lateral_velocity_penalty.reference_length=400.0',
+   'agents.car_0.reward.reward.centerline_deviation_penalty.weight=0.01',
+   'agents.car_0.reward.reward.steering_penalty.weight=0.03',
+   'agents.car_0.reward.reward.collision.penalty=-250.0',
+   'agents.car_0.reward.reward.target_crash_bonus=!delete',
+   'agents.car_0.reward.reward.timeout_penalty.penalty=-50.0',
+   'agents.car_0.reward.reward.self_crash_penalty.penalty=-125.0',
+   'agents.car_0.reward.reward.progress_delta_bonus={"enabled":true,"weight":100.0,"positive_only":true}',
+   'agents.car_0.reward.reward.relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false}',
+   'agents.car_0.reward.reward.team_progress_bonus={"enabled":true,"weight":100.0,"positive_only":true,"aggregation":"mean"}',
+   'agents.car_0.reward.reward.team_relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false,"aggregation":"mean"}',
+   'agents.car_0.reward.reward.wrong_way_penalty={"enabled":true,"penalty":-2.0}',
+   'agents.car_0.reward.reward.reverse_progress_penalty={"enabled":true,"weight":5.0}',
+   'agents.car_0.reward.reward.offtrack_penalty={"enabled":true,"max_abs_d":1.5,"penalty":-1.0}',
+   'agents.car_0.reward.reward.lap_completion={"enabled":true,"bonus":150.0,"require_clean":true}',
+   'agents.car_0.reward.reward.per_lap_bonus={"enabled":true,"bonus":25.0,"include_final_lap":false}',
+   'agents.car_0.reward.reward.finish_ahead_bonus={"enabled":true,"bonus":100.0,"require_clean":true}',
+   'agents.car_0.reward.reward.target_finish={"enabled":true,"penalty":-100.0}',
+   'agents.car_0.reward.reward.step_time_penalty={"enabled":true,"penalty":-0.01,"apply_on_terminal":true}',
+   'agents.car_0.reward.task.name="race_team_2v2_completion"',
+   'agents.car_0.reward.task.description="Conservative 2v2 racing with local completion pressure '
+   'until team facts are available."',
+   'agents.car_0.trainable=true',
+   'agents.car_1.role="racer"',
+   'agents.car_1.observation.observation.target_state=!delete',
+   'agents.car_1.observation.observation.relative_pose=!delete',
+   'agents.car_1.observation.observation.progress={"enabled":true}',
+   'agents.car_1.reward.reward.target_proximity=!delete',
+   'agents.car_1.reward.reward.target_edge_pressure=!delete',
+   'agents.car_1.reward.reward.centerline_progress.weight=0.1',
+   'agents.car_1.reward.reward.centerline_progress.normalize_by_track_length=true',
+   'agents.car_1.reward.reward.centerline_progress.reference_length=400.0',
+   'agents.car_1.reward.reward.centerline_lateral_velocity_penalty.normalize_by_track_length=true',
+   'agents.car_1.reward.reward.centerline_lateral_velocity_penalty.reference_length=400.0',
+   'agents.car_1.reward.reward.centerline_deviation_penalty.weight=0.01',
+   'agents.car_1.reward.reward.steering_penalty.weight=0.03',
+   'agents.car_1.reward.reward.collision.penalty=-250.0',
+   'agents.car_1.reward.reward.target_crash_bonus=!delete',
+   'agents.car_1.reward.reward.timeout_penalty.penalty=-50.0',
+   'agents.car_1.reward.reward.self_crash_penalty.penalty=-125.0',
+   'agents.car_1.reward.reward.progress_delta_bonus={"enabled":true,"weight":100.0,"positive_only":true}',
+   'agents.car_1.reward.reward.relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false}',
+   'agents.car_1.reward.reward.team_progress_bonus={"enabled":true,"weight":100.0,"positive_only":true,"aggregation":"mean"}',
+   'agents.car_1.reward.reward.team_relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false,"aggregation":"mean"}',
+   'agents.car_1.reward.reward.wrong_way_penalty={"enabled":true,"penalty":-2.0}',
+   'agents.car_1.reward.reward.reverse_progress_penalty={"enabled":true,"weight":5.0}',
+   'agents.car_1.reward.reward.offtrack_penalty={"enabled":true,"max_abs_d":1.5,"penalty":-1.0}',
+   'agents.car_1.reward.reward.lap_completion={"enabled":true,"bonus":150.0,"require_clean":true}',
+   'agents.car_1.reward.reward.per_lap_bonus={"enabled":true,"bonus":25.0,"include_final_lap":false}',
+   'agents.car_1.reward.reward.finish_ahead_bonus={"enabled":true,"bonus":100.0,"require_clean":true}',
+   'agents.car_1.reward.reward.target_finish={"enabled":true,"penalty":-100.0}',
+   'agents.car_1.reward.reward.step_time_penalty={"enabled":true,"penalty":-0.01,"apply_on_terminal":true}',
+   'agents.car_1.reward.task.name="race_team_2v2_completion"',
+   'agents.car_1.reward.task.description="Conservative 2v2 racing with local completion pressure '
+   'until team facts are available."',
+   'agents.car_1.trainable=true',
+   'agents.car_2.role="opponent"',
+   'agents.car_2.params.lookahead=2.0',
+   'agents.car_2.params.min_speed=0.8',
+   'agents.car_2.params.max_speed=2.5',
+   'agents.car_2.params.max_steer=0.35',
+   'agents.car_2.params.blend_distance=2.0',
+   'agents.car_2.params.full_ftg_distance=0.75',
+   'agents.car_2.params.ftg.window_size=6',
+   'agents.car_2.params.ftg.max_steer=0.3',
+   'agents.car_2.params.ftg.min_speed=0.8',
+   'agents.car_2.params.ftg.max_speed=2.5',
+   'agents.car_2.params.ftg.steering_gain=0.2',
+   'agents.car_2.params.ftg.steer_smooth=0.7',
+   'agents.car_2.params.ftg.wall_avoid_kick=0.01',
+   'agents.car_2.params.ftg.disparity_threshold=0.35',
+   'agents.car_2.params.wheelbase=0.3302',
+   'agents.car_2.params.curvature_slowdown_threshold=0.2',
+   'agents.car_2.params.speed_horizon=3.0',
+   'agents.car_2.trainable=false',
+   'agents.car_2.target_id="car_0"',
+   'agents.car_3.role="opponent"',
+   'agents.car_3.params.lookahead=2.0',
+   'agents.car_3.params.min_speed=0.8',
+   'agents.car_3.params.max_speed=2.5',
+   'agents.car_3.params.max_steer=0.35',
+   'agents.car_3.params.blend_distance=2.0',
+   'agents.car_3.params.full_ftg_distance=0.75',
+   'agents.car_3.params.ftg.window_size=6',
+   'agents.car_3.params.ftg.max_steer=0.3',
+   'agents.car_3.params.ftg.min_speed=0.8',
+   'agents.car_3.params.ftg.max_speed=2.5',
+   'agents.car_3.params.ftg.steering_gain=0.2',
+   'agents.car_3.params.ftg.steer_smooth=0.7',
+   'agents.car_3.params.ftg.wall_avoid_kick=0.01',
+   'agents.car_3.params.ftg.disparity_threshold=0.35',
+   'agents.car_3.params.wheelbase=0.3302',
+   'agents.car_3.params.curvature_slowdown_threshold=0.2',
+   'agents.car_3.params.speed_horizon=3.0',
+   'agents.car_3.trainable=false',
+   'agents.car_3.target_id="car_1"'])])
+def test_mappo_comparison_scenarios_have_explicit_contracts(
+    scenario_path: str,
+    reward_mode: str,
+    critic_mode: str, overrides,
+) -> None:
+    scenario = load_and_expand_scenario(scenario_path, overrides=overrides)
+
+    assert scenario["mappo"] == {
+        "reward_mode": reward_mode,
+        "critic_mode": critic_mode,
+        "team_reward_reduction": "mean",
+    }
+
+
+def test_individual_rewards_reject_shared_team_critic() -> None:
+    scenario = load_and_expand_scenario("scenarios/legacy/complete_4.yaml", overrides=['wandb.tags=["mappo","racing","completion","4car","individual_reward","agent_conditioned_critic"]',
+         'wandb.notes="One-full-circuit four-racer MAPPO with individual rewards and V_i(s)"',
+         'experiment.name="complete_4_individual"'])
+    scenario["mappo"]["critic_mode"] = "shared_team"
+
+    with pytest.raises(ScenarioError, match="individual rewards require"):
+        validate_scenario(scenario)
+
+
+@pytest.mark.parametrize("field", ["observation", "params", "action_constraints"])
+def test_shared_mappo_agents_reject_inconsistent_policy_contracts(field: str) -> None:
+    scenario = load_and_expand_scenario("scenarios/legacy/mappo_gaplock.yaml")
+    if field == "observation":
+        scenario["agents"]["car_1"][field] = "different_observation.yaml"
+    elif field == "params":
+        scenario["agents"]["car_1"][field]["hidden_dims"] = [128, 128]
+    else:
+        scenario["agents"]["car_1"][field]["prevent_reverse"] = False
+
+    with pytest.raises(ScenarioError, match=f"identical '{field}'"):
+        validate_scenario(scenario)
+
+
+def test_global_state_exposes_distinct_lifecycle_masks() -> None:
+    lifecycle = RaceLifecycle(["car_0", "car_1", "car_2"], 1)
+    lifecycle.record_lap_crossing("car_0", step=1)
+    lifecycle.record_collision("car_1", step=2)
+    state = build_global_state(
+        possible_agents=lifecycle.agent_ids,
+        active_agents=lifecycle.active_agents,
+        central_vector=np.zeros(3, dtype=np.float32),
+        lifecycle_records=lifecycle.records,
+    )
+    assert state.masks["active_mask"].tolist() == [False, False, True]
+    assert state.masks["finished_mask"].tolist() == [True, False, False]
+    assert state.masks["crashed_mask"].tolist() == [False, True, False]
+    assert state.masks["truncated_mask"].tolist() == [False, False, False]
+
+
+def test_four_car_standings_remain_immutable() -> None:
+    episode = create_episode_facts(
+        episode=0,
+        agent_ids=["car_0", "car_1", "car_2", "car_3"],
+        trainable_ids=["car_0", "car_1"],
+        opponent_ids=["car_2", "car_3"],
+    )
+    steps = [
+        {
+            "car_1": {
+                "race_completed": True,
+                "terminal_reason": "race_complete",
+                "terminal_step": 1,
+                "finish_position": 1,
+                "lap_count": 3,
+            }
+        },
+        {
+            "car_1": {
+                "race_completed": True,
+                "terminal_reason": "race_complete",
+                "collision": True,
+                "finish_position": 1,
+            },
+            "car_2": {"terminal_reason": "collision", "terminal_step": 2},
+        },
+        {
+            "car_0": {
+                "race_completed": True,
+                "terminal_reason": "race_complete",
+                "terminal_step": 3,
+                "finish_position": 2,
+                "lap_count": 3,
+            }
+        },
+        {"car_3": {"terminal_reason": "time_limit", "time_limit": True}},
+    ]
+    terminal_maps = [
+        {"car_1": True},
+        {"car_1": True, "car_2": True},
+        {"car_0": True, "car_1": True, "car_2": True},
+        {"car_0": True, "car_1": True, "car_2": True},
+    ]
+    trunc_maps = [{}, {}, {}, {"car_3": True}]
+    for idx, info in enumerate(steps, start=1):
+        update_agent_step_facts(
+            episode,
+            step_idx=idx,
+            infos=info,
+            terminations=terminal_maps[idx - 1],
+            truncations=trunc_maps[idx - 1],
+        )
+    finalize_episode_facts(episode)
+
+    assert episode.agents["car_1"].outcome == "finished"
+    assert episode.agents["car_1"].finish_position == 1
+    assert episode.agents["car_1"].collision_step is None
+    assert episode.agents["car_2"].outcome == "crashed"
+    assert episode.agents["car_3"].outcome == "truncated"
+    summary = aggregate_eval_episodes([episode])
+    assert summary["team_both_finished_rate"] == 1.0
+    assert summary["team_mean_finish_position"] == 1.5
+    assert summary["team_best_finish_position"] == 1.0
+
+
+def test_cooperative_team_collision_rate_does_not_require_opponents() -> None:
+    episode = create_episode_facts(
+        episode=0,
+        agent_ids=["car_0", "car_1"],
+        trainable_ids=["car_0", "car_1"],
+        opponent_ids=[],
+    )
+    update_agent_step_facts(
+        episode,
+        step_idx=1,
+        infos={
+            "car_0": {"terminal_reason": "collision"},
+            "car_1": {"terminal_reason": "collision"},
+        },
+        terminations={"car_0": True, "car_1": True},
+    )
+    finalize_episode_facts(episode)
+
+    summary = aggregate_eval_episodes([episode])
+    assert summary["team_collision_rate"] == 1.0
+    assert summary["team_both_finished_rate"] == 0.0
+
+
+def test_finished_vehicle_remains_physical_and_can_crash_active_vehicle() -> None:
+    scenario = load_and_expand_scenario("scenarios/legacy/mappo_2v2.yaml", overrides=['environment.centerline_autoload=true',
+         'environment.walls_autoload=true',
+         'environment.episode_termination.mode="all_agents"',
+         'environment.maps=!delete',
+         'environment.max_steps=250000',
+         'environment.vehicle_params.v_max=3.0',
+         'environment.map_bundles=["Budapest_map","circle_map","Melbourne_map","Montreal_map","Shanghai_map","Silverstone_map","Spa_map","Spielberg_map"]',
+         'environment.map_bundles_train=["Budapest_map","circle_map","Melbourne_map","Montreal_map","Shanghai_map","Spielberg_map"]',
+         'environment.map_bundles_eval=["Silverstone_map","Spa_map"]',
+         'environment.target_laps=3',
+         'environment.centerline_features=true',
+         'wandb.enabled=false',
+         'wandb.project="marl-f110"',
+         'wandb.entity="ahoop004-old-dominion-university"',
+         'wandb.name=null',
+         'wandb.group="racing_baselines"',
+         'wandb.job_type="mappo_2v2_vs_hybrid_pp_ftg"',
+         'wandb.tags=["mappo","racing","hybrid_pp_ftg","2v2"]',
+         'wandb.notes="Three-lap MAPPO 2v2 race with independent lifecycle and collidable terminal '
+         'vehicles"',
+         'wandb.mode="online"',
+         'experiment.name="mappo_2v2_vs_hybrid_pp_ftg"',
+         'agents.car_0.role="racer"',
+         'agents.car_0.observation.observation.target_state=!delete',
+         'agents.car_0.observation.observation.relative_pose=!delete',
+         'agents.car_0.observation.observation.progress={"enabled":true}',
+         'agents.car_0.reward.reward.target_proximity=!delete',
+         'agents.car_0.reward.reward.target_edge_pressure=!delete',
+         'agents.car_0.reward.reward.centerline_progress.weight=0.1',
+         'agents.car_0.reward.reward.centerline_progress.normalize_by_track_length=true',
+         'agents.car_0.reward.reward.centerline_progress.reference_length=400.0',
+         'agents.car_0.reward.reward.centerline_lateral_velocity_penalty.normalize_by_track_length=true',
+         'agents.car_0.reward.reward.centerline_lateral_velocity_penalty.reference_length=400.0',
+         'agents.car_0.reward.reward.centerline_deviation_penalty.weight=0.01',
+         'agents.car_0.reward.reward.steering_penalty.weight=0.03',
+         'agents.car_0.reward.reward.collision.penalty=-250.0',
+         'agents.car_0.reward.reward.target_crash_bonus=!delete',
+         'agents.car_0.reward.reward.timeout_penalty.penalty=-50.0',
+         'agents.car_0.reward.reward.self_crash_penalty.penalty=-125.0',
+         'agents.car_0.reward.reward.progress_delta_bonus={"enabled":true,"weight":100.0,"positive_only":true}',
+         'agents.car_0.reward.reward.relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false}',
+         'agents.car_0.reward.reward.team_progress_bonus={"enabled":true,"weight":100.0,"positive_only":true,"aggregation":"mean"}',
+         'agents.car_0.reward.reward.team_relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false,"aggregation":"mean"}',
+         'agents.car_0.reward.reward.wrong_way_penalty={"enabled":true,"penalty":-2.0}',
+         'agents.car_0.reward.reward.reverse_progress_penalty={"enabled":true,"weight":5.0}',
+         'agents.car_0.reward.reward.offtrack_penalty={"enabled":true,"max_abs_d":1.5,"penalty":-1.0}',
+         'agents.car_0.reward.reward.lap_completion={"enabled":true,"bonus":150.0,"require_clean":true}',
+         'agents.car_0.reward.reward.per_lap_bonus={"enabled":true,"bonus":25.0,"include_final_lap":false}',
+         'agents.car_0.reward.reward.finish_ahead_bonus={"enabled":true,"bonus":100.0,"require_clean":true}',
+         'agents.car_0.reward.reward.target_finish={"enabled":true,"penalty":-100.0}',
+         'agents.car_0.reward.reward.step_time_penalty={"enabled":true,"penalty":-0.01,"apply_on_terminal":true}',
+         'agents.car_0.reward.task.name="race_team_2v2_completion"',
+         'agents.car_0.reward.task.description="Conservative 2v2 racing with local completion pressure '
+         'until team facts are available."',
+         'agents.car_0.trainable=true',
+         'agents.car_1.role="racer"',
+         'agents.car_1.observation.observation.target_state=!delete',
+         'agents.car_1.observation.observation.relative_pose=!delete',
+         'agents.car_1.observation.observation.progress={"enabled":true}',
+         'agents.car_1.reward.reward.target_proximity=!delete',
+         'agents.car_1.reward.reward.target_edge_pressure=!delete',
+         'agents.car_1.reward.reward.centerline_progress.weight=0.1',
+         'agents.car_1.reward.reward.centerline_progress.normalize_by_track_length=true',
+         'agents.car_1.reward.reward.centerline_progress.reference_length=400.0',
+         'agents.car_1.reward.reward.centerline_lateral_velocity_penalty.normalize_by_track_length=true',
+         'agents.car_1.reward.reward.centerline_lateral_velocity_penalty.reference_length=400.0',
+         'agents.car_1.reward.reward.centerline_deviation_penalty.weight=0.01',
+         'agents.car_1.reward.reward.steering_penalty.weight=0.03',
+         'agents.car_1.reward.reward.collision.penalty=-250.0',
+         'agents.car_1.reward.reward.target_crash_bonus=!delete',
+         'agents.car_1.reward.reward.timeout_penalty.penalty=-50.0',
+         'agents.car_1.reward.reward.self_crash_penalty.penalty=-125.0',
+         'agents.car_1.reward.reward.progress_delta_bonus={"enabled":true,"weight":100.0,"positive_only":true}',
+         'agents.car_1.reward.reward.relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false}',
+         'agents.car_1.reward.reward.team_progress_bonus={"enabled":true,"weight":100.0,"positive_only":true,"aggregation":"mean"}',
+         'agents.car_1.reward.reward.team_relative_progress_bonus={"enabled":true,"weight":100.0,"positive_only":false,"aggregation":"mean"}',
+         'agents.car_1.reward.reward.wrong_way_penalty={"enabled":true,"penalty":-2.0}',
+         'agents.car_1.reward.reward.reverse_progress_penalty={"enabled":true,"weight":5.0}',
+         'agents.car_1.reward.reward.offtrack_penalty={"enabled":true,"max_abs_d":1.5,"penalty":-1.0}',
+         'agents.car_1.reward.reward.lap_completion={"enabled":true,"bonus":150.0,"require_clean":true}',
+         'agents.car_1.reward.reward.per_lap_bonus={"enabled":true,"bonus":25.0,"include_final_lap":false}',
+         'agents.car_1.reward.reward.finish_ahead_bonus={"enabled":true,"bonus":100.0,"require_clean":true}',
+         'agents.car_1.reward.reward.target_finish={"enabled":true,"penalty":-100.0}',
+         'agents.car_1.reward.reward.step_time_penalty={"enabled":true,"penalty":-0.01,"apply_on_terminal":true}',
+         'agents.car_1.reward.task.name="race_team_2v2_completion"',
+         'agents.car_1.reward.task.description="Conservative 2v2 racing with local completion pressure '
+         'until team facts are available."',
+         'agents.car_1.trainable=true',
+         'agents.car_2.role="opponent"',
+         'agents.car_2.params.lookahead=2.0',
+         'agents.car_2.params.min_speed=0.8',
+         'agents.car_2.params.max_speed=2.5',
+         'agents.car_2.params.max_steer=0.35',
+         'agents.car_2.params.blend_distance=2.0',
+         'agents.car_2.params.full_ftg_distance=0.75',
+         'agents.car_2.params.ftg.window_size=6',
+         'agents.car_2.params.ftg.max_steer=0.3',
+         'agents.car_2.params.ftg.min_speed=0.8',
+         'agents.car_2.params.ftg.max_speed=2.5',
+         'agents.car_2.params.ftg.steering_gain=0.2',
+         'agents.car_2.params.ftg.steer_smooth=0.7',
+         'agents.car_2.params.ftg.wall_avoid_kick=0.01',
+         'agents.car_2.params.ftg.disparity_threshold=0.35',
+         'agents.car_2.params.wheelbase=0.3302',
+         'agents.car_2.params.curvature_slowdown_threshold=0.2',
+         'agents.car_2.params.speed_horizon=3.0',
+         'agents.car_2.trainable=false',
+         'agents.car_2.target_id="car_0"',
+         'agents.car_3.role="opponent"',
+         'agents.car_3.params.lookahead=2.0',
+         'agents.car_3.params.min_speed=0.8',
+         'agents.car_3.params.max_speed=2.5',
+         'agents.car_3.params.max_steer=0.35',
+         'agents.car_3.params.blend_distance=2.0',
+         'agents.car_3.params.full_ftg_distance=0.75',
+         'agents.car_3.params.ftg.window_size=6',
+         'agents.car_3.params.ftg.max_steer=0.3',
+         'agents.car_3.params.ftg.min_speed=0.8',
+         'agents.car_3.params.ftg.max_speed=2.5',
+         'agents.car_3.params.ftg.steering_gain=0.2',
+         'agents.car_3.params.ftg.steer_smooth=0.7',
+         'agents.car_3.params.ftg.wall_avoid_kick=0.01',
+         'agents.car_3.params.ftg.disparity_threshold=0.35',
+         'agents.car_3.params.wheelbase=0.3302',
+         'agents.car_3.params.curvature_slowdown_threshold=0.2',
+         'agents.car_3.params.speed_horizon=3.0',
+         'agents.car_3.trainable=false',
+         'agents.car_3.target_id="car_1"'])
+    env_cfg = apply_map_split(scenario["environment"], scenario["experiment"], "train")
+    env_cfg = dict(env_cfg)
+    env_cfg["map_cycle"] = ""
+    env = create_environment(
+        env_cfg,
+        {"car_0": scenario["agents"]["car_0"], "car_1": scenario["agents"]["car_1"]},
+        seed=42,
+    )
+    try:
+        env.reset(seed=42)
+        winner = env.lifecycle.records["car_0"]
+        winner.lap_count = winner.target_laps - 1
+        env.lifecycle.record_lap_crossing("car_0", step=0)
+        env.agents = list(env.lifecycle.active_agents)
+        env._terminal_controller.capture(
+            "car_0",
+            status=winner.status,
+            terminal_step=0,
+            action=np.zeros(2, dtype=np.float32),
+            vehicle_state=env.sim.agents[0].state,
+        )
+
+        # The simulator has no collision impulses: overlap produces collision
+        # facts but cannot move or rewrite the parked winner's result.
+        env.sim.agents[1].state[:] = env.sim.agents[0].state
+        _, _, terminations, _, _ = env.step(
+            {"car_1": np.zeros(2, dtype=np.float32)}
+        )
+
+        assert env.lifecycle.records["car_0"].status == AgentRaceStatus.FINISHED
+        assert env.lifecycle.records["car_0"].finish_position == 1
+        assert env.lifecycle.records["car_1"].status == AgentRaceStatus.CRASHED
+        assert terminations == {"car_0": True, "car_1": True}
+        assert env.physical_agents == ("car_0", "car_1")
+        assert env.get_global_state().agent_ids == ("car_0", "car_1")
+    finally:
+        env.close()

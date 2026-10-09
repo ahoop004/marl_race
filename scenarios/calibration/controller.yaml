@@ -1,0 +1,216 @@
+# Standalone workflow: calibration/controller.
+# All active settings are inline. No scenario or config includes are required.
+# Edit values below, or use: python3 run.py --scenario scenarios/calibration/controller.yaml --set key=value
+# Parameter overrides accept YAML scalars/lists/mappings; quote values containing spaces.
+# A mapping replaces that subtree; key=!delete removes an optional setting.
+# Dedicated flags (--seed, --num-envs, --episodes, etc.) take precedence over --set.
+# Agent params override training_defaults. Keep physics, actions and observation layout
+# matched to the checkpoint. The commented recipes at the end list coordinated choices.
+
+# Run identity, execution budget and CPU/GPU collection layout.
+experiment:
+  # Run/output name; use a distinct name for each parameter comparison.
+  name: calibration_hybrid_pp_ftg_3lap
+  # Episode budget. A non-null total_steps takes precedence; --episodes removes total_steps.
+  episodes: 8
+  # Reproducible seed. Keep final-test seeds disjoint from checkpoint-selection seeds.
+  seed: 11
+
+# Simulation, map selection, race lifecycle and sensing parameters.
+environment:
+  # Physics seconds per step; decision duration is timestep * action_repeat.
+  timestep: 0.01
+  # Number of LiDAR beams; affects policy input width when LiDAR is enabled.
+  lidar_beams: 108
+  # Maximum LiDAR range in metres.
+  lidar_range: 10.0
+  # true opens visualization; false is headless. --render/--no-render overrides this.
+  render: false
+  # Load centerline geometry from the selected map bundle.
+  centerline_autoload: true
+  # Load wall geometry from the selected map bundle.
+  walls_autoload: true
+  # Track lookahead geometry used by observations/controllers.
+  track_preview:
+    # Number of preview samples; changing this changes observation dimensions.
+    points: 20
+    # Distance in metres between track-preview samples.
+    spacing: 0.3
+  # Joint reset rule and whether a completed lap target ends a car's episode.
+  episode_termination:
+    # Options: any_agent, all_agents, all_trainable. Choose whether survivors keep driving.
+    mode: all_agents
+  # Behavior of cars after their terminal event; clearance affects collisions and sensing.
+  terminal_agents:
+    # Whether terminal cars remain physical obstacles before any configured removal.
+    remain_collidable: true
+    # Terminal crash behavior: stationary.
+    crashed_behavior: stationary
+    # Terminal finish behavior: coast_then_stop.
+    finished_behavior: coast_then_stop
+    # Physics steps allowed for finished-car clearance.
+    finish_clearance_steps: 200
+  # Available map bundles under maps/. Choose matching training/evaluation lists below.
+  map_bundles:
+    - Budapest_map
+    - circle_map
+    - Melbourne_map
+    - Montreal_map
+    - Shanghai_map
+    - Silverstone_map
+    - Spa_map
+    - Spielberg_map
+  # Training maps. Keep intended held-out maps out of this list.
+  map_bundles_train:
+    - Budapest_map
+    - circle_map
+    - Melbourne_map
+    - Montreal_map
+    - Shanghai_map
+    - Silverstone_map
+    - Spa_map
+    - Spielberg_map
+  # Map switching schedule; per_episode changes the map when the environment resets.
+  map_cycle: per_episode
+  # Map selection: first, round_robin or random; epoch_shuffle reshuffles each completed cycle.
+  map_pick: round_robin
+  # Lap finish target; ignored as a termination trigger when lap_completion is false.
+  target_laps: 3
+  # Physics-step horizon; 0 disables the timeout. Evaluation should use a finite horizon.
+  max_steps: 250000
+  # Physics steps per policy decision; use 1 with joint team-return contracts.
+  action_repeat: 2
+  # Enable centerline progress/state facts required by observations and rewards.
+  centerline_features: true
+  # Episode start randomization; fixed starts use enabled: false and explicit spawn settings.
+  random_spawn:
+    # true enables this component; false disables it.
+    enabled: true
+    # Whether multiple spawn selections may reuse available slots.
+    allow_reuse: false
+  # Physical model contract. Keep values matched for checkpoint transfer; synthetic values are uncalibrated.
+  vehicle_params:
+    v_switch: 0.8
+    a_max: 2.0
+    v_min: -1.0
+    v_max: 3.0
+
+# Per-car policy, inline observation/reward definitions and action processing.
+agents:
+  car_0:
+    # Trainable: ppo/mappo. Fixed: ftg, pure_pursuit, stanley, hybrid_pp_ftg, racing_mpc or another registered MPC controller.
+    algorithm: hybrid_pp_ftg
+    # true creates a learner; false creates a fixed controller.
+    trainable: false
+    # racer, attacker, defender or opponent; attacker/defender roles may resolve target_id automatically.
+    role: racer
+    # Policy/controller parameters. Learner values here override training_defaults.
+    params:
+      lookahead: 2.0
+      # Fixed-controller minimum target speed in m/s.
+      min_speed: 0.8
+      # Fixed-controller target-speed cap in m/s, before the wheel adapter.
+      max_speed: 2.5
+      max_steer: 0.35
+      wheelbase: 0.3302
+      curvature_slowdown_threshold: 0.2
+      speed_horizon: 3.0
+      blend_distance: 2.0
+      full_ftg_distance: 0.75
+      ftg:
+        max_distance: 10.0
+        window_size: 6
+        bubble_radius: 2.5
+        max_steer: 0.3
+        # Fixed-controller minimum target speed in m/s.
+        min_speed: 0.8
+        # Fixed-controller target-speed cap in m/s, before the wheel adapter.
+        max_speed: 2.5
+        steering_gain: 0.2
+        fov: 4.71238898
+        normalized: false
+        steer_smooth: 0.7
+        mode: lidar
+        gap_min_range: 0.5
+        target_mode: center
+        wall_avoid_kick: 0.01
+        use_disparity_extender: true
+        disparity_threshold: 0.35
+        vehicle_width: 0.225
+        safety_margin: 0.1
+
+# Weights & Biases logging; --no-wandb disables it.
+wandb:
+  logging:
+    # auto selects compact task metrics; debug includes detailed diagnostics.
+    profile: auto
+    groups:
+      train: true
+      eval: true
+      performance: true
+      curriculum: true
+      # collector and reward_components default off; debug enables both.
+  # true enables this component; false disables it.
+  enabled: false
+  # Group related runs for comparison.
+  group: race_duration_calibration
+  # Run category in W&B.
+  job_type: fixed_controller_3lap
+  # Searchable run labels.
+  tags:
+    - calibration
+    - hybrid_pp_ftg
+    - 3lap
+  # Human-readable description of this experiment.
+  notes: Three-lap fixed-controller duration calibration across all race maps
+
+# Physical model contract. Keep values matched for checkpoint transfer; synthetic values are uncalibrated.
+vehicle_params:
+  # Road friction coefficient.
+  mu: 1.0489
+  C_Sf: 4.718
+  C_Sr: 5.4562
+  # Centre-of-mass to front axle distance in metres.
+  lf: 0.15875
+  # Centre-of-mass to rear axle distance in metres.
+  lr: 0.17145
+  # Centre-of-mass height in metres.
+  h: 0.074
+  # Vehicle body length in metres.
+  length: 0.32
+  # Vehicle body width in metres.
+  width: 0.225
+  # Vehicle mass in kilograms.
+  m: 3.74
+  # Yaw inertia in kg m².
+  I: 0.04712
+  s_min: -0.46
+  s_max: 0.46
+  sv_min: -3.2
+  sv_max: 3.2
+  v_switch: 7.319
+  a_max: 9.51
+  v_min: -5.0
+  v_max: 10.0
+
+
+# Optional controls (uncomment at the indicated section, or use --set):
+# experiment.collector_scheduling: synchronous  # synchronous | ready; self-play retains its scheduler.
+# experiment.checkpoint: null  # PPO scratch; set a file/run directory for transfer or evaluation.
+# experiment.evaluation_only: false  # true requires --eval.
+
+# Parameter choice: hybrid_pp_ftg_1lap
+# Apply these assignments together to reproduce the previous settings:
+# --set environment.target_laps=1
+# --set 'experiment.name="calibration_hybrid_pp_ftg_1lap"'
+
+# Parameter choice: pure_pursuit_3lap
+# Apply these assignments together to reproduce the previous settings:
+# --set environment.max_steps=150000
+# --set 'experiment.name="calibration_pure_pursuit_3lap"'
+# --set 'agents.car_0.algorithm="pure_pursuit"'
+# --set agents.car_0.params.lookahead=0.75
+# --set agents.car_0.params.min_speed=0.5
+# --set agents.car_0.params.max_speed=2.0
+# --set agents.car_0.params.max_steer=0.42
+# --set agents.car_0.params.curvature_slowdown_threshold=0.3

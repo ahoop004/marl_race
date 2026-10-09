@@ -1,0 +1,13 @@
+# Retained privileged comparison: 50 driving inputs plus three neighbor slots.
+# Active PPO and MAPPO scenarios use rl_racer_simulated_wheel.yaml with LiDAR.
+includes:
+  - rl_racer_simulated_wheel.yaml
+observation:
+  lidar:
+    enabled: false
+  frenet_neighbors:
+    enabled: true
+    max_neighbors: 3
+    include_team: true
+    maxima: {delta_s: 30.0, delta_d: 5.0, delta_vs: 20.0, delta_vd: 20.0}
+    clip: false
