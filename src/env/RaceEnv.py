@@ -58,10 +58,6 @@ from env.state_buffer import (
     TerminalVehicleController,
 )
 from env.types import AgentRaceStatus, AgentState, GlobalState, TerminalReason
-from env.respawn import validate_respawn, sample_ahead_pose
-from env.attack import AttackTracker, MultiTargetAttackTracker, attack_geometry, validate_attack
-from env.skills import SkillTracker, validate_skill_task, sample_skill_spawn
-from utils.centerline import project_to_centerline
 from render.render_state import RenderRuntimeState, parse_heatmap_config, parse_overlay_config
 
 # Type checking only imports (don't execute at runtime)
@@ -199,9 +195,9 @@ DEFAULT_AGENT_SENSORS = (
     "collision",
 )
 
-class F110ParallelEnv:
+class RaceEnv:
 
-    metadata = {"name": "F110ParallelEnv", "render_modes": ["human", "rgb_array"]}
+    metadata = {"name": "Env", "render_modes": ["human", "rgb_array"]}
 
     # rendering
     def __init__(self, **kwargs):
@@ -241,8 +237,7 @@ class F110ParallelEnv:
         self.track_limits_enabled = bool(limits_cfg.get("enabled", False))
         self.terminate_on_track_boundary = bool(limits_cfg.get("terminate", True))
         if (self.track_limits_enabled and self.terminate_on_track_boundary
-                and self.n_agents != 1 and not merged.get("respawn_agents") and not merged.get("respawn")
-                and not merged.get('skill_task')):
+                and self.n_agents != 1):
             raise ValueError("Track-limit time trials require one vehicle")
         preview_cfg = merged.get("track_preview", {}) or {}
         self._track_preview_points = max(int(preview_cfg.get("points", 20)), 1)
@@ -311,27 +306,6 @@ class F110ParallelEnv:
         self.lifecycle = RaceLifecycle(self.possible_agents, self.target_laps,
                                        finish_on_laps=bool(episode_termination.get("lap_completion", True)),
                                        lap_finish_agents=episode_termination.get("lap_finish_agents"))
-        recovery = validate_respawn(merged.get("respawn"), self.possible_agents)
-        self._respawn_config = recovery
-        attack = validate_attack(merged.get("attack_task"), self.possible_agents)
-        self._attack_tracker = None
-        skill = validate_skill_task(merged.get('skill_task'), self.possible_agents)
-        self._skill_tracker = SkillTracker(skill) if skill else None
-        self._skill_stages = merged.get('skill_stages', [])
-        self._skill_stage = None
-        self._pending_skill_stage = 0
-        self.skill_spawn = None
-        if skill and not self._skill_stages:
-            raise ValueError('skill_task requires skill_curriculum stages')
-        if attack:
-            tracker_type = MultiTargetAttackTracker if "target_ids" in attack else AttackTracker
-            self._attack_tracker = tracker_type(attack)
-        self.boundary_respawn_agents = set(recovery.get("boundary_agents", []))
-        self.collision_respawn_agents = set(recovery.get("collision_agents", []))
-        self.respawn_agents = set(merged.get("respawn_agents", []))
-        self.respawn_on_vehicle_collision = bool(merged.get("respawn_on_vehicle_collision", False))
-        if not self.respawn_agents <= set(self.possible_agents):
-            raise ValueError("respawn_agents contains unknown agents")
         self.terminal_agent_config = TerminalAgentConfig.from_mapping(
             merged.get("terminal_agents")
         )
@@ -452,7 +426,7 @@ class F110ParallelEnv:
 
     def _configure_rendering(self, cfg: Mapping[str, Any]) -> None:
         self.render_mode = cfg.get("render_mode", "human")
-        self.metadata = {"render_modes": ["human", "rgb_array"], "name": "F110ParallelEnv"}
+        self.metadata = {"render_modes": ["human", "rgb_array"], "name": "Env"}
         self.renderer: Optional["EnvRenderer"] = None
         headless_env = str(os.environ.get("PYGLET_HEADLESS", "")).lower()
         if headless_env in {"1", "true", "yes", "on"}:
@@ -832,12 +806,6 @@ class F110ParallelEnv:
             return
         self.start_poses = np.asarray(poses, dtype=np.float32)
 
-    def set_skill_stage(self, index):
-        """Queue a curriculum change; never alter an episode already in flight."""
-        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(self._skill_stages):
-            raise ValueError('Invalid skill stage index')
-        self._pending_skill_stage = index
-
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         """Reset; seeded map cycles restart unless map_episode_index is supplied."""
         map_episode_index = (options or {}).get("map_episode_index", 0)
@@ -854,13 +822,6 @@ class F110ParallelEnv:
                 or not isinstance(spawn_episode_index, (int, np.integer))
                 or spawn_episode_index < 0):
             raise ValueError('spawn_episode_index requires an explicit seed and a nonnegative integer')
-        if self._skill_tracker is not None:
-            if 'skill_stage' in (options or {}):
-                self.set_skill_stage(options['skill_stage'])
-            if self._skill_stage != self._pending_skill_stage:
-                self._skill_stage = self._pending_skill_stage
-                self._map_scheduler.set_bundles(self._skill_stages[self._skill_stage]['maps'],
-                    split='eval' if self._map_split_mode == 'eval' else 'train')
         self._invalidate_global_state_cache()
         self._global_state_metadata = None
         self.last_step_facts = None
@@ -886,8 +847,6 @@ class F110ParallelEnv:
         self._collision_flags.fill(False)
         self._collision_steps.fill(-1)
         self.lifecycle.reset()
-        if self._attack_tracker is not None:
-            self._attack_tracker.reset()
         self._terminal_controller.reset()
 
         self.lap_counts.fill(0.0)
@@ -918,17 +877,6 @@ class F110ParallelEnv:
         _spawn_plan = None
         if isinstance(options, dict) and "spawn_plan" in options:
             _spawn_plan = options["spawn_plan"]
-
-        if self._skill_tracker is not None:
-            if any(key in (options or {}) for key in ('spawn_plan', 'poses', 'velocities')):
-                raise ValueError('Skill starts are configured through skill_curriculum stages')
-            poses, velocities, self.skill_spawn = sample_skill_spawn(
-                geometry=self._centerline_progress_tracker.prepare_geometry(self.centerline_points), walls=self.walls,
-                rng=self.rng, stage=self._skill_stages[self._skill_stage],
-                task=self._skill_tracker.config, agent_ids=self.possible_agents,
-                length=self.params['length'], width=self.params['width'])
-            self.skill_spawn['stage_index'] = self._skill_stage
-            options = {**(options or {}), 'poses': poses, 'velocities': velocities}
 
         spawn_result = self._spawn_manager.resolve(
             options,
@@ -972,13 +920,6 @@ class F110ParallelEnv:
             info_level=self.info_level,
         )
         self._update_centerline_observation_facts(infos)
-        if self._skill_tracker is not None:
-            ego = self._skill_tracker.config['ego_id']
-            lead = -infos[ego]['target_frenet']['delta_s'] if self._skill_tracker.config.get('target_id') else 0.
-            self._skill_tracker.reset(lead, opponent_speed=self.skill_spawn.get('opponent_speed'))
-            infos[ego]['skill'] = self._skill_tracker.facts()
-            infos[ego]['skill'].update(stage_index=self._skill_stage, stage=self.skill_spawn['stage'])
-            infos[ego]['skill_spawn'] = dict(self.skill_spawn)
         self._attach_physics_metadata(infos)
         self._attach_central_state(obs)
         self._refresh_render_observations(obs)
@@ -989,8 +930,6 @@ class F110ParallelEnv:
         joint = np.zeros((self.n_agents, 2), dtype=np.float32)
         agent_index = self._agent_id_to_index
         active_before_step = tuple(self.agents)
-        attack_ego = self._attack_tracker.config["ego_id"] if self._attack_tracker else None
-        acted_target = self.get_target_id(attack_ego) if attack_ego else None
         for aid in active_before_step:
             if aid in actions:
                 joint[agent_index[aid]] = np.asarray(actions[aid], dtype=np.float32)
@@ -1034,18 +973,13 @@ class F110ParallelEnv:
         self.current_time += self.timestep
         infos = {aid: {} for aid in self.possible_agents}
         self._update_centerline_observation_facts(infos)
-        skip_laps = {aid for aid in active_before_step
-                     if (aid in self.boundary_respawn_agents
-                         and infos[aid].get("track_limits", {}).get("exceeded"))
-                     or (aid in self.collision_respawn_agents
-                         and obs_joint["collisions"][agent_index[aid]])}
         if self._lap_tracker is not None:
             lap_crossings = self._lap_tracker.update(
                 self.poses_x,
                 self.poses_y,
                 self.linear_vels_x_curr,
                 self.linear_vels_y_curr,
-                step=self._elapsed_steps, skip_agents=skip_laps,
+                step=self._elapsed_steps,
             )
         else:
             self.lifecycle.begin_step()
@@ -1054,22 +988,11 @@ class F110ParallelEnv:
         # simple per-step reward (customize as needed)
         rewards = {aid: float(self.timestep * 0.0) for aid in self.agents}
 
-        # Boundary facts above describe the physical step before any relocation.
-        respawn = set()
-        recovery_reasons = {}
         boundary_events = {aid for aid in active_before_step
                            if infos[aid].get("track_limits", {}).get("exceeded")}
-        for aid in boundary_events & self.boundary_respawn_agents:
-            recovery_reasons[aid] = "track_boundary"
         if self.track_limits_enabled and self.terminate_on_track_boundary:
-            for aid in active_before_step:
-                if infos[aid]["track_limits"]["exceeded"]:
-                    if aid in self.boundary_respawn_agents:
-                        continue
-                    if aid in self.respawn_agents:
-                        respawn.add(aid)
-                    else:
-                        self.lifecycle.record_track_boundary(aid, step=self._elapsed_steps)
+            for aid in boundary_events:
+                self.lifecycle.record_track_boundary(aid, step=self._elapsed_steps)
 
         # terminations/truncations
         collisions = obs_joint["collisions"]
@@ -1082,62 +1005,12 @@ class F110ParallelEnv:
             self._elapsed_steps,
         )
         collision_array = np.asarray(collisions)
-        if self._attack_tracker is not None and attack_ego in active_before_step:
-            self._attack_tracker.update(time=self.current_time, infos=infos,
-                collisions=dict(zip(self.possible_agents, map(bool, collision_array))),
-                **({"active_target": acted_target} if isinstance(self._attack_tracker, MultiTargetAttackTracker)
-                   else {"geometry": attack_geometry(
-                       self.sim.agent_poses[self._agent_id_to_index[attack_ego]],
-                       self.sim.agent_poses[self._agent_id_to_index[self._attack_tracker.config["target_id"]]],
-                       self.walls, self.sim.params["length"], self.sim.params["width"])}))
-            ego_id = self._attack_tracker.config["ego_id"]
-            ego_record = self.lifecycle.records[ego_id]
-            infos[ego_id]["attack"].update(
-                horizon_steps=self.max_steps,
-                target_laps=ego_record.target_laps if ego_record.finish_on_laps else 0,
-            )
         for idx, agent_id in enumerate(self.possible_agents):
             if agent_id not in active_before_step:
                 continue
             collision_event = idx < collision_array.size and bool(collision_array[idx])
             if collision_event and self.terminate_on_collision.get(agent_id, True):
-                if agent_id in self.collision_respawn_agents:
-                    recovery_reasons[agent_id] = "collision"
-                elif agent_id in self.respawn_agents and (
-                    self.sim.collision_idx[idx] < 0 or self.respawn_on_vehicle_collision
-                ):
-                    respawn.add(agent_id)
-                else:
-                    self.lifecycle.record_collision(agent_id, step=self._elapsed_steps)
-
-        # Preserve the legacy pursuit protocol. Explicit per-event recovery also
-        # runs when another car terminates on this step.
-        if not all(self.lifecycle.records[a].is_active for a in active_before_step):
-            respawn.clear()
-        recovery_reasons = {aid: reason for aid, reason in recovery_reasons.items()
-                            if self.lifecycle.records[aid].is_active}
-        respawn.update(recovery_reasons)
-        if respawn:
-            obs_joint = self._respawn_on_centerline(respawn)
-            obs = self._split_obs(obs_joint)
-            previous_velocities = [getattr(self.state_buffers, name).copy() for name in
-                                   ("linear_vels_x_prev", "linear_vels_y_prev", "angular_vels_prev")]
-            self._update_state(obs_joint)
-            for name, values in zip(("linear_vels_x_prev", "linear_vels_y_prev", "angular_vels_prev"),
-                                    previous_velocities):
-                getattr(self.state_buffers, name)[:] = values
-            saved_deltas = {a: f["centerline"]["progress_delta"] for a, f in infos.items()
-                            if "centerline" in f}
-            self._update_centerline_observation_facts(infos)
-            for aid, delta in saved_deltas.items():
-                infos[aid]["centerline"]["progress_delta"] = 0.0 if aid in respawn else delta
-            for aid in self.possible_agents:
-                target = self._agent_target_index.get(aid)
-                infos[aid]["target_respawned"] = (target is not None and
-                    self.possible_agents[target] in respawn)
-
-        for aid, reason in recovery_reasons.items():
-            infos[aid].update(respawned=True, respawn_reason=reason)
+                self.lifecycle.record_collision(agent_id, step=self._elapsed_steps)
         for aid in boundary_events:
             infos[aid]["boundary_event"] = True
 
@@ -1158,18 +1031,6 @@ class F110ParallelEnv:
             no_progress_stop = bool(relevant) and all(
                 self.current_time - self._no_progress_state[aid][2] + 1e-9
                 >= self._no_progress_timeout for aid in relevant)
-        if self._skill_tracker is not None:
-            ego = self._skill_tracker.config['ego_id']
-            facts = self._skill_tracker.update(time=self.current_time, infos=infos,
-                collisions=dict(zip(self.possible_agents, map(bool, collision_array))),
-                track_length=self.centerline_track_length, timed_out=trunc_flag)
-            infos[ego]['skill'] = facts
-            facts.update(stage_index=self._skill_stage, stage=self.skill_spawn['stage'])
-            infos[ego]['skill_spawn'] = dict(self.skill_spawn)
-            if facts['done'] and facts['outcome'] != 'timeout':
-                self.lifecycle.complete_skill(success=facts['success'], step=self._elapsed_steps)
-            elif facts['done']:
-                trunc_flag = True
         if trunc_flag or no_progress_stop:
             self.lifecycle.truncate_active(
                 step=self._elapsed_steps,
@@ -1177,7 +1038,7 @@ class F110ParallelEnv:
 
         terminations = {
             aid: self.lifecycle.records[aid].status
-            in {AgentRaceStatus.FINISHED, AgentRaceStatus.CRASHED, AgentRaceStatus.TASK_COMPLETE}
+            in {AgentRaceStatus.FINISHED, AgentRaceStatus.CRASHED}
             for aid in self.possible_agents
         }
         truncations = {
@@ -1275,48 +1136,6 @@ class F110ParallelEnv:
         )
 
         return obs, rewards, terminations, truncations, infos
-
-    def _respawn_on_centerline(self, agent_ids):
-        """Recover at the nearest clear point, or a configured random gap ahead."""
-        points = np.asarray(self.centerline_points)[:, :2]
-        poses = self.sim.agent_poses.copy()
-        indices = []
-        ahead = self._respawn_config.get("random_ahead")
-        for aid in sorted(agent_ids):
-            idx = self._agent_id_to_index[aid]
-            others = poses[[i for i in range(self.n_agents) if i != idx and self.sim.collidable_mask[i]], :2]
-            geometry = self._centerline_progress_tracker._geometry
-            if ahead:
-                poses[idx] = sample_ahead_pose(geometry=geometry,
-                    ego_pose=poses[self._agent_id_to_index[ahead["ego_id"]]],
-                    other_positions=others, rng=self.rng, config=ahead, walls=self.walls,
-                    length=self.sim.params["length"], width=self.sim.params["width"])
-            else:
-                order = np.argsort(np.sum((points - poses[idx, :2]) ** 2, axis=1))
-                clearance = 2.0 * float(self.sim.params["length"])
-                valid = order[np.all(np.linalg.norm(points[order, None] - others[None], axis=2)
-                                     > clearance, axis=1)]
-                if not len(valid):
-                    raise RuntimeError("No unoccupied centerline respawn point")
-                position = points[int(valid[0])]
-                projection = project_to_centerline(geometry, position, 0.0)
-                poses[idx] = [*position, projection.tangent_heading]
-            indices.append(idx)
-            self._collision_flags[idx] = False
-            self._collision_steps[idx] = -1
-            self._last_control_commands[idx] = 0.0
-            self._last_speed_reference_rates[idx] = 0.0
-            self._centerline_progress_tracker._last_indices[aid] = -1
-            self._centerline_progress_tracker._prev_progress[aid] = -1.0
-            self._track_preview_last_indices.pop(aid, None)
-            if self._lap_tracker is not None:
-                self._lap_tracker.relocate(aid, poses[idx, :2])
-        obs = self.sim.reset(poses, agent_indices=indices,
-                            velocities=np.full(self.n_agents, ahead["speed"]) if ahead else None)
-        if ahead:
-            for idx in indices:
-                self._last_control_commands[idx] = self.sim.agents[idx].control_reference
-        return obs
 
     # ------------------------------------------------------------------
     # Finish line helpers
@@ -1832,13 +1651,6 @@ class F110ParallelEnv:
                 continue
             infos.setdefault(agent_id, {})["frenet_neighbors"] = neighbors
             infos[agent_id]["agent_id"] = agent_id
-            if (isinstance(self._attack_tracker, MultiTargetAttackTracker)
-                    and agent_id == self._attack_tracker.config["ego_id"]):
-                candidates = [n for n in neighbors if n["agent_id"] in self._attack_tracker.config["target_ids"]
-                              and self.lifecycle.records[n["agent_id"]].is_active and n["delta_s"] > 0]
-                nearest = min(candidates, key=lambda n: (n["delta_s"], n["agent_id"]), default=None)
-                self._agent_target_index[agent_id] = (self._agent_id_to_index[nearest["agent_id"]]
-                                                      if nearest else None)
             target_index = self._agent_target_index.get(agent_id)
             target_id = self.possible_agents[target_index] if target_index is not None else None
             infos[agent_id]["target_id"] = target_id

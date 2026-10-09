@@ -2,7 +2,7 @@
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from env import F110ParallelEnv
+from env import RaceEnv
 from core.agent_builder import (
     build_fixed_policy_agents,
     get_fixed_agent_ids,
@@ -92,7 +92,7 @@ def create_training_setup(
     *,
     mode: str = "train",
     scenario_dir: Optional[Path] = None,
-) -> Tuple[F110ParallelEnv, Dict[str, Any], Dict]:
+) -> Tuple[RaceEnv, Dict[str, Any], Dict]:
     """Create training setup from scenario configuration.
 
     Args:
@@ -104,7 +104,7 @@ def create_training_setup(
 
     Returns:
         Tuple of (env, agents, reward_strategies):
-            - env: F110ParallelEnv instance
+            - env: Env instance
             - agents: Dict mapping agent_id -> agent instance
             - reward_strategies: Dict mapping agent_id -> RewardStrategy (for trainable agents)
     """

@@ -9,7 +9,7 @@ import numpy as np
 
 from core.map_selection import relative_yaml_name
 from core.spawn_config import normalize_spawn_config
-from env import F110ParallelEnv
+from env import RaceEnv
 from env.spawn import load_spawn_points_from_map
 from utils.map_loader import MapLoader
 
@@ -35,7 +35,7 @@ def build_env_kwargs(
     agent_configs: Mapping[str, Any],
     seed: Any = None,
 ) -> Dict[str, Any]:
-    """Translate scenario env config into F110ParallelEnv constructor kwargs.
+    """Translate scenario env config into Env constructor kwargs.
 
     Handles both the new nested ``environment.spawn:`` block and legacy flat
     spawn keys via :func:`normalize_spawn_config`.  All other env config keys
@@ -170,7 +170,7 @@ def maybe_load_map_data(env_config: Mapping[str, Any]) -> Any:
 
 
 def validate_environment_feature_requirements(
-    env: F110ParallelEnv,
+    env: RaceEnv,
     requirements: Mapping[str, Any],
 ) -> None:
     """Fail setup when configured consumers cannot receive required geometry."""
@@ -231,7 +231,7 @@ def create_environment(
     env_config: Mapping[str, Any],
     agent_configs: Mapping[str, Any],
     seed: Any = None,
-) -> F110ParallelEnv:
+) -> RaceEnv:
     env_kwargs = build_env_kwargs(env_config, agent_configs, seed)
     map_data = maybe_load_map_data(env_config)
 
@@ -254,7 +254,7 @@ def create_environment(
     elif "start_poses" in spawn_norm and "start_poses" not in env_kwargs:
         env_kwargs["start_poses"] = np.array(spawn_norm["start_poses"], dtype=np.float64)
 
-    env = F110ParallelEnv(**env_kwargs)
+    env = RaceEnv(**env_kwargs)
     if map_data is not None and map_data.centerline is not None:
         env.set_centerline(map_data.centerline, path=map_data.centerline_path)
         env.register_centerline_usage(

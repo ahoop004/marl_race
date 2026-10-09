@@ -17,7 +17,7 @@ from loggers.wandb_logger import WandbLogger
 if TYPE_CHECKING:
     from env.types import TransitionRecord
     from loggers.csv_logger import CSVLogger
-    from training.curriculum import CurriculumManager
+
 
 _log = logging.getLogger(__name__)
 
@@ -410,53 +410,6 @@ class CSVHook(TrainingHook):
     def on_training_end(self) -> None:
         self._csv.close()
 
-
-class CurriculumHook(TrainingHook):
-    """Updates a :class:`~training.curriculum.CurriculumManager` after each episode.
-
-    Reads ``info["outcome"]`` (the string value set by the trainers via
-    :func:`~metrics.outcomes.determine_outcome`) and forwards it to
-    :meth:`~training.curriculum.CurriculumManager.on_episode_end`.  When the
-    curriculum advances, logs a message and optionally emits the new phase
-    metrics to a W&B logger.
-
-    Parameters
-    ----------
-    manager:
-        The :class:`~training.curriculum.CurriculumManager` to update.
-    wandb_logger:
-        Optional W&B logger.  If supplied, curriculum summary metrics are
-        logged after every episode.
-    """
-
-    def __init__(
-        self,
-        manager: "CurriculumManager",
-        wandb_logger: Optional[Any] = None,
-    ) -> None:
-        self._manager = manager
-        self._wandb = wandb_logger
-
-    @property
-    def manager(self) -> "CurriculumManager":
-        return self._manager
-
-    def on_episode_end(self, episode: int, reward: float, info: Dict, metrics: Dict) -> None:
-        outcome = info.get("outcome", "timeout") if isinstance(info, dict) else "timeout"
-        advanced = self._manager.on_episode_end(outcome)
-
-        if advanced:
-            _log.info(
-                "Curriculum: phase → %d ('%s') at episode %d (success_rate=%.2f)",
-                self._manager.phase_index,
-                self._manager.current_phase.name,
-                episode,
-                self._manager.success_rate,
-            )
-
-        if self._wandb is not None:
-            summary = self._manager.summary()
-            self._wandb.log_metrics(summary)
 
 
 class CheckpointHook(TrainingHook):

@@ -212,18 +212,8 @@ def resolve_evaluation_protocol(scenario: Dict[str, Any], protocol: str) -> Dict
     evaluation = scenario.get("evaluation", {}) or {}
     if not isinstance(evaluation, dict):
         raise ScenarioError("'evaluation' must be a dictionary.")
-    if evaluation.get("selection_strategy", "completion_safety") not in {"skill", "racer_attack", "attack", "asymmetric_support", "map_curriculum", "completion_safety", "completion_progress", "lap_time", "team_completion", "team_combined", "team_first_place", "team_sweep", "team_combined_penalties", "two_team_completion"}:
+    if evaluation.get("selection_strategy", "completion_safety") not in {"asymmetric_support", "completion_safety", "completion_progress", "lap_time", "team_completion", "team_combined", "team_first_place", "team_sweep", "team_combined_penalties"}:
         raise ScenarioError("Unknown evaluation.selection_strategy.")
-    if evaluation.get("selection_strategy") == "attack" and not scenario.get("environment", {}).get("attack_task"):
-        raise ScenarioError("attack checkpoint selection requires environment.attack_task")
-    if evaluation.get('selection_strategy') == 'skill' and not scenario.get('skill_curriculum'):
-        raise ScenarioError('skill checkpoint selection requires skill_curriculum')
-    if evaluation.get("selection_strategy") == "racer_attack":
-        attack = scenario.get("environment", {}).get("attack_task") or {}
-        racer = evaluation.get("progress_agent_id")
-        if ("target_ids" not in attack or racer == attack.get("ego_id")
-                or not scenario.get("agents", {}).get(racer, {}).get("trainable")):
-            raise ScenarioError("racer_attack selection requires a separate racer and dynamic attacker")
     if evaluation.get("selection_strategy") == "asymmetric_support":
         progress_id = evaluation.get("progress_agent_id")
         config = scenario.get("agents", {}).get(progress_id, {})
@@ -282,22 +272,6 @@ def resolve_evaluation_protocol(scenario: Dict[str, Any], protocol: str) -> Dict
     return result
 
 
-def _validate_attack_episode_limit(termination, max_steps, ego, phase):
-    """Keep the target driving and require a time or learner-lap episode bound."""
-    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 0:
-        raise ScenarioError(f"attack_task {phase} max_steps must be a nonnegative integer")
-    if termination.get("mode") != "all_trainable":
-        raise ScenarioError(f"attack_task {phase} requires all_trainable termination")
-    lap_completion = termination.get("lap_completion", True)
-    if not isinstance(lap_completion, bool):
-        raise ScenarioError(f"attack_task {phase} lap_completion must be boolean")
-    finishers = [ego] if isinstance(ego, str) else list(ego)
-    if lap_completion and termination.get("lap_finish_agents") != finishers:
-        raise ScenarioError(f"attack_task {phase} lap_finish_agents must contain only {ego}")
-    if max_steps == 0 and not lap_completion:
-        raise ScenarioError(f"attack_task {phase} requires a finite horizon or learner lap completion")
-
-
 def validate_scenario(scenario: Dict[str, Any]) -> None:
     """Validate scenario configuration before env construction.
 
@@ -342,11 +316,7 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
         raise ScenarioError("'experiment.total_steps' must be a positive integer or null.")
 
     environment = scenario["environment"]
-    from training.skill_curriculum import validate_skill_curriculum
-    try:
-        validate_skill_curriculum(scenario)
-    except ValueError as exc:
-        raise ScenarioError(str(exc)) from exc
+    
     if any(key in block for block in (scenario, environment)
            for key in ("wheel_actuators", "combined_slip_vehicle")):
         raise ScenarioError(
@@ -468,94 +438,9 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
         raise ScenarioError("track_limits accepts enabled and terminate booleans")
     if any(not isinstance(v, bool) for v in limits.values()):
         raise ScenarioError("track_limits values must be booleans")
-    from env.respawn import validate_respawn
-    try:
-        recovery = validate_respawn(environment.get("respawn"), agents)
-    except ValueError as exc:
-        raise ScenarioError(str(exc)) from exc
-    if recovery:
-        if environment.get("respawn_agents"):
-            raise ScenarioError("Use either respawn or legacy respawn_agents")
-        if not limits.get("enabled"):
-            raise ScenarioError("respawn requires track_limits.enabled")
-        if set(recovery.get("collision_agents", [])) & set(trainable_ids):
-            raise ScenarioError("respawn.collision_agents must be fixed-policy agents")
-    respawn_agents = environment.get("respawn_agents", [])
-    if (not isinstance(respawn_agents, list) or
-            any(aid not in agents or aid in trainable_ids for aid in respawn_agents)):
-        raise ScenarioError("respawn_agents must list fixed-policy agent IDs")
-    if respawn_agents and (len(agents) < 2 or len(trainable_ids) != 1 or
-                           not limits.get("enabled") or not limits.get("terminate") or
-                           not environment.get("terminate_on_collision", True)):
-        raise ScenarioError("Opponent respawning requires one learner with boundary and collision termination")
-    if not isinstance(environment.get("respawn_on_vehicle_collision", False), bool):
-        raise ScenarioError("respawn_on_vehicle_collision must be boolean")
-    if environment.get("respawn_on_vehicle_collision", False) and not respawn_agents:
-        raise ScenarioError("respawn_on_vehicle_collision requires respawn_agents")
-    from env.attack import validate_attack
-    try:
-        attack = validate_attack(environment.get("attack_task"), agents)
-    except ValueError as exc:
-        raise ScenarioError(str(exc)) from exc
-    if attack and "target_ids" in attack:
-        ego, targets = attack["ego_id"], attack["target_ids"]
-        if (len(agents) != 4 or len(trainable_ids) != 2 or ego not in trainable_ids
-                or set(targets) != set(agents) - set(trainable_ids)
-                or any(agents[a].get("algorithm") != "racing_mpc" for a in targets)
-                or any(agents[a].get("algorithm") != "mappo" for a in trainable_ids)):
-            raise ScenarioError("Dynamic attack_task requires two MAPPO learners and two racing_mpc opponents")
-        if (set(recovery.get("boundary_agents", [])) != set(targets)
-                or set(recovery.get("collision_agents", [])) != set(targets)
-                or recovery.get("collision_placement") != "nearest_centerline"):
-            raise ScenarioError("Dynamic attack_task requires opponent-only nearest-centerline respawn")
-        if (not limits.get("terminate") or environment.get("terminate_on_collision") is not True
-                or environment.get("action_repeat", 1) != 1):
-            raise ScenarioError("Dynamic attack_task requires learner failure termination and action_repeat=1")
-        terminal = environment.get("terminal_agents", {})
-        if (not terminal.get("remove_after_clearance") or terminal.get("crash_clearance_steps") != 0
-                or terminal.get("finish_clearance_steps") != 0):
-            raise ScenarioError("Dynamic attack_task requires immediate terminal vehicle removal")
-        termination = environment.get("episode_termination", {})
-        _validate_attack_episode_limit(termination, environment.get("max_steps", 5000), trainable_ids, "training")
-        evaluation = scenario.get("evaluation", {}) or {}
-        if evaluation:
-            if not evaluation.get("terminate_on_track_limit") or not evaluation.get("terminate_on_collision"):
-                raise ScenarioError("Dynamic attack evaluation requires learner failure termination")
-            eval_term = {**termination, "mode": evaluation.get("episode_termination_mode", termination.get("mode")),
-                         "lap_completion": evaluation.get("lap_completion", True)}
-            for phase in (["selection", "final"] if evaluation.get("final_test") else ["selection"]):
-                _validate_attack_episode_limit(eval_term, resolve_evaluation_protocol(scenario, phase)["max_steps"],
-                                               trainable_ids, f"evaluation.{phase}")
-    if attack and "target_id" in attack:
-        ego, target = attack["ego_id"], attack["target_id"]
-        if (len(agents) != 2 or trainable_ids != [ego] or agents[target].get("algorithm") != "racing_mpc"
-                or agents[ego].get("target_id") != target):
-            raise ScenarioError("attack_task requires one learner targeting one fixed racing_mpc")
-        if (set(recovery.get("boundary_agents", [])) != {target}
-                or set(recovery.get("collision_agents", [])) != {target}
-                or recovery.get("collision_placement") != "random_ahead"
-                or recovery.get("random_ahead", {}).get("ego_id") != ego):
-            raise ScenarioError("attack_task requires target-only random-ahead boundary and collision respawn")
-        termination = environment.get("episode_termination", {})
-        if (not limits.get("terminate") or environment.get("terminate_on_collision") is not True
-                or environment.get("action_repeat", 1) != 1):
-            raise ScenarioError("attack_task requires ego crash termination and action_repeat=1")
-        _validate_attack_episode_limit(termination, environment.get("max_steps", 5000), ego, "training")
-        evaluation = scenario.get("evaluation", {}) or {}
-        if evaluation:
-            # Track-limit evaluation enables lap finishing by default in setup;
-            # an explicit lap_completion setting takes precedence.
-            eval_termination = {**termination,
-                "mode": evaluation.get("episode_termination_mode", termination.get("mode")),
-                "lap_completion": evaluation.get("lap_completion", True)}
-            protocols = ["selection", "final"] if evaluation.get("final_test") else ["selection"]
-            for protocol in protocols:
-                resolved = resolve_evaluation_protocol(scenario, protocol)
-                _validate_attack_episode_limit(eval_termination, resolved["max_steps"], ego,
-                                               f"evaluation.{protocol}")
     # Multi-car races can request boundary facts for rewards without enabling
     # the single-car time-trial boundary-reset protocol.
-    if (limits.get("enabled") and limits.get("terminate", True) and not respawn_agents and not recovery and not environment.get('skill_task')
+    if (limits.get("enabled") and limits.get("terminate", True)
             and (len(agents) != 1 or environment.get("terminate_on_collision", True))):
         raise ScenarioError("Track-limit time trials require one vehicle and terminate_on_collision: false")
     evaluation_mode = scenario.get("evaluation", {}).get("episode_termination_mode")
@@ -573,14 +458,6 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
         value = experiment.get(name, 1)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ScenarioError(f"'experiment.{name}' must be a positive integer.")
-    if scenario.get("map_curriculum") is not None:
-        from training.map_curriculum import validate_map_curriculum
-        try:
-            validate_map_curriculum(scenario)
-        except ValueError as exc:
-            raise ScenarioError(str(exc)) from exc
-    elif scenario.get("evaluation", {}).get("selection_strategy") == "map_curriculum":
-        raise ScenarioError("map_curriculum selection requires map_curriculum configuration")
     if num_envs > 1:
         if trainable_algos not in ({"ppo"}, {"mappo"}):
             raise ScenarioError("Parallel environments require PPO or MAPPO.")
@@ -656,18 +533,6 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
                 "MAPPO individual rewards require critic_mode='agent_conditioned'; "
                 "a shared team critic cannot represent distinct per-agent returns."
             )
-
-        if scenario.get("two_team", {}).get("enabled", False):
-            from training.two_team import resolve_teams
-            try:
-                resolve_teams(scenario)
-            except ValueError as exc:
-                raise ScenarioError(str(exc)) from exc
-            if (team_return_mode != "joint" or reduction != "sum"
-                    or environment.get("episode_termination", {}).get("mode") != "all_agents"
-                    or not environment.get("episode_termination", {}).get("lap_completion", True)
-                    or int(environment.get("max_steps", 0)) <= 0):
-                raise ScenarioError("Two-team training requires joint/sum rewards, all_agents, and finite laps/deadline")
 
         # One MAPPO object owns one shared actor and optimizer. Per-agent
         # reward configs may differ, but policy inputs, action processing, and

@@ -45,7 +45,6 @@ from training.hooks import (
     CSVHook,
     CheckpointHook,
     ConsoleHook,
-    CurriculumHook,
     EvaluationCheckpointHook,
     WandbHook,
 )
