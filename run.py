@@ -229,9 +229,6 @@ def _run_heuristic(
     env, agents, _ = create_training_setup(
         scenario, mode="train", scenario_dir=Path(args.scenario).resolve().parent
     )
-    for ag in agents.values():
-        if hasattr(ag, "set_env"):
-            ag.set_env(env)
 
     try:
         for episode in range(n_episodes):
@@ -527,9 +524,6 @@ def main() -> None:
     # Other agents (fixed policy) — exclude ALL trainable agents, not just rl_agent_id
     trainable_set = set(trainable_ids)
     other_agents = {aid: ag for aid, ag in agents.items() if aid not in trainable_set}
-    for aid, ag in other_agents.items():
-        if hasattr(ag, "set_env"):
-            ag.set_env(env)
 
     provenance = build_run_provenance(
         scenario,
@@ -768,7 +762,7 @@ def _run_eval(
         )
         sys.exit(1)
 
-    focal_agent_id = scenario.get("evaluation", {}).get("progress_agent_id", trainable_ids[0])
+    focal_agent_id = trainable_ids[0]
     focal_cfg = agent_configs[focal_agent_id]
     provenance_scenario = scenario
     protocol_name = getattr(args, "eval_protocol", None)
@@ -905,9 +899,6 @@ def _run_eval(
 
     trainable_set = set(trainable_ids)
     other_agents = {aid: ag for aid, ag in agents.items() if aid not in trainable_set}
-    for ag in other_agents.values():
-        if hasattr(ag, "set_env"):
-            ag.set_env(env)
 
     device_str = str(resolve_device([params.get("device", "cpu")]))
     fixed_str = ", ".join(other_agents) or "none"
@@ -1316,9 +1307,6 @@ def _run_on_policy(
         eval_other_agents = {
             aid: controller for aid, controller in eval_agents.items() if aid != rl_agent_id
         }
-        for controller in eval_other_agents.values():
-            if hasattr(controller, "set_env"):
-                controller.set_env(eval_env)
         evaluator = DeterministicPPOEvaluator(
             env=eval_env,
             rl_agent_id=rl_agent_id,
@@ -1360,7 +1348,7 @@ def _run_on_policy(
                 output_dir=output_dir,
                 evaluator=evaluator,
                 evaluate_every=int(eval_cfg.get("every_episodes", 100)),
-                selection_strategy=eval_cfg.get("selection_strategy", "completion_safety"),
+                selection_strategy=eval_cfg.get("selection_strategy", "completion_progress"),
                 evaluate_every_steps=eval_cfg.get("every_steps"),
                 provenance=provenance,
                 console=console,
@@ -1372,7 +1360,7 @@ def _run_on_policy(
             + (f"every {eval_cfg['every_steps']} transitions " if eval_cfg.get("every_steps")
                else f"every {int(eval_cfg.get('every_episodes', 100))} episodes ") +
             f"over {int(eval_cfg.get('episodes', 8))} fixed-seed episodes; "
-            f"strategy={eval_cfg.get('selection_strategy', 'completion_safety')}."
+            f"strategy={eval_cfg.get('selection_strategy', 'completion_progress')}."
         )
 
     trainer = OnPolicyTrainer(
@@ -1551,9 +1539,6 @@ def _run_mappo(
                         or not np.array_equal(space.low, action_low)
                         or not np.array_equal(space.high, action_high)):
                     raise ValueError("MAPPO evaluation observation/action contracts must match training")
-            for controller in eval_agents.values():
-                if hasattr(controller, "set_env"):
-                    controller.set_env(eval_env)
             evaluator_class = ParallelMAPPOEvaluator if eval_workers > 1 else DeterministicMAPPOEvaluator
             parallel_options = (dict(scenario=eval_scenario, scenario_dir=scenario_dir,
                                      num_workers=eval_workers) if eval_workers > 1 else {})
@@ -1562,7 +1547,6 @@ def _run_mappo(
                 obs_composers=eval_obs, action_composer=action_composer,
                 episodes=protocol["episodes"], base_seed=protocol["seed"],
                 action_repeat=action_repeat,
-                focal_agent_id=eval_cfg.get("progress_agent_id"),
                 **parallel_options,
             ).bind_agent(agent)
             trainer.hooks.append(EvaluationCheckpointHook(

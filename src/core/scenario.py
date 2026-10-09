@@ -18,11 +18,7 @@ class ScenarioError(Exception):
     pass
 
 
-_MPC_ALGORITHMS = {
-    "racing_mpc", "kinematic_mpc", "obstacle_aware_mpc",
-    "defensive_mpc", "cbf_mpc", "mpcc",
-}
-
+EVALUATION_STRATEGIES = frozenset({"completion_progress", "lap_time", "team_completion"})
 
 def resolve_max_speed(scenario: Dict[str, Any]) -> Dict[str, Any]:
     """Apply an optional shared forward speed limit to learners and MPCs.
@@ -50,16 +46,17 @@ def resolve_max_speed(scenario: Dict[str, Any]) -> Dict[str, Any]:
         actuators["wheel_speed_max"] = float(speed) / radius
     else:
         vehicle["v_max"] = float(speed)
+    from core.agent_builder import fixed_controller_names
     for agent in result.get("agents", {}).values():
-        if str(agent.get("algorithm", "")).strip().lower() in _MPC_ALGORITHMS:
+        if str(agent.get("algorithm", "")).strip().lower() in fixed_controller_names():
             agent.setdefault("params", {})["max_speed"] = float(speed)
     return result
 
 
 MAPPO_DEFAULTS: Dict[str, str] = {
     "actor_mode": "shared",
-    "reward_mode": "individual",
-    "critic_mode": "agent_conditioned",
+    "reward_mode": "team_shared",
+    "critic_mode": "shared_team",
     "team_reward_reduction": "mean",
 }
 
@@ -212,13 +209,10 @@ def resolve_evaluation_protocol(scenario: Dict[str, Any], protocol: str) -> Dict
     evaluation = scenario.get("evaluation", {}) or {}
     if not isinstance(evaluation, dict):
         raise ScenarioError("'evaluation' must be a dictionary.")
-    if evaluation.get("selection_strategy", "completion_safety") not in {"asymmetric_support", "completion_safety", "completion_progress", "lap_time", "team_completion", "team_combined", "team_first_place", "team_sweep", "team_combined_penalties"}:
-        raise ScenarioError("Unknown evaluation.selection_strategy.")
-    if evaluation.get("selection_strategy") == "asymmetric_support":
-        progress_id = evaluation.get("progress_agent_id")
-        config = scenario.get("agents", {}).get(progress_id, {})
-        if not config.get("trainable", False) or config.get("algorithm") != "mappo":
-            raise ScenarioError("asymmetric_support requires evaluation.progress_agent_id naming a MAPPO learner")
+    if evaluation.get("selection_strategy", "completion_progress") not in EVALUATION_STRATEGIES:
+        raise ScenarioError("evaluation.selection_strategy must be completion_progress, lap_time or team_completion")
+    if "progress_agent_id" in evaluation:
+        raise ScenarioError("evaluation.progress_agent_id is unsupported for completion experiments")
     for key in ("terminate_on_track_limit", "terminate_on_collision", "lap_completion"):
         if key in evaluation and not isinstance(evaluation[key], bool):
             raise ScenarioError(f"evaluation.{key} must be boolean")
@@ -290,12 +284,13 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
         On the first validation failure found.
     """
     from core.agent_builder import (
-        HEURISTIC_ALGOS,
+        fixed_controller_names,
         PYTORCH_RL_ALGOS,
         is_trainable_agent,
     )
 
-    _ALL_KNOWN_ALGOS = PYTORCH_RL_ALGOS | HEURISTIC_ALGOS
+    fixed_algos = set(fixed_controller_names())
+    known_algos = PYTORCH_RL_ALGOS | fixed_algos
 
     # --- Required top-level sections ---
     for section in ("experiment", "environment", "agents"):
@@ -371,12 +366,15 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
                 f"Agent '{agent_id}' is missing required 'algorithm' field."
             )
 
-        if algo not in _ALL_KNOWN_ALGOS:
+        if algo not in known_algos:
             raise ScenarioError(
                 f"Agent '{agent_id}' has unknown algorithm '{algo}'. "
                 f"Known RL algorithms: {sorted(PYTORCH_RL_ALGOS)}. "
-                f"Known heuristic algorithms: {sorted(HEURISTIC_ALGOS)}."
+                f"Known fixed controllers: {sorted(fixed_algos)}."
             )
+
+        if agent_cfg.get("role") in {"attacker", "defender"}:
+            raise ScenarioError("Attacker/defender roles are unsupported for completion experiments")
 
         nonlinear = (vehicle_params or {}).get("model") == "combined_slip_st"
         action_mode = agent_cfg.get("action_constraints", {}).get("speed_control", "direct")
@@ -406,7 +404,7 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
         if explicit is not None and explicit != (algo in PYTORCH_RL_ALGOS):
             raise ScenarioError(
                 f"Agent '{agent_id}': algorithm '{algo}' does not support trainable={explicit}. "
-                "PPO/MAPPO are trainable; fixed opponents must use a registered controller."
+                "PPO/MAPPO are trainable; fixed opponents use a fixed controller."
             )
 
         # Trainable agents need observation and reward configs
@@ -424,8 +422,13 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     }
     if len(trainable_algos) > 1:
         raise ScenarioError("Mixed trainable algorithms are unsupported; use one PPO agent or a MAPPO team.")
-    if trainable_algos == {"ppo"} and len(trainable_ids) > 1:
-        raise ScenarioError("PPO requires exactly one trainable agent; use MAPPO for a trainable team.")
+    if trainable_algos == {"ppo"} and len(agents) != 1:
+        raise ScenarioError("PPO completion experiments require one vehicle")
+    evaluation_strategy = scenario.get("evaluation", {}).get("selection_strategy")
+    if evaluation_strategy is not None:
+        supported = {"team_completion"} if trainable_algos == {"mappo"} else {"completion_progress", "lap_time"}
+        if evaluation_strategy not in supported:
+            raise ScenarioError(f"Unsupported evaluation selection strategy for {sorted(trainable_algos)}: {evaluation_strategy}")
     if total_steps is not None and trainable_algos not in ({"ppo"}, {"mappo"}):
         raise ScenarioError("A total_steps budget requires PPO or MAPPO.")
     lap_counting = environment.get("lap_counting", {}) or {}
@@ -483,119 +486,38 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
             horizon = scenario.get("training_defaults", {}).get("rollout_steps_per_env", 256)
             if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1:
                 raise ScenarioError("MAPPO rollout_steps_per_env must be a positive integer")
-    trainable_mappo = trainable_ids if trainable_algos == {"mappo"} else []
-    if trainable_mappo:
+    if trainable_algos == {"mappo"}:
+        if len(trainable_ids) != 2 or len(agents) != 4:
+            raise ScenarioError("MAPPO completion experiments require two learners and two fixed opponents")
         mappo = resolve_mappo_config(scenario)
         if mappo["actor_mode"] not in {"shared", "independent"}:
             raise ScenarioError("mappo.actor_mode must be shared or independent")
-        reward_mode = mappo["reward_mode"]
-        critic_mode = mappo["critic_mode"]
-        reduction = mappo["team_reward_reduction"]
-        params = {**scenario.get("training_defaults", {}), **agents[trainable_ids[0]].get("params", {})}
+        if (mappo["reward_mode"] != "team_shared" or mappo["critic_mode"] != "shared_team"
+                or mappo["team_reward_reduction"] != "mean"):
+            raise ScenarioError("MAPPO completion requires team_shared rewards, shared_team critic and mean reduction")
+        reference_id = trainable_ids[0]
+        params = {**scenario.get("training_defaults", {}), **agents[reference_id].get("params", {})}
         if "adapter_transfer" in params:
-            raise ScenarioError("adapter_transfer is no longer supported; use pretrained_actor_checkpoint for PPO actor transfer")
+            raise ScenarioError("adapter_transfer is unsupported; use pretrained_actor_checkpoint for PPO actor transfer")
         if not isinstance(params.get("require_pretrained_actor", False), bool):
             raise ScenarioError("require_pretrained_actor must be boolean")
-        if mappo["actor_mode"] == "independent" and params.get("lora") is not None:
-            raise ScenarioError("Independent actors use full training; per-agent LoRA requires actor_mode=shared")
-        team_return_mode = params.get("team_return_mode", "per_agent")
-        if team_return_mode not in {"per_agent", "joint"}:
-            raise ScenarioError("team_return_mode must be per_agent or joint")
-        if team_return_mode == "joint" and (
-            reward_mode != "team_shared" or critic_mode != "shared_team"
-            or int(environment.get("action_repeat", 1)) != 1
-            or (environment.get("episode_termination", {}) or {}).get("mode") not in {"all_agents", "all_trainable"}
-        ):
-            raise ScenarioError("Joint team returns require team_shared/shared_team, action_repeat=1, and all_agents/all_trainable termination")
-        if reward_mode not in {"individual", "team_shared"}:
-            raise ScenarioError(
-                "'mappo.reward_mode' must be 'individual' or 'team_shared'."
-            )
-        if critic_mode not in {"shared_team", "agent_conditioned"}:
-            raise ScenarioError(
-                "'mappo.critic_mode' must be 'shared_team' or 'agent_conditioned'."
-            )
-        if reduction not in {"mean", "sum"}:
-            raise ScenarioError(
-                "'mappo.team_reward_reduction' must be 'mean' or 'sum'."
-            )
-        if reward_mode == "individual" and critic_mode == "shared_team":
-            raise ScenarioError(
-                "MAPPO individual rewards require critic_mode='agent_conditioned'; "
-                "a shared team critic cannot represent distinct per-agent returns."
-            )
-
-        # One MAPPO object owns one shared actor and optimizer. Per-agent
-        # reward configs may differ, but policy inputs, action processing, and
-        # optimizer/model parameters must not depend on which agent happened
-        # to be selected as the focal agent in run.py.
-        reference_id = trainable_mappo[0]
+        lora = params.get("lora")
+        if lora is not None and (not isinstance(lora, dict)
+                or mappo["actor_mode"] != "shared" or lora.get("mode") != "per_agent"):
+            raise ScenarioError("LoRA completion experiments require a shared actor with per_agent adapters")
+        if (params.get("team_return_mode") != "joint"
+                or int(environment.get("action_repeat", 1)) != 1
+                or environment.get("episode_termination", {}).get("mode") not in {"all_agents", "all_trainable"}):
+            raise ScenarioError("MAPPO completion requires joint team returns, action_repeat=1 and all_agents/all_trainable termination")
         reference = agents[reference_id]
-        shared_fields = (("params", "action_constraints") if (params.get("lora") or {}).get("mode") == "per_agent"
-                         else ("observation", "params", "action_constraints"))
-        for agent_id in trainable_mappo[1:]:
-            for field in shared_fields:
+        for agent_id in trainable_ids[1:]:
+            for field in ("observation", "reward", "params", "action_constraints"):
                 if agents[agent_id].get(field, {}) != reference.get(field, {}):
-                    raise ScenarioError(
-                        "Shared MAPPO agents require identical "
-                        f"'{field}' configuration; agents '{reference_id}' and "
-                        f"'{agent_id}' differ."
-                    )
-
-
-def resolve_target_ids(scenario: Dict[str, Any]) -> Dict[str, Any]:
-    """Resolve target_id for agents based on roles.
-
-    For adversarial tasks, automatically resolves which agent is the target
-    for each attacker based on explicit roles.
-
-    Args:
-        scenario: Scenario configuration
-
-    Returns:
-        Scenario with target_id resolved for each agent
-
-    Example:
-        >>> scenario = {
-        ...     'agents': {
-        ...         'car_0': {'role': 'attacker', 'algorithm': 'ppo'},
-        ...         'car_1': {'role': 'defender', 'algorithm': 'ftg'},
-        ...     }
-        ... }
-        >>> resolved = resolve_target_ids(scenario)
-        >>> resolved['agents']['car_0']['target_id']
-        'car_1'
-    """
-    scenario = copy.deepcopy(scenario)
-
-    if 'agents' not in scenario:
-        return scenario
-
-    agents = scenario['agents']
-
-    # Find agents by role
-    attackers = []
-    defenders = []
-
-    for agent_id, agent_config in agents.items():
-        role = agent_config.get('role', None)
-        if role == 'attacker':
-            attackers.append(agent_id)
-        elif role == 'defender':
-            defenders.append(agent_id)
-
-    # For each attacker, set target_id to first defender
-    # (Simple 1v1 case, can be extended for multi-agent)
-    if attackers and defenders:
-        for attacker_id in attackers:
-            if 'target_id' not in agents[attacker_id]:
-                agents[attacker_id]['target_id'] = defenders[0]
-
-    return scenario
+                    raise ScenarioError(f"MAPPO completion learners require identical {field} config; {reference_id} and {agent_id} differ")
 
 
 def load_and_expand_scenario(path: str, validate: bool = True, *, overrides=None) -> Dict[str, Any]:
-    """Load and validate a scenario, then resolve agent targets.
+    """Load inherited YAML, apply overrides and validate the scenario.
 
     The historical entry-point name is retained for callers.
 
@@ -617,12 +539,8 @@ def load_and_expand_scenario(path: str, validate: bool = True, *, overrides=None
     # Load raw scenario
     scenario = resolve_max_speed(apply_parameter_overrides(load_scenario(path), overrides))
 
-    # Validate before resolving targets
     if validate:
         validate_scenario(scenario)
-
-    # Resolve target IDs for adversarial tasks
-    scenario = resolve_target_ids(scenario)
 
     return scenario
 
@@ -635,6 +553,5 @@ __all__ = [
     'load_yaml_config',
     'validate_scenario',
     'resolve_mappo_config',
-    'resolve_target_ids',
     'load_and_expand_scenario',
 ]

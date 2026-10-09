@@ -40,12 +40,9 @@ def _make_collector(scenario, directory, agent_id, env_id, quota, horizon,
     env_cfg['render'] = False
     env, opponents, _ = create_training_setup(scenario, scenario_dir=Path(directory))
     try:
-        for opponent in opponents.values():
-            if hasattr(opponent, 'set_env'):
-                opponent.set_env(env)
         cfg = scenario['agents'][agent_id]
         space = env.action_spaces[agent_id]
-        obs = build_obs_composer(cfg, env_cfg, Path(directory), space.n)
+        obs = build_obs_composer(cfg, env_cfg, Path(directory))
         rewards = build_reward_composer(cfg, Path(directory))
         policy = _RemotePolicy(None, horizon, obs.obs_dim, space.n, gamma, gae_lambda,
                                map_scheduler=env._map_scheduler, worker_id=env_id)

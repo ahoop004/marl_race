@@ -8,7 +8,6 @@ from core.agent_builder import (
     get_fixed_agent_ids,
     get_trainable_agent_ids,
 )
-from core.config import register_builtin_agents
 from core.env_builder import create_environment
 from core.feature_requirements import derive_environment_feature_requirements
 from core.map_selection import apply_map_split
@@ -107,9 +106,6 @@ def create_training_setup(
             - agents: Dict mapping agent_id -> agent instance
             - reward_strategies: Dict mapping agent_id -> RewardStrategy (for trainable agents)
     """
-    # Register built-in agents
-    register_builtin_agents()
-
     # Extract configuration sections
     experiment_config = scenario['experiment']
     env_config = dict(scenario['environment'])
@@ -188,9 +184,7 @@ def create_training_setup(
 
     env = create_environment(env_config, agent_configs, seed)
 
-    # Wire per-agent target_id (set explicitly or via resolve_target_ids) into
-    # the env's agent_target_index, which feeds target_pose/target_state/
-    # relative_pose observations and target_collision/target_finished info.
+    # Preserve explicitly configured targets in environment lifecycle facts.
     target_mapping = {
         aid: cfg["target_id"]
         for aid, cfg in agent_configs.items()
@@ -199,5 +193,12 @@ def create_training_setup(
     if target_mapping:
         env.configure_agent_targets(target_mapping)
 
-    agents = build_fixed_policy_agents(agent_configs, vehicle_params=env.params)
+    try:
+        agents = build_fixed_policy_agents(agent_configs, vehicle_params=env.params)
+        for controller in agents.values():
+            if hasattr(controller, "set_env"):
+                controller.set_env(env)
+    except Exception:
+        env.close()
+        raise
     return env, agents, {}

@@ -41,9 +41,6 @@ def _worker_evaluator(connection, spec):
     directory = Path(spec['scenario_dir'])
     env, controllers, _ = create_training_setup(scenario, mode='eval', scenario_dir=directory)
     try:
-        for controller in controllers.values():
-            if hasattr(controller, 'set_env'):
-                controller.set_env(env)
         observations = build_obs_composers(spec['observation_agents'], kwargs['trainable_ids'],
                                            scenario['environment'], directory)
         evaluator = DeterministicMAPPOEvaluator(env=env, other_agents=controllers,
@@ -298,7 +295,7 @@ class ParallelMAPPOEvaluator(DeterministicMAPPOEvaluator):
             observation_agents=self.observation_agents,
             kwargs=dict(trainable_ids=self.trainable_ids, action_composer=self.actions[self.trainable_ids[0]],
                 episodes=self.episodes, base_seed=self.base_seed, action_repeat=self.action_repeat,
-                focal_agent_id=self.focal_agent_id, protocol_name=self.protocol_name))
+                protocol_name=self.protocol_name))
 
     def _collect_episodes(self, protocol):
         if self.num_workers == 1 or getattr(self, 'render', False):

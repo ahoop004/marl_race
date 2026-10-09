@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional
 
 import numpy as np
 
+from core.scenario import EVALUATION_STRATEGIES
 from loggers.console import ConsoleLogger
 from loggers.lap_completion import episode_lap_summary
 from loggers.wandb_logger import WandbLogger
@@ -469,11 +470,8 @@ class CheckpointHook(TrainingHook):
 class EvaluationCheckpointHook(CheckpointHook):
     """Select ``best_model.pt`` using deterministic racing outcomes.
 
-    Racing strategies rank completion first, then collision avoidance,
-    absolute progress, and finish speed. The opt-in completion_progress strategy
-    ranks earned net progress before collision avoidance until every race is
-    completed, then ranks safety and finish time. Attack selection instead uses
-    survival-qualified target crashes and ego failures. None infer outcomes from reward.
+    Completion selection uses earned progress, clean finishes and lap times.
+    Outcomes come from simulator facts rather than reward values.
     """
 
     def __init__(
@@ -485,10 +483,10 @@ class EvaluationCheckpointHook(CheckpointHook):
         provenance: Optional[Dict[str, Any]] = None,
         console: Optional[ConsoleLogger] = None,
         wandb_logger: Optional[WandbLogger] = None,
-        selection_strategy: str = "completion_safety",
+        selection_strategy: str = "completion_progress",
         evaluate_every_steps: Optional[int] = None,
     ) -> None:
-        if selection_strategy not in {"asymmetric_support", "completion_safety", "completion_progress", "lap_time", "team_completion", "team_combined", "team_first_place", "team_sweep", "team_combined_penalties"}:
+        if selection_strategy not in EVALUATION_STRATEGIES:
             raise ValueError(f"Unknown checkpoint selection strategy: {selection_strategy!r}")
         self._selection_strategy = selection_strategy
         super().__init__(
@@ -512,33 +510,19 @@ class EvaluationCheckpointHook(CheckpointHook):
         self._evaluation_count = 0
         self.evaluation_seconds = 0.0
         self._policy_version = 0
-        if console is not None and (selection_strategy.startswith("team_") or selection_strategy == "asymmetric_support"):
+        if console is not None and selection_strategy == "team_completion":
             console.print_info("Checkpoint priority: " + self.selection_priority(selection_strategy))
 
     @staticmethod
     def selection_priority(strategy):
-        if strategy == "asymmetric_support":
-            return "progress car completion > progress car beats opponents > fewer learner collisions > progress car finish time/net progress"
-        objective = {"team_completion": "at-least-one-finished rate",
-                     "team_combined": "rank score", "team_combined_penalties": "rank plus penalty score",
-                     "team_first_place": "first-place rate", "team_sweep": "sweep rate"}.get(strategy, strategy)
-        return (f"both-finished rate > {objective} > fewer learner collision DNFs > "
+        return ("both-finished rate > at-least-one-finished rate > fewer learner collision DNFs > "
                 "clean finish time if both-finished=100%, otherwise earned net progress")
 
     @staticmethod
-    def selection_score(summary: Dict[str, Any], strategy: str = "completion_safety") -> tuple[float, ...]:
-        if strategy == "asymmetric_support":
-            complete = float(summary["focal_completion_rate"])
-            finish = summary.get("focal_mean_clean_finish_time_s")
-            tie = (-float(finish) if finish is not None else float("-inf")) if complete == 1.0 else float(summary["focal_mean_net_progress"])
-            return (complete, float(summary["focal_opponent_win_rate"]),
-                    -float(summary["team_collision_rate"]), tie)
-        if strategy.startswith("team_"):
-            objective_key = {"team_completion": "team_completion_rate",
-                             "team_combined": "team_rank_score",
-                             "team_combined_penalties": "team_rank_penalty_score",
-                             "team_first_place": "team_first_place",
-                             "team_sweep": "team_sweep"}[strategy]
+    def selection_score(summary: Dict[str, Any], strategy: str = "completion_progress") -> tuple[float, ...]:
+        if strategy not in EVALUATION_STRATEGIES:
+            raise ValueError(f"Unknown checkpoint selection strategy: {strategy!r}")
+        if strategy == "team_completion":
             complete = float(summary["team_both_finished_rate"])
             finish = summary.get("mean_clean_finish_time_s")
             if complete == 1.0:
@@ -546,7 +530,7 @@ class EvaluationCheckpointHook(CheckpointHook):
             else:
                 tie_break = round(float(summary.get("mean_net_progress") or 0.0), 6)
             return (complete,
-                    float(summary[objective_key]),
+                    float(summary["team_completion_rate"]),
                     -float(summary["team_collision_rate"]),
                     tie_break)
         if strategy == "lap_time":
@@ -558,7 +542,6 @@ class EvaluationCheckpointHook(CheckpointHook):
                     -float(error) if error is not None else float("-inf"))
         completion = float(summary.get("completion_rate", 0.0))
         collision = float(summary.get("collision_rate", 1.0))
-        progress = float(summary.get("mean_progress", 0.0))
         finish_steps = summary.get("mean_finish_steps")
         finish_speed_score = (
             -float(finish_steps) if finish_steps is not None else float("-inf")
@@ -573,9 +556,6 @@ class EvaluationCheckpointHook(CheckpointHook):
                 return (completion, 0.0, -collision, finish_speed_score)
             # Ignore sub-millionth-lap numerical jitter when selecting a model.
             return (completion, round(float(net_progress), 6), -collision, finish_speed_score)
-        if strategy != "completion_safety":
-            raise ValueError(f"Unknown checkpoint selection strategy: {strategy!r}")
-        return (completion, -collision, progress, finish_speed_score)
 
     def on_episode_end(self, episode: int, reward: float, info: Dict, metrics: Dict) -> None:
         if self._evaluate_every_steps is not None:
@@ -613,7 +593,7 @@ class EvaluationCheckpointHook(CheckpointHook):
             "environment_steps": self._environment_steps,
             "selection_strategy": self._selection_strategy,
             "selection_priority": (self.selection_priority(self._selection_strategy)
-                                   if self._selection_strategy.startswith("team_") or self._selection_strategy == "asymmetric_support" else None),
+                                   if self._selection_strategy == "team_completion" else None),
             "selection_score": [
                 value if np.isfinite(value) else None for value in score
             ],
@@ -634,14 +614,7 @@ class EvaluationCheckpointHook(CheckpointHook):
             scalar_metrics["eval/environment_steps"] = self._environment_steps
             self._wandb.log_metrics(scalar_metrics)
 
-        if self._console is not None and self._selection_strategy == "asymmetric_support":
-            self._console.print_info(
-                f"asymmetric eval steps={self._environment_steps} "
-                f"racer_completion={summary['focal_completion_rate']:.1%} "
-                f"racer_beats_opponents={summary['focal_opponent_win_rate']:.1%} "
-                f"learner_collision={summary['team_collision_rate']:.1%} "
-                f"checkpoint={'saved best' if is_best else 'kept previous'}")
-        elif self._console is not None and self._selection_strategy in {"team_completion", "lap_time"}:
+        if self._console is not None and self._selection_strategy in {"team_completion", "lap_time"}:
             finish = summary.get("mean_clean_finish_time_s")
             finish_text = "n/a" if finish is None else f"{finish:.2f}s"
             completion_key = "team_both_finished_rate" if self._selection_strategy == "team_completion" else "completion_rate"
@@ -653,16 +626,6 @@ class EvaluationCheckpointHook(CheckpointHook):
                 f"failed={summary.get('learner_failure_rate', 0):.1%} "
                 f"timeout={summary.get('timeout_rate', 0):.1%} "
                 f"lap_time={lap_text} clean_finish={finish_text} "
-                f"checkpoint={'saved best' if is_best else 'kept previous'}")
-        elif self._console is not None and self._selection_strategy.startswith("team_"):
-            finish = summary.get("mean_clean_finish_time_s")
-            finish_text = "n/a" if finish is None else f"{finish:.2f}s"
-            self._console.print_info(
-                f"checkpoint eval races={summary.get('episodes', 0)} env_steps={self._environment_steps} "
-                f"both_finished={summary.get('team_both_finished_rate', 0):.1%} "
-                f"first_place={summary.get('team_first_place', 0):.1%} "
-                f"sweep={summary.get('team_sweep', 0):.1%} rank={summary.get('team_rank_score', 0):.3f} "
-                f"clean_finish={finish_text} finishers={summary.get('clean_finish_count', 0)} "
                 f"checkpoint={'saved best' if is_best else 'kept previous'}")
         elif self._console is not None:
             finish = summary.get("mean_clean_finish_time_s")

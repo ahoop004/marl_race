@@ -7,12 +7,7 @@ from typing import Dict, List, Tuple, Type
 from core.scenario import load_yaml_config
 
 from wrappers.rewards.base import RewardComponent
-from wrappers.rewards.events import (
-    CollisionRewardComponent,
-    OpponentCrashBonusComponent,
-    TimeoutPenaltyComponent,
-)
-from wrappers.rewards.interaction import TeamSupportComponent
+from wrappers.rewards.events import TimeoutPenaltyComponent
 from wrappers.rewards.completion import (
     LapCompletionComponent,
     ProgressDeltaBonusComponent,
@@ -23,12 +18,9 @@ from wrappers.rewards.completion import (
 
 COMPONENT_REGISTRY: Dict[str, Type[RewardComponent]] = {
     "team_race_result": TeamRaceResultComponent,
-    "collision": CollisionRewardComponent,
     "progress_delta_bonus": ProgressDeltaBonusComponent,
     "step_time_penalty": StepTimePenaltyComponent,
     "lap_completion": LapCompletionComponent,
-    "opponent_crash_bonus": OpponentCrashBonusComponent,
-    "team_support": TeamSupportComponent,
     "timeout_penalty": TimeoutPenaltyComponent,
 }
 

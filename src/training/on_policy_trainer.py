@@ -683,12 +683,9 @@ def _collect_ppo_worker(connection, scenario, scenario_dir, agent_id, worker_id,
         env_cfg["seed"] = ((base_seed if env_seed is None else int(env_seed)) + worker_id) % (2 ** 32)
         env_cfg["render"] = False
         env, opponents, _ = create_training_setup(scenario, scenario_dir=Path(scenario_dir))
-        for opponent in opponents.values():
-            if hasattr(opponent, "set_env"):
-                opponent.set_env(env)
         cfg = scenario["agents"][agent_id]
         space = env.action_spaces[agent_id]
-        observations = build_obs_composer(cfg, env_cfg, Path(scenario_dir), space.n)
+        observations = build_obs_composer(cfg, env_cfg, Path(scenario_dir))
         rewards = build_reward_composer(cfg, Path(scenario_dir))
         policy = _RemotePolicy(connection, n_steps, observations.obs_dim, space.n, gamma, gae_lambda,
             **({"map_scheduler": env._map_scheduler, "worker_id": worker_id}

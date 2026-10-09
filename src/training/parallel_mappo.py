@@ -157,9 +157,6 @@ def _make_collector(scenario, scenario_dir, env_id, episodes, horizon, contract,
     env, opponents, _ = create_training_setup(scenario, scenario_dir=Path(scenario_dir))
     try:
         ids = contract["agent_ids"]
-        for opponent in opponents.values():
-            if hasattr(opponent, "set_env"):
-                opponent.set_env(env)
         obs = build_obs_composers(scenario["agents"], ids, env_cfg, Path(scenario_dir))
         rewards = build_reward_composers(scenario["agents"], ids, Path(scenario_dir))
         snapshot = env.get_global_state()

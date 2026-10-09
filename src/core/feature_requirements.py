@@ -14,7 +14,6 @@ _CENTERLINE_OBSERVATIONS = {
 }
 _CENTERLINE_REWARDS = {
     "progress_delta_bonus",
-    "team_support",
 }
 
 
@@ -94,7 +93,7 @@ def derive_environment_feature_requirements(
         if "frenet_vehicle_track" in observation_keys:
             vehicle_state.add(agent_id)
             preview.add(agent_id)
-        if "frenet_neighbors" in observation_keys or "team_support" in reward_keys:
+        if "frenet_neighbors" in observation_keys:
             neighbors.add(agent_id)
 
     return EnvironmentFeatureRequirements(
