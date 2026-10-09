@@ -55,30 +55,11 @@ class AgentFactory:
 
 def register_builtin_agents() -> None:
     """Register built-in fixed-policy agents into :class:`AgentFactory`."""
-    try:
-        from agents.ftg import FTGAgent
-        AgentFactory.register("ftg", FTGAgent)
-        AgentFactory.register("follow_gap", FTGAgent)
-        AgentFactory.register("gap_follow", FTGAgent)
-        AgentFactory.register("followthegap", FTGAgent)
-    except ImportError:
-        pass
+
+
 
     try:
-        from agents.waypoint import PurePursuitAgent, StanleyAgent, HybridPPFTGAgent
-        AgentFactory.register("pure_pursuit", PurePursuitAgent)
-        AgentFactory.register("stanley", StanleyAgent)
-        AgentFactory.register("hybrid_pp_ftg", HybridPPFTGAgent)
-    except ImportError:
-        pass
-
-    try:
-        from agents.mpc import CBFMPCAgent, DefensiveMPCAgent, KinematicMPCAgent, MPCCAgent, ObstacleAwareMPCAgent
-        AgentFactory.register("cbf_mpc", CBFMPCAgent)
-        AgentFactory.register("defensive_mpc", DefensiveMPCAgent)
-        AgentFactory.register("kinematic_mpc", KinematicMPCAgent)
-        AgentFactory.register("mpcc", MPCCAgent)
-        AgentFactory.register("obstacle_aware_mpc", ObstacleAwareMPCAgent)
+  
         from agents.mpc.racing import RacingMPCAgent
         AgentFactory.register("racing_mpc", RacingMPCAgent)
     except ImportError:

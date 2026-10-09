@@ -36,18 +36,7 @@ logger = logging.getLogger(__name__)
 PYTORCH_RL_ALGOS: frozenset[str] = frozenset({"ppo", "mappo"})
 
 HEURISTIC_ALGOS: frozenset[str] = frozenset({
-    "ftg",
-    "follow_gap",
-    "gap_follow",
-    "followthegap",
-    "pure_pursuit",
-    "stanley",
-    "hybrid_pp_ftg",
-    "cbf_mpc",
-    "defensive_mpc",
-    "kinematic_mpc",
-    "mpcc",
-    "obstacle_aware_mpc",
+    
     "racing_mpc",
 })
 
