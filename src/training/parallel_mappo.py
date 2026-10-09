@@ -181,19 +181,11 @@ def _make_collector(scenario, scenario_dir, env_id, episodes, horizon, contract,
             decision_dt=float(env_cfg.get("timestep", .01)) * repeat,
         )
         agent = CollectorAgent(contract, horizon)
-        recorder = None
-        recording = scenario.get('recording', {})
-        if recording.get('enabled', False):
-            from replay.race_recorder import RaceRecorder
-            recorder = RaceRecorder(recording, lambda event: sink.send(('race_record', event)),
-                                    run_id=run_id, environment_id=env_id,
-                                    num_envs=int(scenario['experiment'].get('num_envs', 1)))
         trainer = MARLTrainer(
             env, agent, ids, opponents, obs, rewards, actions, action_repeat=repeat,
             hooks=[_WorkerHook(sink, env_id, seed, record_transitions)],
             run_id=f"{run_id}_env{env_id:04d}", reward_mode=agent.reward_mode,
             team_reward_reduction=agent.team_reward_reduction,
-            race_recorder=recorder,
         )
         return env, agent, trainer.iter_train(episodes, parallel=True, total_steps=total_steps)
     except BaseException:
@@ -264,12 +256,7 @@ def _collect_worker(connection, scenario, scenario_dir, assignments, horizon,
             connection.send(("rollout", (pooled, sum(counts.values()), physics, sink.take())))
             metrics = connection.recv()  # Policy update barrier, including an empty final rollout.
             for agent in agents.values():
-                if 'skill_curriculum' in metrics:
-                    agent.skill_curriculum_state = metrics['skill_curriculum']
                 agent.policy_version = metrics["train/updates"]
-                agent.recording_stop = metrics.get('recording/storage_full', False)
-                agent.recording_progress = metrics['train/environment_steps']
-                agent.recording_exhausted_windows = metrics.get('recording/exhausted_windows', [])
             for env_id in sorted(paused):
                 advance(env_id)
         connection.send(("done", sink.take()))
@@ -310,10 +297,6 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
         "gae_lambda", "critic_mode", "reward_mode", "team_return_mode", "team_reward_reduction",
     )}
     record_hooks = transition_record_hooks(trainer.hooks)
-    race_hooks = [h for h in trainer.hooks if hasattr(h, 'on_race_record')]
-    scenario = copy.deepcopy(scenario)
-    # Enable worker capture only when the parent has a corresponding writer.
-    scenario['recording'] = race_hooks[0].recording_config if race_hooks else {'enabled': False}
     connections, processes, process_by_worker = {}, [], {}
     completed, collected, actor_samples, updates = 0, 0, 0, 0
     physics_collected = 0
@@ -361,9 +344,6 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
                         if isinstance(hook, ConsoleHook):
                             hook.on_episode_end(completed + len(pending_episodes), *payload)
                 pending_episodes.append(payload)
-            elif kind == 'race_record':
-                for hook in race_hooks:
-                    hook.on_race_record(payload)
             elif kind == 'episode_start':
                 for hook in trainer.hooks:
                     callback = getattr(hook, 'on_episode_start', None)
@@ -550,17 +530,12 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
                     metrics['perf/cpu_affinity_count'] = affinity_cpus
                 if affinity_cores is not None:
                     metrics['perf/cpu_affinity_core_count'] = affinity_cores
-                if race_hooks:
-                    metrics['recording/storage_full'] = any(h.storage_full for h in race_hooks)
-                    metrics['recording/exhausted_windows'] = sorted(set().union(*(h.exhausted_windows for h in race_hooks)))
                 progress.set(phase="evaluation_checkpoint_logging",
                              updated_environment_steps=collected, updates=updates)
                 publish_progress(force=True)
                 if steps:
                     for hook in trainer.hooks:
                         hook.on_update(metrics)
-                if getattr(agent, 'skill_curriculum_state', None) is not None:
-                    metrics['skill_curriculum'] = agent.skill_curriculum_state
                 for worker_id in waiting:
                     connections[worker_id].send(metrics)
                 waiting.clear()

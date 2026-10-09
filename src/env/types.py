@@ -31,8 +31,6 @@ class TerminalReason(str, Enum):
     TRACK_BOUNDARY = "track_boundary"
     TIME_LIMIT = "time_limit"
     NO_PROGRESS = "no_progress"
-    SKILL_SUCCESS = "skill_success"
-    SKILL_FAILURE = "skill_failure"
 
 
 @dataclass

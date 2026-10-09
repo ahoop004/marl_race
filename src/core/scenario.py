@@ -461,8 +461,8 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     if num_envs > 1:
         if trainable_algos not in ({"ppo"}, {"mappo"}):
             raise ScenarioError("Parallel environments require PPO or MAPPO.")
-        if environment.get("render") or scenario.get("curriculum"):
-            raise ScenarioError("Parallel training requires headless training without curriculum.")
+        if environment.get("render"):
+            raise ScenarioError("Parallel training requires headless training.")
         seed = experiment.get("seed")
         env_seed = environment.get("seed", seed)
         if env_seed is None:
@@ -485,8 +485,6 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
                 raise ScenarioError("MAPPO rollout_steps_per_env must be a positive integer")
     trainable_mappo = trainable_ids if trainable_algos == {"mappo"} else []
     if trainable_mappo:
-        if scenario.get("curriculum"):
-            raise ScenarioError("MAPPO does not yet support scenario curriculum; use PPO curriculum experiments.")
         mappo = resolve_mappo_config(scenario)
         if mappo["actor_mode"] not in {"shared", "independent"}:
             raise ScenarioError("mappo.actor_mode must be shared or independent")

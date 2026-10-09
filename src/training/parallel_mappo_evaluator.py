@@ -41,13 +41,9 @@ def _worker_evaluator(connection, spec):
     directory = Path(spec['scenario_dir'])
     env, controllers, _ = create_training_setup(scenario, mode='eval', scenario_dir=directory)
     try:
-        if spec['skill_stage'] is not None:
-            env.set_skill_stage(spec['skill_stage'])
         for controller in controllers.values():
             if hasattr(controller, 'set_env'):
                 controller.set_env(env)
-        # Solo retention removes the target from the simulator, but the policy
-        # still needs its original target-relative inputs (all zero when absent).
         observations = build_obs_composers(spec['observation_agents'], kwargs['trainable_ids'],
                                            scenario['environment'], directory)
         evaluator = DeterministicMAPPOEvaluator(env=env, other_agents=controllers,
@@ -110,7 +106,7 @@ class EvaluationWorkerPool:
     """One CPU process pool shared by sequential evaluation suites and policies.
 
     Workers cache isolated environments for each suite, avoiding repeated process
-    startup without multiplying the process count by the number of skill stages.
+    startup across evaluations.
     """
 
     def __init__(self, scenario):
@@ -268,12 +264,12 @@ class EvaluationWorkerPool:
 class ParallelMAPPOEvaluator(DeterministicMAPPOEvaluator):
     """Preserve serial trial identities and inference shapes in concurrent races.
 
-    Rendering and trajectory recording retain the serial implementation. Skill
-    suites can share a worker pool while keeping isolated environment contexts.
+    Rendering uses the serial implementation. Evaluations can share a worker
+    pool while keeping isolated environment contexts.
     """
 
     def __init__(self, *, scenario, scenario_dir, num_workers, worker_pool=None,
-                 skill_stage=None, observation_agents=None, **kwargs):
+                 observation_agents=None, **kwargs):
         super().__init__(**kwargs)
         if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 1:
             raise ValueError('Evaluation workers must be a positive integer')
@@ -281,7 +277,6 @@ class ParallelMAPPOEvaluator(DeterministicMAPPOEvaluator):
         self.scenario = deepcopy(scenario)
         self.scenario['environment']['render'] = False
         self.scenario_dir = str(scenario_dir)
-        self.skill_stage = skill_stage
         self.observation_agents = deepcopy(scenario['agents'] if observation_agents is None else observation_agents)
         self._pool = worker_pool if worker_pool is not None else EvaluationWorkerPool(scenario)
         self._owns_pool = worker_pool is None
@@ -300,15 +295,15 @@ class ParallelMAPPOEvaluator(DeterministicMAPPOEvaluator):
 
     def _worker_spec(self):
         return dict(scenario=self.scenario, scenario_dir=self.scenario_dir,
-            skill_stage=self.skill_stage, observation_agents=self.observation_agents,
+            observation_agents=self.observation_agents,
             kwargs=dict(trainable_ids=self.trainable_ids, action_composer=self.actions[self.trainable_ids[0]],
                 episodes=self.episodes, base_seed=self.base_seed, action_repeat=self.action_repeat,
                 focal_agent_id=self.focal_agent_id, protocol_name=self.protocol_name))
 
     def _collect_episodes(self, protocol):
-        if self.num_workers == 1 or self.recording is not None or getattr(self, 'render', False):
+        if self.num_workers == 1 or getattr(self, 'render', False):
             if self.num_workers > 1 and not self._warned_serial:
-                warnings.warn('MAPPO evaluation uses one environment when recording or rendering is enabled.',
+                warnings.warn('MAPPO evaluation uses one environment when rendering is enabled.',
                               RuntimeWarning, stacklevel=2)
                 self._warned_serial = True
             return super()._collect_episodes(protocol)

@@ -60,16 +60,6 @@ class AgentEpisodeFacts:
     reward_total: float = 0.0
     individual_reward_total: float = 0.0
     reward_components: Dict[str, float] = field(default_factory=dict)
-    boundary_respawns: int = 0
-    collision_respawns: int = 0
-    attack_successes: int = 0
-    attack_target_crashes: int = 0
-    attack_eligible_crashes: int = 0
-    attack_ego_failed: bool = False
-    # None means this episode has no attack task; zero means no time limit.
-    attack_horizon_steps: Optional[int] = None
-    attack_target_laps: int = 0
-    skill: Optional[dict] = None
     active_steps: int = 0
     done_step: Optional[int] = None
     finish_step: Optional[int] = None
@@ -103,7 +93,7 @@ class AgentEpisodeFacts:
 
     @property
     def clean_finish(self) -> bool:
-        if self.finish_step is None or self.boundary_respawns or self.collision_respawns:
+        if self.finish_step is None:
             return False
         return self.collision_step is None or self.collision_step > self.finish_step
 
@@ -174,20 +164,6 @@ def update_agent_step_facts(
         if facts.done_step is not None:
             continue
         facts.active_steps += 1
-        if 'skill' in info:
-            facts.skill = dict(info['skill'])
-        attack = info.get("attack")
-        if attack is not None:
-            facts.attack_successes += int(attack["success"])
-            facts.attack_target_crashes += int(attack["target_crash"])
-            facts.attack_eligible_crashes += int(attack["eligible_crash"])
-            facts.attack_ego_failed |= bool(attack["ego_failed"])
-            facts.attack_horizon_steps = int(attack["horizon_steps"])
-            facts.attack_target_laps = int(attack.get("target_laps", 0))
-        if info.get("respawned"):
-            facts.boundary_respawns += info.get("respawn_reason") == "track_boundary"
-            facts.collision_respawns += info.get("respawn_reason") == "collision"
-            facts._lap_exceeded = True
         limits = info.get("track_limits")
         if isinstance(limits, Mapping):
             if facts._lap_started:
@@ -304,8 +280,6 @@ def episode_race_record(episode: EvalEpisodeFacts, *, timestep: float,
             "terminal_reason": f.terminal_reason, "outcome": f.outcome,
             "collision_dnf": f.terminal_reason == "collision",
             "boundary_dnf": f.terminal_reason == "track_boundary",
-            "boundary_respawns": f.boundary_respawns,
-            "collision_respawns": f.collision_respawns,
             "timeout": f.timed_out, "laps": f.final_lap_count,
             "net_progress_laps": f.net_progress if f.progress_delta_samples else None,
             "active_time_s": f.active_steps * timestep,
@@ -317,15 +291,6 @@ def episode_race_record(episode: EvalEpisodeFacts, *, timestep: float,
         if include_rewards and aid in episode.trainable_team:
             agents[aid].update(reward=f.reward_total, individual_reward=f.individual_reward_total,
                                reward_components=dict(f.reward_components))
-        if f.attack_horizon_steps is not None:
-            agents[aid].update(attack_successes=f.attack_successes,
-                              attack_target_crashes=f.attack_target_crashes,
-                              attack_eligible_crashes=f.attack_eligible_crashes,
-                              attack_ego_failed=f.attack_ego_failed,
-                              attack_horizon_steps=f.attack_horizon_steps,
-                              attack_target_laps=f.attack_target_laps)
-        if f.skill is not None:
-            agents[aid]['skill'] = dict(f.skill)
     own = [agents[aid] for aid in episode.trainable_team]
     others = [agents[aid] for aid in episode.opponent_team]
     finishes = [a["clean_finish_time_s"] for a in own if a["clean_finish_time_s"] is not None]
@@ -346,8 +311,6 @@ def episode_race_record(episode: EvalEpisodeFacts, *, timestep: float,
         "agents": agents,
     }
     for prefix, rows in (("own", own), ("opponent", others)):
-        for kind in ("boundary_respawns", "collision_respawns"):
-            record[f"{prefix}_{kind}"] = sum(a[kind] for a in rows)
         for kind in ("collision_dnf", "boundary_dnf", "timeout"):
             record[f"{prefix}_{kind}_count"] = sum(a[kind] for a in rows)
     if len(own) == len(others) == 2:
@@ -423,29 +386,6 @@ def aggregate_eval_episodes(
         times = [f.finish_elapsed_steps * timestep for f in focal
                  if timestep is not None and f.clean_finish and f.finish_elapsed_steps is not None]
         summary["focal_mean_clean_finish_time_s"] = _mean(times) if times else None
-        attacks = [ep.agents[aid] for ep in episodes for aid in trainable_ids
-                   if ep.agents[aid].attack_horizon_steps is not None]
-        if attacks:
-            successes = sum(f.attack_successes for f in attacks)
-            failures = sum(f.attack_ego_failed for f in attacks)
-            minutes = sum(f.active_steps for f in attacks) * timestep / 60 if timestep else 0.
-            if all(f.attack_horizon_steps > 0 for f in attacks):
-                basis = "scheduled_minutes"
-                budget = sum(f.attack_horizon_steps for f in attacks) * timestep / 60 if timestep else 0.
-            elif all(f.attack_horizon_steps == 0 and f.attack_target_laps > 0 for f in attacks):
-                basis = "scheduled_laps"
-                budget = sum(f.attack_target_laps for f in attacks)
-            else:
-                raise ValueError("Attack evaluation requires a consistent time or lap budget")
-            summary.update(attack_successes=successes,
-                attack_target_crashes=sum(f.attack_target_crashes for f in attacks),
-                attack_eligible_crashes=sum(f.attack_eligible_crashes for f in attacks),
-                attack_ego_crash_rate=failures / len(attacks),
-                attack_successes_per_minute=successes / minutes if minutes else 0.,
-                # Early ego termination retains its full evaluation budget;
-                # dying shortly after a success cannot inflate selection score.
-                attack_score_basis=basis, attack_score_budget=budget,
-                attack_score=(successes - 2 * failures) / budget if budget else 0.)
     summary["per_agent_timeout_rate"] = {
         aid: _rate(ep.agents[aid].timed_out for ep in episodes if aid in ep.agents)
         for aid in all_agent_ids
@@ -573,16 +513,12 @@ def aggregate_eval_episodes(
             "race_count": len(facts), "finished_count": sum(f.completed for f in facts),
             "collision_dnf_count": sum(f.terminal_reason == "collision" for f in facts),
             "boundary_dnf_count": sum(f.terminal_reason == "track_boundary" for f in facts),
-            "boundary_respawns": sum(f.boundary_respawns for f in facts),
-            "collision_respawns": sum(f.collision_respawns for f in facts),
             "timeout_count": sum(f.timed_out for f in facts),
             "clean_finish_count": sum(f.clean_finish for f in facts),
             "finish_time_sample_count": len(times),
             "mean_clean_finish_time_s": float(np.mean(times)) if times else None,
         }
     for prefix, ids in (("own", trainable_ids), ("opponent", opponent_ids)):
-        for kind in ("boundary_respawns", "collision_respawns"):
-            summary[f"{prefix}_{kind}"] = sum(summary["per_car"][aid][kind] for aid in ids)
         for kind in ("collision_dnf", "boundary_dnf", "timeout"):
             summary[f"{prefix}_{kind}_count"] = sum(summary["per_car"][aid][f"{kind}_count"] for aid in ids)
 

@@ -946,8 +946,6 @@ class MAPPOAgent:
                 "activation": self.activation,
                 "lora_contract": self.lora_contract,
                 "pretrained_actor_source": self.pretrained_actor_source,
-                **({'skill_curriculum': self.skill_curriculum_state}
-                   if getattr(self, 'skill_curriculum_state', None) is not None else {}),
             },
             path,
         )
@@ -985,6 +983,5 @@ class MAPPOAgent:
         self.critic.load_state_dict(ckpt["critic"], strict=True)
         if "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.skill_curriculum_state = ckpt.get('skill_curriculum')
         self.pretrained_actor_source = ckpt.get("pretrained_actor_source")
         self._lora_ready = True

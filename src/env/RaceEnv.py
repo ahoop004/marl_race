@@ -948,9 +948,6 @@ class RaceEnv:
             simulator=self.sim,
             step=self._elapsed_steps,
         )
-        if getattr(self, 'record_applied_commands', False):
-            # Capture the actual simulator input after clipping and terminal control.
-            self._recorded_applied_commands = joint.copy()
 
 
         # Increment episode step counter

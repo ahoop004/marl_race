@@ -8,13 +8,9 @@ AXES = {
     "perf": "train/environment_steps",
     "eval": "eval/environment_steps",
     "collector": "collector/elapsed_seconds",
-    "curriculum": "train/environment_steps",
-    "selfplay": "selfplay/environment_steps",
-    "selfplay_eval": "selfplay_eval/environment_steps",
 }
 
 CORE = (
-    "episode/skill/*", "eval/skill_*", "eval/retention_*", "eval/base_skill_*", "eval/curriculum_*",
     "episode/reward", "episode/steps", "episode/lap_count", "episode/lap_time_s",
     "episode/completed", "episode/failed", "episode/timeout", "episode/net_progress_laps",
     "episode/reward/*", "episode/individual_reward/*",
@@ -29,17 +25,6 @@ CORE = (
     "eval/mean_net_progress", "eval/mean_clean_finish_time_s", "eval/clean_finish_count",
     "eval/race_count", "eval/evaluation_seconds", "eval/map/*/clean_completion_rate",
     "eval/focal_completion_rate", "eval/focal_opponent_win_rate",
-    "curriculum/*",
-    "selfplay/rolling100/*/reward", "selfplay/rolling100/*/win",
-    "selfplay/rolling100/*/finish_rate", "selfplay/rolling100/*/any_crash",
-    "selfplay_eval/*/finish_rate", "selfplay_eval/*/win", "selfplay_eval/*/both_finished",
-    "selfplay_eval/*/progress_laps", "selfplay_eval/*/crash_count", "selfplay_eval/is_best",
-)
-ATTACK = (
-    "episode/attack_successes", "episode/attack_target_crashes", "episode/attack_eligible_crashes",
-    "episode/attack_ego_failed", "eval/attack_score", "eval/attack_successes",
-    "eval/attack_successes_per_minute", "eval/attack_ego_crash_rate",
-    "eval/attack_target_crashes", "eval/attack_eligible_crashes",
 )
 RACING = (
     "eval/win_rate", "eval/team_both_finished_rate", "eval/team_first_place",
@@ -51,7 +36,7 @@ LAP_COMPLETION = (
     "eval/team_both_finished_rate",
 )
 COMPLETION_STRATEGIES = {"lap_time", "completion_progress", "completion_safety",
-                         "team_completion", "map_curriculum"}
+                         "team_completion"}
 
 
 class MetricPolicy:
@@ -59,20 +44,18 @@ class MetricPolicy:
         self.config = config or {}
         scenario = scenario or {}
         profile = self.config.get("profile", "auto")
-        if profile not in {"auto", "attack", "lap_completion", "racing", "debug"}:
-            raise ValueError("wandb.logging.profile must be auto, attack, lap_completion, racing, or debug")
+        if profile not in {"auto", "lap_completion", "racing", "debug"}:
+            raise ValueError("wandb.logging.profile must be auto, lap_completion, racing, or debug")
         self.debug = profile == "debug"
-        self.attack = profile == "attack" or (profile == "auto" and bool(
-            scenario.get("environment", {}).get("attack_task")))
         learners = sum(bool(a.get("trainable")) for a in scenario.get("agents", {}).values())
         self.multi_agent = learners > 1
         self.shared_reward = scenario.get("mappo", {}).get("reward_mode") == "team_shared"
         self.finite_training = scenario.get("environment", {}).get("episode_termination", {}).get("lap_completion", True)
         self.selection_strategy = scenario.get("evaluation", {}).get("selection_strategy")
         self.lap_completion = profile == "lap_completion" or (
-            profile == "auto" and not self.attack and
+            profile == "auto" and
             self.selection_strategy in COMPLETION_STRATEGIES)
-        patterns = (*CORE, *(ATTACK if self.attack else LAP_COMPLETION if self.lap_completion else RACING))
+        patterns = (*CORE, *(LAP_COMPLETION if self.lap_completion else RACING))
         self._names = set(patterns)
         self._patterns = tuple(pattern for pattern in patterns if "*" in pattern)
 
@@ -83,8 +66,7 @@ class MetricPolicy:
 
     def accepts(self, key):
         namespace = key.split("/", 1)[0]
-        group = {"episode": "train", "selfplay": "train", "selfplay_eval": "eval",
-                 "perf": "performance"}.get(namespace, namespace)
+        group = {"episode": "train", "perf": "performance"}.get(namespace, namespace)
         if not self.group_enabled(group):
             return False
         components = "reward_component" in key
@@ -106,11 +88,7 @@ class MetricPolicy:
                 "episode/completed", "episode/team/completion_rate", "episode/team/all_finished",
                 "episode/team/first_place", "episode/team/sweep", "episode/team/rank_score"}:
             return False
-        # Supporting racer outcomes matter in asymmetric attack teams, but are
-        # aliases of completion in the single-learner attack task.
         if not self.multi_agent and key.startswith("eval/focal_"):
-            return False
-        if self.attack and not self.multi_agent and key in {"episode/failed", "eval/learner_failure_rate"}:
             return False
         if self.selection_strategy == "lap_time" and key in {
                 "eval/offtrack_error_m_s_per_lap", "eval/boundary_violation_lap_rate"}:

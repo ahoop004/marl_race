@@ -21,7 +21,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-from env.respawn import reset_respawned
+
 
 from agents.mappo import MAPPOAgent
 from env.types import GlobalState, TransitionRecord
@@ -102,7 +102,6 @@ class MARLTrainer:
         run_id: str = "run",
         reward_mode: str = "individual",
         team_reward_reduction: str = "mean",
-        race_recorder=None,
     ) -> None:
         self.env = env
         self.agent = agent
@@ -122,7 +121,6 @@ class MARLTrainer:
         self.render = render
         self.focal_id = focal_agent_id or (trainable_ids[0] if trainable_ids else "")
         self.run_id = run_id
-        self.race_recorder = race_recorder
         self.reward_mode = str(reward_mode).strip().lower()
         self.team_reward_reduction = str(team_reward_reduction).strip().lower()
         self.team_return_mode = getattr(agent, "team_return_mode", "per_agent")
@@ -169,7 +167,6 @@ class MARLTrainer:
     ) -> Dict[str, np.ndarray]:
         """Combine trainable and fixed-policy actions into one dict."""
         actions: Dict[str, np.ndarray] = dict(trainable_actions)
-        self._opponent_action_errors = set()
         active_agents = set(getattr(self.env, "agents", obs_dict))
         for aid, other_agent in self.other_agents.items():
             if aid in active_agents:
@@ -177,7 +174,6 @@ class MARLTrainer:
                     act = other_agent.act(obs_dict[aid])
                 except Exception:
                     act = np.zeros(2, dtype=np.float32)
-                    self._opponent_action_errors.add(aid)
                 actions[aid] = np.asarray(act, dtype=np.float32)
         return actions
 
@@ -256,12 +252,7 @@ class MARLTrainer:
         started_training = time.perf_counter()
         collection_started = started_training
         while (collected < total_steps if total_steps is not None else episode < n_episodes):
-            curriculum = getattr(self.agent, 'skill_curriculum_state', None)
-            if curriculum is not None:
-                self.env.set_skill_stage(curriculum['stage'])
             obs_dict, info_dict = self.env.reset()
-            from env.skills import reset_skill_opponent
-            reset_skill_opponent(self.env, self.other_agents)
             for controller in self.other_agents.values():
                 if hasattr(controller, "reset"):
                     controller.reset()
@@ -316,21 +307,8 @@ class MARLTrainer:
             start_policy = getattr(self.agent, "policy_version", self._updates)
             finite_race = getattr(getattr(self.env, "lifecycle", None), "finish_on_laps", True)
             team_components = {}
-            recorder = self.race_recorder
-            if recorder is not None:
-                recorder.start(episode_id=episode_id, episode=episode, map_id=map_id,
-                    seed=getattr(self.env, 'seed', None), timestep=float(self.env.timestep),
-                    action_repeat=self.action_repeat, trainable_ids=self.trainable_ids,
-                    agent_ids=list(facts.agents), track_length=float(getattr(self.env, 'centerline_track_length', 0.) or 0.),
-                    policy_version=start_policy, spawn=spawn_context,
-                    physics=info_dict.get(self.focal_id, {}).get('physics'),
-                    termination=dict(mode=getattr(self.env, 'episode_termination_mode', None), finish_on_laps=finite_race))
 
             while not episode_done:
-                if recorder is not None and (getattr(self.agent, 'recording_stop', False) or
-                        any(getattr(h, 'storage_full', False) for h in self.hooks)):
-                    if not recorder.stopped:
-                        recorder.stop()
                 decision_policy = getattr(self.agent, "policy_version", self._updates)
                 # --- Act: all trainable agents via shared actor ---
                 active_before = set(getattr(self.env, "agents", obs_dict))
@@ -380,19 +358,7 @@ class MARLTrainer:
                 team_step_reward = 0.0
                 team_breakdowns: Dict[str, float] = {}
 
-                for substep in range(self.action_repeat):
-                    if recorder is not None:
-                        exhausted = set(getattr(self.agent, 'recording_exhausted_windows', ()))
-                        for hook in self.hooks:
-                            exhausted.update(getattr(hook, 'exhausted_windows', ()))
-                        recorder.prepare(getattr(self.agent, 'recording_progress', 0) if parallel else self._environment_steps,
-                            physics_steps, decision_policy, exhausted_windows=exhausted,
-                            clock='last_completed_collection_barrier' if parallel else 'joint_environment_decisions')
-                    recording_active = recorder is not None and recorder.capturing
-                    self.env.record_applied_commands = recording_active
-                    if recording_active:
-                        from replay.race_recorder import capture_state, plain
-                        recorded_pre = capture_state(self.env, info_dict, obs_dict, facts.agents)
+                for _ in range(self.action_repeat):
                     obs_dict, rew_dict, term_dict, trunc_dict, info_dict = self.env.step(
                         all_actions
                     )
@@ -415,7 +381,6 @@ class MARLTrainer:
                             pass
                     # Compute factual sub-step rewards independently first.
                     substep_individual_rewards: Dict[str, float] = {}
-                    substep_breakdowns = {}
                     for aid in actions_norm:
                         agent_term = bool(term_dict.get(aid, False))
                         agent_trunc = bool(trunc_dict.get(aid, False))
@@ -442,8 +407,6 @@ class MARLTrainer:
                             )
                         )
                         sub_reward, breakdown = self.reward_composers[aid].compute(sub_step_info)
-                        if recording_active:
-                            substep_breakdowns[aid] = dict(breakdown)
                         substep_individual_rewards[aid] = float(sub_reward)
                         accumulated_individual_rewards[aid] += float(sub_reward)
                         for name, component_reward in breakdown.items():
@@ -475,37 +438,10 @@ class MARLTrainer:
                     for aid, learning_reward in substep_learning_rewards.items():
                         accumulated_learning_rewards[aid] += learning_reward
 
-                    if recording_active:
-                        applied = getattr(self.env, '_recorded_applied_commands', None)
-                        agent_order = list(getattr(self.env, 'possible_agents', facts.agents))
-                        recorder.step(plain(dict(
-                            physics_index=physics_steps - 1, physics_index_end=physics_steps,
-                            decision_index=step_idx, substep_index=substep,
-                            policy_version=decision_policy, timestep_s=float(self.env.timestep),
-                            action_repeat=self.action_repeat,
-                            simulation_time_s=(physics_steps - 1) * float(self.env.timestep),
-                            simulation_time_end_s=physics_steps * float(self.env.timestep),
-                            pre_state=recorded_pre,
-                            post_state=capture_state(self.env, info_dict, obs_dict, facts.agents),
-                            commands={aid: dict(
-                                requested=all_actions.get(aid),
-                                applied=applied[index] if applied is not None else None,
-                                source=('learner' if aid in actions_norm else 'controller_error_fallback'
-                                        if aid in self._opponent_action_errors else 'opponent'
-                                        if aid in all_actions else 'terminal_controller'))
-                                for index, aid in enumerate(agent_order)},
-                            learners={aid: dict(observation=wrapped_obs[aid], action_normalized=actions_norm[aid],
-                                reward=substep_learning_rewards[aid], individual_reward=substep_individual_rewards[aid],
-                                reward_components=substep_breakdowns[aid]) for aid in actions_norm},
-                            team_reward_components=team_breakdowns,
-                            terminated=term_dict, truncated=trunc_dict,
-                        )))
-
                     active_after_substep = set(getattr(self.env, "agents", []))
                     repeat_boundary = (
                         bool(getattr(self.env, "episode_done", False))
                         or not set(all_actions).issubset(active_after_substep)
-                        or any(info.get("respawned") for info in info_dict.values())
                     )
                     if repeat_boundary:
                         break
@@ -519,9 +455,6 @@ class MARLTrainer:
                 if post_step_global_snapshot is None:
                     post_step_global_snapshot = self.env.get_global_state()
                 next_global_state = post_step_global_snapshot.vector
-
-                respawned = reset_respawned(info_dict, controllers=self.other_agents,
-                    actions=self.action_composers, observations=self.obs_composers)
 
                 # --- Store transitions with accumulated rewards ---
                 step_reward = 0.0
@@ -546,8 +479,7 @@ class MARLTrainer:
                     # The next observation must expose the action that produced
                     # the next environment state. Updating after composition
                     # leaves PrevActionComponent one decision behind.
-                    if aid not in respawned:
-                        self.obs_composers[aid].update_prev_action(actions_norm[aid])
+                    self.obs_composers[aid].update_prev_action(actions_norm[aid])
                     next_obs = self.obs_composers[aid].wrap(
                         obs_dict.get(aid, {}), agent_info
                     )
@@ -666,8 +598,6 @@ class MARLTrainer:
 
             # A budget cut is neither a crash nor a completed episode. The last
             # fragment was bootstrapped above; do not fabricate episode metrics.
-            if recorder is not None:
-                recorder.end(episode_done)
             if not episode_done:
                 break
             last_info = agent_last_info.get(self.focal_id, {})

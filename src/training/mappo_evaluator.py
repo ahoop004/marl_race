@@ -4,7 +4,7 @@ import random
 import time
 
 import numpy as np
-from env.respawn import reset_respawned
+
 import torch
 
 from metrics.racing_eval import (
@@ -37,7 +37,6 @@ class DeterministicMAPPOEvaluator:
         self.base_seed = int(base_seed)
         self.protocol_name = protocol_name
         self.action_repeat = int(action_repeat)
-        self.recording = None
         self.progress_callback = None
         self._next_progress = 0.
 
@@ -61,10 +60,6 @@ class DeterministicMAPPOEvaluator:
             laps=','.join(f'{a.agent_id}:{a.final_lap_count}/'
                          f'{self.env.target_laps if a.agent_id in finishers else "unlimited"}' for a in learners),
             outcome=','.join(f'{a.agent_id}:{a.terminal_reason or "active"}' for a in learners))
-        attacks = [a for a in learners if a.attack_horizon_steps is not None]
-        if attacks:
-            row.update(attack_successes=sum(a.attack_successes for a in attacks),
-                       target_crashes=sum(a.attack_target_crashes for a in attacks))
         self.progress_callback(row)
 
     def bind_agent(self, agent):
@@ -91,10 +86,6 @@ class DeterministicMAPPOEvaluator:
                     episode_records.append(record)
                     if physics is not None:
                         physics_episodes.append(physics)
-        except BaseException:
-            if self.recording:
-                self.recording.failed = True
-            raise
         finally:
             self.agent.actor.train(was_training)
             self.agent.last_raw_actions = raw_actions
@@ -125,10 +116,7 @@ class DeterministicMAPPOEvaluator:
     def _evaluate_episode(self, episode, protocol):
         obs, infos = self.env.reset(seed=self.base_seed + episode,
                                    options={"map_episode_index": episode, "spawn_episode_index": episode})
-        from env.skills import reset_skill_opponent
-        reset_skill_opponent(self.env, self.other_agents)
         spawn_context = capture_spawn_context(self.env, self.env.possible_agents)
-        record_context = self.recording.start(episode, infos, protocol=protocol) if self.recording else {}
         for item in [*self.obs_composers.values(), *self.actions.values(),
                      *self.other_agents.values()]:
             if hasattr(item, "reset"):
@@ -139,47 +127,32 @@ class DeterministicMAPPOEvaluator:
             opponent_ids=list(self.other_agents),
         )
         steps = 0
-        decision = 0
         self._report_progress(facts, episode, steps, 'starting')
         while self.env.agents:
             ids = [aid for aid in self.trainable_ids if aid in self.env.agents]
-            normalized, physical, wrapped_rows = {}, {}, {}
+            normalized, physical = {}, {}
             if ids:
                 wrapped = [self.obs_composers[aid].wrap(
                     obs.get(aid, {}), infos.get(aid, {})) for aid in ids]
-                wrapped_rows = dict(zip(ids, wrapped))
                 normalized, _ = self.agent.act_batch(ids, wrapped, deterministic=True)
                 physical = {aid: self.actions[aid].process(normalized[aid]) for aid in ids}
             for aid, controller in self.other_agents.items():
                 if aid in self.env.agents:
                     physical[aid] = controller.act(obs.get(aid, {}))
-            for substep in range(self.action_repeat):
-                if self.recording:
-                    self.recording.before_step(infos, obs, steps)
+            for _ in range(self.action_repeat):
                 obs, _, terms, truncs, infos = self.env.step(physical)
                 steps += 1
                 update_agent_step_facts(facts, step_idx=steps, infos=infos,
                                         terminations=terms, truncations=truncs,
                                         agent_states={aid: self.env.get_agent_state(aid)
                                                       for aid in self.env.possible_agents})
-                if self.recording:
-                    self.recording.step(infos=infos, obs=obs, physical=physical, normalized=normalized,
-                        wrapped=wrapped_rows, physics_index=steps-1, decision_index=decision, substep=substep,
-                        terminated=terms, truncated=truncs)
-                if (not set(physical).issubset(self.env.agents)
-                        or any(info.get("respawned") for info in infos.values())):
+                if not set(physical).issubset(self.env.agents):
                     break
-            respawned = reset_respawned(infos, controllers=self.other_agents,
-                actions=self.actions, observations=self.obs_composers)
-            decision += 1
             for aid in ids:
-                if aid not in respawned:
-                    self.obs_composers[aid].update_prev_action(normalized[aid])
+                self.obs_composers[aid].update_prev_action(normalized[aid])
             self._report_progress(facts, episode, steps)
             if getattr(self, 'render', False):
                 self.env.render()
-        if self.recording:
-            self.recording.end()
         result = finalize_episode_facts(facts)
         self._report_progress(result, episode, steps, 'complete')
         map_name = getattr(self.env, "_map_bundle_active", None) or self.env.map_name
@@ -187,7 +160,7 @@ class DeterministicMAPPOEvaluator:
             **episode_race_record(result, timestep=self.env.timestep, include_rewards=False),
             "phase": "evaluation", "environment_episode": episode,
             "seed": self.base_seed + episode, "map_id": map_name,
-            "spawn_configuration": spawn_context, **record_context,
+            "spawn_configuration": spawn_context,
         }
         physics = infos.get(self.trainable_ids[0], {}).get("physics")
         physics_record = ({"seed": self.base_seed + episode, "map_bundle": map_name,
@@ -195,6 +168,4 @@ class DeterministicMAPPOEvaluator:
         return result, str(map_name), record, physics_record
 
     def close(self):
-        if self.recording:
-            self.recording.close()
         self.env.close()

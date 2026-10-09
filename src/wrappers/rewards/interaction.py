@@ -39,11 +39,10 @@ class TargetEdgePressureComponent(RewardComponent):
 
 
 class RacePursuitComponent(RewardComponent):
-    """Penalize trailing by unwrapped progress; reward each isolated respawn."""
+    """Penalize trailing by unwrapped progress."""
 
     def __init__(self, config):
         self.penalty = float(config.get("behind_penalty", -0.01))
-        self.bonus = float(config.get("respawn_bonus", 1.0))
         self.target_id = str(config.get("target_id", "car_1"))
         self.reset()
 
@@ -63,8 +62,7 @@ class RacePursuitComponent(RewardComponent):
             self._gap = (target["progress"] - ego["progress"] + .5) % 1.0 - .5
         else:
             self._gap += target["progress_delta"] - ego["progress_delta"]
-        return {"race_pursuit/behind": self.penalty if self._gap > 0 else 0.0,
-                "race_pursuit/respawn": self.bonus if info.get("target_respawned") else 0.0}
+        return {"race_pursuit/behind": self.penalty if self._gap > 0 else 0.0}
 
 
 class TeamSupportComponent(RewardComponent):
@@ -96,8 +94,7 @@ class TeamSupportComponent(RewardComponent):
         ego = step_info.get('info') or {}
         mate = infos.get(self.teammate_id, {})
         # No bonus for a mutual crash or for continuing after the racer is gone.
-        if (ego.get('respawned') or mate.get('respawned')
-                or ego.get('terminal_reason') or mate.get('terminal_reason')
+        if (ego.get('terminal_reason') or mate.get('terminal_reason')
                 or (ego.get('track_limits') or {}).get('exceeded')
                 or (mate.get('track_limits') or {}).get('exceeded')):
             return {}
@@ -118,7 +115,7 @@ class TeamSupportComponent(RewardComponent):
                 aid = neighbor['agent_id']
                 other = infos.get(aid, {})
                 if (aid not in opponents or not other.get('centerline')
-                        or other.get('terminal_reason') or other.get('respawned')
+                        or other.get('terminal_reason')
                         or (other.get('track_limits') or {}).get('exceeded')):
                     continue
                 if (-self.max_distance <= neighbor['delta_s'] <= -self.min_distance
