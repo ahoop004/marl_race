@@ -308,7 +308,7 @@ class RaceCar(object):
         # Simulator, but never between concurrently active environments.
         self.scan_simulator = scan_simulator or ScanSimulator2D(self.num_beams, fov)
         if self.integrator is Integrator.RK4:
-            warnings.warn(f"Chosen integrator is RK4. This is different from previous versions of the gym.")
+            warnings.warn("Chosen integrator is RK4. This is different from previous simulator versions.")
 
         # state is [x, y, steer_angle, vel, yaw_angle, yaw_rate, slip_angle]
         self.state = np.zeros((7, ))

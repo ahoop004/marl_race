@@ -8,8 +8,9 @@ import numpy as np
 import pytest
 import torch
 
-from adapters import RaceParallelEnv
 from adapters.rewards import RewardMapping
+from adapters.native_torchrl import NativeRaceTorchRLEnv
+from torchrl.envs import step_mdp
 from tasks import RaceTask
 from training.evaluation import run_evaluation_episode
 from training.mappo_evaluator import DeterministicMAPPOEvaluator
@@ -27,6 +28,7 @@ def two_policy_task():
     core = ScriptedEnv({1: (("learner",), False, ("learner",), ()),
                         2: ((), True, (), ("opponent",))})
     core.render_mode, core.map_name, core.max_steps = None, "scripted", 2
+    core.close = lambda: None
     ids = core.possible_agents
     return RaceTask(core, policy_agents=ids, fixed_controllers={},
         obs_composers={aid: ObservationComposer([LidarComponent(1, 10, normalize=False)]) for aid in ids},
@@ -40,19 +42,26 @@ def two_policy_task():
     ("team_shared", "mean", (11, 11)),
     ("team_shared", "sum", (12, 12)),
 ])
-def test_pettingzoo_and_evaluation_deliver_identical_rewards_after_retirement(mode, reduction, expected):
+def test_native_torchrl_and_evaluation_deliver_identical_rewards_after_retirement(mode, reduction, expected):
     task = two_policy_task()
-    env = RaceParallelEnv(task, reward_mode=mode, team_reward_reduction=reduction)
-    env.reset(seed=17)
+    env = NativeRaceTorchRLEnv(task, reward_mode=mode, team_reward_reduction=reduction)
     delivered, trace = {}, []
-    while env.agents:
-        _, rewards, _, _, infos = env.step({aid: [0, 0] for aid in env.agents})
-        trace.extend(env.last_step.substeps)
-        for aid, reward in rewards.items():
-            delivered[aid] = delivered.get(aid, 0.0) + reward
-            assert infos[aid]["learning_reward"] == reward
-            assert infos[aid]["individual_reward"] == task.env.tick
-            assert infos[aid]["team_reward"] == 10
+    try:
+        current = env.reset(seed=17)
+        while not env.snapshot.episode_done:
+            current["agents", "action"] = torch.zeros(len(env.agent_ids), 2)
+            transition = env.step(current)
+            nxt = transition["next"]
+            trace.extend(env.last_step.substeps)
+            for aid in env.last_step.decisions:
+                row = env.agent_ids.index(aid)
+                reward = nxt["agents", "reward"][row].item()
+                delivered[aid] = delivered.get(aid, 0.0) + reward
+                assert nxt["agents", "individual_reward"][row].item() == task.env.tick
+                assert nxt["shared_bonus"].item() == 10
+            current = step_mdp(transition)
+    finally:
+        env.close()
     assert delivered == {"learner": expected[0], "opponent": sum(expected)}
     evaluated = run_evaluation_episode(two_policy_task(),
         lambda ids, obs: {aid: np.zeros(2, dtype=np.float32) for aid in ids},

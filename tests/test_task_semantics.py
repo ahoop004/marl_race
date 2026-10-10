@@ -78,7 +78,6 @@ def test_shared_finish_rewards_are_incremental_and_reset_for_the_next_race():
 
 
 def native_gae(rewards, values, next_values, terminated, truncated):
-    pytest.importorskip("torchrl")
     from tensordict import TensorDict
     from torchrl.objectives.value import GAE
 
@@ -115,7 +114,6 @@ def test_collection_cut_bootstraps_without_a_task_boundary():
 
 
 def test_joint_team_credit_continues_after_an_individual_learner_finishes():
-    pytest.importorskip("torchrl.objectives.multiagent")
     from agents.torchrl_mappo import TorchRLMAPPOAgent
 
     agent = TorchRLMAPPOAgent(

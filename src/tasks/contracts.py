@@ -5,10 +5,10 @@ Ownership
 RaceEnv owns physical cars, maps, spawning, sensing, race lifecycle, physical
 terminal-car behavior, and the scenario's episode-ending policy. RaceTask owns
 per-policy-agent observation, action, and reward composers, fixed controllers,
-and advancing one joint policy decision. Gymnasium/PettingZoo adapters translate
-this contract and explicitly map individual/shared learning rewards; learners own
+and advancing one joint policy decision. The native TorchRL environment translates
+this contract and explicitly maps individual/shared learning rewards; learners own
 policies, value estimates, returns, buffers, updates, budgets and checkpoints. RaceEnv
-does not inherit from either library. Training hooks and evaluation reporting stay outside the task.
+does not inherit from TorchRL. Training hooks and evaluation reporting stay outside the task.
 
 Agent identities
 ----------------

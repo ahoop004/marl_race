@@ -1,16 +1,10 @@
-"""Optional external interoperability adapters, loaded only when requested."""
+"""Native TorchRL environment and task reward translation."""
 from adapters.rewards import RewardMapping
 
-__all__ = ["RaceGymEnv", "RaceParallelEnv", "NativeRaceTorchRLEnv", "RewardMapping"]
+__all__ = ["NativeRaceTorchRLEnv", "RewardMapping"]
 
 
 def __getattr__(name):
-    if name == "RaceGymEnv":
-        from adapters.gymnasium import RaceGymEnv
-        return RaceGymEnv
-    if name == "RaceParallelEnv":
-        from adapters.pettingzoo import RaceParallelEnv
-        return RaceParallelEnv
     if name == "NativeRaceTorchRLEnv":
         from adapters.native_torchrl import NativeRaceTorchRLEnv
         return NativeRaceTorchRLEnv

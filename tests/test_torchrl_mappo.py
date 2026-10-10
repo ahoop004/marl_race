@@ -4,8 +4,6 @@ import numpy as np
 import pytest
 import torch
 
-pytest.importorskip("pettingzoo")
-pytest.importorskip("torchrl.objectives.multiagent")
 from torchrl.objectives.multiagent import MAPPOLoss
 from torchrl.objectives.value import MultiAgentGAE
 

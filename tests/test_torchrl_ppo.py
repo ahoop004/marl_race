@@ -4,8 +4,6 @@ import numpy as np
 import pytest
 import torch
 
-pytest.importorskip("gymnasium")
-pytest.importorskip("torchrl")
 from tensordict import TensorDict
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
@@ -226,7 +224,6 @@ def test_serial_trainers_stop_after_update_and_keep_evaluated_weights(algorithm)
                  "experiment.total_steps=7", "environment.max_steps=10", "evaluation.enabled=false",
                  "++agents.car_0.params.n_steps=4"]
     if algorithm == "mappo":
-        pytest.importorskip("torchrl.objectives.multiagent")
         overrides += ["++agents.car_1.params.n_steps=4", "controllers.racing_mpc.max_evaluations=10"]
     scenario = load_and_expand_scenario(str(scenarios / filename), overrides=overrides)
     task = create_race_task(scenario, scenario_dir=scenarios)

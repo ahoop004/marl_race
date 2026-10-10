@@ -1,24 +1,12 @@
-"""PPO startup must not load optional legacy training stacks."""
+"""Verify native TorchRL startup in a fresh interpreter."""
 from pathlib import Path
 import subprocess
 import sys
 
-import pytest
-
-
-pytest.importorskip("torchrl")
-
-
-def test_native_ppo_does_not_import_external_training_adapters():
+def test_native_ppo_startup_uses_torchrl_environment_and_loss():
     # A fresh interpreter prevents earlier tests from hiding transitive imports.
     script = '''
 import sys
-
-blocked = {"gym", "stable_baselines3", "tensorflow"}
-def guard(event, args):
-    if event == "import" and args[0].split(".")[0] in blocked:
-        raise AssertionError(f"Unexpected optional import: {args[0]}")
-sys.addaudithook(guard)
 
 from pathlib import Path
 sys.path.insert(0, str(Path("src").resolve()))
@@ -26,6 +14,9 @@ from core.scenario import load_and_expand_scenario
 from core.task_builder import create_race_task
 from training.algorithms import create_learner, learner_params
 from training.on_policy import OnPolicyTrainer as TorchRLPPOTrainer
+from adapters import NativeRaceTorchRLEnv
+from torchrl.envs import EnvBase
+from torchrl.objectives import ClipPPOLoss
 
 directory = Path("scenarios")
 scenario = load_and_expand_scenario(str(directory / "ppo_lap_completion_pretrain.yaml"))
@@ -37,11 +28,11 @@ try:
     params.update(device="cpu", hidden_dims=[8], n_steps=2, n_epochs=1, batch_size=2)
     learner = create_learner("ppo", spec, params)
     trainer = TorchRLPPOTrainer(task, learner)
+    assert isinstance(trainer.env, NativeRaceTorchRLEnv)
+    assert isinstance(trainer.env, EnvBase)
+    assert isinstance(learner.loss_module, ClipPPOLoss)
     trainer.train(total_steps=2)
     assert trainer.collected_steps == 2
-    assert not blocked.intersection(sys.modules)
-    assert "adapters.gymnasium" not in sys.modules
-    assert "adapters.pettingzoo" not in sys.modules
 finally:
     task.close()
 '''
