@@ -431,13 +431,9 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     if experiment.get("ppo_backend") == "torchrl":
         if trainable_algos != {"ppo"}:
             raise ScenarioError("The TorchRL PPO backend requires one PPO learner")
-        if experiment.get("num_envs", 1) != 1:
-            raise ScenarioError("TorchRL PPO currently requires num_envs=1")
     if experiment.get("mappo_backend") == "torchrl":
         if trainable_algos != {"mappo"}:
             raise ScenarioError("The TorchRL MAPPO backend requires MAPPO learners")
-        if experiment.get("num_envs", 1) != 1:
-            raise ScenarioError("TorchRL MAPPO currently requires num_envs=1")
     evaluation_strategy = scenario.get("evaluation", {}).get("selection_strategy")
     if evaluation_strategy is not None:
         supported = {"team_completion"} if trainable_algos == {"mappo"} else {"completion_progress", "lap_time"}

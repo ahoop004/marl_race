@@ -176,3 +176,92 @@ def test_episode_budget_flushes_a_deferred_update_with_final_learning_rate():
     assert hook.updates[0]["train/rollout_steps"] == 6
     assert hook.updates[0]["train/updates"] == 1
     assert hook.updates[0]["train/learning_rate"] == pytest.approx(1e-4)
+
+
+def test_parallel_fragments_use_final_observations_and_independent_gae(monkeypatch):
+    from multiprocessing.reduction import ForkingPickler
+    import pickle
+    from training.torchrl_collectors import PPOCollectorPolicy, deserialize_rollout, serialize_rollout
+
+    learner = agent(gamma=0.9, gae_lambda=1)
+    with torch.no_grad():
+        learner.critic.net[0].weight.fill_(1)
+        learner.critic.net[0].bias.zero_()
+    fragments = []
+    for observations, next_observations, rewards in (([2, 3], [3, 4], [1, 2]), ([100], [7], [4])):
+        policy = PPOCollectorPolicy(None, 2, 1, 2, 0.9, 1)
+        actions, log_probs, values = learner.act_batch(np.array(observations, dtype=np.float32).reshape(-1, 1))
+        for row, observation in enumerate(observations):
+            policy.buffer.add([observation], actions[row], rewards[row], log_probs[row], values[row],
+                              terminated=False, truncated=False, raw_action=learner.last_raw_actions[row],
+                              next_observation=[next_observations[row]])
+        payload = ForkingPickler.dumps(serialize_rollout(policy.pack_rollout(0)))
+        fragments.append(deserialize_rollout(pickle.loads(payload)))
+        policy.buffer.clear()
+    captured = []
+    monkeypatch.setattr("agents.torchrl_ppo.optimize_ppo", lambda agent, data: captured.append(data.clone()) or {})
+    learner.update_rollouts(fragments)
+    torch.testing.assert_close(captured[0]["value_target"].flatten(), torch.tensor([6.04, 5.6, 10.3]))
+    # Parallel inference uses the same latent log-probability as the native loss.
+    log_probs = learner.probabilistic_actor.get_dist(captured[0]).log_prob(captured[0]["raw_action"])
+    torch.testing.assert_close(log_probs, captured[0]["raw_log_prob"])
+
+
+@pytest.mark.parametrize("algorithm,scheduling", [("ppo", "ready"), ("mappo", "synchronous")])
+def test_spawned_collectors_stop_at_update_barrier_and_keep_evaluated_weights(algorithm, scheduling):
+    from pathlib import Path
+    import multiprocessing as mp
+    from core.scenario import load_and_expand_scenario
+    from core.task_builder import create_race_task
+
+    scenarios = Path(__file__).resolve().parents[1] / "scenarios"
+    filename = "ppo_lap_completion_pretrain.yaml" if algorithm == "ppo" else "mappo_2v2_completion_scratch.yaml"
+    overrides = [f"experiment.{algorithm}_backend=torchrl", "experiment.num_envs=2",
+                 "experiment.num_workers=1", f"experiment.collector_scheduling={scheduling}",
+                 "experiment.total_steps=7", "environment.max_steps=10", "evaluation.enabled=false",
+                 "training_defaults.rollout_steps_per_env=2", "agents.car_0.params.n_steps=4"]
+    if algorithm == "mappo":
+        pytest.importorskip("torchrl.objectives.multiagent")
+        overrides += ["agents.car_1.params.n_steps=4", "agents.car_2.params.max_evaluations=10",
+                      "agents.car_3.params.max_evaluations=10"]
+    scenario = load_and_expand_scenario(str(scenarios / filename), overrides=overrides)
+    task = create_race_task(scenario, scenario_dir=scenarios)
+    ids = list(task.possible_agents)
+    params = {"device": "cpu", "hidden_dims": [8], "n_steps": 4, "n_epochs": 1, "batch_size": 4}
+    obs_dim = task.obs_composers[ids[0]].obs_dim
+    bounds = task.env.action_spaces[ids[0]]
+    hook = Capture(False)
+
+    def stop(metrics):
+        hook.updates.append(dict(metrics))
+        hook.should_stop = True
+        hook.weights = {key: value.clone() for key, value in learner.actor.state_dict().items()}
+
+    hook.on_update = stop
+    try:
+        if algorithm == "ppo":
+            learner = TorchRLPPOAgent(obs_dim, bounds.low, bounds.high, params)
+            training = TorchRLPPOTrainer(task.env, ids[0], learner, task.fixed_controllers,
+                                        task.obs_composers[ids[0]], task.reward_composers[ids[0]],
+                                        task.action_composers[ids[0]], hooks=[hook])
+        else:
+            from agents.torchrl_mappo import TorchRLMAPPOAgent
+            from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
+
+            state = task.env.get_global_state()
+            params.update(critic_mode="shared_team", reward_mode="team_shared", team_return_mode="joint",
+                          _global_state_contract_version=state.metadata["vector_contract_version"],
+                          _observation_dims={aid: task.obs_composers[aid].obs_dim for aid in ids},
+                          _observation_contracts={aid: task.obs_composers[aid].contract for aid in ids})
+            learner = TorchRLMAPPOAgent(obs_dim, len(state.vector), bounds.low, bounds.high, ids, params)
+            training = TorchRLMAPPOTrainer(task.env, learner, ids, task.fixed_controllers,
+                                          task.obs_composers, task.reward_composers,
+                                          task.action_composers[ids[0]], hooks=[hook], reward_mode="team_shared")
+        training.train_parallel(scenario, scenarios, 2, total_steps=7)
+        assert len(hook.updates) == 1 and hook.updates[0]["train/environment_steps"] == 4
+        assert hook.ended and not hook.episodes
+        for key, value in learner.actor.state_dict().items():
+            torch.testing.assert_close(value, hook.weights[key], rtol=0, atol=0)
+        assert not any("collector" in child.name for child in mp.active_children())
+    finally:
+        task.close()

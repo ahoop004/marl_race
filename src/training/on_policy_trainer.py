@@ -407,6 +407,8 @@ class OnPolicyTrainer:
                     truncated=rl_trunc,
                     **({"raw_action": raw_action} if raw_action is not None else {}),
                     **({"final_value": final_value} if final_value is not None else {}),
+                    **({"next_observation": next_obs}
+                       if getattr(self.agent.buffer, "requires_next_observation", False) else {}),
                 )
 
                 if self.agent.buffer.is_full() or budget_done or (done and total_steps is None):
@@ -494,12 +496,13 @@ _WORKER_THREADS = 1
 
 class _RemotePolicy:
     def __init__(self, connection, n_steps, obs_dim, action_dim, gamma, gae_lambda,
-                 *, map_scheduler=None, worker_id=0):
+                 *, map_scheduler=None, worker_id=0, buffer=None):
         import torch
         from agents.ppo import RolloutBuffer
 
         self.connection = connection
-        self.buffer = RolloutBuffer(n_steps, obs_dim, action_dim, torch.device("cpu"))
+        self.buffer = (RolloutBuffer(n_steps, obs_dim, action_dim, torch.device("cpu"))
+                       if buffer is None else buffer)
         self.gamma, self.gae_lambda = gamma, gae_lambda
         self.map_scheduler = map_scheduler
         self.worker_id = worker_id

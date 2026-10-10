@@ -26,7 +26,7 @@ from training.on_policy_trainer import (
 
 
 def _make_collector(scenario, directory, agent_id, env_id, quota, horizon,
-                    run_id, gamma, gae_lambda, sink, record, step_budget):
+                    run_id, gamma, gae_lambda, sink, record, step_budget, native=False):
     from core.setup import build_obs_composer, build_reward_composer, create_training_setup
     from wrappers.actions.composer import ActionComposer
 
@@ -44,7 +44,11 @@ def _make_collector(scenario, directory, agent_id, env_id, quota, horizon,
         space = env.action_spaces[agent_id]
         obs = build_obs_composer(cfg, env_cfg, Path(directory))
         rewards = build_reward_composer(cfg, Path(directory))
-        policy = _RemotePolicy(None, horizon, obs.obs_dim, space.n, gamma, gae_lambda,
+        policy_class = _RemotePolicy
+        if native:
+            from training.torchrl_collectors import PPOCollectorPolicy
+            policy_class = PPOCollectorPolicy
+        policy = policy_class(None, horizon, obs.obs_dim, space.n, gamma, gae_lambda,
                                map_scheduler=env._map_scheduler, worker_id=env_id)
         trainer = OnPolicyTrainer(
             env, agent_id, policy, opponents, obs, rewards,
@@ -63,7 +67,7 @@ def _make_collector(scenario, directory, agent_id, env_id, quota, horizon,
 
 
 def _collect_worker(connection, scenario, directory, agent_id, assignments,
-                    horizon, run_id, gamma, gae_lambda, record, step_budget):
+                    horizon, run_id, gamma, gae_lambda, record, step_budget, native=False):
     os.environ['CUDA_VISIBLE_DEVICES'] = ''
     os.environ['PYGLET_HEADLESS'] = 'true'
     torch.set_num_threads(1)
@@ -74,7 +78,7 @@ def _collect_worker(connection, scenario, directory, agent_id, assignments,
         for env_id, quota in assignments:
             envs[env_id], generators[env_id], contract = _make_collector(
                 scenario, directory, agent_id, env_id, quota, horizon, run_id,
-                gamma, gae_lambda, sink, record, step_budget)
+                gamma, gae_lambda, sink, record, step_budget, native)
             contracts.append(contract)
         connection.send(('ready', contracts))
         if connection.recv() != ('start', None):
@@ -96,6 +100,9 @@ def _collect_worker(connection, scenario, directory, agent_id, assignments,
                     if env_id in paused:
                         continue
                     if kind == 'rollout':
+                        if native:
+                            from training.torchrl_collectors import serialize_rollout
+                            payload = serialize_rollout(payload)
                         paused[env_id] = payload
                     else:
                         requests[env_id] = (kind, payload)
@@ -122,6 +129,7 @@ def train_parallel(trainer, scenario, directory, num_envs, n_episodes, *, total_
     experiment = scenario.get('experiment', {})
     workers = min(num_envs, int(experiment.get('num_workers', num_envs)))
     agent = trainer.agent
+    native = getattr(agent, "collection_backend", None) == "torchrl"
     horizon = agent.n_steps // num_envs
     budget = total_steps if total_steps is not None else n_episodes
     if workers < 1 or horizon < 1 or agent.n_steps % num_envs or budget < num_envs:
@@ -193,7 +201,7 @@ def train_parallel(trainer, scenario, directory, num_envs, n_episodes, *, total_
                 process = context.Process(target=_collect_worker, name=f'ppo-collector-{worker_id}', args=(
                     child, scenario, str(directory), trainer.rl_agent_id, assignments,
                     horizon, trainer.run_id, agent.gamma, agent.gae_lambda,
-                    bool(record_hooks), total_steps is not None))
+                    bool(record_hooks), total_steps is not None, native))
                 connections[worker_id] = parent
                 try:
                     process.start()
@@ -257,13 +265,16 @@ def train_parallel(trainer, scenario, directory, num_envs, n_episodes, *, total_
                 collection_s = time.perf_counter() - round_start
                 rollouts = [rollout for worker in sorted(waiting)
                             for _, rollout in sorted(waiting[worker].items())]
-                steps = sum(len(rollout[0]) for rollout in rollouts)
+                if native:
+                    from training.torchrl_collectors import deserialize_rollout
+                    rollouts = [deserialize_rollout(rollout) for rollout in rollouts]
+                steps = sum(rollout.numel() if native else len(rollout[0]) for rollout in rollouts)
                 collected += steps
                 trainer.collected_steps = collected
                 if total_steps is not None:
                     trainer._set_training_progress(collected, budget)
                 update_start = time.perf_counter()
-                metrics = agent.update_rollouts(rollouts)
+                metrics = agent.update_rollouts(rollouts) if not trainer._should_stop() else {}
                 update_s = time.perf_counter() - update_start
                 did_update = bool(metrics)
                 updates += did_update

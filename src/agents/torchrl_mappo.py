@@ -44,6 +44,8 @@ class _DecisionCount:
 
 
 class TorchRLMAPPOAgent(MAPPOAgent):
+    collection_backend = "torchrl"
+
     def _make_buffers(self):
         self._steps = []
         return {aid: _DecisionCount() for aid in self.agent_ids}
@@ -155,6 +157,26 @@ class TorchRLMAPPOAgent(MAPPOAgent):
     def any_buffer_full(self):
         return len(self._steps) >= self.n_steps
 
+    def set_next_state(self, state):
+        self._steps[-1]["next", "state"] = torch.tensor(
+            np.asarray(state).copy(), dtype=torch.float32, device=self.device,
+        )
+
+    @torch.no_grad()
+    def actor_actions(self, observations, agent_ids, *, deterministic=False, return_raw=False):
+        # Parallel inference may repeat the same actor across independent races.
+        self._require_lora_source()
+        if len(agent_ids) != len(observations) or any(aid not in self._agent_index for aid in agent_ids):
+            raise ValueError("Actor rows require matching, known agent IDs")
+        data = TensorDict({"agents": TensorDict({
+            "observation": observations,
+            "index": torch.tensor([self._agent_index[aid] for aid in agent_ids], device=self.device),
+        }, [len(agent_ids)])}, [])
+        with set_exploration_type(ExplorationType.MODE if deterministic else ExplorationType.RANDOM):
+            self.policy(data)
+        result = (data["agents", "action"], data["agents", "raw_log_prob"])
+        return (*result, data["agents", "raw_action"]) if return_raw else result
+
     def clear_buffers(self):
         self._steps.clear()
         for buffer in self.buffers.values():
@@ -164,12 +186,20 @@ class TorchRLMAPPOAgent(MAPPOAgent):
         if not self._steps:
             return {}
         self._require_lora_source()
-        self._steps[-1]["next", "state"] = torch.tensor(
-            np.asarray(next_global_state).copy(), dtype=torch.float32, device=self.device,
-        )
-        data = torch.stack(self._steps)
-        with torch.no_grad():
-            self.gae(data)
+        self.set_next_state(next_global_state)
+        return self.update_rollouts([torch.stack(self._steps)])
+
+    def update_rollouts(self, rollouts):
+        self._require_lora_source()
+        fragments = []
+        for rollout in rollouts:
+            fragment = rollout.to(self.device).clone()
+            with torch.no_grad():
+                self.gae(fragment)
+            fragments.append(fragment)
+        if not fragments:
+            return {}
+        data = torch.cat(fragments, dim=0)
         # Keep retired slots in GAE for continuing team credit, then select only
         # actual decisions before advantage normalization and minibatch sampling.
         mask = data["agents", "mask"].reshape(-1)
@@ -177,6 +207,6 @@ class TorchRLMAPPOAgent(MAPPOAgent):
         selected = data["agents"].reshape(-1)[mask]
         samples = TensorDict({"agents": selected.unsqueeze(-1), "state": states[mask]}, [selected.numel()])
         metrics = optimize_ppo(self, samples, group="agents")
-        metrics["train/rollout_steps"] = len(self._steps)
+        metrics["train/rollout_steps"] = data.numel()
         metrics["train/rollout_agent_samples"] = selected.numel()
         return metrics

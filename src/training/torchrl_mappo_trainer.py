@@ -15,8 +15,9 @@ class TorchRLMAPPOTrainer(MARLTrainer):
         super().__init__(*args, **kwargs)
         self.parallel_env = _TrainingParallelEnv(self.task)
 
-    def train_parallel(self, *args, **kwargs):
-        raise ValueError("TorchRL MAPPO currently requires num_envs=1")
+    def train_parallel(self, scenario, scenario_dir, num_envs, n_episodes=0, *, total_steps=None):
+        from training.parallel_mappo import train_parallel
+        return train_parallel(self, scenario, scenario_dir, num_envs, n_episodes, total_steps=total_steps)
 
     def _reset_task(self):
         self.parallel_env.reset()

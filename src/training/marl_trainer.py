@@ -386,6 +386,8 @@ class MARLTrainer:
                         value=values[ordered_ids[0]],
                         terminal=not any(aid in getattr(self.env, "agents", []) for aid in self.trainable_ids),
                     )
+                if ordered_ids and hasattr(self.agent, "set_next_state"):
+                    self.agent.set_next_state(next_global_state)
 
                 if self._transition_hooks:
                     for aid in ordered_ids:

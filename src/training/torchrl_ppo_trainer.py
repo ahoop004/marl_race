@@ -14,8 +14,9 @@ from training.reward_context import transition_lifecycle_fields
 
 
 class TorchRLPPOTrainer(OnPolicyTrainer):
-    def train_parallel(self, *args, **kwargs):
-        raise ValueError("TorchRL PPO currently requires num_envs=1")
+    def train_parallel(self, scenario, scenario_dir, num_envs, n_episodes=0, *, total_steps=None):
+        from training.parallel_ppo import train_parallel
+        return train_parallel(self, scenario, scenario_dir, num_envs, n_episodes, total_steps=total_steps)
 
     def train(self, n_episodes=0, *, total_steps=None):
         if total_steps is not None and (

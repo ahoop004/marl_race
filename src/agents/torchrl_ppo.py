@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import torch
-from tensordict import TensorDictBase
+from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.modules import IndependentNormal, ProbabilisticActor
+from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 
@@ -31,6 +32,8 @@ class _Value(torch.nn.Module):
 
 
 class TorchRLPPOAgent(PPOAgent):
+    collection_backend = "torchrl"
+
     def _make_buffer(self):
         # Collection and storage use TensorDicts instead of the legacy buffer.
         return None
@@ -69,6 +72,28 @@ class TorchRLPPOAgent(PPOAgent):
         self._pending_batches = []
 
     def update(self, rollout: TensorDictBase):
+        return self.update_rollouts([rollout])
+
+    @torch.no_grad()
+    def act_batch(self, observations, deterministic=False):
+        observation = torch.as_tensor(observations, dtype=torch.float32, device=self.device)
+        data = TensorDict({"observation": observation}, [len(observation)])
+        with set_exploration_type(ExplorationType.MODE if deterministic else ExplorationType.RANDOM):
+            self.policy(data)
+        outputs = torch.cat((data["action"], data["raw_action"], data["raw_log_prob"][:, None],
+                             self.critic(observation)[:, None]), dim=1).cpu().numpy()
+        self.last_raw_actions = outputs[:, self.action_dim:2 * self.action_dim].copy()
+        return outputs[:, :self.action_dim], outputs[:, -2], outputs[:, -1]
+
+    def update_rollouts(self, rollouts):
+        # GAE must see each race's time axis independently, before flattening.
+        for rollout in rollouts:
+            self._append_rollout(rollout)
+        if self._pending_steps < self.min_rollout_steps:
+            return {}
+        return self.flush_pending_update()
+
+    def _append_rollout(self, rollout):
         if not isinstance(rollout, TensorDictBase):
             raise TypeError("TorchRL PPO requires a TensorDict rollout")
         data = rollout.to(self.device).clone()
@@ -76,9 +101,6 @@ class TorchRLPPOAgent(PPOAgent):
             self.gae(data)
         self._pending_batches.append(data.reshape(-1))
         self._pending_steps += data.numel()
-        if self._pending_steps < self.min_rollout_steps:
-            return {}
-        return self.flush_pending_update()
 
     def flush_pending_update(self):
         if not self._pending_batches:

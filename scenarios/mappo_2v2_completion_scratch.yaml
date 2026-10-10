@@ -1,6 +1,7 @@
-
+# TorchRL MAPPO with the PettingZoo parallel adapter; variants inherit this backend.
 experiment:
   name: mappo_2v2_completion_scratch
+  mappo_backend: torchrl
   episodes: 5000
   seed: 42
   num_envs: 1
@@ -10,9 +11,9 @@ experiment:
   total_steps: 120000000
   collector_scheduling: synchronous
 training_defaults:
-  update_version: p7-packed-batch512-v1
+  update_version: torchrl-mappo-batch512-v1
   progress_unit: environment_steps
-  n_steps: 2048
+  n_steps: 2048  # joint race decisions per serial update
   action_repeat: 1
   n_epochs: 10
   gae_lambda: 0.95
@@ -33,7 +34,7 @@ training_defaults:
   pretrained_actor_observation_extension: frenet_neighbors
   device: cpu
   checkpoint_every_steps: 4096000
-  rollout_steps_per_env: 256
+  rollout_steps_per_env: 256  # joint decisions per environment in parallel
 mappo:
   actor_mode: independent
   reward_mode: team_shared
@@ -487,6 +488,7 @@ wandb:
   job_type: mappo-team
   tags:
   - mappo
+  - torchrl
   - 2v2
   - lap-completion
   - scratch

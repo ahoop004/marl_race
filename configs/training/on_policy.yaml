@@ -1,6 +1,10 @@
+experiment:
+  ppo_backend: torchrl
+
 training_defaults:
-  progress_unit: episodes
-  n_steps: 2048
+  update_version: torchrl-ppo-v1
+  progress_unit: environment_steps
+  n_steps: 2048  # pooled decisions; must divide evenly across num_envs
   n_epochs: 10
   gae_lambda: 0.95
   clip_range: 0.2

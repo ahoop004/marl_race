@@ -81,9 +81,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--torch-threads", type=int, default=None,
                    help="Parent PyTorch CPU threads; parallel collectors use one each")
     p.add_argument("--ppo-backend", choices=("torch", "torchrl"), default=None,
-                   help="PPO implementation; TorchRL currently requires one environment")
+                   help="PPO implementation")
     p.add_argument("--mappo-backend", choices=("torch", "torchrl"), default=None,
-                   help="MAPPO implementation; TorchRL currently requires one environment")
+                   help="MAPPO implementation")
     p.add_argument("--eval", action="store_true", help="Run evaluation instead of training")
     p.add_argument("--checkpoint", type=str, default=None,
                    help="Checkpoint file or run directory (best_model.pt): evaluate with --eval, "
@@ -554,6 +554,8 @@ def main() -> None:
         env_seed = env_cfg.get("seed")
         env_seed = exp_cfg["seed"] if env_seed is None else env_seed
         provenance["ppo_collection"] = {
+            "backend": exp_cfg.get("ppo_backend", "torch"),
+            "advantage_estimator": "torchrl.GAE" if exp_cfg.get("ppo_backend") == "torchrl" else "legacy_gae",
             "mode": ("synchronous_grouped_workers_v1" if (int(exp_cfg.get("num_workers", num_envs)) < num_envs
                        or exp_cfg.get("collector_scheduling") == "ready")
                      else "synchronous_workers_v1"),
@@ -566,6 +568,9 @@ def main() -> None:
         }
     if num_envs > 1 and algorithm == "mappo":
         provenance["mappo_collection"] = {
+            "backend": exp_cfg.get("mappo_backend", "torch"),
+            "advantage_estimator": ("torchrl.MultiAgentGAE" if exp_cfg.get("mappo_backend") == "torchrl"
+                                    else "legacy_gae"),
             "mode": "synchronous_grouped_workers_v1", "num_envs": num_envs,
             "num_workers": min(num_envs, int(exp_cfg.get("num_workers", num_envs))),
             "worker_threads": 1,

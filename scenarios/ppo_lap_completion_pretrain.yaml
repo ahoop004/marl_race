@@ -11,6 +11,8 @@
 experiment:
   # Run/output name; use a distinct name for each parameter comparison.
   name: ppo_lap_completion_pretrain
+  # TorchRL losses/GAE with the Gymnasium task adapter.
+  ppo_backend: torchrl
   # Aggregate environment decisions, excluding evaluation; one joint race step counts once.
   total_steps: 120000000
   # Reproducible seed. Keep final-test seeds disjoint from checkpoint-selection seeds.
@@ -29,8 +31,10 @@ experiment:
 # Shared learner defaults. agents.<id>.params overrides these values.
 training_defaults:
   # Options used here: episodes or environment_steps; match the chosen run budget.
-  progress_unit: episodes
-  # PPO: pooled rollout transitions. MAPPO: per-agent serial buffer size.
+  progress_unit: environment_steps
+  # Records the new loss/advantage implementation in resolved-config provenance.
+  update_version: torchrl-ppo-v1
+  # PPO: pooled decisions across all environments.
   n_steps: 2048
   # Optimizer passes over each collected rollout.
   n_epochs: 10
@@ -445,7 +449,7 @@ agents:
         - 512
       # Available network activations: tanh, relu, silu, swish, leaky_relu (see agents/common/networks.py).
       activation: leaky_relu
-      # PPO: pooled rollout transitions. MAPPO: per-agent serial buffer size.
+      # Pooled decisions across all environments; --rollout-steps-per-env overrides this.
       n_steps: 409600
       # Reward discount per policy decision; changing action_repeat changes its physical time horizon.
       gamma: 0.99
@@ -506,6 +510,7 @@ wandb:
   # Searchable run labels.
   tags:
     - ppo
+    - torchrl
     - single-agent
     - time-trial
     - actor-pretraining
@@ -528,12 +533,13 @@ wandb:
 # environment.friction.eval: {mode: grid, values: [0.8, 1.0, 1.2]}
 # Friction phases accept exactly the keys shown for the chosen mode.
 # Optional controls (uncomment at the indicated section, or use --set):
-# experiment.collector_scheduling: synchronous  # synchronous | ready; self-play retains its scheduler.
+# experiment.collector_scheduling: synchronous  # synchronous | ready
+# experiment.ppo_backend: torch  # Legacy implementation for comparison runs.
 # experiment.checkpoint: null  # PPO scratch; set a file/run directory for transfer or evaluation.
 # experiment.evaluation_only: false  # true requires --eval.
 # Local: --num-envs 1 --num-workers 1 --rollout-steps-per-env 1024
 # HPC: --num-envs 400 --num-workers 100 --rollout-steps-per-env 1024
-# The active historical base retains its 409600-transition rollout for compatibility.
+# The base keeps a 409600-decision rollout; use the local recipe for smaller updates.
 
 # Parameter choice: ppo_lap_completion_pretrain_local
 # Apply these assignments together to reproduce the previous settings:

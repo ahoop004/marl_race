@@ -177,8 +177,13 @@ def _make_collector(scenario, scenario_dir, env_id, episodes, horizon, contract,
             space.low, space.high, scenario["agents"][ids[0]].get("action_constraints", {}),
             decision_dt=float(env_cfg.get("timestep", .01)) * repeat,
         )
-        agent = CollectorAgent(contract, horizon)
-        trainer = MARLTrainer(
+        agent_class, trainer_class = CollectorAgent, MARLTrainer
+        if contract.get("collection_backend") == "torchrl":
+            from training.torchrl_collectors import MAPPOCollectorAgent
+            from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
+            agent_class, trainer_class = MAPPOCollectorAgent, TorchRLMAPPOTrainer
+        agent = agent_class(contract, horizon)
+        trainer = trainer_class(
             env, agent, ids, opponents, obs, rewards, actions, action_repeat=repeat,
             hooks=[_WorkerHook(sink, env_id, seed, record_transitions)],
             run_id=f"{run_id}_env{env_id:04d}", reward_mode=agent.reward_mode,
@@ -246,14 +251,20 @@ def _collect_worker(connection, scenario, scenario_dir, assignments, horizon,
                     else:
                         advance(env_id, response)
             fragments = [fragment for agent in agents.values() for fragment in agent.take_fragments()]
-            pooled = None if not fragments else tuple(
-                np.concatenate([fragment[i] for fragment in fragments]) for i in range(3)
-            )
+            if contract.get("collection_backend") == "torchrl":
+                from training.torchrl_collectors import serialize_rollout
+                pooled = [serialize_rollout(fragment) for fragment in fragments] or None
+            else:
+                pooled = None if not fragments else tuple(
+                    np.concatenate([fragment[i] for fragment in fragments]) for i in range(3)
+                )
             physics = sum(a.physics_steps_collected for a in agents.values()) - physics_start
             connection.send(("rollout", (pooled, sum(counts.values()), physics, sink.take())))
             metrics = connection.recv()  # Policy update barrier, including an empty final rollout.
             for agent in agents.values():
                 agent.policy_version = metrics["train/updates"]
+            if metrics.get("collector_stop", False):
+                break
             for env_id in sorted(paused):
                 advance(env_id)
         connection.send(("done", sink.take()))
@@ -287,18 +298,21 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
     scheduler = CollectorScheduler(experiment.get("collector_scheduling", "synchronous"),
                                    startup["worker_response_timeout_s"])
     agent = trainer.agent
+    native = getattr(agent, "collection_backend", None) == "torchrl"
     contract = {name: getattr(agent, name) for name in (
         "agent_ids", "obs_dim", "global_state_dim", "global_state_contract_version",
         "obs_dims", "observation_contracts",
         "action_dim", "action_low", "action_high", "observation_contract", "gamma",
         "gae_lambda", "critic_mode", "reward_mode", "team_return_mode", "team_reward_reduction",
     )}
+    if native:
+        contract["collection_backend"] = "torchrl"
     record_hooks = transition_record_hooks(trainer.hooks)
     connections, processes, process_by_worker = {}, [], {}
     completed, collected, actor_samples, updates = 0, 0, 0, 0
     physics_collected = 0
     pending_episodes = []
-    success = False
+    success = stopped = False
     started_training = time.perf_counter()
     context = mp.get_context("spawn")
     # Set before spawning, so NumPy/BLAS/Numba imports inherit single-thread limits.
@@ -492,20 +506,28 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
                 progress.finish_collection()
                 steps = sum(item[1] for item in waiting.values())
                 rollouts = [waiting[i][0] for i in sorted(waiting) if waiting[i][0] is not None]
-                samples = sum(len(item[0]) for item in rollouts)
+                if native:
+                    from training.torchrl_collectors import deserialize_rollout
+                    rollouts = [deserialize_rollout(fragment) for worker in rollouts for fragment in worker]
+                    samples = sum(int(item["agents", "mask"].sum()) for item in rollouts)
+                else:
+                    samples = sum(len(item[0]) for item in rollouts)
                 collected += steps
                 physics_collected += sum(item[2] for item in waiting.values())
                 actor_samples += samples
                 trainer._environment_steps = collected
+                trainer._physics_steps = physics_collected
+                trainer._agent_steps = actor_samples
                 progress.set(phase="episode_logging")
                 publish_progress(force=True)
                 flush_episodes()
                 progress.set(phase="updating")
                 publish_progress(force=True)
                 started = time.perf_counter()
-                metrics = agent.update_rollouts(rollouts) if samples else {}
+                metrics = agent.update_rollouts(rollouts) if samples and not trainer._should_stop() else {}
                 update_s = time.perf_counter() - started
-                updates += bool(samples)
+                updates += bool(metrics)
+                trainer._updates = updates
                 metrics.update({
                     "train/environment_steps": collected, "train/agent_steps": actor_samples,
                     "train/physics_steps": physics_collected,
@@ -533,8 +555,9 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
                 if steps:
                     for hook in trainer.hooks:
                         hook.on_update(metrics)
+                stopped = trainer._should_stop()
                 for worker_id in waiting:
-                    connections[worker_id].send(metrics)
+                    connections[worker_id].send(dict(metrics, collector_stop=True) if stopped else metrics)
                 waiting.clear()
                 scheduler.reset()
                 round_start = time.perf_counter()
@@ -544,9 +567,9 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
                 progress.set(phase="collecting", waiting_workers=0)
                 publish_progress(force=True)
         flush_episodes()
-        if total_steps is not None and collected != total_steps:
+        if not stopped and total_steps is not None and collected != total_steps:
             raise RuntimeError(f"MAPPO collectors collected {collected} of {total_steps} environment decisions")
-        if total_steps is None and completed != n_episodes:
+        if not stopped and total_steps is None and completed != n_episodes:
             raise RuntimeError(f"MAPPO collectors completed {completed} of {n_episodes} episodes")
         progress.set(phase="final_checkpoint")
         publish_progress(force=True)
