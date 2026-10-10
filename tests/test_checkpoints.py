@@ -198,7 +198,7 @@ def test_mappo_recovery_restores_actor_ownership_and_lora_base(mode, tmp_path):
     continued = OnPolicyTrainer(new_task, recovered, hooks=[capture, CheckpointHook(recovered, tmp_path / "recovery")])
     continued.restore_training_state(state)
     continued.train(total_steps=5)
-    assert continued.collected_steps == 5 and len(capture.steps) == 6
+    assert continued.collected_steps == 5 and len(capture.steps) == 8
     assert continued._agent_steps == 10
 
 

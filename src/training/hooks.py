@@ -28,6 +28,9 @@ class TrainingHook:
 
     requires_transition_record: Optional[bool] = None
 
+    def bind_trainer(self, trainer):
+        self._trainer = trainer
+
     def on_episode_start(self, metadata: Dict) -> None:
         """Small reset provenance record, independent of transition capture."""
         pass
@@ -167,6 +170,22 @@ class ConsoleHook(TrainingHook):
                 agent_counts = Counter(outcomes)
                 self._log.print_info(f"    {aid} outcomes: {dict(agent_counts)}")
 
+    def on_update(self, metrics: Dict[str, float]) -> None:
+        self._log.print_info(
+            f"update {metrics['train/updates']}  "
+            f"environment_steps={metrics['train/environment_steps']}  "
+            f"physics_steps={metrics['train/physics_steps']}  "
+            f"learner_samples={metrics['train/agent_steps']}  "
+            f"episodes={metrics['train/completed_episodes']}  "
+            f"optimizer_steps={metrics['train/optimizer_steps_total']}")
+
+    def on_training_end(self) -> None:
+        trainer = getattr(self, "_trainer", None)
+        if trainer is not None:
+            progress = trainer.checkpoint_progress()
+            self._log.print_info("Training stopped: " + "  ".join(
+                f"{key}={value}" for key, value in progress.items() if key != "next_episode"))
+
 
 class WandbHook(TrainingHook):
     """Log completed episode facts without requesting per-step transitions."""
@@ -185,6 +204,9 @@ class WandbHook(TrainingHook):
         learners = {aid: facts for aid, facts in race.get("agents", {}).items()
                     if facts["team"] == "trainable"}
         log = {"episode/reward": reward, "episode/number": episode}
+        log.update({key.replace("train/", "episode/"): value for key, value in metrics.items() if key in {
+            "train/environment_steps", "train/physics_steps", "train/agent_steps",
+            "train/completed_episodes", "train/updates", "train/optimizer_steps_total"}})
         for key in ("outcome", "map_bundle"):
             value = info.get(key)
             if value is not None:
@@ -246,6 +268,11 @@ class WandbHook(TrainingHook):
         self._update += 1
         self._wandb.log_metrics({"train/updates": self._update, **metrics})
 
+    def on_training_end(self) -> None:
+        trainer = getattr(self, "_trainer", None)
+        if trainer is not None:
+            self._wandb.log_metrics(trainer.counter_metrics())
+
 
 class CSVHook(TrainingHook):
     """Persist normal training metrics locally, independent of W&B."""
@@ -260,6 +287,9 @@ class CSVHook(TrainingHook):
         self._csv.log_update(metrics)
 
     def on_training_end(self) -> None:
+        trainer = getattr(self, "_trainer", None)
+        if trainer is not None:
+            self._csv.save_summary(trainer.checkpoint_progress())
         self._csv.close()
 
 

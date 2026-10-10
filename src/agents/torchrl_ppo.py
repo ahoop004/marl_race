@@ -35,7 +35,8 @@ class _Value(torch.nn.Module):
 class TorchRLPPOAgent(PPOPolicy):
     def __init__(self, obs_dim, action_low, action_high, params):
         super().__init__(obs_dim, action_low, action_high, params, training=True)
-        if min(self.n_steps, self.n_epochs, self.batch_size) < 1:
+        self.frames_per_batch = int(params.get("frames_per_batch", 256))
+        if min(self.n_steps, self.n_epochs, self.batch_size, self.frames_per_batch) < 1:
             raise ValueError("PPO rollout size, epochs, and batch size must be positive")
         parameters = TensorDictModule(
             _PolicyParameters(self.actor), in_keys=["observation"], out_keys=["loc", "scale"],
@@ -74,6 +75,7 @@ class TorchRLPPOAgent(PPOPolicy):
         )
         self._pending_batches = []
         self._pending_steps = 0
+        self._pending_environment_steps = 0
 
     def update(self, rollout: TensorDictBase):
         return self.update_rollouts([rollout])
@@ -100,20 +102,37 @@ class TorchRLPPOAgent(PPOPolicy):
     def _append_rollout(self, rollout):
         if not isinstance(rollout, TensorDictBase):
             raise TypeError("TorchRL PPO requires a TensorDict rollout")
+        if not rollout.batch_size.numel():
+            return
         data = rollout.to(self.device).clone()
+        environment_steps = data.numel()
         if ("agents", "observation") in data.keys(True):
             data["observation"] = data["agents", "observation"].squeeze(-2)
             data["next", "observation"] = data["next", "agents", "observation"].squeeze(-2)
             data["next", "reward"] = data["next", "agents", "reward"].squeeze(-2)
+            # Physical race closure may occur after the PPO learner retires.
+            data["next", "done"] = data["next", "agents", "done"].squeeze(-2)
+            data["next", "terminated"] = data["next", "agents", "terminated"].squeeze(-2)
         with torch.no_grad():
             self.gae(data)
-        self._pending_batches.append(data.reshape(-1))
-        self._pending_steps += data.numel()
+        data = data.reshape(-1)
+        if ("agents", "active") in data.keys(True):
+            data = data[data["agents", "active"].reshape(-1)]
+        self._pending_environment_steps += environment_steps
+        if not data.batch_size.numel():
+            return
+        self._pending_batches.append(data)
+        self._pending_steps += data.batch_size.numel()
 
     def flush_pending_update(self):
         if not self._pending_batches:
+            self._pending_environment_steps = 0
             return {}
         data = torch.cat(self._pending_batches, dim=0)
         self._pending_batches.clear()
         self._pending_steps = 0
-        return optimize_ppo(self, data)
+        metrics = optimize_ppo(self, data)
+        metrics["train/rollout_agent_samples"] = data.numel()
+        metrics["train/rollout_steps"] = self._pending_environment_steps
+        self._pending_environment_steps = 0
+        return metrics

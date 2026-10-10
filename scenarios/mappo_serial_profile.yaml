@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+- mappo_2v2_completion_scratch
+- override /algorithm: mappo_profile
+- override /execution: serial_profile
+- _self_
+experiment:
+  name: mappo_serial_profile
+environment:
+  render: false
+evaluation:
+  enabled: false
+wandb:
+  enabled: false

@@ -8,9 +8,10 @@ class OnPolicyOptimizationSettings:
         self.lr_schedule = str(params.get("lr_schedule", "constant"))
         if self.lr_schedule not in {"constant", "linear"}:
             raise ValueError("lr_schedule must be 'constant' or 'linear'")
-        if self.lr_schedule == "linear" and "learning_rate_end" not in params:
+        if self.lr_schedule == "linear" and params.get("learning_rate_end") is None:
             raise ValueError("Linear lr_schedule requires learning_rate_end")
-        self.lr_end = float(params.get("learning_rate_end", self.lr))
+        end = params.get("learning_rate_end")
+        self.lr_end = self.lr if end is None else float(end)
         if not all(np.isfinite(rate) and rate > 0 for rate in (self.lr, self.lr_end)):
             raise ValueError("Learning rates must be finite and positive")
         if self.lr_schedule == "constant" and self.lr_end != self.lr:

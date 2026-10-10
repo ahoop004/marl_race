@@ -96,6 +96,37 @@ def test_budget_cut_bootstraps_one_shared_global_value(monkeypatch):
     torch.testing.assert_close(captured[0]["agents", "value_target"].flatten(), torch.tensor([3.7, 3.7]))
 
 
+def test_pooled_completed_episodes_keep_separate_team_returns(monkeypatch):
+    agent = learner()
+    with torch.no_grad():
+        for parameter in agent.critic.parameters():
+            parameter.zero_()
+    data = torch.stack([transition(agent, IDS, step, reward, terminal=terminal)
+                        for step, reward, terminal in ((0, 1, False), (1, 2, True), (0, 100, True))])
+    captured = []
+    monkeypatch.setattr("agents.torchrl_mappo.optimize_ppo",
+                        lambda agent, data, **kwargs: captured.append(data.clone()) or {})
+    agent.update(data)
+    torch.testing.assert_close(captured[0]["agents", "value_target"].flatten(),
+                               torch.tensor([2.8, 2.8, 2., 2., 100., 100.]))
+
+
+@pytest.mark.parametrize("frames_per_batch", [1, 16])
+def test_collection_accumulates_team_samples_across_races(frames_per_batch):
+    from test_native_torchrl_env import team_task
+
+    task = team_task({3: ((), True, (), (*IDS, "car_2", "car_3"))})
+    policy = TorchRLMAPPOAgent(1, task.state_space().shape[0], *BOUNDS, IDS,
+                              params(n_steps=8, frames_per_batch=frames_per_batch))
+    hook = Capture(False)
+    training = TorchRLMAPPOTrainer(task, policy, hooks=[hook])
+    training.train(total_steps=7)
+    assert [row["train/environment_steps"] for row in hook.updates] == [4, 7]
+    assert [row["train/rollout_agent_samples"] for row in hook.updates] == [8, 6]
+    assert [row["train/update_agent_samples"] for row in hook.updates] == [8, 6]
+    assert len(hook.episodes) == 2
+
+
 @pytest.mark.parametrize("actor_mode", ["shared", "independent", "lora"])
 def test_native_update_routes_actors_and_reloads_versioned_checkpoints(actor_mode, tmp_path):
     extra = {"actor_mode": actor_mode, "hidden_dims": [4]}
@@ -134,7 +165,8 @@ def test_native_update_routes_actors_and_reloads_versioned_checkpoints(actor_mod
         np.testing.assert_array_equal(actual[aid], expected[aid])
 
 
-def test_native_training_preserves_team_rewards_and_fixed_only_continuation():
+@pytest.mark.parametrize("target,samples,steps", [(4, [4, 2], [3, 6]), (5, [6], [6]), (8, [6], [6])])
+def test_native_training_preserves_team_rewards_and_fixed_only_continuation(target, samples, steps):
     class Core(ScriptedEnv):
         possible_agents = (*IDS, "car_2", "car_3")
         trainable_agents = tuple(IDS)
@@ -158,7 +190,7 @@ def test_native_training_preserves_team_rewards_and_fixed_only_continuation():
         obs_composers={aid: ObservationComposer([LidarComponent(1, 10, normalize=False)]) for aid in IDS},
         reward_composers={aid: Reward() for aid in IDS},
         action_composers={aid: ActionComposer([]) for aid in IDS}, team_reward_agent_id=IDS[0])
-    training = TorchRLMAPPOTrainer(task, learner(), hooks=[hooks])
+    training = TorchRLMAPPOTrainer(task, learner(n_steps=target), hooks=[hooks])
     training.train(total_steps=6)
     assert training._environment_steps == training._physics_steps == training._agent_steps == 6
     assert len(hooks.steps) == 6
@@ -166,8 +198,10 @@ def test_native_training_preserves_team_rewards_and_fixed_only_continuation():
     assert [record.reward for record in hooks.steps] == [11, 11, 11, 11.5, 11, 11]
     assert len(hooks.episodes) == 1 and hooks.episodes[0][1] == 33.5
     assert hooks.episodes[0][3]["episode_steps"] == 5
-    assert [row["train/rollout_agent_samples"] for row in hooks.updates] == [4, 2]
-    assert [row["train/environment_steps"] for row in hooks.updates] == [5, 6]
+    assert [row["train/rollout_agent_samples"] for row in hooks.updates] == samples
+    assert [row["train/environment_steps"] for row in hooks.updates] == steps
+    assert [row["train/update_agent_samples"] for row in hooks.updates] == samples
+    assert sum(row["train/update_environment_steps"] for row in hooks.updates) == 6
     assert hooks.ended
 
 

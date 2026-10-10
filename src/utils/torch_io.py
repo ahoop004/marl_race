@@ -72,6 +72,13 @@ def atomic_save(payload, path):
             temporary.unlink(missing_ok=True)
 
 
+def synchronize_device(device) -> None:
+    """Complete CUDA work at timing boundaries; CPU needs no synchronization."""
+    device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def resolve_device(preferred: Optional[Iterable[Any]] = None) -> torch.device:
     """Resolve torch device from preferred values, environment, then availability."""
 
@@ -106,4 +113,4 @@ def resolve_device(preferred: Optional[Iterable[Any]] = None) -> torch.device:
     return torch.device("cpu")
 
 
-__all__ = ["safe_load", "atomic_save", "resolve_device", "validate_checkpoint_compatibility"]
+__all__ = ["safe_load", "atomic_save", "resolve_device", "synchronize_device", "validate_checkpoint_compatibility"]

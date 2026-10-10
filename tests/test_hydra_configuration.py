@@ -247,3 +247,29 @@ def test_resolved_config_and_choices_are_saved_with_experiments(tmp_path):
     assert snapshot["_configuration"]["choices"]["adaptation"] == "lora"
     assert snapshot["adaptation"]["lora"]["rank"] == 2
     assert json.loads((tmp_path / "config_snapshot.json").read_text())["config"] == config
+
+
+@pytest.mark.parametrize("algorithm,target,rate", [("ppo", 4096, .001), ("mappo", 2048, .0001)])
+def test_serial_profiling_presets_keep_production_settings_separate(algorithm, target, rate):
+    production_path = PRETRAIN if algorithm == "ppo" else TEAM
+    production = load_and_expand_scenario(production_path)
+    config = load_and_expand_scenario(f"scenarios/{algorithm}_serial_profile.yaml")
+    validate_experiment_scenario(config)
+    values = resolve_training_params(config["agents"]["car_0"], config)
+    assert values["n_steps"] == target and values["frames_per_batch"] == 256
+    assert values["n_epochs"] == 4 and values["batch_size"] == 512
+    assert values["learning_rate"] == rate and values["lr_schedule"] == "constant"
+    assert values.get("learning_rate_end") in (None, rate)
+    assert values["device"] == "cpu" and values["target_kl"] is None
+    assert {key: values[key] for key in ("gamma", "gae_lambda", "clip_range", "ent_coef", "vf_coef", "max_grad_norm")} == {
+        "gamma": .99, "gae_lambda": .95, "clip_range": .2, "ent_coef": .01, "vf_coef": .5, "max_grad_norm": .5}
+    assert config["experiment"]["torch_threads"] == 1
+    assert config["experiment"]["total_steps"] == 16384 and "episodes" not in config["experiment"]
+    assert not config["evaluation"]["enabled"] and not config["wandb"]["enabled"]
+    assert not config["environment"]["render"] and config["environment"]["max_steps"] > 0
+    assert config["checkpoint"]["every_steps"] is None
+    overridden = load_and_expand_scenario(f"scenarios/{algorithm}_serial_profile.yaml", overrides=[
+        "experiment.total_steps=9", "execution.params.device=cuda"])
+    assert overridden["experiment"]["total_steps"] == 9
+    assert overridden["training_defaults"]["device"] == "cuda"
+    assert load_and_expand_scenario(production_path) == production

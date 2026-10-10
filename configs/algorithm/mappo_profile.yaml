@@ -1,0 +1,11 @@
+defaults:
+- mappo
+- _self_
+params:
+  n_steps: 2048  # Active learner samples per update, across completed races.
+  frames_per_batch: 256
+  batch_size: 512
+  n_epochs: 4
+  learning_rate: 0.0001
+  lr_schedule: constant
+  target_kl: null

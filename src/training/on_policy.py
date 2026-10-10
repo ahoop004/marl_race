@@ -7,6 +7,7 @@ from torchrl.collectors import Collector
 from adapters.native_torchrl import NativeRaceTorchRLEnv
 from training.contracts import validate_team_reward_composers
 from training.race_reporting import RaceTrainingReports
+from utils.torch_io import synchronize_device
 
 
 class _CollectionBoundary:
@@ -47,6 +48,8 @@ class OnPolicyTrainer:
             if task.action_repeat != 1:
                 raise ValueError("Joint team returns require action_repeat=1")
         self._environment_steps = self._physics_steps = self._agent_steps = self._updates = 0
+        # n_steps targets active actor samples. A joint decision is indivisible,
+        # so MAPPO can exceed the target by at most number_of_learners - 1.
         self._pending_learning_steps = 0
         self.total_steps = self.n_episodes = None
         self.env = None
@@ -64,6 +67,14 @@ class OnPolicyTrainer:
                 "physics_steps": self._physics_steps, "completed_episodes": self.reports.completed,
                 "updates": self._updates, "optimizer_steps": self._optimizer_steps,
                 "next_episode": self.reports.next_episode}
+
+    def counter_metrics(self):
+        return {"train/environment_steps": self._environment_steps,
+                "train/physics_steps": self._physics_steps,
+                "train/agent_steps": self._agent_steps,
+                "train/completed_episodes": self.reports.completed,
+                "train/updates": self._updates,
+                "train/optimizer_steps_total": self._optimizer_steps}
 
     def checkpoint_state(self):
         """Recovery at a completed update; the next collection starts a new race.
@@ -146,21 +157,28 @@ class OnPolicyTrainer:
         started = collection_started = time.perf_counter()
         metrics = {}
         collector = None
+        update_environment_steps = self._environment_steps
+        update_physics_steps = self._physics_steps
+        update_agent_steps = self._agent_steps
         self._set_progress()
 
         def report_update(updated, update_started):
-            nonlocal collection_started
+            nonlocal collection_started, update_environment_steps, update_physics_steps, update_agent_steps
             if updated:
                 self._updates += 1
                 self._optimizer_steps += int(updated["train/optimizer_steps"])
                 updated.update({
-                    "train/environment_steps": self._environment_steps,
-                    "train/physics_steps": self._physics_steps, "train/agent_steps": self._agent_steps,
-                    "train/updates": self._updates,
+                    **self.counter_metrics(),
+                    "train/update_environment_steps": self._environment_steps - update_environment_steps,
+                    "train/update_physics_steps": self._physics_steps - update_physics_steps,
+                    "train/update_agent_samples": self._agent_steps - update_agent_steps,
                     "perf/update_seconds": time.perf_counter() - update_started,
                     "perf/collection_seconds": update_started - collection_started,
                     "perf/elapsed_seconds": time.perf_counter() - started,
                     "perf/end_to_end_env_steps_per_second": self._environment_steps / max(time.perf_counter() - started, 1e-9)})
+                update_environment_steps = self._environment_steps
+                update_physics_steps = self._physics_steps
+                update_agent_steps = self._agent_steps
                 for hook in self.hooks:
                     hook.on_update(updated)
                 collection_started = time.perf_counter()
@@ -175,8 +193,15 @@ class OnPolicyTrainer:
 
         def optimize(data):
             self._set_progress()
+            synchronize_device(self.agent.device)
             update_started = time.perf_counter()
-            return report_update(self.agent.update(data), update_started)
+            updated = self.agent.update(data)
+            # The trainer owns cadence, including final rollouts smaller than
+            # the legacy PPO minimum used by direct update_rollouts callers.
+            if not updated and getattr(self.agent, "_pending_batches", []):
+                updated = self.agent.flush_pending_update()
+            synchronize_device(self.agent.device)
+            return report_update(updated, update_started)
 
         try:
             require_source = getattr(self.agent, "_require_lora_source", None)
@@ -190,7 +215,7 @@ class OnPolicyTrainer:
                     self.env.set_seed(self._resume_state["recovery_seed"])
                 collector = Collector(
                     self.env, self.agent.collection_policy, backend="direct",
-                    frames_per_batch=self.agent.n_steps, total_frames=-1,
+                    frames_per_batch=self.agent.frames_per_batch, total_frames=-1,
                     policy_device=self.agent.device, env_device="cpu", storing_device="cpu",
                     reset_at_each_iter=False, set_truncated=False, use_buffers=True,
                     auto_register_policy_transforms=False,
@@ -203,11 +228,14 @@ class OnPolicyTrainer:
                 for data in collector:
                     self.checkpoint_ready = False
                     updated = False
-                    pending.append(data)
-                    boundary = self.env.last_step is None
-                    ready = (self._pending_learning_steps >= self.agent.n_steps or self.budget_reached()
-                             or (boundary and (self.algorithm == "mappo" or total_steps is None)))
-                    if ready:
+                    metrics = {}
+                    # Fixed-only continuation counts toward the physical budget,
+                    # but follows the learner endpoint and needs no GAE rows.
+                    data = data[data["agents", "active"].any(dim=(-2, -1))]
+                    if data.batch_size.numel():
+                        pending.append(data)
+                    ready = self._pending_learning_steps >= self.agent.n_steps or self.budget_reached()
+                    if ready and pending:
                         metrics = optimize(torch.cat(pending, dim=0))
                         pending, self._pending_learning_steps = [], 0
                         updated = bool(metrics)
@@ -220,12 +248,6 @@ class OnPolicyTrainer:
                     metrics = optimize(torch.cat(pending, dim=0))
                     pending, self._pending_learning_steps = [], 0
                     if metrics:
-                        checkpoint_boundary()
-                flush = getattr(self.agent, "flush_pending_update", None)
-                if not self._should_stop() and flush:
-                    self._set_progress()
-                    update_started = time.perf_counter()
-                    if report_update(flush(), update_started):
                         checkpoint_boundary()
             for hook in self.hooks:
                 hook.on_training_end()

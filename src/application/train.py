@@ -163,6 +163,14 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     if wandb_logger:
         provenance["wandb_run_id"] = wandb_logger.wandb_run_id
     provenance["network"] = learner.network_config
+    provenance["execution"] = {
+        "requested_device": params.get("device", "cpu"),
+        "policy_device": str(learner.device),
+        "environment_device": "cpu",
+        "rollout_storage_device": "cpu",
+        "update_device": str(learner.device),
+        "torch_threads": exp_cfg.get("torch_threads", 1),
+    }
     provenance["algorithm_implementation"] = {
         "backend": "torchrl",
         "loss": "torchrl.ClipPPOLoss" if algorithm == "ppo" else "torchrl.MAPPOLoss",
@@ -176,6 +184,9 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "mode": "serial",
         "num_envs": 1,
         "inference": "local",
+        "frames_per_batch": learner.frames_per_batch,
+        "learning_sample_target": learner.n_steps,
+        "learning_sample_unit": "active_learner_samples",
     }
     csv_logger = CSVLogger(
         output_dir=output_dir,

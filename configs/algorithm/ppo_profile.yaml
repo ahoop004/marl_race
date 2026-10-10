@@ -1,0 +1,12 @@
+defaults:
+- ppo
+- _self_
+params:
+  n_steps: 4096  # Active learner samples per update.
+  frames_per_batch: 256  # Physical collector rows; independent of n_steps.
+  batch_size: 512
+  n_epochs: 4
+  learning_rate: 0.001
+  lr_schedule: constant
+  learning_rate_end: null
+  target_kl: null

@@ -182,7 +182,7 @@ def test_evaluation_gate_stops_collection_and_preserves_evaluated_weights():
 
 def test_episode_budget_flushes_a_deferred_update_with_final_learning_rate():
     hook = Capture(False)
-    training, controller = trainer(hook, min_rollout_steps=10, lr_schedule="linear",
+    training, controller = trainer(hook, n_steps=10, min_rollout_steps=10, lr_schedule="linear",
                                    learning_rate=1e-3, learning_rate_end=1e-4)
     training.train(n_episodes=2)
     assert training.collected_steps == 6
@@ -213,7 +213,10 @@ def test_rollout_fragments_bootstrap_independently_with_native_log_probabilities
 
 
 @pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
-def test_serial_trainers_stop_after_update_and_keep_evaluated_weights(algorithm):
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_serial_trainers_stop_after_update_and_keep_evaluated_weights(algorithm, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA hardware unavailable")
     from pathlib import Path
     from core.scenario import load_and_expand_scenario
     from core.task_builder import create_race_task
@@ -228,7 +231,7 @@ def test_serial_trainers_stop_after_update_and_keep_evaluated_weights(algorithm)
     scenario = load_and_expand_scenario(str(scenarios / filename), overrides=overrides)
     task = create_race_task(scenario, scenario_dir=scenarios)
     ids = list(task.possible_agents)
-    params = {"device": "cpu", "hidden_dims": [8], "n_steps": 4, "n_epochs": 1, "batch_size": 4}
+    params = {"device": device, "hidden_dims": [8], "n_steps": 4, "n_epochs": 1, "batch_size": 4}
     obs_dim = task.obs_composers[ids[0]].obs_dim
     bounds = task.env.action_spaces[ids[0]]
     hook = Capture(False)
@@ -255,7 +258,9 @@ def test_serial_trainers_stop_after_update_and_keep_evaluated_weights(algorithm)
             learner = TorchRLMAPPOAgent(obs_dim, len(state.vector), bounds.low, bounds.high, ids, params)
             training = TorchRLMAPPOTrainer(task, learner, hooks=[hook])
         training.train(total_steps=7)
-        assert len(hook.updates) == 1 and hook.updates[0]["train/environment_steps"] == 4
+        assert len(hook.updates) == 1
+        assert hook.updates[0]["train/environment_steps"] == (4 if algorithm == "ppo" else 2)
+        assert hook.updates[0]["train/rollout_agent_samples"] == 4
         assert hook.ended and not hook.episodes
         for key, value in learner.actor.state_dict().items():
             torch.testing.assert_close(value, hook.weights[key], rtol=0, atol=0)

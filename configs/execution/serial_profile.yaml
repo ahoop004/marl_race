@@ -1,0 +1,7 @@
+experiment:
+  total_steps: 16384  # Joint environment decisions; override with --total-steps.
+  seed: 42
+  torch_threads: 1
+params:
+  device: cpu  # CUDA: execution.params.device=cuda
+checkpoint_every_steps: null

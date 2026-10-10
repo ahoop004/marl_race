@@ -24,7 +24,8 @@ def optimize_ppo(agent, data, *, group=None):
         sampler=SamplerWithoutReplacement(drop_last=False), batch_size=agent.batch_size,
     )
     replay.extend(data)
-    rows, early_stop, measured_kl = [], False, 0.0
+    rows, early_stop = [], False
+    last_kl = torch.zeros((), device=agent.device)
     target_kl = getattr(agent, "target_kl", None)
     for _ in range(agent.n_epochs):
         for _ in range(math.ceil(data.numel() / agent.batch_size)):
@@ -33,12 +34,12 @@ def optimize_ppo(agent, data, *, group=None):
                 dist = agent.probabilistic_actor.get_dist(batch.clone(False))
                 log_ratio = dist.log_prob(batch[key("raw_action")]) - batch[key("raw_log_prob")]
                 kl = (torch.expm1(log_ratio) - log_ratio).mean()
+                last_kl = kl
+            if target_kl is not None:
                 measured_kl = float(kl)
-            if target_kl is not None and (
-                not math.isfinite(measured_kl) or measured_kl > target_kl
-            ):
-                early_stop = True
-                break
+                if not math.isfinite(measured_kl) or measured_kl > target_kl:
+                    early_stop = True
+                    break
             losses = agent.loss_module(batch)
             actor_kwargs = {}
             if getattr(agent, "routed_actor", False):
@@ -71,7 +72,7 @@ def optimize_ppo(agent, data, *, group=None):
     metrics.update({
         "train/learning_rate": agent.optimizer.param_groups[0]["lr"],
         "train/rollout_steps": data.numel(), "train/optimizer_steps": len(rows),
-        "train/kl_early_stop": float(early_stop), "train/last_checked_kl": measured_kl,
+        "train/kl_early_stop": float(early_stop), "train/last_checked_kl": float(last_kl),
         "train/action_saturation": float((data[key("action")].abs() >= 1 - 1e-6).float().mean()),
         "train/action_std": float(torch.cat(log_stds).clamp(agent.actor.LOG_STD_MIN, agent.actor.LOG_STD_MAX).exp().mean()),
     })

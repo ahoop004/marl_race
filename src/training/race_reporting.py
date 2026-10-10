@@ -102,7 +102,7 @@ class RaceTrainingReports:
         self.steps += 1
         t._environment_steps += 1
         t._agent_steps += result.agent_steps
-        t._pending_learning_steps += bool(result.decisions)
+        t._pending_learning_steps += result.agent_steps
         if result.after.episode_done:
             self.finish(result)
 
@@ -144,6 +144,7 @@ class RaceTrainingReports:
             metrics.pop("race_record")
         self.pending_episodes.append((self.episode, self.reward, info, metrics))
         self.completed += 1
+        metrics.update(t.counter_metrics())
 
     def dispatch(self, update_metrics):
         for episode, reward, info, metrics in self.pending_episodes:

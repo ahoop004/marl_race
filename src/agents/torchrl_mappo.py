@@ -37,10 +37,11 @@ class _CentralValue(torch.nn.Module):
 class TorchRLMAPPOAgent(MAPPOPolicy):
     def __init__(self, obs_dim, global_state_dim, action_low, action_high, agent_ids, params):
         super().__init__(obs_dim, global_state_dim, action_low, action_high, agent_ids, params, training=True)
+        self.frames_per_batch = int(params.get("frames_per_batch", 256))
         if (self.critic_mode != "shared_team" or self.reward_mode != "team_shared"
                 or self.team_return_mode != "joint"):
             raise ValueError("TorchRL MAPPO requires shared_team critic, team_shared rewards and joint team returns")
-        if min(self.n_steps, self.n_epochs, self.batch_size) < 1:
+        if min(self.n_steps, self.n_epochs, self.batch_size, self.frames_per_batch) < 1:
             raise ValueError("MAPPO rollout size, epochs, and batch size must be positive")
         parameters = TensorDictModule(
             _PolicyParameters(self.actor, self.routed_actor),
@@ -100,6 +101,8 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
         self._require_lora_source()
         fragments = []
         for rollout in rollouts:
+            if not rollout.batch_size.numel():
+                continue
             fragment = rollout.to(self.device).clone()
             with torch.no_grad():
                 self.gae(fragment)
@@ -112,10 +115,12 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
         mask = data["agents", "active"].reshape(-1)
         states = data["state"].unsqueeze(-2).expand(-1, len(self.agent_ids), -1).reshape(-1, self.global_state_dim)
         selected = data["agents"].reshape(-1)[mask]
-        samples = TensorDict({"agents": selected.unsqueeze(-1), "state": states[mask]}, [selected.numel()])
-        if not selected.numel():
+        # TensorDict.numel() clamps empty batches to one in TensorDict 0.14.
+        n_samples = selected.batch_size.numel()
+        if not n_samples:
             return {}
+        samples = TensorDict({"agents": selected.unsqueeze(-1), "state": states[mask]}, [n_samples])
         metrics = optimize_ppo(self, samples, group="agents")
         metrics["train/rollout_steps"] = data.numel()
-        metrics["train/rollout_agent_samples"] = selected.numel()
+        metrics["train/rollout_agent_samples"] = n_samples
         return metrics
