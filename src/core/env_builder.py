@@ -69,7 +69,9 @@ def build_env_kwargs(
         env_kwargs["lidar_beams"] = env_config["lidar_beams"]
     if "lidar_range" in env_config:
         env_kwargs["lidar_range"] = env_config["lidar_range"]
-    if "render" in env_config:
+    if "render_mode" in env_config:
+        env_kwargs["render_mode"] = env_config["render_mode"]
+    elif "render" in env_config:
         env_kwargs["render_mode"] = "human" if env_config["render"] else None
     if "vehicle_params" in env_config:
         env_kwargs["vehicle_params"] = env_config["vehicle_params"]

@@ -81,6 +81,10 @@ class RaceTask:
     def timestep(self):
         return float(self.env.timestep)
 
+    @property
+    def render_mode(self):
+        return self.env.render_mode
+
     def action_space(self, agent: str) -> SpaceSpec:
         if agent not in self.possible_agents:
             raise KeyError(agent)
@@ -89,6 +93,9 @@ class RaceTask:
     def observation_space(self, agent: str) -> SpaceSpec:
         composer = self.obs_composers[agent]
         return SpaceSpec((composer.obs_dim,), -np.inf, np.inf)
+
+    def state_space(self) -> SpaceSpec:
+        return SpaceSpec(self.env.get_global_state().vector.shape, -np.inf, np.inf)
 
     def _make_snapshot(self, raw_obs, infos, observations, global_state):
         active = tuple(self.env.agents)
