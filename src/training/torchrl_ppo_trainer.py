@@ -53,8 +53,7 @@ class TorchRLPPOTrainer(PPOTrainerBase):
             while (self.collected_steps < total_steps if total_steps is not None else episode < n_episodes):
                 if self._should_stop():
                     break
-                plan = self.spawn_plan_fn() if self.spawn_plan_fn is not None else None
-                current = wrapped.reset(**({"options": {"spawn_plan": plan}} if plan is not None else {}))
+                current = wrapped.reset()
                 episode_reward, step_idx = 0.0, 0
                 metrics = {}
                 episode_id, map_id, spawn_id = self._episode_id(episode), self._map_id(), self._spawn_id()

@@ -9,9 +9,11 @@ import torch
 import torch.optim as optim
 
 from agents.common.outputs import PolicyOutput
-from agents.common.networks import Actor, Critic
-from agents.common.lora import LoRAActor, resolve_lora_config
-from agents.common.independent import IndependentActors
+from agents.common.networks import build_actor, build_critic, resolve_network_config, route_actor
+from agents.common.lora import resolve_lora_config
+from agents.common.checkpoints import (
+    restore_policy_state, transfer_network_state, validate_network_checkpoint,
+)
 from agents.common.observations import pack_observations
 from utils.torch_io import resolve_device
 
@@ -110,22 +112,16 @@ class MAPPOPolicy:
         self.n_epochs = int(params.get("n_epochs", 10))
         self.batch_size = int(params.get("batch_size", 64))
 
-        hidden_dims: List[int] = list(
-            params.get("pi_hidden_dims", params.get("hidden_dims", [256, 256]))
-        )
-        vf_dims: List[int] = list(
-            params.get("vf_hidden_dims", params.get("hidden_dims", [256, 256]))
-        )
-        activation: str = str(params.get("activation", "tanh"))
-        self.actor_hidden_dims = list(hidden_dims)
-        self.critic_hidden_dims = list(vf_dims)
-        self.activation = activation
+        self.network_config = resolve_network_config(params, default_hidden_dims=[256, 256])
+        self.actor_hidden_dims = self.network_config["actor_hidden_dims"]
+        self.critic_hidden_dims = self.network_config["critic_hidden_dims"]
+        self.activation = self.network_config["activation"]
 
         device_str = str(params.get("device", "cpu"))
         self.device = resolve_device([device_str])
 
         # Shared actor (local obs → action)
-        self.actor = Actor(obs_dim, self.action_dim, hidden_dims, activation).to(self.device)
+        self.actor = build_actor(obs_dim, self.action_dim, self.network_config).to(self.device)
 
         # The team critic estimates one shared V(s).  The agent-conditioned
         # critic estimates V_i(s) by appending a focal-agent one-hot vector.
@@ -133,20 +129,21 @@ class MAPPOPolicy:
         self.critic_input_dim = global_state_dim + (
             len(self.agent_ids) if self.critic_mode == "agent_conditioned" else 0
         )
-        self.critic = Critic(self.critic_input_dim, vf_dims, activation).to(self.device)
+        self.critic = build_critic(self.critic_input_dim, self.network_config).to(self.device)
         self._agent_identity = torch.eye(
             len(self.agent_ids), dtype=torch.float32, device=self.device
         )
 
         # Build adapters after the critic so its initialization matches the
         # full-fine-tuning control under the same seed.
-        if self.actor_mode == "independent":
-            self.actor = IndependentActors(self.actor, self.agent_ids).to(self.device)
+        inputs = ([self.obs_dims[aid] for aid in self.agent_ids]
+                  if self.per_agent_adapters else None)
+        self.actor = route_actor(
+            self.actor, self.agent_ids, actor_mode=self.actor_mode,
+            lora_config=self.lora_config, input_dims=inputs,
+        ).to(self.device)
         self.lora_contract = None
         if self.lora_config is not None:
-            inputs = ([self.obs_dims[aid] for aid in self.agent_ids]
-                      if self.lora_config["mode"] == "per_agent" else None)
-            self.actor = LoRAActor(self.actor, self.lora_config, len(self.agent_ids), inputs).to(self.device)
             self.lora_contract = {
                 "version": 1, **self.lora_config,
                 "target_layers": self.actor.target_layers,
@@ -344,6 +341,7 @@ class MAPPOPolicy:
         from utils.torch_io import safe_load, validate_checkpoint_compatibility
 
         ckpt = safe_load(path, map_location=self.device)
+        validate_network_checkpoint(ckpt, self.network_config, actor_only=True)
         validate_checkpoint_compatibility(ckpt, {
             "algorithm": "ppo",
             "action_dim": self.action_dim,
@@ -384,15 +382,10 @@ class MAPPOPolicy:
                      if self.actor_mode == "independent" else self.actor)
         expected = (recipient.base_state_dict() if self.lora_config is not None
                     else recipient.state_dict())
-        actor_state = dict(ckpt["actor"])
-        old_weight = actor_state.get("net.0.weight")
-        if (not isinstance(old_weight, torch.Tensor) or old_weight.ndim != 2
-                or old_weight.shape != (expected["net.0.weight"].shape[0], source_width)):
-            raise ValueError("Pretrained first-layer weights do not match the source observation width")
-        if source_width < self.obs_dim:
-            expanded = torch.zeros_like(expected["net.0.weight"])
-            expanded[:, :source_width] = old_weight
-            actor_state["net.0.weight"] = expanded
+        actor_state = transfer_network_state(
+            ckpt["actor"], expected, self.network_config,
+            source_width=source_width, expand_inputs=source_width < self.obs_dim,
+        )
         validate_checkpoint_compatibility(ckpt, {}, states=[("actor", actor_state, expected)])
         import hashlib
         source = {
@@ -428,6 +421,7 @@ class MAPPOPolicy:
                 "critic": self.critic.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "algorithm": "mappo",
+                "network": self.network_config,
                 "agent_ids": self.agent_ids,
                 "obs_dim": self.obs_dim,
                 "obs_dims": self.obs_dims,
@@ -454,9 +448,10 @@ class MAPPOPolicy:
             path,
         )
 
-    def load(self, path: str) -> None:
+    def load(self, path: str, *, load_optimizer: bool = True) -> None:
         from utils.torch_io import safe_load, validate_checkpoint_compatibility
         ckpt = safe_load(path, map_location=self.device)
+        validate_network_checkpoint(ckpt, self.network_config)
         fields = (
             "actor_mode", "agent_ids", "actor_hidden_dims", "critic_hidden_dims",
             "activation", "critic_mode", "global_state_dim", "global_state_contract_version",
@@ -479,14 +474,8 @@ class MAPPOPolicy:
                            for aid, state in actors.items() for key, value in state.items()}
         else:
             actor_state = ckpt.get("actor")
-        validate_checkpoint_compatibility(ckpt, {}, states=[
-            ("actor", actor_state, self.actor.state_dict()),
-            ("critic", ckpt.get("critic"), self.critic.state_dict()),
-        ])
-        self.actor.load_state_dict(actor_state, strict=True)
-        self.critic.load_state_dict(ckpt["critic"], strict=True)
-        if "optimizer" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
+        restore_policy_state(ckpt, self.actor, self.critic, self.optimizer,
+                             actor_state=actor_state, load_optimizer=load_optimizer)
         self.pretrained_actor_source = ckpt.get("pretrained_actor_source")
         self._lora_ready = True
 

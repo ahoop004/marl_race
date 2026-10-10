@@ -140,13 +140,6 @@ class RaceTask:
             finish_on_laps,
         )
 
-    @property
-    def training_bundles(self):
-        return tuple(self.env._map_scheduler.training_bundles)
-
-    def set_training_bundles(self, bundles):
-        self.env._map_scheduler.set_training_bundles(list(bundles))
-
     def _capture_episode_metadata(self):
         manager = getattr(self.env, "_spawn_manager", None)
         context = _detach(getattr(manager, "last_spawn_metadata", {}) or {})

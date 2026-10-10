@@ -2,7 +2,6 @@
 from copy import deepcopy
 import multiprocessing as mp
 from multiprocessing.connection import wait
-import os
 from pathlib import Path
 import time
 import warnings
@@ -11,7 +10,7 @@ import torch
 
 from training.worker_runtime import (
     worker_settings, close_workers, report_worker_error, receive_worker,
-    worker_thread_limits,
+    worker_thread_limits, initialize_worker, start_worker,
 )
 
 from training.mappo_evaluator import DeterministicMAPPOEvaluator
@@ -57,9 +56,7 @@ def _worker_evaluator(connection, spec):
 
 def _evaluation_worker(connection):
     # No policy networks or CUDA contexts live in these processes.
-    os.environ['CUDA_VISIBLE_DEVICES'] = ''
-    os.environ['PYGLET_HEADLESS'] = 'true'
-    torch.set_num_threads(1)
+    initialize_worker()
     evaluators = {}
     try:
         connection.send(('ready', None))
@@ -146,15 +143,9 @@ class EvaluationWorkerPool:
             for start in range(len(self._connections), num_workers, batch_size):
                 active, last_seen = set(), {}
                 for worker in range(start, min(start + batch_size, num_workers)):
-                    parent, child = context.Pipe()
-                    process = context.Process(target=_evaluation_worker,
-                        args=(child,),
+                    parent, process = start_worker(context, _evaluation_worker,
                         name=f'mappo-evaluation-{worker}')
                     self._connections[worker] = parent
-                    try:
-                        process.start()
-                    finally:
-                        child.close()
                     self._processes.append(process)
                     active.add(worker)
                     last_seen[worker] = time.monotonic()

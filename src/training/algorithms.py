@@ -12,7 +12,8 @@ def resolve_training_params(agent_cfg: dict, scenario: dict) -> dict:
     params = agent_cfg.get("params", {})
     environment = scenario.get("environment", {})
     decision_dt = float(environment.get("timestep", 0.01)) * int(environment.get("action_repeat", 1))
-    return {**defaults, **params, "_physics_contract": physics_contract(environment),
+    return {"network": scenario.get("network", {}), **defaults, **params,
+            "_physics_contract": physics_contract(environment),
             "_action_contract": ActionComposer.contract_from_config(
         agent_cfg.get("action_constraints", {}), decision_dt,
     )}

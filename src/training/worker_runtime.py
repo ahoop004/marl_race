@@ -39,6 +39,38 @@ def collector_scenario(scenario, environment_id):
     return result, seed
 
 
+def initialize_worker():
+    """CPU simulators use one thread and never initialize a CUDA context."""
+    import torch
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["PYGLET_HEADLESS"] = "true"
+    torch.set_num_threads(1)
+
+
+def worker_assignments(worker_id, num_workers, num_envs, budget):
+    return [(i, budget // num_envs + (i < budget % num_envs))
+            for i in range(worker_id, num_envs, num_workers)]
+
+
+def start_worker(context, target, args=(), *, name):
+    """Start a pipe worker; own and close both endpoints on startup failure."""
+    parent, child = context.Pipe()
+    process = None
+    try:
+        process = context.Process(target=target, args=(child, *args), name=name)
+        process.start()
+    except BaseException:
+        parent.close()
+        if process is not None and process.pid is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join()
+        raise
+    finally:
+        child.close()
+    return parent, process
+
+
 def receive_worker(connection, process, *, label, timeout=None, on_received=None):
     if timeout is not None and not connection.poll(timeout):
         raise RuntimeError(f"{label} timed out after {timeout}s "

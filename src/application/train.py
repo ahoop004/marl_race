@@ -166,35 +166,41 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
             "optimizer_restored": False,
             "training_progress_restored": False,
         }
-    if num_envs > 1 and algorithm == "ppo":
+    provenance["network"] = learner.network_config
+    provenance["algorithm_implementation"] = {
+        "backend": "torchrl",
+        "loss": "torchrl.ClipPPOLoss" if algorithm == "ppo" else "torchrl.MAPPOLoss",
+        "advantage_estimator": "torchrl.GAE" if algorithm == "ppo" else "torchrl.MultiAgentGAE",
+        "update_version": params.get("update_version"),
+    }
+    provenance["collector"] = {
+        "backend": "multiprocessing_spawn" if num_envs > 1 else "local",
+        "task_adapter": "gymnasium" if algorithm == "ppo" else "pettingzoo_parallel",
+        "mode": "synchronous_grouped_workers_v1" if num_envs > 1 else "serial",
+        "num_envs": num_envs,
+        "inference": "centralized_batched" if num_envs > 1 else "local",
+    }
+    if num_envs > 1:
         env_seed = env_cfg.get("seed")
         env_seed = exp_cfg["seed"] if env_seed is None else env_seed
-        provenance["ppo_collection"] = {
-            "backend": "torchrl",
-            "advantage_estimator": "torchrl.GAE",
-            "mode": "synchronous_grouped_workers_v1",
-            "num_envs": num_envs, "worker_threads": 1,
-            "collector_scheduling": exp_cfg.get("collector_scheduling", "synchronous"),
-            "num_workers": min(num_envs, int(exp_cfg.get("num_workers", num_envs))),
-            "worker_seeds": [(exp_cfg["seed"] + i) % (2 ** 32) for i in range(num_envs)],
-            "environment_seeds": [(env_seed + i) % (2 ** 32) for i in range(num_envs)],
-            "max_steps_per_worker_rollout": int(params.get("n_steps", 2048)) // num_envs,
-        }
-    if num_envs > 1 and algorithm == "mappo":
-        provenance["mappo_collection"] = {
-            "backend": "torchrl",
-            "advantage_estimator": "torchrl.MultiAgentGAE",
-            "mode": "synchronous_grouped_workers_v1", "num_envs": num_envs,
-            "num_workers": min(num_envs, int(exp_cfg.get("num_workers", num_envs))),
+        provenance["collector"].update({
             "worker_threads": 1,
             "collector_scheduling": exp_cfg.get("collector_scheduling", "synchronous"),
-            "rollout_steps_per_env": scenario.get("training_defaults", {}).get("rollout_steps_per_env", 256),
-            "environment_step_unit": "joint_environment_decisions_including_opponent_only_steps",
+            "num_workers": min(num_envs, int(exp_cfg.get("num_workers", num_envs))),
+            "environment_seeds": [(env_seed + i) % (2 ** 32) for i in range(num_envs)],
             "policy_seeds": ("parent RNG; arrival ordering" if exp_cfg.get("collector_scheduling") == "ready"
                              else "parent RNG; deterministic worker/environment ordering"),
-            "environment_seeds": [((env_cfg.get("seed") if env_cfg.get("seed") is not None
-                                    else exp_cfg["seed"]) + i) % (2 ** 32) for i in range(num_envs)],
-        }
+        })
+        if algorithm == "ppo":
+            provenance["collector"].update({
+                "worker_seeds": [(exp_cfg["seed"] + i) % (2 ** 32) for i in range(num_envs)],
+                "max_steps_per_worker_rollout": int(params.get("n_steps", 2048)) // num_envs,
+            })
+        else:
+            provenance["collector"].update({
+                "rollout_steps_per_env": scenario.get("training_defaults", {}).get("rollout_steps_per_env", 256),
+                "environment_step_unit": "joint_environment_decisions_including_opponent_only_steps",
+            })
     if pretrained_actor_path is not None:
         provenance["pretrained_actor"] = {
             "path": str(pretrained_actor_path),

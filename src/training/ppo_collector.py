@@ -1,7 +1,7 @@
 """Task setup and the scheduled PPO worker collection loop."""
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from env.types import TransitionRecord
 from metrics.outcomes import determine_outcome
@@ -16,7 +16,7 @@ class PPOTrainerBase:
     def __init__(
         self, task: RaceTask, agent: Any, *,
         hooks: Optional[List[TrainingHook]] = None, render: bool = False,
-        run_id: str = "run", spawn_plan_fn: Optional[Callable] = None,
+        run_id: str = "run",
     ) -> None:
         if len(task.possible_agents) != 1:
             raise ValueError("PPO requires exactly one policy agent")
@@ -29,7 +29,6 @@ class PPOTrainerBase:
         self._transition_hooks = transition_record_hooks(self.hooks)
         self.render = render
         self.run_id = run_id
-        self.spawn_plan_fn = spawn_plan_fn
         self.collected_steps = 0
 
     def _set_training_progress(self, completed: int, total: int) -> None:
@@ -48,10 +47,7 @@ class PPOTrainerBase:
         return self.task.episode_metadata.spawn_id(self.rl_agent_id)
 
     def _reset_env(self) -> TaskSnapshot:
-        """Reset env, injecting a curriculum spawn plan when one is available."""
-        spawn_plan = self.spawn_plan_fn() if self.spawn_plan_fn is not None else None
-        options = {"spawn_plan": spawn_plan} if spawn_plan is not None else None
-        return self.task.reset(options=options)
+        return self.task.reset()
 
     def _on_physics_step(self, substep) -> None:
         if self.render:

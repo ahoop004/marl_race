@@ -1,13 +1,15 @@
-"""Shared MLP building blocks for all PyTorch RL agents."""
+"""MLP networks and the small actor/critic construction factory."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from functools import partial
+import math
 from typing import List, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from agents.common.distributions import SquashedGaussianActor
 
 # Fixed as part of the "leaky_relu" checkpoint activation contract.
 LEAKY_RELU_NEGATIVE_SLOPE = 0.2
@@ -42,15 +44,8 @@ def make_mlp(
     return nn.Sequential(*layers)
 
 
-class Actor(nn.Module):
-    """Gaussian policy — outputs mean; log_std is a learned parameter.
-
-    Actions are sampled as: action = tanh(mean + std * noise)
-    This keeps actions in (-1, 1) matching the normalized action space.
-    """
-
-    LOG_STD_MIN = -5.0
-    LOG_STD_MAX = 2.0
+class Actor(SquashedGaussianActor):
+    """MLP producing Gaussian parameters; retain legacy net/log_std keys."""
 
     def __init__(
         self,
@@ -60,71 +55,14 @@ class Actor(nn.Module):
         activation: str = "tanh",
     ) -> None:
         super().__init__()
+        self.action_dim = action_dim
         self.net = make_mlp(obs_dim, hidden_dims, action_dim, activation)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
-        # Deterministic quadrature for E[log |d tanh(z)/dz|]. Nonpersistent
-        # buffers preserve the parameter layout of existing checkpoints.
-        nodes, weights = np.polynomial.hermite.hermgauss(32)
-        self.register_buffer("_entropy_nodes", torch.tensor(nodes * np.sqrt(2), dtype=torch.float32), persistent=False)
-        self.register_buffer("_entropy_weights", torch.tensor(weights / np.sqrt(np.pi), dtype=torch.float32), persistent=False)
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         mean = self.net(obs)
         log_std = self.log_std.clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
-        std = log_std.exp()
-        return mean, std
-
-    def get_action(
-        self, obs: torch.Tensor, deterministic: bool = False, *, return_raw: bool = False,
-        adapter_indices: Optional[torch.Tensor] = None,
-    ):
-        mean, std = self(obs) if adapter_indices is None else self(obs, adapter_indices=adapter_indices)
-        if deterministic:
-            raw = mean
-            action = torch.tanh(mean)
-            log_prob = torch.zeros(obs.shape[0], device=obs.device)
-        else:
-            dist = torch.distributions.Normal(mean, std)
-            raw = dist.rsample()
-            action = torch.tanh(raw)
-            log_prob = self._log_prob(dist, raw)
-        return (action, log_prob, raw) if return_raw else (action, log_prob)
-
-    @staticmethod
-    def _log_jacobian(raw: torch.Tensor) -> torch.Tensor:
-        # log(1 - tanh(z)^2), without cancellation at large |z|.
-        return 2.0 * (np.log(2.0) - raw - F.softplus(-2.0 * raw))
-
-    def _log_prob(self, dist, raw):
-        return (dist.log_prob(raw) - self._log_jacobian(raw)).sum(-1)
-
-    def evaluate_actions(
-        self,
-        obs: torch.Tensor,
-        actions: torch.Tensor,
-        raw_actions: Optional[torch.Tensor] = None,
-        *, adapter_indices: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Evaluate log probabilities for already-sampled squashed actions.
-
-        PPO must compare the current policy probability of each rollout action
-        with the probability recorded when that same action was collected.
-        Training retains pre-tanh samples because float32 tanh loses their
-        identity near the bounds. The inverse fallback supports callers that
-        only have nonsaturated actions; it cannot recover saturated samples.
-        """
-        mean, std = self(obs) if adapter_indices is None else self(obs, adapter_indices=adapter_indices)
-        dist = torch.distributions.Normal(mean, std)
-        bounded_actions = actions.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
-        recovered = torch.atanh(bounded_actions)
-        raw_actions = recovered if raw_actions is None else torch.where(
-            torch.isfinite(raw_actions), raw_actions, recovered
-        )
-        log_prob = self._log_prob(dist, raw_actions)
-        samples = mean.unsqueeze(-1) + std.unsqueeze(-1) * self._entropy_nodes
-        correction = (self._log_jacobian(samples) * self._entropy_weights).sum(-1)
-        entropy = (dist.entropy() + correction).sum(-1)
-        return log_prob, entropy
+        return mean, log_std.exp()
 
 
 class Critic(nn.Module):
@@ -145,3 +83,63 @@ class Critic(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x).squeeze(-1)
+
+
+def resolve_network_config(params, *, default_hidden_dims):
+    """Resolve explicit network settings, with historical params as defaults."""
+    network = params.get("network", {})
+    allowed = {"architecture", "actor_hidden_dims", "critic_hidden_dims", "activation"}
+    if not isinstance(network, Mapping) or set(network) - allowed:
+        raise ValueError(f"network must be a mapping with fields {sorted(allowed)}")
+    config = {
+        "architecture": "mlp",
+        "actor_hidden_dims": list(params.get("pi_hidden_dims", params.get("hidden_dims", default_hidden_dims))),
+        "critic_hidden_dims": list(params.get("vf_hidden_dims", params.get("hidden_dims", default_hidden_dims))),
+        "activation": str(params.get("activation", "tanh")),
+        **network,
+    }
+    if config["architecture"] != "mlp":
+        raise ValueError(f"Unsupported network architecture: {config['architecture']!r}; only mlp is available")
+    for field in ("actor_hidden_dims", "critic_hidden_dims"):
+        dims = config[field]
+        if not isinstance(dims, (list, tuple)) or any(
+                isinstance(d, bool) or not isinstance(d, int) or d <= 0 for d in dims):
+            raise ValueError(f"network.{field} must be a sequence of positive integers")
+        config[field] = list(dims)
+    if not isinstance(config["activation"], str):
+        raise ValueError("network.activation must be a string")
+    return config
+
+
+def build_actor(obs_dim, action_dim, config, *, log_std_init=0.0):
+    """Return an actor mapping observations to (mean, scale)."""
+    if config["architecture"] != "mlp":
+        raise ValueError(f"Unsupported actor architecture: {config['architecture']!r}")
+    actor = Actor(obs_dim, action_dim, config["actor_hidden_dims"], config["activation"])
+    if not math.isfinite(log_std_init) or not actor.LOG_STD_MIN <= log_std_init <= actor.LOG_STD_MAX:
+        raise ValueError("log_std_init must be within the actor's log standard deviation bounds")
+    with torch.no_grad():
+        actor.log_std.fill_(log_std_init)
+    return actor
+
+
+def build_critic(input_dim, config):
+    """Return a critic mapping local observations or global states to values."""
+    if config["architecture"] != "mlp":
+        raise ValueError(f"Unsupported critic architecture: {config['architecture']!r}")
+    return Critic(input_dim, config["critic_hidden_dims"], config["activation"])
+
+
+def route_actor(actor, agent_ids, *, actor_mode="shared", lora_config=None, input_dims=None):
+    """Apply routing after critic construction to preserve seeded initialization."""
+    if actor_mode not in {"shared", "independent"}:
+        raise ValueError("actor_mode must be shared or independent")
+    if actor_mode == "independent":
+        if lora_config is not None:
+            raise ValueError("Independent actors cannot also use LoRA")
+        from agents.common.independent import IndependentActors
+        return IndependentActors(actor, agent_ids)
+    if lora_config is not None:
+        from agents.common.lora import LoRAActor
+        return LoRAActor(actor, lora_config, len(agent_ids), input_dims)
+    return actor

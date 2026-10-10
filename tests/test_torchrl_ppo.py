@@ -88,10 +88,20 @@ def test_native_update_handles_partial_minibatches_and_legacy_checkpoints(vf_coe
     observation = np.array([0.3], dtype=np.float32)
     np.testing.assert_array_equal(evaluation_policy.predict(observation), learner.predict(observation))
     evaluation_policy.save(str(checkpoint))
+    payload = torch.load(checkpoint, weights_only=False)
+    assert payload.pop("network")["architecture"] == "mlp"
+    torch.save(payload, checkpoint)
     restored = agent(vf_coef=vf_coef)
     restored.load(str(checkpoint))
     assert restored.optimizer.state_dict()["state"]
     np.testing.assert_array_equal(restored.predict(observation), learner.predict(observation))
+
+
+def test_prediction_uses_actor_distribution_parameters(monkeypatch):
+    learner = agent()
+    mean = torch.tensor([[0.25, -0.75]])
+    monkeypatch.setattr(learner.actor, "forward", lambda observations: (mean, torch.ones(2)))
+    np.testing.assert_array_equal(learner.predict(np.zeros(1, dtype=np.float32)), mean.tanh()[0].numpy())
 
 
 class Capture(TrainingHook):

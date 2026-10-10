@@ -353,7 +353,7 @@ evaluation:
   max_steps: 80000
   # Reproducible seed. Keep final-test seeds disjoint from checkpoint-selection seeds.
   seed: 10042
-  # Match the objective: lap_time, completion_progress, team_completion, team_combined, team_first_place, team_sweep, team_combined_penalties, map_curriculum, or two_team_completion.
+  # Match the objective: lap_time, completion_progress, or team_completion.
   selection_strategy: completion_progress
   # Final evaluation after the policy/configuration is frozen; never use it for checkpoint selection.
   final_test:
@@ -493,7 +493,6 @@ wandb:
       train: true
       eval: true
       performance: true
-      curriculum: true
       # collector and reward_components default off; debug enables both.
   # true enables this component; false disables it.
   enabled: true

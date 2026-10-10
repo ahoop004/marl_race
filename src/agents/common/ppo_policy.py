@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.optim as optim
 
 from agents.common.outputs import PolicyOutput
-from agents.common.networks import Actor, Critic
+from agents.common.networks import build_actor, build_critic, resolve_network_config
+from agents.common.checkpoints import (
+    restore_policy_state, transfer_network_state, validate_network_checkpoint,
+)
 from utils.torch_io import resolve_device
 
 
@@ -61,27 +64,19 @@ class PPOPolicy:
             if not np.isfinite(self.target_kl) or self.target_kl <= 0:
                 raise ValueError("target_kl must be finite and positive")
 
-        hidden_dims: List[int] = list(
-            params.get("pi_hidden_dims", params.get("hidden_dims", [64, 64]))
-        )
-        vf_dims: List[int] = list(
-            params.get("vf_hidden_dims", params.get("hidden_dims", [64, 64]))
-        )
-        activation: str = str(params.get("activation", "tanh"))
-        self.actor_hidden_dims = list(hidden_dims)
-        self.critic_hidden_dims = list(vf_dims)
-        self.activation = activation
+        self.network_config = resolve_network_config(params, default_hidden_dims=[64, 64])
+        self.actor_hidden_dims = self.network_config["actor_hidden_dims"]
+        self.critic_hidden_dims = self.network_config["critic_hidden_dims"]
+        self.activation = self.network_config["activation"]
 
         device_str = str(params.get("device", "cpu"))
         self.device = resolve_device([device_str])
 
-        self.actor = Actor(obs_dim, self.action_dim, hidden_dims, activation).to(self.device)
-        log_std_init = float(params.get("log_std_init", 0.0))
-        if not np.isfinite(log_std_init) or not self.actor.LOG_STD_MIN <= log_std_init <= self.actor.LOG_STD_MAX:
-            raise ValueError("log_std_init must be within the actor's log standard deviation bounds")
-        with torch.no_grad():
-            self.actor.log_std.fill_(log_std_init)
-        self.critic = Critic(obs_dim, vf_dims, activation).to(self.device)
+        self.actor = build_actor(
+            obs_dim, self.action_dim, self.network_config,
+            log_std_init=float(params.get("log_std_init", 0.0)),
+        ).to(self.device)
+        self.critic = build_critic(obs_dim, self.network_config).to(self.device)
         self._optim_parameters = tuple(self.actor.parameters()) + tuple(self.critic.parameters())
         self.optimizer = optim.Adam(self._optim_parameters, lr=self.lr)
 
@@ -109,7 +104,8 @@ class PPOPolicy:
     def predict(self, obs: np.ndarray) -> np.ndarray:
         """Return a deterministic evaluation action without evaluating the critic."""
         obs_t = torch.as_tensor(np.asarray(obs)[None], dtype=torch.float32, device=self.device)
-        return torch.tanh(self.actor.net(obs_t))[0].cpu().numpy()
+        actions, _ = self.actor.get_action(obs_t, deterministic=True)
+        return actions[0].cpu().numpy()
 
     @torch.no_grad()
     def act(
@@ -154,6 +150,7 @@ class PPOPolicy:
                 "critic": self.critic.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "algorithm": "ppo",
+                "network": self.network_config,
                 "obs_dim": self.obs_dim,
                 "action_dim": self.action_dim,
                 "action_low": self.action_low,
@@ -172,15 +169,13 @@ class PPOPolicy:
         """Load actor/critic weights; transfer runs keep their fresh optimizer."""
         from utils.torch_io import safe_load
         ckpt = safe_load(path, map_location=self.device)
+        validate_network_checkpoint(ckpt, self.network_config)
+        actor_state = ckpt.get("actor")
         if observation_extension:
-            for name, module in (("actor", self.actor), ("critic", self.critic)):
-                weights = ckpt[name]["net.0.weight"]
-                expected = module.state_dict()["net.0.weight"]
-                if weights.shape[0] == expected.shape[0] and weights.shape[1] < expected.shape[1]:
-                    ckpt[name]["net.0.weight"] = torch.nn.functional.pad(
-                        weights, (0, expected.shape[1] - weights.shape[1]))
-        self.actor.load_state_dict(ckpt["actor"])
-        self.critic.load_state_dict(ckpt["critic"])
-        if load_optimizer and "optimizer" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
+            actor_state = transfer_network_state(
+                actor_state, self.actor.state_dict(), self.network_config, expand_inputs=True)
+            ckpt = {**ckpt, "critic": transfer_network_state(
+                ckpt.get("critic"), self.critic.state_dict(), self.network_config, expand_inputs=True)}
+        restore_policy_state(ckpt, self.actor, self.critic, self.optimizer,
+                             actor_state=actor_state, load_optimizer=load_optimizer)
 

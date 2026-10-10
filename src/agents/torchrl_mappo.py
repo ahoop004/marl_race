@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
 import torch
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule, TensorDictSequential

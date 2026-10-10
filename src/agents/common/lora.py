@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from agents.common.networks import Actor
+from agents.common.distributions import SquashedGaussianActor
 
 
 def resolve_lora_config(value):
@@ -58,8 +59,8 @@ class LowRankResidual(nn.Module):
         return F.linear(F.linear(inputs, self.A), self.B) * self.scale
 
 
-class LoRAActor(Actor):
-    """Reuse Actor's squashed-Gaussian likelihood with explicit adapter routing.
+class LoRAActor(SquashedGaussianActor):
+    """MLP residual adapter with squashed-Gaussian likelihood with explicit adapter routing.
 
     Every hidden linear layer has a residual; the output head and all original
     biases stay frozen. Exploration is shared by default; per_agent_log_std
@@ -68,11 +69,12 @@ class LoRAActor(Actor):
     """
 
     def __init__(self, base: Actor, config, n_agents, input_dims=None):
-        nn.Module.__init__(self)
+        super().__init__()
+        if not isinstance(base, Actor):
+            raise ValueError("LoRA currently supports the MLP actor only")
+        self.action_dim = base.action_dim
         self.net = base.net
         self.log_std = base.log_std
-        self.register_buffer("_entropy_nodes", base._entropy_nodes, persistent=False)
-        self.register_buffer("_entropy_weights", base._entropy_weights, persistent=False)
         self.config = resolve_lora_config(config)
         self.target_layers = [i for i, layer in enumerate(self.net)
                               if isinstance(layer, nn.Linear) and i != len(self.net) - 1]

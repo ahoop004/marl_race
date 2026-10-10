@@ -143,3 +143,21 @@ def test_resolution_preserves_source_nested_configuration():
     resolved = resolve_environment_config(scenario, mode="eval", scenario_dir=SCENARIOS)
     resolved["vehicle_params"]["v_max"] = 1234
     assert scenario == original
+
+
+def test_network_configuration_is_separate_and_legacy_params_remain_defaults():
+    from agents.common.networks import build_actor, build_critic, resolve_network_config
+    from training.algorithms import resolve_training_params
+
+    scenario = ppo_scenario()
+    scenario["network"] = {"architecture": "mlp", "actor_hidden_dims": [8],
+                           "critic_hidden_dims": [16], "activation": "relu"}
+    resolved = resolve_training_params(scenario["agents"]["car_0"], scenario)
+    config = resolve_network_config(resolved, default_hidden_dims=[64, 64])
+    assert config == scenario["network"]
+    assert build_actor(3, 2, config).net[0].out_features == 8
+    assert build_critic(3, config).net[0].out_features == 16
+    legacy = resolve_network_config({"hidden_dims": [4], "vf_hidden_dims": [6]}, default_hidden_dims=[64, 64])
+    assert legacy["actor_hidden_dims"] == [4] and legacy["critic_hidden_dims"] == [6]
+    with pytest.raises(ValueError, match="Unsupported network architecture"):
+        resolve_network_config({"network": {"architecture": "cnn"}}, default_hidden_dims=[64, 64])

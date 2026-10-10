@@ -7,17 +7,16 @@ weights until every live environment has delivered its next fragment.
 from __future__ import annotations
 
 import multiprocessing as mp
-import os
 import time
 from pathlib import Path
 from contextlib import ExitStack
 
 import numpy as np
-import torch
 
 from training.worker_runtime import (
     worker_settings, close_workers, report_worker_error, receive_worker,
     worker_thread_limits, collector_scenario,
+    initialize_worker, start_worker, worker_assignments,
 )
 
 from training.hooks import transition_record_hooks
@@ -41,7 +40,7 @@ def _make_collector(scenario, directory, agent_id, env_id, quota, horizon,
         if task.possible_agents != (agent_id,):
             raise ValueError("PPO collector requires the configured policy agent")
         spec = task.spec
-        policy = PPOCollectorState(horizon, curriculum=task, worker_id=env_id)
+        policy = PPOCollectorState(horizon)
         trainer = PPOCollector(
             task, policy, hooks=[WorkerHook(sink, env_id, seed, record)],
             run_id=f'{run_id}_worker{env_id:03d}',
@@ -56,9 +55,7 @@ def _make_collector(scenario, directory, agent_id, env_id, quota, horizon,
 
 def _collect_worker(connection, scenario, directory, agent_id, assignments,
                     horizon, run_id, record, step_budget):
-    os.environ['CUDA_VISIBLE_DEVICES'] = ''
-    os.environ['PYGLET_HEADLESS'] = 'true'
-    torch.set_num_threads(1)
+    initialize_worker()
     tasks, generators, pending = {}, {}, {}
     sink = CollectorEventSink()
     try:
@@ -170,17 +167,12 @@ def train_parallel(trainer, scenario, directory, num_envs, n_episodes, *, total_
         for start in range(0, workers, batch_size):
             batch = range(start, min(start + batch_size, workers))
             for worker_id in batch:
-                assignments = [(i, budget // num_envs + (i < budget % num_envs))
-                               for i in range(worker_id, num_envs, workers)]
-                parent, child = context.Pipe()
-                process = context.Process(target=_collect_worker, name=f'ppo-collector-{worker_id}', args=(
-                    child, scenario, str(directory), trainer.rl_agent_id, assignments,
-                    horizon, trainer.run_id, bool(record_hooks), total_steps is not None))
+                assignments = worker_assignments(worker_id, workers, num_envs, budget)
+                parent, process = start_worker(context, _collect_worker, (
+                    scenario, str(directory), trainer.rl_agent_id, assignments,
+                    horizon, trainer.run_id, bool(record_hooks), total_steps is not None),
+                    name=f'ppo-collector-{worker_id}')
                 connections[worker_id] = parent
-                try:
-                    process.start()
-                finally:
-                    child.close()
                 processes.append(process)
                 process_by_worker[worker_id] = process
             for worker_id in batch:
@@ -265,11 +257,8 @@ def train_parallel(trainer, scenario, directory, num_envs, n_episodes, *, total_
                         hook.on_update(metrics)
                 stopped = trainer._should_stop()
                 reply = metrics
-                if scenario.get('map_curriculum') is not None or stopped:
-                    control = {'stop': stopped}
-                    if scenario.get('map_curriculum') is not None:
-                        control['training_bundles'] = trainer.task.training_bundles
-                    reply = {'metrics': metrics, 'collector_control': control}
+                if stopped:
+                    reply = {'metrics': metrics, 'collector_control': {'stop': True}}
                 for worker_id in waiting:
                     connections[worker_id].send(reply)
                 waiting.clear()

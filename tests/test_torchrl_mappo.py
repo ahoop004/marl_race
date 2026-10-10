@@ -112,6 +112,10 @@ def test_native_update_routes_actors_and_retains_checkpoint_compatibility(actor_
     agent.save(str(path))
     evaluation_policy = MAPPOPolicy(1, 1, *BOUNDS, IDS, params(**extra))
     evaluation_policy.load(str(path))
+    payload = torch.load(path, weights_only=False)
+    assert payload.pop("network")["architecture"] == "mlp"
+    torch.save(payload, path)
+    evaluation_policy.load(str(path))
     expected, _ = agent.act_batch(IDS, np.zeros((2, 1), dtype=np.float32), deterministic=True)
     actual, _ = evaluation_policy.act_batch(IDS, np.zeros((2, 1), dtype=np.float32), deterministic=True)
     for aid in IDS:
@@ -209,3 +213,67 @@ def test_parallel_inference_repeated_ids_match_native_log_probabilities(actor_mo
     expected = agent.probabilistic_actor.get_dist(data).log_prob(raw)
     actual = torch.tensor([responses[key][1][aid] for key, aid in rows])
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("actor_mode", ["shared", "independent", "lora"])
+def test_legacy_ppo_transfer_extends_inputs_keeps_fresh_critic_and_updates(actor_mode, tmp_path):
+    from pathlib import Path
+    from agents.common.ppo_policy import PPOPolicy
+    from core.scenario import load_and_expand_scenario
+
+    directory = Path(__file__).resolve().parents[1] / "scenarios"
+    contracts = []
+    for name in ("ppo_lap_completion_pretrain", "mappo_2v2_completion_scratch"):
+        scenario = load_and_expand_scenario(str(directory / f"{name}.yaml"))
+        composer = ObservationComposer.from_config(scenario["agents"]["car_0"]["observation"],
+                                                   scenario["environment"])
+        contracts.append(composer.contract)
+        assert composer.obs_dim == (158 if len(contracts) == 1 else 192)
+    source = PPOPolicy(158, *BOUNDS, {"hidden_dims": [8], "device": "cpu",
+                                    "_observation_contract": contracts[0]})
+    path = tmp_path / "legacy-ppo.pt"
+    source.save(str(path))
+    checkpoint = torch.load(path, weights_only=False)
+    checkpoint.pop("network")
+    torch.save(checkpoint, path)
+    options = params(hidden_dims=[8], vf_hidden_dims=[6],
+                     actor_mode="shared" if actor_mode == "lora" else actor_mode,
+                     _observation_contract=contracts[1],
+                     pretrained_actor_observation_extension="frenet_neighbors")
+    if actor_mode == "lora":
+        options["lora"] = {"mode": "per_agent", "rank": 2, "per_agent_log_std": True}
+    agent = TorchRLMAPPOAgent(192, 3, *BOUNDS, IDS, options)
+    fresh_critic = {key: value.clone() for key, value in agent.critic.state_dict().items()}
+    agent.load_pretrained_actor(str(path))
+    assert all(torch.equal(value, fresh_critic[key]) for key, value in agent.critic.state_dict().items())
+    assert not agent.optimizer.state
+    observations = torch.randn(2, 192)
+    indices = {"adapter_indices": torch.tensor([0, 1])} if agent.routed_actor else {}
+    mean, scale = agent.actor(observations, **indices)
+    expected_mean, expected_scale = source.actor(observations[:, :158])
+    torch.testing.assert_close(mean, expected_mean)
+    torch.testing.assert_close(scale, expected_scale.expand_as(scale))
+    before = {key: value.clone() for key, value in agent.actor.state_dict().items()}
+    for step in range(2):
+        obs = {aid: observations[i].numpy() for i, aid in enumerate(IDS)}
+        output = agent.sample_batch(IDS, obs)
+        agent.store_batch(IDS, observations=obs, global_state=np.full(3, step, dtype=np.float32),
+                          actions=output.actions, log_probs=output.log_probs, raw_actions=output.raw_actions,
+                          rewards=dict.fromkeys(IDS, 1), values=dict.fromkeys(IDS, 0),
+                          terminated=dict.fromkeys(IDS, step == 1), truncated=dict.fromkeys(IDS, False))
+        agent.store_team_step(IDS, reward=1, value=0, terminal=step == 1)
+    assert agent.update(np.full(3, 2, dtype=np.float32))["train/optimizer_steps"] > 0
+    if actor_mode == "lora":
+        assert all(not p.requires_grad for p in agent.actor.net.parameters())
+        assert all(torch.equal(before[key], value) for key, value in agent.actor.state_dict().items()
+                   if key.startswith("net."))
+        for i in range(2):
+            assert any(not torch.equal(before[key], value) for key, value in agent.actor.state_dict().items()
+                       if key.startswith(f"adapters.{i}."))
+    elif actor_mode == "independent":
+        for aid in IDS:
+            assert any(not torch.equal(before[key], value) for key, value in agent.actor.state_dict().items()
+                       if key.startswith(f"actors.{aid}."))
+        assert agent.actor.actors[IDS[0]].net[0].weight.data_ptr() != agent.actor.actors[IDS[1]].net[0].weight.data_ptr()
+    else:
+        assert any(not torch.equal(before[key], value) for key, value in agent.actor.state_dict().items())
