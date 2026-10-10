@@ -3,14 +3,15 @@ from __future__ import annotations
 import time
 
 import torch
-from torchrl.envs import GymWrapper, step_mdp
+from torchrl.envs import step_mdp
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 from adapters import RaceGymEnv
+from adapters.torchrl import RaceTorchRLEnv
 from env.types import TransitionRecord
 from metrics.outcomes import determine_outcome
 from training.ppo_collector import PPOTrainerBase
-from training.reward_context import transition_lifecycle_fields
+from training.transition_records import transition_lifecycle_fields
 
 
 class TorchRLPPOTrainer(PPOTrainerBase):
@@ -28,7 +29,7 @@ class TorchRLPPOTrainer(PPOTrainerBase):
         gym_env = RaceGymEnv(self.task)
         if not self.render:
             gym_env.render_mode = None
-        wrapped = GymWrapper(gym_env, device="cpu")
+        wrapped = RaceTorchRLEnv(gym_env, device="cpu")
         episode, self.collected_steps, updates = 0, 0, 0
         started = time.perf_counter()
         pending, pending_steps = [], 0
@@ -74,7 +75,7 @@ class TorchRLPPOTrainer(PPOTrainerBase):
                             terminated=decision.terminated, truncated=decision.truncated, info=dict(decision.info),
                             global_state=result.before.global_state.vector.copy(), map_id=map_id, spawn_id=spawn_id,
                             episode_id=episode_id, step_idx=step_idx, agent_id=self.rl_agent_id,
-                            **transition_lifecycle_fields(self.env, decision.info, global_state=result.after.global_state),
+                            **transition_lifecycle_fields(decision.info, global_state=result.after.global_state),
                         )
                         for hook in self._transition_hooks:
                             hook.on_step(record)

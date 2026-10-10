@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, List, Optional
 from env.types import TransitionRecord
 from metrics.outcomes import determine_outcome
 from training.hooks import TrainingHook, transition_record_hooks
-from training.reward_context import transition_lifecycle_fields
+from training.transition_records import transition_lifecycle_fields
 from tasks import RaceTask, TaskSnapshot
 
 
@@ -23,7 +23,6 @@ class PPOTrainerBase:
         if task.team_reward_agent_id is not None:
             raise ValueError("Team race rewards require MAPPO joint team returns")
         self.task = task
-        self.env = task.env
         self.rl_agent_id = task.possible_agents[0]
         self.agent = agent
         self.hooks = hooks or []
@@ -42,18 +41,11 @@ class PPOTrainerBase:
     def _episode_id(self, episode: int) -> str:
         return f"{self.run_id}_ep{episode:06d}"
 
-    def _map_id(self) -> Optional[str]:
-        return getattr(self.env, "_map_bundle_active", None) or getattr(
-            self.env, "map_name", None
-        )
+    def _map_id(self):
+        return self.task.episode_metadata.map_id
 
-    def _spawn_id(self) -> Optional[str]:
-        sm = getattr(self.env, "_spawn_manager", None)
-        if sm is None:
-            return None
-        meta = getattr(sm, "last_spawn_metadata", {}) or {}
-        spawn_ids = meta.get("spawn_ids", {})
-        return spawn_ids.get(self.rl_agent_id) or meta.get("spawn_id")
+    def _spawn_id(self):
+        return self.task.episode_metadata.spawn_id(self.rl_agent_id)
 
     def _reset_env(self) -> TaskSnapshot:
         """Reset env, injecting a curriculum spawn plan when one is available."""
@@ -153,7 +145,6 @@ class PPOCollector(PPOTrainerBase):
                         step_idx=step_idx,
                         agent_id=self.rl_agent_id,
                         **transition_lifecycle_fields(
-                            self.env,
                             last_info,
                             global_state=post_step_global_snapshot,
                         ),
@@ -196,7 +187,7 @@ class PPOCollector(PPOTrainerBase):
             # Lifecycle timing persists after the crossing and counts physics
             # steps, not policy decisions (so do not multiply by action_repeat).
             lap_time_steps = last_info.get("lap_time_steps")
-            timestep = getattr(self.env, "timestep", None)
+            timestep = self.task.timestep
             update_metrics["lap_time_s"] = (
                 float(lap_time_steps) * float(timestep)
                 if lap_time_steps is not None and timestep is not None else None

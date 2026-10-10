@@ -7,20 +7,24 @@ no worker resumes collection until the pooled policy update has finished.
 """
 from __future__ import annotations
 
-import copy
 import os
 import time
 from pathlib import Path
+from contextlib import ExitStack
 
 import numpy as np
 import torch
+
+from training.worker_runtime import (
+    worker_settings, close_workers, report_worker_error, receive_worker,
+    worker_thread_limits, collector_scenario,
+)
 
 from training.hooks import ConsoleHook, transition_record_hooks
 from training.collector_progress import CollectorProgress
 from loggers.metric_policy import MetricPolicy
 from training.collector_scheduling import (
     CollectorEventSink, CollectorScheduler,
-    _close_collectors, _report_worker_error, _worker_startup_settings,
     cpu_affinity_count, cpu_affinity_core_count,
 )
 from training.collector_hooks import WorkerHook
@@ -72,31 +76,20 @@ def _make_collector(scenario, scenario_dir, env_id, episodes, horizon, contract,
     from core.task_builder import create_race_task
     from training.runtime import seed_process
 
-    scenario = copy.deepcopy(scenario)
-    base_seed = int(scenario["experiment"]["seed"])
-    seed = (base_seed + env_id) % (2 ** 32)
-    scenario["experiment"]["seed"] = seed
-    env_cfg = scenario["environment"]
-    env_seed = env_cfg.get("seed")
-    env_cfg["seed"] = ((base_seed if env_seed is None else int(env_seed)) + env_id) % (2 ** 32)
-    env_cfg["render"] = False
+    scenario, seed = collector_scenario(scenario, env_id)
     seed_process(seed)
     task = create_race_task(scenario, scenario_dir=Path(scenario_dir))
-    env = task.env
     try:
         ids = contract["agent_ids"]
-        obs = task.obs_composers
-        snapshot = env.get_global_state()
-        if (len(snapshot.vector) != contract["global_state_dim"] or
-                snapshot.metadata.get("vector_contract_version", "legacy_unspecified") !=
-                contract["global_state_contract_version"]):
-            raise ValueError("MAPPO collector global-state contract mismatch")
+        spec = task.spec
+        if (spec.agent_ids != tuple(ids) or spec.state_dim != contract["global_state_dim"] or
+                spec.state_version != contract["global_state_contract_version"]):
+            raise ValueError("MAPPO collector global-state/agent contract mismatch")
         for aid in ids:
-            space = env.action_spaces[aid]
-            if (obs[aid].obs_dim != contract.get("obs_dims", {}).get(aid, contract["obs_dim"]) or
-                    obs[aid].contract != contract.get("observation_contracts", {}).get(aid, contract["observation_contract"]) or
-                    not np.array_equal(space.low, contract["action_low"]) or
-                    not np.array_equal(space.high, contract["action_high"])):
+            if (spec.observation_dims[aid] != contract.get("obs_dims", {}).get(aid, contract["obs_dim"]) or
+                    spec.observation_contracts[aid] != contract.get("observation_contracts", {}).get(aid, contract["observation_contract"]) or
+                    not np.array_equal(spec.action_lows[aid], contract["action_low"]) or
+                    not np.array_equal(spec.action_highs[aid], contract["action_high"])):
                 raise ValueError("MAPPO collector observation/action contract mismatch")
         from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
         agent = MAPPOCollectorState(contract, horizon)
@@ -105,9 +98,9 @@ def _make_collector(scenario, scenario_dir, env_id, episodes, horizon, contract,
             hooks=[WorkerHook(sink, env_id, seed, record_transitions)],
             run_id=f"{run_id}_env{env_id:04d}",
         )
-        return env, agent, trainer.iter_train(episodes, parallel=True, total_steps=total_steps)
+        return task, agent, trainer.iter_train(episodes, parallel=True, total_steps=total_steps)
     except BaseException:
-        env.close()
+        task.close()
         raise
 
 
@@ -116,16 +109,16 @@ def _collect_worker(connection, scenario, scenario_dir, assignments, horizon,
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["PYGLET_HEADLESS"] = "true"
     torch.set_num_threads(1)
-    envs, agents, generators, pending = {}, {}, {}, {}
+    tasks, agents, generators, pending = {}, {}, {}, {}
     sink = CollectorEventSink()
     try:
         for env_id, quota in assignments:
-            envs[env_id], agents[env_id], generators[env_id] = _make_collector(
+            tasks[env_id], agents[env_id], generators[env_id] = _make_collector(
                 scenario, scenario_dir, env_id, 0 if step_budget else quota, horizon, contract, run_id,
                 sink, record_transitions,
                 total_steps=quota if step_budget else None,
             )
-        connection.send(("ready", len(envs)))
+        connection.send(("ready", len(tasks)))
         if connection.recv() != ("start", None):
             raise RuntimeError("MAPPO collector expected start after readiness")
 
@@ -181,10 +174,10 @@ def _collect_worker(connection, scenario, scenario_dir, assignments, horizon,
     except (BrokenPipeError, EOFError, ConnectionResetError):
         pass
     except BaseException:
-        _report_worker_error(connection)
+        report_worker_error(connection)
     finally:
-        for env in envs.values():
-            env.close()
+        for task in tasks.values():
+            task.close()
         connection.close()
 
 
@@ -204,7 +197,7 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
     if total_steps is None and n_episodes < num_envs:
         raise ValueError("Parallel MAPPO needs at least num_envs episodes")
     budget = total_steps if total_steps is not None else n_episodes
-    startup = _worker_startup_settings(scenario)
+    startup = worker_settings(scenario)
     scheduler = CollectorScheduler(experiment.get("collector_scheduling", "synchronous"),
                                    startup["worker_response_timeout_s"])
     agent = trainer.agent
@@ -223,9 +216,7 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
     started_training = time.perf_counter()
     context = mp.get_context("spawn")
     # Set before spawning, so NumPy/BLAS/Numba imports inherit single-thread limits.
-    thread_vars = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
-                   "NUMEXPR_NUM_THREADS", "NUMBA_NUM_THREADS")
-    previous = {key: os.environ.get(key) for key in thread_vars}
+    resources = ExitStack()
     progress = CollectorProgress(getattr(trainer, 'console', None), workers=workers,
         environments=num_envs, horizon=horizon,
         interval=experiment.get('collector_progress_interval_s', 15.),
@@ -236,18 +227,11 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
 
     def receive(worker_id, starting=False):
         timeout = startup["worker_startup_timeout_s" if starting else "worker_response_timeout_s"]
-        process = process_by_worker[worker_id]
-        if not connections[worker_id].poll(timeout):
-            raise RuntimeError(f"MAPPO worker {worker_id} timed out after {timeout}s "
-                               f"(pid={process.pid}, exitcode={process.exitcode})")
-        try:
-            kind, payload = connections[worker_id].recv()
-        except (EOFError, ConnectionResetError) as exc:
-            raise RuntimeError(f"MAPPO worker {worker_id} disconnected (exitcode={process.exitcode})") from exc
-        progress.received()
-        if kind == "error":
-            raise RuntimeError(f"MAPPO worker {worker_id} failed:\n{payload}")
-        return kind, payload
+        return receive_worker(
+            connections[worker_id], process_by_worker[worker_id],
+            label=f"MAPPO worker {worker_id}", timeout=timeout,
+            on_received=progress.received,
+        )
 
     def process_events(items):
         for kind, payload in items:
@@ -325,8 +309,7 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
             elif affinity_cores is not None and workers > affinity_cores:
                 console.print_info(f"MAPPO {workers} workers share {affinity_cores} physical cores. "
                                    "Compare fewer workers using round_steps/s to measure hardware-thread contention.")
-        for key in thread_vars:
-            os.environ[key] = "1"
+        resources.enter_context(worker_thread_limits())
         batch_size = startup["worker_startup_batch_size"]
         for start in range(0, workers, batch_size):
             batch = range(start, min(start + batch_size, workers))
@@ -484,9 +467,7 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
         for setter, previous_callback in evaluation_callbacks:
             setter(previous_callback)
         progress.close()
-        _close_collectors(list(connections.values()), processes, failed=not success)
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+        try:
+            close_workers(list(connections.values()), processes, failed=not success)
+        finally:
+            resources.close()

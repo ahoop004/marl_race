@@ -3,7 +3,9 @@ import argparse
 import sys
 from pathlib import Path
 from core.scenario import (ScenarioError, apply_parameter_overrides,
-                           load_and_expand_scenario, resolve_max_speed, validate_scenario)
+                           load_and_expand_scenario, resolve_max_speed)
+from application.configuration import validate_experiment_scenario
+from core.agent_roles import resolve_agent_roles
 from application.checkpoints import resolve_scenario_relative_path
 from loggers.console import ConsoleLogger
 
@@ -95,9 +97,14 @@ def apply_cli_overrides(scenario: dict, args: argparse.Namespace) -> dict:
         if horizon <= 0:
             raise ValueError("--rollout-steps-per-env must be positive")
         num_envs = int(scenario.get("experiment", {}).get("num_envs", 1))
-        for cfg in scenario.get("agents", {}).values():
-            if cfg.get("trainable", False) and cfg.get("algorithm") in {"ppo", "mappo"}:
-                cfg.setdefault("params", {})["n_steps"] = horizon * (num_envs if cfg["algorithm"] == "ppo" else 1)
+        try:
+            roles = resolve_agent_roles(scenario.get("agents", {}))
+        except ValueError as exc:
+            raise ScenarioError(str(exc)) from exc
+        for aid in roles.policy_agents:
+            cfg = scenario["agents"][aid]
+            algorithm = str(cfg["algorithm"]).strip().lower()
+            cfg.setdefault("params", {})["n_steps"] = horizon * (num_envs if algorithm == "ppo" else 1)
         scenario.setdefault("training_defaults", {})["rollout_steps_per_env"] = horizon
     return resolve_max_speed(scenario)
 
@@ -123,7 +130,7 @@ def main() -> None:
 
     try:
         scenario = apply_cli_overrides(scenario, args)
-        validate_scenario(scenario)
+        validate_experiment_scenario(scenario)
     except ScenarioError as exc:
         console.print_error(f"Invalid scenario after CLI overrides: {exc}")
         sys.exit(1)
@@ -138,7 +145,6 @@ def main() -> None:
                 configured_checkpoint, scenario_dir
             ))
 
-    from core.agent_builder import resolve_agent_roles
     roles = resolve_agent_roles(scenario["agents"])
     if args.pretrained_actor and (args.eval or not roles.policy_agents or any(
             str(scenario["agents"][aid]["algorithm"]).lower() != "mappo" for aid in roles.policy_agents)):

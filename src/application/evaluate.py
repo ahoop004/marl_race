@@ -12,8 +12,8 @@ import numpy as np
 
 from application.checkpoints import resolve_checkpoint_path
 from adapters.rewards import RewardMapping
-from core.agent_builder import get_trainable_agent_ids
-from core.scenario import resolve_evaluation_protocol
+from core.agent_roles import resolve_agent_roles
+from training.evaluation_config import resolve_evaluation_protocol
 from core.task_builder import create_race_task
 from core.run_id import resolve_run_id
 from core.provenance import build_run_provenance, provenance_mismatches
@@ -22,7 +22,7 @@ from loggers.metric_policy import MetricPolicy
 from loggers.lap_completion import episode_lap_summary
 from metrics.racing_eval import aggregate_eval_episodes, episode_race_record, team_finish_result
 from training.contracts import validate_team_reward_composers
-from training.algorithms import TaskSpec, select_algorithm, learner_params, create_learner
+from training.algorithms import select_algorithm, learner_params, create_learner
 from training.evaluation import run_evaluation_episode
 from training.runtime import evaluation_mode, seed_process
 from utils.torch_io import resolve_device
@@ -50,7 +50,7 @@ def _run_evaluation(
     compact_laps = MetricPolicy(scenario.get("wandb", {}).get("logging"), scenario).lap_completion
 
     agent_configs = scenario.get("agents", {})
-    trainable_ids = get_trainable_agent_ids(agent_configs)
+    trainable_ids = list(resolve_agent_roles(agent_configs).policy_agents)
     if not trainable_ids:
         console.print_error(
             "--eval requires at least one trainable agent in the scenario."
@@ -89,7 +89,7 @@ def _run_evaluation(
                             render_mode="human" if render else None)
     resources.callback(task.close)
     env = task.env
-    spec = TaskSpec.from_task(task)
+    spec = task.spec
     params = learner_params(scenario, spec, algorithm)
     action_dim = len(spec.action_lows[focal_agent_id])
     has_team_rewards = validate_team_reward_composers(

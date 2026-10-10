@@ -13,7 +13,7 @@ from core.provenance import build_run_provenance
 from loggers.csv_logger import CSVLogger
 from loggers.wandb_logger import WandbLogger
 from loggers.metric_policy import MetricPolicy
-from training.algorithms import TaskSpec, select_algorithm, learner_params, create_learner, create_trainer
+from training.algorithms import select_algorithm, learner_params, create_learner, create_trainer
 from training.selection import create_selection_evaluator
 from training.runtime import seed_process
 from training.hooks import (CSVHook, CheckpointHook, ConsoleHook,
@@ -83,7 +83,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     # no sizing reset and exposes the state contract before episode zero.
     if algorithm == "mappo" and resolve_training_params(agent_cfg, scenario)["_physics_contract"] is None:
         task.env.reset()
-    spec = TaskSpec.from_task(task)
+    spec = task.spec
     params = learner_params(scenario, spec, algorithm)
     if initial_checkpoint is not None:
         params["_initial_checkpoint_sha256"] = hashlib.sha256(initial_checkpoint.read_bytes()).hexdigest()

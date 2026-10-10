@@ -3,13 +3,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from env.RaceEnv import RaceEnv
-from core.agent_builder import (
-    build_fixed_policy_agents,
-    AgentRoles, resolve_agent_roles,
-)
+from core.agent_builder import build_fixed_policy_agents
 from core.env_builder import create_environment
-from core.feature_requirements import derive_environment_feature_requirements
-from core.map_selection import apply_map_split
+from core.agent_roles import AgentRoles, resolve_agent_roles
+from core.environment_config import resolve_environment_config
 from wrappers.observations.composer import ObservationComposer
 from wrappers.rewards.composer import RewardComposer
 
@@ -76,95 +73,37 @@ def create_environment_setup(
     mode: str = "train",
     scenario_dir: Optional[Path] = None,
     roles: Optional[AgentRoles] = None,
+    env_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[RaceEnv, Dict[str, Any]]:
     """Create physics and fixed controllers from resolved action-owner roles.
 
-    Mode selects map splits and physical evaluation overrides. This builder
-    neither selects a learner nor seeds process-global policy randomness.
+    Resolve physical configuration when the caller has not already supplied it.
+    This builder neither selects a learner nor seeds policy randomness.
     """
-    # Extract configuration sections
-    experiment_config = scenario['experiment']
-    env_config = dict(scenario['environment'])
-    env_config = apply_map_split(env_config, experiment_config, mode)
-    env_config["physics_phase"] = "eval" if mode in {"eval", "evaluation", "test"} else "train"
-    evaluation = scenario.get("evaluation", {}) or {}
-    if env_config["physics_phase"] == "eval" and "no_progress" in evaluation:
-        env_config["no_progress"] = evaluation["no_progress"]
-    if env_config["physics_phase"] == "eval" and "target_laps" in evaluation:
-        # Continuous training can disable finishing and timeouts. Evaluation
-        # explicitly restores a finite race for PPO and multi-agent MAPPO alike.
-        env_config["target_laps"] = int(evaluation["target_laps"])
-        env_config["episode_termination"] = {**env_config.get("episode_termination", {}),
-                                             "lap_completion": True}
-        if "max_steps" in evaluation:
-            env_config["max_steps"] = int(evaluation["max_steps"])
-    if env_config["physics_phase"] == "eval" and "terminate_on_collision" in evaluation:
-        env_config["terminate_on_collision"] = evaluation["terminate_on_collision"]
-    if env_config["physics_phase"] == "eval" and env_config.get("track_limits", {}).get("enabled"):
-        # Default paper evaluation records excursions; safety evaluation can
-        # explicitly retain boundary termination as well as collision checks.
-        env_config["track_limits"] = {
-            "enabled": True,
-            "terminate": bool(evaluation.get("terminate_on_track_limit", False)),
-        }
-        env_config["episode_termination"] = {**env_config.get("episode_termination", {}),
-                                             "lap_completion": True}
-        env_config["target_laps"] = int(evaluation.get("target_laps", 20))
-        env_config["max_steps"] = int(evaluation.get("max_steps", 16000))
-    if env_config["physics_phase"] == "eval" and "lap_completion" in evaluation:
-        env_config["episode_termination"] = {**env_config.get("episode_termination", {}),
-                                             "lap_completion": evaluation["lap_completion"]}
-    if env_config["physics_phase"] == "eval" and "episode_termination_mode" in evaluation:
-        env_config["episode_termination"] = {**env_config.get("episode_termination", {}),
-                                             "mode": evaluation["episode_termination_mode"]}
+    env_config = (resolve_environment_config(
+        scenario, mode=mode, scenario_dir=scenario_dir, roles=roles,
+    ) if env_config is None else env_config)
     agent_configs = scenario['agents']
     roles = roles or resolve_agent_roles(agent_configs)
-    if (set(roles.policy_agents) & set(roles.fixed_agents)
-            or set(roles.policy_agents) | set(roles.fixed_agents) != set(agent_configs)):
-        raise ValueError("Every physical agent needs exactly one action owner")
-    env_config.setdefault("trainable_agents", list(roles.policy_agents))
-    env_config.setdefault("fixed_policy_agents", list(roles.fixed_agents))
-    if scenario_dir is not None:
-        requirements = derive_environment_feature_requirements(
-            agent_configs,
-            scenario_dir=Path(scenario_dir),
-            centerline_render=bool(env_config.get("centerline_render", False)),
-        )
-        env_config["feature_requirements"] = requirements.as_dict()
-        geometry_required = bool(
-            requirements.requires_centerline_facts
-            or requirements.requires_track_preview
-            or requirements.requires_frenet_neighbors
-            or requirements.centerline_render
-        )
-        if geometry_required:
-            env_config["centerline_autoload"] = True
-        if (
-            requirements.requires_centerline_facts
-            or requirements.requires_track_preview
-            or requirements.requires_frenet_neighbors
-        ):
-            env_config["centerline_features"] = True
-
-    seed = experiment_config.get('seed')
+    seed = scenario['experiment'].get('seed')
     env = create_environment(env_config, agent_configs, seed)
 
-    # Preserve explicitly configured targets in environment lifecycle facts.
-    target_mapping = {
-        aid: cfg["target_id"]
-        for aid, cfg in agent_configs.items()
-        if cfg.get("target_id")
-    }
-    if target_mapping:
-        env.configure_agent_targets(target_mapping)
-
     try:
+        # Preserve explicitly configured targets in environment lifecycle facts.
+        target_mapping = {
+            aid: cfg["target_id"]
+            for aid, cfg in agent_configs.items()
+            if cfg.get("target_id")
+        }
+        if target_mapping:
+            env.configure_agent_targets(target_mapping)
+
         agents = build_fixed_policy_agents(agent_configs, fixed_ids=roles.fixed_agents,
                                           vehicle_params=env.params)
         for controller in agents.values():
             if hasattr(controller, "set_env"):
                 controller.set_env(env)
-    except Exception:
+    except BaseException:
         env.close()
         raise
     return env, agents

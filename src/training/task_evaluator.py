@@ -15,21 +15,17 @@ class TaskEvaluator:
                  reward_mapping=RewardMapping()):
         if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes < 1:
             raise ValueError("Evaluation episodes must be a positive integer")
-        self.task, self.env = task, task.env
+        self.task = task
         self.trainable_ids = list(task.possible_agents)
         self.episodes, self.base_seed = episodes, int(base_seed)
         self.protocol_name, self.reward_mapping = protocol_name, reward_mapping
         self.action_repeat = task.action_repeat
         self.progress_callback = None
         self._next_progress = 0.0
-        if self.env.max_steps <= 0:
-            finishers = self.env.lifecycle.lap_finish_agents if self.env.lifecycle.finish_on_laps else set()
-            relevant = (self.trainable_ids if self.env.episode_termination_mode == "all_trainable"
-                        or self.completion == "policy" else self.env.possible_agents)
-            lap_bounded = (bool(finishers) if self.env.episode_termination_mode == "any_agent"
-                           else bool(relevant) and set(relevant) <= finishers)
-            if not lap_bounded:
-                raise ValueError("Checkpoint evaluation requires a finite horizon for its termination group")
+        if not task.episode_limits.is_bounded(
+            task.physical_agents, task.possible_agents, completion=self.completion,
+        ):
+            raise ValueError("Checkpoint evaluation requires a finite horizon for its termination group")
 
     def set_progress_callback(self, callback):
         previous, self.progress_callback = self.progress_callback, callback
@@ -43,13 +39,14 @@ class TaskEvaluator:
             return
         self._next_progress = now + 1.0
         learners = [facts.agents[aid] for aid in self.trainable_ids]
-        finishers = self.env.lifecycle.lap_finish_agents if self.env.lifecycle.finish_on_laps else set()
+        limits = self.task.episode_limits
+        finishers = limits.finish_agents
         self.progress_callback(dict(episode=episode + 1, episodes=self.episodes,
-            map=str(getattr(self.env, "_map_bundle_active", None) or self.env.map_name),
-            status=status, steps=steps, max_steps=self.env.max_steps,
+            map=str(self.task.episode_metadata.map_id),
+            status=status, steps=steps, max_steps=self.task.episode_limits.max_steps,
             sim_seconds=steps * self.task.timestep,
             laps=",".join(f'{a.agent_id}:{a.final_lap_count}/'
-                          f'{self.env.target_laps if a.agent_id in finishers else "unlimited"}' for a in learners),
+                          f'{limits.target_laps if a.agent_id in finishers else "unlimited"}' for a in learners),
             outcome=",".join(f'{a.agent_id}:{a.terminal_reason or "active"}' for a in learners)))
 
     def bind_agent(self, agent):
@@ -77,8 +74,8 @@ class TaskEvaluator:
             raise ValueError("Checkpoint evaluation requires a bound policy")
         protocol = dict(name=self.protocol_name, spawn_schedule="episode_index_v1",
             seeds=list(range(self.base_seed, self.base_seed + self.episodes)),
-            max_steps=self.env.max_steps, timestep_s=self.task.timestep,
-            target_laps=getattr(self.env, "target_laps", None), action_repeat=self.action_repeat,
+            max_steps=self.task.episode_limits.max_steps, timestep_s=self.task.timestep,
+            target_laps=self.task.episode_limits.target_laps, action_repeat=self.action_repeat,
             completion=self.completion)
         by_map, physics, records, results = {}, [], [], []
         try:

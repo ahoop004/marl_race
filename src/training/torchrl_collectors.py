@@ -51,9 +51,9 @@ class _DecisionBuffer:
 class PPOCollectorState:
     """CPU decision storage and parent control; workers own no policy networks."""
 
-    def __init__(self, n_steps, *, map_scheduler=None, worker_id=0):
+    def __init__(self, n_steps, *, curriculum=None, worker_id=0):
         self.buffer = _DecisionBuffer(n_steps)
-        self.map_scheduler = map_scheduler
+        self.curriculum = curriculum
         self.worker_id = worker_id
         self.should_stop = False
         self._training_bundles = None
@@ -68,10 +68,10 @@ class PPOCollectorState:
         self.should_stop = bool(control["stop"])
         bundles = tuple(control.get("training_bundles", ()))
         if bundles and bundles != self._training_bundles:
-            if self.map_scheduler is None:
+            if self.curriculum is None:
                 raise RuntimeError("Collector received map curriculum without a scheduler")
             offset = self.worker_id % len(bundles)
-            self.map_scheduler.set_training_bundles(list(bundles[offset:] + bundles[:offset]))
+            self.curriculum.set_training_bundles(list(bundles[offset:] + bundles[:offset]))
             self._training_bundles = bundles
         return reply["metrics"]
 

@@ -5,7 +5,7 @@ from typing import Any
 from adapters.rewards import RewardMapping
 from metrics.racing_eval import (
     create_episode_facts, update_agent_step_facts, finalize_episode_facts,
-    episode_race_record, capture_spawn_context,
+    episode_race_record,
 )
 
 
@@ -33,8 +33,8 @@ def run_evaluation_episode(task, actions_fn, *, episode, seed,
         raise ValueError("Evaluation completion must be race or policy")
     snapshot = task.reset(seed=seed, options={"map_episode_index": episode,
                                            "spawn_episode_index": episode})
-    spawn = capture_spawn_context(task.env, task.physical_agents)
-    map_id = getattr(task.env, "_map_bundle_active", None) or getattr(task.env, "map_name", None)
+    spawn = task.episode_metadata.spawn_configuration
+    map_id = task.episode_metadata.map_id
     facts = create_episode_facts(episode=episode, agent_ids=task.physical_agents,
                                 trainable_ids=task.possible_agents,
                                 opponent_ids=task.fixed_policy_agents)

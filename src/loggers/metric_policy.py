@@ -1,7 +1,7 @@
 """Dashboard selection only; training and checkpoint selection retain all facts."""
 from fnmatch import fnmatchcase
 
-from core.scenario import EVALUATION_STRATEGIES
+from training.evaluation_config import EVALUATION_STRATEGIES
 
 
 AXES = {

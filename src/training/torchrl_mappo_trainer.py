@@ -9,11 +9,11 @@ import numpy as np
 from env.types import TransitionRecord
 from metrics.outcomes import determine_outcome
 from training.hooks import TrainingHook, transition_record_hooks
-from training.reward_context import transition_lifecycle_fields
+from training.transition_records import transition_lifecycle_fields
 from training.contracts import validate_team_reward_composers
 from metrics.racing_eval import (team_finish_result, create_episode_facts,
                                 update_agent_step_facts, finalize_episode_facts,
-                                episode_race_record, capture_spawn_context)
+                                episode_race_record)
 from tasks import RaceTask
 from adapters import RaceParallelEnv
 
@@ -25,7 +25,6 @@ class TorchRLMAPPOTrainer:
                  hooks: Optional[List[TrainingHook]] = None, render: bool = False,
                  focal_agent_id: Optional[str] = None, run_id: str = "run") -> None:
         self.task = task
-        self.env = task.env
         self.agent = agent
         self.trainable_ids = list(task.possible_agents)
         self.other_agents = task.fixed_controllers
@@ -59,19 +58,11 @@ class TorchRLMAPPOTrainer:
     def _episode_id(self, episode: int) -> str:
         return f"{self.run_id}_ep{episode:06d}"
 
-    def _map_id(self) -> Optional[str]:
-        return getattr(self.env, "_map_bundle_active", None) or getattr(
-            self.env, "map_name", None
-        )
+    def _map_id(self):
+        return self.task.episode_metadata.map_id
 
-    def _spawn_id(self, agent_id: str) -> Optional[str]:
-        spawn_manager = getattr(self.env, "_spawn_manager", None)
-        if spawn_manager is None:
-            return None
-        metadata = getattr(spawn_manager, "last_spawn_metadata", {}) or {}
-        spawn_ids = metadata.get("spawn_ids", {})
-        return (spawn_ids.get(agent_id) or metadata.get("spawn_id") or
-                getattr(spawn_manager, "last_spawn_mapping", {}).get(agent_id))
+    def _spawn_id(self, agent_id):
+        return self.task.episode_metadata.spawn_id(agent_id)
 
     # ------------------------------------------------------------------
     # Training loop
@@ -146,10 +137,10 @@ class TorchRLMAPPOTrainer:
             facts = create_episode_facts(episode=episode,
                 agent_ids=[*self.trainable_ids, *self.other_agents],
                 trainable_ids=self.trainable_ids, opponent_ids=list(self.other_agents))
-            spawn_context = capture_spawn_context(self.env, facts.agents)
+            spawn_context = self.task.episode_metadata.spawn_configuration
             physics_steps = 0
             start_policy = getattr(self.agent, "policy_version", self._updates)
-            finite_race = getattr(getattr(self.env, "lifecycle", None), "finish_on_laps", True)
+            finite_race = self.task.episode_limits.finish_on_laps
             team_components = {}
 
             def on_physics_step(substep):
@@ -261,7 +252,7 @@ class TorchRLMAPPOTrainer:
                     self.agent.store_team_step(
                         ordered_ids, reward=team_step_reward,
                         value=values[ordered_ids[0]],
-                        terminal=not any(aid in getattr(self.env, "agents", []) for aid in self.trainable_ids),
+                        terminal=not self.task.agents,
                     )
                 if ordered_ids and hasattr(self.agent, "set_next_state"):
                     self.agent.set_next_state(next_global_state)
@@ -287,7 +278,6 @@ class TorchRLMAPPOTrainer:
                             step_idx=step_idx,
                             agent_id=aid,
                             **transition_lifecycle_fields(
-                                self.env,
                                 agent_infos[aid],
                                 global_state=post_step_global_snapshot,
                             ),
@@ -388,10 +378,10 @@ class TorchRLMAPPOTrainer:
             }
             episode_metrics["race_record"] = {
                 **episode_race_record(finalize_episode_facts(facts),
-                    timestep=float(getattr(self.env, "timestep", .01)), finite_race=finite_race),
+                    timestep=self.task.timestep, finite_race=finite_race),
                 "run_id": self.run_id, "environment_id": 0, "episode_id": episode_id,
                 "environment_episode": episode, "map_id": map_id,
-                "environment_seed": getattr(self.env, "seed", None),
+                "environment_seed": self.task.episode_metadata.environment_seed,
                 "spawn_ids": {aid: self._spawn_id(aid) for aid in facts.agents},
                 "spawn_configuration": spawn_context,
                 "environment_decisions": step_idx,

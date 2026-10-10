@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional
 
 import numpy as np
 
-from core.scenario import EVALUATION_STRATEGIES
+from training.evaluation_config import EVALUATION_STRATEGIES
 from loggers.console import ConsoleLogger
 from loggers.lap_completion import episode_lap_summary
 from loggers.wandb_logger import WandbLogger

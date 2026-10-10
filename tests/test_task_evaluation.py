@@ -147,7 +147,7 @@ def test_checkpoint_evaluation_restores_rng_and_actor_mode_after_failure():
 
 
 def test_task_creation_does_not_depend_on_learner_algorithm_or_global_rng(monkeypatch):
-    from core.agent_builder import AgentRoles
+    from core.agent_roles import AgentRoles
     from core.scenario import load_and_expand_scenario
     from core.task_builder import create_race_task
 
@@ -182,7 +182,7 @@ def test_task_assigns_one_owner_for_configured_shared_components():
 def test_serial_and_parallel_selection_evaluation_match(monkeypatch):
     from core.scenario import load_and_expand_scenario
     from core.task_builder import create_race_task
-    from training.algorithms import TaskSpec, learner_params, create_learner
+    from training.algorithms import learner_params, create_learner
     from training.selection import create_selection_evaluator
 
     monkeypatch.setenv("PYGLET_HEADLESS", "true")
@@ -194,7 +194,7 @@ def test_serial_and_parallel_selection_evaluation_match(monkeypatch):
     training_task = create_race_task(config, scenario_dir=ROOT / "scenarios")
     serial = parallel = None
     try:
-        spec = TaskSpec.from_task(training_task)
+        spec = training_task.spec
         params = learner_params(config, spec, "mappo")
         policy = create_learner("mappo", spec, params, training=False)
         serial = create_selection_evaluator("mappo", config, ROOT / "scenarios", spec, params).bind_agent(policy)

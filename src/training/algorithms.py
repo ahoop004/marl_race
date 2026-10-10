@@ -1,9 +1,7 @@
 """Learner selection and contracts, independent of environment construction."""
-from dataclasses import dataclass
-
 import numpy as np
 
-from core.scenario import resolve_mappo_config
+from training.configuration import POLICY_ALGORITHMS, resolve_mappo_config
 from core.provenance import physics_contract
 from wrappers.actions.composer import ActionComposer
 
@@ -20,31 +18,10 @@ def resolve_training_params(agent_cfg: dict, scenario: dict) -> dict:
     )}
 
 
-@dataclass(frozen=True)
-class TaskSpec:
-    agent_ids: tuple
-    observation_dims: dict
-    observation_contracts: dict
-    action_lows: dict
-    action_highs: dict
-    state_dim: int
-    state_version: str
-
-    @classmethod
-    def from_task(cls, task):
-        state = task.env.get_global_state()
-        ids = task.possible_agents
-        return cls(ids, {aid: task.observation_space(aid).shape[0] for aid in ids},
-                   {aid: task.obs_composers[aid].contract for aid in ids},
-                   {aid: task.env.action_spaces[aid].low.copy() for aid in ids},
-                   {aid: task.env.action_spaces[aid].high.copy() for aid in ids},
-                   len(state.vector), state.metadata.get("vector_contract_version", "legacy_unspecified"))
-
-
 def select_algorithm(scenario, policy_agents):
     algorithms = {str(scenario["agents"][aid]["algorithm"]).strip().lower()
                   for aid in policy_agents}
-    if len(algorithms) != 1 or not algorithms <= {"ppo", "mappo"}:
+    if len(algorithms) != 1 or not algorithms <= POLICY_ALGORITHMS:
         raise ValueError("Select one PPO learner or a homogeneous MAPPO team")
     algorithm = algorithms.pop()
     if algorithm == "ppo" and len(policy_agents) != 1:

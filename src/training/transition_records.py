@@ -9,17 +9,11 @@ from env.types import GlobalState
 
 
 def transition_lifecycle_fields(
-    env: Any,
     info: Dict[str, Any],
     *,
     global_state: Optional[GlobalState] = None,
 ) -> Dict[str, Any]:
-    """Build dataset lifecycle fields from one post-decision environment view."""
-    if global_state is None:
-        try:
-            global_state = env.get_global_state()
-        except Exception:
-            global_state = None
+    """Build dataset lifecycle fields from detached post-decision facts."""
     masks = getattr(global_state, "masks", {})
     return {
         "lap_crossed": bool(info.get("lap_crossed", False)),

@@ -1,9 +1,4 @@
-"""Scenario configuration system for v2 training pipeline.
-
-Provides shared YAML include loading and scenario validation
-for algorithms, rewards, and observations. Scenarios define complete
-training setups in a concise, readable format.
-"""
+"""Inherited scenario loading and algorithm-independent task validation."""
 
 from typing import Dict, Any, Optional
 import copy
@@ -17,8 +12,6 @@ class ScenarioError(Exception):
     """Exception raised for scenario configuration errors."""
     pass
 
-
-EVALUATION_STRATEGIES = frozenset({"completion_progress", "lap_time", "team_completion"})
 
 def resolve_max_speed(scenario: Dict[str, Any]) -> Dict[str, Any]:
     """Apply an optional shared forward speed limit to learners and MPCs.
@@ -51,27 +44,6 @@ def resolve_max_speed(scenario: Dict[str, Any]) -> Dict[str, Any]:
         if str(agent.get("algorithm", "")).strip().lower() in fixed_controller_names():
             agent.setdefault("params", {})["max_speed"] = float(speed)
     return result
-
-
-MAPPO_DEFAULTS: Dict[str, str] = {
-    "actor_mode": "shared",
-    "reward_mode": "team_shared",
-    "critic_mode": "shared_team",
-    "team_reward_reduction": "mean",
-}
-
-
-def resolve_mappo_config(scenario: Dict[str, Any]) -> Dict[str, str]:
-    """Return the normalized MAPPO reward/critic experiment contract."""
-    raw = scenario.get("mappo", {}) or {}
-    if not isinstance(raw, dict):
-        raise ScenarioError("'mappo' must be a dictionary when provided.")
-    unknown = sorted(set(raw) - set(MAPPO_DEFAULTS))
-    if unknown:
-        raise ScenarioError(f"Unknown MAPPO config field(s): {unknown}.")
-    config = dict(MAPPO_DEFAULTS)
-    config.update({key: str(value).strip().lower() for key, value in raw.items()})
-    return config
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -204,116 +176,20 @@ def load_scenario(path: str) -> Dict[str, Any]:
         raise ScenarioError(str(exc)) from exc
 
 
-def resolve_evaluation_protocol(scenario: Dict[str, Any], protocol: str) -> Dict[str, Any]:
-    """Resolve fixed selection/final seeds without mutating training config."""
-    evaluation = scenario.get("evaluation", {}) or {}
-    if not isinstance(evaluation, dict):
-        raise ScenarioError("'evaluation' must be a dictionary.")
-    if evaluation.get("selection_strategy", "completion_progress") not in EVALUATION_STRATEGIES:
-        raise ScenarioError("evaluation.selection_strategy must be completion_progress, lap_time or team_completion")
-    if "progress_agent_id" in evaluation:
-        raise ScenarioError("evaluation.progress_agent_id is unsupported for completion experiments")
-    for key in ("terminate_on_track_limit", "terminate_on_collision", "lap_completion"):
-        if key in evaluation and not isinstance(evaluation[key], bool):
-            raise ScenarioError(f"evaluation.{key} must be boolean")
-    for key in ("target_laps", "every_steps", "every_episodes"):
-        value = evaluation.get(key)
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
-            raise ScenarioError(f"evaluation.{key} must be a positive integer")
-    if protocol not in {"selection", "final"}:
-        raise ScenarioError(f"Unknown evaluation protocol: {protocol!r}.")
-    selection = {
-        "seed": evaluation.get("seed", int(scenario["experiment"].get("seed", 0) or 0) + 10_000),
-        "episodes": evaluation.get("episodes", 8),
-    }
-    final = evaluation.get("final_test")
-    if final is not None and (not isinstance(final, dict) or not {"seed", "episodes"} <= final.keys()):
-        raise ScenarioError("'evaluation.final_test' requires explicit seed and episodes.")
-    if final is not None and set(final) - {"seed", "episodes", "target_laps", "max_steps"}:
-        raise ScenarioError("'evaluation.final_test' accepts seed, episodes, target_laps and max_steps.")
-    for key in ("target_laps", "max_steps"):
-        value = (final or {}).get(key)
-        minimum = 0 if key == "max_steps" else 1
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < minimum):
-            raise ScenarioError(f"evaluation.final_test.{key} must be an integer >= {minimum}")
-    for name, config in (("selection", selection), ("final", final)):
-        if config is None:
-            continue
-        for key, minimum in (("seed", 0), ("episodes", 1)):
-            value = config[key]
-            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-                raise ScenarioError(f"Evaluation {name} {key} must be an integer >= {minimum}.")
-        if config["seed"] + config["episodes"] > 2**32:
-            raise ScenarioError(f"Evaluation {name} seeds exceed the NumPy seed range.")
-    if final is not None and max(selection["seed"], final["seed"]) < min(
-        selection["seed"] + selection["episodes"], final["seed"] + final["episodes"]
-    ):
-        raise ScenarioError("Checkpoint-selection and final-test seed ranges must be disjoint.")
-    if protocol == "final" and final is None:
-        raise ScenarioError("--eval-protocol final requires evaluation.final_test.")
-    config = selection if protocol == "selection" else final
-    # Final evaluation may override the horizon; otherwise inherit selection.
-    max_steps = evaluation.get("max_steps")
-    if max_steps is None:
-        max_steps = scenario["environment"].get("max_steps", 5000)
-    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 0:
-        raise ScenarioError("Evaluation max_steps must be a nonnegative integer.")
-    result = {"name": protocol, "seed": config["seed"], "episodes": config["episodes"],
-              "max_steps": config.get("max_steps", max_steps)}
-    target_laps = config.get("target_laps")
-    if target_laps is not None:
-        result["target_laps"] = target_laps
-    return result
-
-
 def validate_scenario(scenario: Dict[str, Any]) -> None:
-    """Validate scenario configuration before env construction.
-
-    Checks
-    ------
-    - Required top-level sections: ``experiment``, ``environment``, ``agents``.
-    - ``experiment.name`` present.
-    - ``environment`` has at least one map field.
-    - Each agent config is a dict with an ``algorithm`` field.
-    - Each agent's ``algorithm`` is a known RL or heuristic algorithm.
-    - Each trainable (RL) agent has ``observation`` and ``reward`` config.
-
-    Raises
-    ------
-    ScenarioError
-        On the first validation failure found.
-    """
-    from core.agent_builder import (
-        fixed_controller_names,
-        PYTORCH_RL_ALGOS,
-        is_trainable_agent,
-    )
-
-    fixed_algos = set(fixed_controller_names())
-    known_algos = PYTORCH_RL_ALGOS | fixed_algos
+    """Validate physical/task configuration without selecting a learner."""
+    from core.agent_builder import fixed_controller_names
+    from core.agent_roles import resolve_agent_roles
 
     # --- Required top-level sections ---
     for section in ("experiment", "environment", "agents"):
         if section not in scenario:
             raise ScenarioError(f"Scenario must have a '{section}' section.")
+        if not isinstance(scenario[section], dict):
+            raise ScenarioError(f"Scenario '{section}' must be a mapping.")
 
-    experiment = scenario["experiment"]
-    if "name" not in experiment:
+    if "name" not in scenario["experiment"]:
         raise ScenarioError("'experiment' section must have a 'name' field.")
-    if "evaluation_only" in experiment and not isinstance(experiment["evaluation_only"], bool):
-        raise ScenarioError("experiment.evaluation_only must be boolean.")
-    checkpoint = experiment.get("checkpoint")
-    if checkpoint is not None and (not isinstance(checkpoint, str) or not checkpoint.strip()):
-        raise ScenarioError("'experiment.checkpoint' must be a nonempty path string or null.")
-    total_steps = experiment.get("total_steps")
-    if total_steps is not None and (isinstance(total_steps, bool)
-            or not isinstance(total_steps, int) or total_steps <= 0):
-        raise ScenarioError("'experiment.total_steps' must be a positive integer or null.")
-    if experiment.get("ppo_backend", "torchrl") != "torchrl":
-        raise ScenarioError("Legacy PPO backends have been removed; experiment.ppo_backend must be torchrl")
-    if experiment.get("mappo_backend", "torchrl") != "torchrl":
-        raise ScenarioError("Legacy MAPPO backends have been removed; experiment.mappo_backend must be torchrl")
-
     environment = scenario["environment"]
     
     if any(key in block for block in (scenario, environment)
@@ -329,8 +205,6 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
             validate_vehicle_params(vehicle_params)
         except ValueError as exc:
             raise ScenarioError(str(exc)) from exc
-    if scenario.get("evaluation"):
-        resolve_evaluation_protocol(scenario, "selection")
     _MAP_KEYS = {"map", "maps", "map_bundle", "map_bundles"}
     if not _MAP_KEYS.intersection(environment):
         raise ScenarioError(
@@ -357,41 +231,35 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
                               or any(not isinstance(team, str) or not team.strip() for team in teams.values())):
         raise ScenarioError("environment.agent_teams must assign every physical agent a nonempty team name.")
 
-    # --- Per-agent checks ---
+    try:
+        roles = resolve_agent_roles(agents)
+    except (ValueError, AttributeError) as exc:
+        raise ScenarioError(str(exc)) from exc
+    policy_ids = set(roles.policy_agents)
     for agent_id, agent_cfg in agents.items():
         if not isinstance(agent_cfg, dict):
-            raise ScenarioError(
-                f"Agent '{agent_id}' config must be a dictionary, got {type(agent_cfg).__name__}."
-            )
-
-        algo = str(agent_cfg.get("algorithm", "")).strip().lower()
-        if not algo:
-            raise ScenarioError(
-                f"Agent '{agent_id}' is missing required 'algorithm' field."
-            )
-
-        if algo not in known_algos:
-            raise ScenarioError(
-                f"Agent '{agent_id}' has unknown algorithm '{algo}'. "
-                f"Known RL algorithms: {sorted(PYTORCH_RL_ALGOS)}. "
-                f"Known fixed controllers: {sorted(fixed_algos)}."
-            )
-
-        if agent_cfg.get("role") in {"attacker", "defender"}:
-            raise ScenarioError("Attacker/defender roles are unsupported for completion experiments")
-
+            raise ScenarioError(f"Agent {agent_id!r} config must be a dictionary")
+        if not str(agent_cfg.get("algorithm", "")).strip():
+            raise ScenarioError(f"Agent {agent_id!r} requires an algorithm/controller name")
+        if agent_id in policy_ids:
+            for key in ("observation", "reward"):
+                if key not in agent_cfg:
+                    raise ScenarioError(f"Policy agent {agent_id!r} requires {key!r} config")
+        else:
+            if str(agent_cfg["algorithm"]).strip().lower() not in fixed_controller_names():
+                raise ScenarioError(f"Unknown fixed controller {agent_cfg['algorithm']!r}")
         nonlinear = (vehicle_params or {}).get("model") == "combined_slip_st"
         action_mode = agent_cfg.get("action_constraints", {}).get("speed_control", "direct")
-        if nonlinear and algo not in PYTORCH_RL_ALGOS:
+        if nonlinear and agent_id not in policy_ids:
             if agent_cfg.get("action_adapter") != "rolling_speed_to_wheel_v1":
                 raise ScenarioError("Nonlinear fixed controllers require action_adapter: rolling_speed_to_wheel_v1")
             if action_mode != "direct":
                 raise ScenarioError("Fixed wheel adapters require physical controller commands, not policy action constraints")
         elif agent_cfg.get("action_adapter") is not None:
             raise ScenarioError("action_adapter is supported only for nonlinear fixed controllers")
-        if algo in PYTORCH_RL_ALGOS and nonlinear != (action_mode in {"wheel_speed", "wheel_acceleration"}):
+        if agent_id in policy_ids and nonlinear != (action_mode in {"wheel_speed", "wheel_acceleration"}):
             raise ScenarioError("combined_slip_st requires wheel_speed or wheel_acceleration actions; legacy uses vehicle-speed actions")
-        if nonlinear and algo in PYTORCH_RL_ALGOS:
+        if nonlinear and agent_id in policy_ids:
             from wrappers.actions.composer import ActionComposer
             constraints = agent_cfg.get("action_constraints", {})
             if constraints.get("speed_index", 1) != 1:
@@ -402,45 +270,6 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
             except ValueError as exc:
                 raise ScenarioError(str(exc)) from exc
 
-        explicit = agent_cfg.get("trainable")
-        if explicit is not None and not isinstance(explicit, bool):
-            raise ScenarioError(f"Agent '{agent_id}' trainable must be a boolean.")
-        if explicit is not None and explicit != (algo in PYTORCH_RL_ALGOS):
-            raise ScenarioError(
-                f"Agent '{agent_id}': algorithm '{algo}' does not support trainable={explicit}. "
-                "PPO/MAPPO are trainable; fixed opponents use a fixed controller."
-            )
-
-        # Trainable agents need observation and reward configs
-        if is_trainable_agent(agent_cfg):
-            for required_key in ("observation", "reward"):
-                if required_key not in agent_cfg:
-                    raise ScenarioError(
-                        f"Trainable agent '{agent_id}' (algorithm='{algo}') "
-                        f"is missing required '{required_key}' config."
-                    )
-
-    trainable_ids = [aid for aid, cfg in agents.items() if is_trainable_agent(cfg)]
-    trainable_algos = {
-        str(agents[aid]["algorithm"]).strip().lower() for aid in trainable_ids
-    }
-    if len(trainable_algos) > 1:
-        raise ScenarioError("Mixed trainable algorithms are unsupported; use one PPO agent or a MAPPO team.")
-    if trainable_algos == {"ppo"} and len(agents) != 1:
-        raise ScenarioError("PPO completion experiments require one vehicle")
-    if experiment.get("ppo_backend") == "torchrl":
-        if trainable_algos != {"ppo"}:
-            raise ScenarioError("The TorchRL PPO backend requires one PPO learner")
-    if experiment.get("mappo_backend") == "torchrl":
-        if trainable_algos != {"mappo"}:
-            raise ScenarioError("The TorchRL MAPPO backend requires MAPPO learners")
-    evaluation_strategy = scenario.get("evaluation", {}).get("selection_strategy")
-    if evaluation_strategy is not None:
-        supported = {"team_completion"} if trainable_algos == {"mappo"} else {"completion_progress", "lap_time"}
-        if evaluation_strategy not in supported:
-            raise ScenarioError(f"Unsupported evaluation selection strategy for {sorted(trainable_algos)}: {evaluation_strategy}")
-    if total_steps is not None and trainable_algos not in ({"ppo"}, {"mappo"}):
-        raise ScenarioError("A total_steps budget requires PPO or MAPPO.")
     lap_counting = environment.get("lap_counting", {}) or {}
     if not isinstance(lap_counting, dict):
         raise ScenarioError("environment.lap_counting must be a mapping")
@@ -459,71 +288,6 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     evaluation_mode = scenario.get("evaluation", {}).get("episode_termination_mode")
     if evaluation_mode is not None and evaluation_mode not in {"any_agent", "all_agents", "all_trainable"}:
         raise ScenarioError("evaluation.episode_termination_mode must be any_agent, all_agents, or all_trainable")
-    if experiment.get("collector_scheduling", "synchronous") not in {"synchronous", "ready"}:
-        raise ScenarioError("experiment.collector_scheduling must be synchronous or ready")
-    eval_workers = scenario.get("evaluation", {}).get("num_workers", 1)
-    if eval_workers != 'auto' and (isinstance(eval_workers, bool)
-            or not isinstance(eval_workers, int) or eval_workers < 1):
-        raise ScenarioError("evaluation.num_workers must be a positive integer or auto")
-    num_envs = experiment.get("num_envs", 1)
-    for name in ("num_envs", "num_workers", "torch_threads", "worker_startup_batch_size",
-                 "worker_startup_timeout_s", "worker_response_timeout_s"):
-        value = experiment.get(name, 1)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ScenarioError(f"'experiment.{name}' must be a positive integer.")
-    if num_envs > 1:
-        if trainable_algos not in ({"ppo"}, {"mappo"}):
-            raise ScenarioError("Parallel environments require PPO or MAPPO.")
-        if environment.get("render"):
-            raise ScenarioError("Parallel training requires headless training.")
-        seed = experiment.get("seed")
-        env_seed = environment.get("seed", seed)
-        if env_seed is None:
-            env_seed = seed
-        if any(isinstance(v, bool) or not isinstance(v, int) or not 0 <= v < 2 ** 32
-               for v in (seed, env_seed)):
-            raise ScenarioError("Parallel training requires explicit integer seeds in [0, 2**32).")
-        if total_steps is not None and total_steps < num_envs:
-            raise ScenarioError("Parallel training total_steps must be at least num_envs")
-        if total_steps is None and int(experiment.get("episodes", 1000)) < num_envs:
-            raise ScenarioError("Parallel training requires at least num_envs total episodes.")
-        params = {**scenario.get("training_defaults", {}), **agents[trainable_ids[0]].get("params", {})}
-        n_steps = params.get("n_steps", 2048)
-        if trainable_algos == {"ppo"} and (isinstance(n_steps, bool) or not isinstance(n_steps, int)
-                or n_steps < num_envs or n_steps % num_envs):
-            raise ScenarioError("Parallel PPO n_steps must be a positive multiple of num_envs.")
-        if trainable_algos == {"mappo"}:
-            horizon = scenario.get("training_defaults", {}).get("rollout_steps_per_env", 256)
-            if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1:
-                raise ScenarioError("MAPPO rollout_steps_per_env must be a positive integer")
-    if trainable_algos == {"mappo"}:
-        if len(trainable_ids) != 2 or len(agents) != 4:
-            raise ScenarioError("MAPPO completion experiments require two learners and two fixed opponents")
-        mappo = resolve_mappo_config(scenario)
-        if mappo["actor_mode"] not in {"shared", "independent"}:
-            raise ScenarioError("mappo.actor_mode must be shared or independent")
-        if (mappo["reward_mode"] != "team_shared" or mappo["critic_mode"] != "shared_team"
-                or mappo["team_reward_reduction"] != "mean"):
-            raise ScenarioError("MAPPO completion requires team_shared rewards, shared_team critic and mean reduction")
-        reference_id = trainable_ids[0]
-        params = {**scenario.get("training_defaults", {}), **agents[reference_id].get("params", {})}
-        if "adapter_transfer" in params:
-            raise ScenarioError("adapter_transfer is unsupported; use pretrained_actor_checkpoint for PPO actor transfer")
-        if not isinstance(params.get("require_pretrained_actor", False), bool):
-            raise ScenarioError("require_pretrained_actor must be boolean")
-        lora = params.get("lora")
-        if lora is not None and (not isinstance(lora, dict)
-                or mappo["actor_mode"] != "shared" or lora.get("mode") != "per_agent"):
-            raise ScenarioError("LoRA completion experiments require a shared actor with per_agent adapters")
-        if (params.get("team_return_mode") != "joint"
-                or int(environment.get("action_repeat", 1)) != 1
-                or environment.get("episode_termination", {}).get("mode") not in {"all_agents", "all_trainable"}):
-            raise ScenarioError("MAPPO completion requires joint team returns, action_repeat=1 and all_agents/all_trainable termination")
-        reference = agents[reference_id]
-        for agent_id in trainable_ids[1:]:
-            for field in ("observation", "reward", "params", "action_constraints"):
-                if agents[agent_id].get(field, {}) != reference.get(field, {}):
-                    raise ScenarioError(f"MAPPO completion learners require identical {field} config; {reference_id} and {agent_id} differ")
 
 
 def load_and_expand_scenario(path: str, validate: bool = True, *, overrides=None) -> Dict[str, Any]:
@@ -537,14 +301,14 @@ def load_and_expand_scenario(path: str, validate: bool = True, *, overrides=None
         overrides: Optional dotted KEY=YAML parameter choices, applied before validation.
 
     Returns:
-        Fully expanded and validated scenario
+        Expanded scenario with validated physical/task configuration
 
     Raises:
         ScenarioError: If scenario is invalid
 
     Example:
         >>> scenario = load_and_expand_scenario('scenarios/ppo_lap_completion_pretrain.yaml')
-        >>> # Ready to use for training
+        >>> # Training entry points additionally validate learner eligibility
     """
     # Load raw scenario
     scenario = resolve_max_speed(apply_parameter_overrides(load_scenario(path), overrides))
@@ -562,6 +326,5 @@ __all__ = [
     'resolve_max_speed',
     'load_yaml_config',
     'validate_scenario',
-    'resolve_mappo_config',
     'load_and_expand_scenario',
 ]

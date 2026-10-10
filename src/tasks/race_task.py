@@ -9,6 +9,7 @@ import numpy as np
 from env.spaces import SpaceSpec
 from tasks.contracts import AgentDecision, TaskSnapshot, TaskStep, TaskSubstep
 from tasks.reward_context import build_reward_context
+from tasks.specification import TaskSpec, EpisodeMetadata, EpisodeLimits
 
 
 def _detach(value, memo=None):
@@ -76,6 +77,7 @@ class RaceTask:
         self._decision_steps = 0
         self._physics_steps = 0
         self._closed = False
+        self._episode_metadata = None
 
     @property
     def agents(self):
@@ -105,6 +107,69 @@ class RaceTask:
     def state_space(self) -> SpaceSpec:
         return SpaceSpec(self.env.get_global_state().vector.shape, -np.inf, np.inf)
 
+    @property
+    def spec(self) -> TaskSpec:
+        """Detached policy inputs and physical action bounds, without a reset."""
+        state = self.env.get_global_state()
+        ids = self.possible_agents
+        return TaskSpec(
+            ids, {aid: self.observation_space(aid).shape[0] for aid in ids},
+            {aid: _detach(self.obs_composers[aid].contract) for aid in ids},
+            {aid: self.env.action_spaces[aid].low.copy() for aid in ids},
+            {aid: self.env.action_spaces[aid].high.copy() for aid in ids},
+            len(state.vector), state.metadata.get("vector_contract_version", "legacy_unspecified"),
+        )
+
+    @property
+    def episode_metadata(self) -> EpisodeMetadata:
+        if self._episode_metadata is not None:
+            return _detach(self._episode_metadata)
+        return EpisodeMetadata(
+            getattr(self.env, "_map_bundle_active", None) or getattr(self.env, "map_name", None),
+            {}, getattr(self.env, "seed", None),
+        )
+
+    @property
+    def episode_limits(self) -> EpisodeLimits:
+        lifecycle = getattr(self.env, "lifecycle", None)
+        finish_on_laps = getattr(lifecycle, "finish_on_laps", True)
+        return EpisodeLimits(
+            getattr(self.env, "max_steps", 0), getattr(self.env, "target_laps", None),
+            getattr(self.env, "episode_termination_mode", "all_agents"),
+            tuple(getattr(lifecycle, "lap_finish_agents", ())) if finish_on_laps else (),
+            finish_on_laps,
+        )
+
+    @property
+    def training_bundles(self):
+        return tuple(self.env._map_scheduler.training_bundles)
+
+    def set_training_bundles(self, bundles):
+        self.env._map_scheduler.set_training_bundles(list(bundles))
+
+    def _capture_episode_metadata(self):
+        manager = getattr(self.env, "_spawn_manager", None)
+        context = _detach(getattr(manager, "last_spawn_metadata", {}) or {})
+        context["spawn_ids"] = dict(getattr(manager, "last_spawn_mapping", {}) or {})
+        context["initial_states"] = {}
+        if hasattr(self.env, "get_agent_state"):
+            for aid in self.physical_agents:
+                try:
+                    state = self.env.get_agent_state(aid)
+                except KeyError:
+                    context["initial_states"][aid] = None
+                    continue
+                context["initial_states"][aid] = {
+                    field: np.asarray(getattr(state, field)).tolist()
+                    for field in ("pose", "velocity") if getattr(state, field, None) is not None}
+        # Some spawn modes publish IDs only in metadata, without a mapping.
+        if not context["spawn_ids"]:
+            context["spawn_ids"] = dict((getattr(manager, "last_spawn_metadata", {}) or {}).get("spawn_ids", {}))
+        return EpisodeMetadata(
+            getattr(self.env, "_map_bundle_active", None) or getattr(self.env, "map_name", None),
+            _detach(context), getattr(self.env, "seed", None),
+        )
+
     def _make_snapshot(self, raw_obs, infos, observations, global_state):
         active = tuple(self.env.agents)
         agents = tuple(aid for aid in self.possible_agents if aid in active)
@@ -132,6 +197,7 @@ class RaceTask:
         observations = {aid: self.obs_composers[aid].wrap(raw_obs.get(aid, {}), infos.get(aid, {}))
                         for aid in self.possible_agents if aid in self.env.agents}
         self._snapshot = self._make_snapshot(raw_obs, infos, observations, self.env.get_global_state())
+        self._episode_metadata = self._capture_episode_metadata()
         return self._snapshot
 
     def step(self, actions: Mapping[str, np.ndarray], *,

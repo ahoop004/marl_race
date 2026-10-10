@@ -128,6 +128,7 @@ import numpy as np
 
 from env.spaces import SpaceSpec
 from env.types import GlobalState, StepFacts
+from tasks.specification import TaskSpec, EpisodeMetadata, EpisodeLimits
 
 
 @dataclass(frozen=True)
@@ -245,6 +246,15 @@ class RaceTaskProtocol(Protocol):
 
     @property
     def render_mode(self) -> Optional[str]: ...
+
+    @property
+    def spec(self) -> TaskSpec: ...
+
+    @property
+    def episode_metadata(self) -> EpisodeMetadata: ...
+
+    @property
+    def episode_limits(self) -> EpisodeLimits: ...
 
     def state_space(self) -> SpaceSpec: ...
 

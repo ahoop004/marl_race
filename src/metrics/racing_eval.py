@@ -245,25 +245,6 @@ def finalize_episode_facts(episode: EvalEpisodeFacts) -> EvalEpisodeFacts:
     return episode
 
 
-def capture_spawn_context(env, agent_ids) -> Dict[str, Any]:
-    """Capture actual reset poses even when the spawn mode has no named metadata."""
-    manager = getattr(env, "_spawn_manager", None)
-    context = dict(getattr(manager, "last_spawn_metadata", {}) or {})
-    context["spawn_ids"] = dict(getattr(manager, "last_spawn_mapping", {}) or {})
-    context["initial_states"] = {}
-    if hasattr(env, "get_agent_state"):
-        for aid in agent_ids:
-            try:
-                state = env.get_agent_state(aid)
-            except KeyError:
-                context["initial_states"][aid] = None
-                continue
-            context["initial_states"][aid] = {
-                field: np.asarray(getattr(state, field)).tolist()
-                for field in ("pose", "velocity") if getattr(state, field, None) is not None}
-    return context
-
-
 def episode_race_record(episode: EvalEpisodeFacts, *, timestep: float,
                         finite_race: bool = True, include_rewards: bool = True) -> Dict[str, Any]:
     """Small shared training/evaluation record; no trajectory arrays or inferred blame.

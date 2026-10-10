@@ -1,11 +1,9 @@
 """Build trainable-agent lists and fixed controllers from scenario config."""
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Mapping
-from dataclasses import dataclass
+from typing import Any, Callable, Dict
 
-
-PYTORCH_RL_ALGOS = frozenset({"ppo", "mappo"})
+from core.agent_roles import resolve_agent_roles
 
 
 def _create_racing_mpc(params: Dict[str, Any]) -> Any:
@@ -18,7 +16,7 @@ _FIXED_CONTROLLERS: Dict[str, Callable] = {"racing_mpc": _create_racing_mpc}
 
 def register_fixed_controller(name: str, constructor: Callable) -> None:
     name = str(name).strip().lower()
-    if not name or name in PYTORCH_RL_ALGOS or not callable(constructor):
+    if not name or not callable(constructor):
         raise ValueError("A fixed controller requires a non-RL name and callable constructor")
     _FIXED_CONTROLLERS[name] = constructor
 
@@ -34,42 +32,11 @@ def create_fixed_controller(name: str, params: Dict[str, Any]) -> Any:
     return _FIXED_CONTROLLERS[key](params)
 
 
-def is_trainable_agent(agent_cfg: Mapping[str, Any]) -> bool:
-    algo = str(agent_cfg.get("algorithm", "")).strip().lower()
-    if algo not in PYTORCH_RL_ALGOS and algo not in _FIXED_CONTROLLERS:
-        raise ValueError(f"Unsupported algorithm {algo!r}; expected PPO, MAPPO or a fixed controller")
-    trainable = algo in PYTORCH_RL_ALGOS
-    if "trainable" in agent_cfg and (
-            not isinstance(agent_cfg["trainable"], bool) or agent_cfg["trainable"] != trainable):
-        raise ValueError(f"Algorithm {algo!r} requires trainable={trainable}")
-    return trainable
-
-
-def get_trainable_agent_ids(agent_configs: Mapping[str, Mapping[str, Any]]) -> List[str]:
-    return [aid for aid, cfg in agent_configs.items() if is_trainable_agent(cfg)]
-
-
-def get_fixed_agent_ids(agent_configs: Mapping[str, Mapping[str, Any]]) -> List[str]:
-    return [aid for aid, cfg in agent_configs.items() if not is_trainable_agent(cfg)]
-
-
-@dataclass(frozen=True)
-class AgentRoles:
-    policy_agents: tuple[str, ...]
-    fixed_agents: tuple[str, ...]
-
-
-def resolve_agent_roles(agent_configs: Mapping[str, Mapping[str, Any]]) -> AgentRoles:
-    """Resolve legacy algorithm fields once, at the scenario boundary."""
-    policy = tuple(get_trainable_agent_ids(agent_configs))
-    return AgentRoles(policy, tuple(aid for aid in agent_configs if aid not in policy))
-
-
 def build_fixed_policy_agents(agent_configs: Mapping[str, Mapping[str, Any]], *,
                              fixed_ids=None, vehicle_params=None) -> Dict[str, Any]:
     agents = {}
     nonlinear = (vehicle_params or {}).get("model") == "combined_slip_st"
-    for agent_id in (get_fixed_agent_ids(agent_configs) if fixed_ids is None else fixed_ids):
+    for agent_id in (resolve_agent_roles(agent_configs).fixed_agents if fixed_ids is None else fixed_ids):
         config = agent_configs[agent_id]
         params = {**config.get("params", {}), "agent_id": agent_id}
         adapter = config.get("action_adapter")

@@ -9,7 +9,11 @@ import warnings
 
 import torch
 
-from training.collector_scheduling import _close_collectors, _report_worker_error, _worker_startup_settings
+from training.worker_runtime import (
+    worker_settings, close_workers, report_worker_error, receive_worker,
+    worker_thread_limits,
+)
+
 from training.mappo_evaluator import DeterministicMAPPOEvaluator
 
 
@@ -79,7 +83,7 @@ def _evaluation_worker(connection):
     except (EOFError, BrokenPipeError, ConnectionResetError):
         pass
     except BaseException:
-        _report_worker_error(connection)
+        report_worker_error(connection)
     finally:
         for evaluator in evaluators.values():
             evaluator.close()
@@ -106,7 +110,7 @@ class EvaluationWorkerPool:
     """
 
     def __init__(self, scenario):
-        self.settings = _worker_startup_settings(scenario)
+        self.settings = worker_settings(scenario)
         self._connections = {}
         self._processes = []
         self._configured = set()
@@ -118,13 +122,8 @@ class EvaluationWorkerPool:
         return key
 
     def _receive(self, worker):
-        try:
-            kind, payload = self._connections[worker].recv()
-        except (EOFError, ConnectionResetError) as exc:
-            raise RuntimeError(f'Evaluation worker {worker} disconnected') from exc
-        if kind == 'error':
-            raise RuntimeError(f'Evaluation worker {worker} failed:\n{payload}')
-        return kind, payload
+        return receive_worker(self._connections[worker], self._processes[worker],
+                              label=f"Evaluation worker {worker}")
 
     def _ready(self, active, last_seen, timeout):
         now = time.monotonic()
@@ -142,12 +141,7 @@ class EvaluationWorkerPool:
         if len(self._connections) >= num_workers:
             return
         context = mp.get_context('spawn')
-        thread_vars = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
-                       'NUMEXPR_NUM_THREADS', 'NUMBA_NUM_THREADS')
-        previous = {key: os.environ.get(key) for key in thread_vars}
-        try:
-            for key in thread_vars:
-                os.environ[key] = '1'
+        with worker_thread_limits():
             batch_size = self.settings['worker_startup_batch_size']
             for start in range(len(self._connections), num_workers, batch_size):
                 active, last_seen = set(), {}
@@ -170,12 +164,6 @@ class EvaluationWorkerPool:
                         if kind != 'ready':
                             raise RuntimeError(f'Unexpected evaluation startup message: {kind}')
                         active.remove(worker)
-        finally:
-            for key, value in previous.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
 
     def _configure(self, evaluator):
         key = evaluator._worker_context
@@ -248,7 +236,7 @@ class EvaluationWorkerPool:
                     connection.send(('close', None))
                 except (BrokenPipeError, EOFError, ConnectionResetError):
                     pass
-        _close_collectors(list(self._connections.values()), self._processes, failed=failed)
+        close_workers(list(self._connections.values()), self._processes, failed=failed)
         self._connections.clear()
         self._processes.clear()
         self._configured.clear()

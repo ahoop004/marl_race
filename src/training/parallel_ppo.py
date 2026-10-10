@@ -6,19 +6,23 @@ weights until every live environment has delivered its next fragment.
 """
 from __future__ import annotations
 
-import copy
 import multiprocessing as mp
 import os
 import time
 from pathlib import Path
+from contextlib import ExitStack
 
 import numpy as np
 import torch
 
+from training.worker_runtime import (
+    worker_settings, close_workers, report_worker_error, receive_worker,
+    worker_thread_limits, collector_scenario,
+)
+
 from training.hooks import transition_record_hooks
 from training.collector_scheduling import (
     CollectorEventSink, CollectorScheduler,
-    _close_collectors, _report_worker_error, _worker_startup_settings,
 )
 from training.ppo_collector import PPOCollector
 from training.collector_hooks import WorkerHook
@@ -30,32 +34,23 @@ def _make_collector(scenario, directory, agent_id, env_id, quota, horizon,
     from core.task_builder import create_race_task
     from training.runtime import seed_process
 
-    scenario = copy.deepcopy(scenario)
-    base_seed = int(scenario['experiment']['seed'])
-    seed = (base_seed + env_id) % (2 ** 32)
-    scenario['experiment']['seed'] = seed
-    env_cfg = scenario['environment']
-    env_seed = env_cfg.get('seed')
-    env_cfg['seed'] = ((base_seed if env_seed is None else int(env_seed)) + env_id) % (2 ** 32)
-    env_cfg['render'] = False
+    scenario, seed = collector_scenario(scenario, env_id)
     seed_process(seed)
     task = create_race_task(scenario, scenario_dir=Path(directory))
-    env = task.env
     try:
         if task.possible_agents != (agent_id,):
             raise ValueError("PPO collector requires the configured policy agent")
-        space = env.action_spaces[agent_id]
-        obs = task.obs_composers[agent_id]
-        policy = PPOCollectorState(horizon, map_scheduler=env._map_scheduler, worker_id=env_id)
+        spec = task.spec
+        policy = PPOCollectorState(horizon, curriculum=task, worker_id=env_id)
         trainer = PPOCollector(
             task, policy, hooks=[WorkerHook(sink, env_id, seed, record)],
             run_id=f'{run_id}_worker{env_id:03d}',
         )
         generator = trainer.iter_train(0 if step_budget else quota,
                                       total_steps=quota if step_budget else None)
-        return env, generator, (obs.obs_dim, space.low, space.high)
+        return task, generator, (spec.observation_dims[agent_id], spec.action_lows[agent_id], spec.action_highs[agent_id])
     except BaseException:
-        env.close()
+        task.close()
         raise
 
 
@@ -64,12 +59,12 @@ def _collect_worker(connection, scenario, directory, agent_id, assignments,
     os.environ['CUDA_VISIBLE_DEVICES'] = ''
     os.environ['PYGLET_HEADLESS'] = 'true'
     torch.set_num_threads(1)
-    envs, generators, pending = {}, {}, {}
+    tasks, generators, pending = {}, {}, {}
     sink = CollectorEventSink()
     try:
         contracts = []
         for env_id, quota in assignments:
-            envs[env_id], generators[env_id], contract = _make_collector(
+            tasks[env_id], generators[env_id], contract = _make_collector(
                 scenario, directory, agent_id, env_id, quota, horizon, run_id,
                 sink, record, step_budget)
             contracts.append(contract)
@@ -109,10 +104,10 @@ def _collect_worker(connection, scenario, directory, agent_id, assignments,
     except (BrokenPipeError, EOFError, ConnectionResetError):
         pass
     except BaseException:
-        _report_worker_error(connection)
+        report_worker_error(connection)
     finally:
-        for env in envs.values():
-            env.close()
+        for task in tasks.values():
+            task.close()
         connection.close()
 
 
@@ -124,7 +119,7 @@ def train_parallel(trainer, scenario, directory, num_envs, n_episodes, *, total_
     budget = total_steps if total_steps is not None else n_episodes
     if workers < 1 or horizon < 1 or agent.n_steps % num_envs or budget < num_envs:
         raise ValueError('Grouped PPO requires positive workers, n_steps divisible by num_envs, and budget >= num_envs')
-    startup = _worker_startup_settings(scenario)
+    startup = worker_settings(scenario)
     scheduler = CollectorScheduler(experiment.get("collector_scheduling", "synchronous"),
                                    startup["worker_response_timeout_s"])
     record_hooks = transition_record_hooks(trainer.hooks)
@@ -135,23 +130,14 @@ def train_parallel(trainer, scenario, directory, num_envs, n_episodes, *, total_
     stopped = success = False
     started = time.perf_counter()
     trainer._set_training_progress(0, budget)
-    thread_vars = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
-                   'NUMEXPR_NUM_THREADS', 'NUMBA_NUM_THREADS')
-    previous = {key: os.environ.get(key) for key in thread_vars}
+    resources = ExitStack()
 
     def receive(worker_id, starting=False):
-        timeout = startup['worker_startup_timeout_s' if starting else 'worker_response_timeout_s']
-        connection, process = connections[worker_id], process_by_worker[worker_id]
-        if not connection.poll(timeout):
-            raise RuntimeError(f'PPO worker {worker_id} timed out after {timeout}s '
-                               f'(pid={process.pid}, exitcode={process.exitcode})')
-        try:
-            kind, payload = connection.recv()
-        except (EOFError, ConnectionResetError) as exc:
-            raise RuntimeError(f'PPO worker {worker_id} disconnected (exitcode={process.exitcode})') from exc
-        if kind == 'error':
-            raise RuntimeError(f'PPO worker {worker_id} failed:\n{payload}')
-        return kind, payload
+        timeout = startup["worker_startup_timeout_s" if starting else "worker_response_timeout_s"]
+        return receive_worker(
+            connections[worker_id], process_by_worker[worker_id],
+            label=f"PPO worker {worker_id}", timeout=timeout,
+        )
 
     def process_events(items):
         nonlocal completed
@@ -179,8 +165,7 @@ def train_parallel(trainer, scenario, directory, num_envs, n_episodes, *, total_
             scheduler.exclude_parent_time(time.monotonic() - event_start)
 
     try:
-        for key in thread_vars:
-            os.environ[key] = '1'
+        resources.enter_context(worker_thread_limits())
         batch_size = startup['worker_startup_batch_size']
         for start in range(0, workers, batch_size):
             batch = range(start, min(start + batch_size, workers))
@@ -283,7 +268,7 @@ def train_parallel(trainer, scenario, directory, num_envs, n_episodes, *, total_
                 if scenario.get('map_curriculum') is not None or stopped:
                     control = {'stop': stopped}
                     if scenario.get('map_curriculum') is not None:
-                        control['training_bundles'] = trainer.env._map_scheduler.training_bundles
+                        control['training_bundles'] = trainer.task.training_bundles
                     reply = {'metrics': metrics, 'collector_control': control}
                 for worker_id in waiting:
                     connections[worker_id].send(reply)
@@ -300,9 +285,7 @@ def train_parallel(trainer, scenario, directory, num_envs, n_episodes, *, total_
             hook.on_training_end()
         success = True
     finally:
-        _close_collectors(list(connections.values()), processes, failed=not success)
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+        try:
+            close_workers(list(connections.values()), processes, failed=not success)
+        finally:
+            resources.close()

@@ -2,9 +2,9 @@
 from copy import deepcopy
 
 from adapters.rewards import RewardMapping
-from core.scenario import resolve_evaluation_protocol
+from training.evaluation_config import resolve_evaluation_protocol
 from core.task_builder import create_race_task
-from training.algorithms import TaskSpec, check_evaluation_spec
+from training.algorithms import check_evaluation_spec
 from training.runtime import preserve_random_state, seed_process
 
 
@@ -20,7 +20,7 @@ def create_selection_evaluator(algorithm, scenario, scenario_dir, training_spec,
         seed_process(protocol["seed"])
         task = create_race_task(evaluation, scenario_dir=scenario_dir, mode="eval")
     try:
-        check_evaluation_spec(training_spec, TaskSpec.from_task(task))
+        check_evaluation_spec(training_spec, task.spec)
         options = dict(task=task, episodes=protocol["episodes"], base_seed=protocol["seed"],
                        reward_mapping=RewardMapping(params.get("reward_mode", "individual"),
                                                     params.get("team_reward_reduction", "mean")))
