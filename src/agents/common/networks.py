@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from agents.common.distributions import SquashedGaussianActor
+from agents.common.encoders import build_encoder
 
 # Fixed as part of the "leaky_relu" checkpoint activation contract.
 LEAKY_RELU_NEGATIVE_SLOPE = 0.2
@@ -27,7 +28,9 @@ def make_mlp(
         "relu": nn.ReLU, "tanh": nn.Tanh, "silu": nn.SiLU, "swish": nn.SiLU,
         "leaky_relu": partial(nn.LeakyReLU, negative_slope=LEAKY_RELU_NEGATIVE_SLOPE),
     }
-    Act = act_map.get(activation.lower(), nn.Tanh)
+    if activation.lower() not in act_map:
+        raise ValueError(f"Unsupported network activation: {activation!r}")
+    Act = act_map[activation.lower()]
 
     layers: List[nn.Module] = []
     prev = input_dim
@@ -56,11 +59,13 @@ class Actor(SquashedGaussianActor):
     ) -> None:
         super().__init__()
         self.action_dim = action_dim
-        self.net = make_mlp(obs_dim, hidden_dims, action_dim, activation)
+        self.encoder = build_encoder(obs_dim)
+        # net is the actor head; its names retain the existing checkpoint layout.
+        self.net = make_mlp(self.encoder.output_dim, hidden_dims, action_dim, activation)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        mean = self.net(obs)
+        mean = self.net(self.encoder(obs))
         log_std = self.log_std.clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
         return mean, log_std.exp()
 
@@ -79,10 +84,11 @@ class Critic(nn.Module):
         activation: str = "tanh",
     ) -> None:
         super().__init__()
-        self.net = make_mlp(input_dim, hidden_dims, 1, activation)
+        self.encoder = build_encoder(input_dim)
+        self.net = make_mlp(self.encoder.output_dim, hidden_dims, 1, activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
+        return self.net(self.encoder(x)).squeeze(-1)
 
 
 def resolve_network_config(params, *, default_hidden_dims):
@@ -108,6 +114,8 @@ def resolve_network_config(params, *, default_hidden_dims):
         config[field] = list(dims)
     if not isinstance(config["activation"], str):
         raise ValueError("network.activation must be a string")
+    if config["activation"].lower() not in {"relu", "tanh", "silu", "swish", "leaky_relu"}:
+        raise ValueError(f"Unsupported network activation: {config['activation']!r}")
     return config
 
 

@@ -9,6 +9,7 @@ import torch
 import torch.optim as optim
 
 from agents.common.outputs import PolicyOutput
+from agents.common.optimization import OnPolicyOptimizationSettings
 from agents.common.networks import build_actor, build_critic, resolve_network_config, route_actor
 from agents.common.lora import resolve_lora_config
 from agents.common.checkpoints import (
@@ -18,7 +19,7 @@ from agents.common.observations import pack_observations
 from utils.torch_io import resolve_device
 
 
-class MAPPOPolicy:
+class MAPPOPolicy(OnPolicyOptimizationSettings):
     """Local actors and a centralized critic without rollout or update code."""
 
     def __init__(
@@ -101,7 +102,7 @@ class MAPPOPolicy:
             )
 
         # Hyperparameters
-        self.lr = float(params.get("learning_rate", 3e-4))
+        self.configure_optimization(params)
         self.gamma = float(params.get("gamma", 0.99))
         self.gae_lambda = float(params.get("gae_lambda", 0.95))
         self.clip_range = float(params.get("clip_range", 0.2))

@@ -77,13 +77,10 @@ def create_learner(algorithm, spec, params, *, training=True):
 
 
 def create_trainer(algorithm, task, learner, **options):
-    if algorithm == "ppo":
-        from training.torchrl_ppo_trainer import TorchRLPPOTrainer as Trainer
-    elif algorithm == "mappo":
-        from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer as Trainer
-    else:
+    if algorithm not in POLICY_ALGORITHMS:
         raise ValueError(f"Unsupported trainer algorithm: {algorithm!r}")
-    return Trainer(task, learner, **options)
+    from training.on_policy import OnPolicyTrainer
+    return OnPolicyTrainer(task, learner, algorithm=algorithm, **options)
 
 
 def check_evaluation_spec(training_spec, evaluation_spec):

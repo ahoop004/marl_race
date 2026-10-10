@@ -49,6 +49,14 @@ class TorchRLPPOAgent(PPOPolicy):
             self.probabilistic_actor,
             TensorDictModule(torch.tanh, in_keys=["raw_action"], out_keys=["action"]),
         )
+        # Native environments keep the singleton learner in an agents group.
+        self.collection_policy = TensorDictSequential(
+            TensorDictModule(lambda obs: obs.squeeze(-2),
+                             in_keys=[("agents", "observation")], out_keys=["observation"]),
+            self.policy,
+            TensorDictModule(lambda action: action.unsqueeze(-2),
+                             in_keys=["action"], out_keys=[("agents", "action")]),
+        )
         self.value_module = TensorDictModule(
             _Value(self.critic), in_keys=["observation"], out_keys=["state_value"],
         )
@@ -93,6 +101,10 @@ class TorchRLPPOAgent(PPOPolicy):
         if not isinstance(rollout, TensorDictBase):
             raise TypeError("TorchRL PPO requires a TensorDict rollout")
         data = rollout.to(self.device).clone()
+        if ("agents", "observation") in data.keys(True):
+            data["observation"] = data["agents", "observation"].squeeze(-2)
+            data["next", "observation"] = data["next", "agents", "observation"].squeeze(-2)
+            data["next", "reward"] = data["next", "agents", "reward"].squeeze(-2)
         with torch.no_grad():
             self.gae(data)
         self._pending_batches.append(data.reshape(-1))

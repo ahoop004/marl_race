@@ -14,6 +14,8 @@ from tasks import RaceTaskProtocol, TaskSnapshot, TaskStep
 class NativeRaceTorchRLEnv(EnvBase):
     """One unbatched race; agents are a nested batch, never environment batches.
 
+    Vector observations are right-padded to the largest learner width; the
+    task specification retains individual widths for per-agent LoRA routing.
     Root done flags reset the physical race. Agent flags retain individual
     boundaries as observations: registering them in done_spec would advance
     Collector trajectory IDs at retirement. ``learning`` describes the existing
@@ -46,8 +48,8 @@ class NativeRaceTorchRLEnv(EnvBase):
         if not self.agent_ids:
             raise ValueError("The native environment requires at least one policy agent")
         widths = {task.observation_space(aid).shape for aid in self.agent_ids}
-        if len(widths) != 1 or len(next(iter(widths))) != 1:
-            raise ValueError("The agents group requires identical vector observation shapes")
+        if any(len(width) != 1 for width in widths):
+            raise ValueError("The agents group requires vector observations")
         for aid in self.agent_ids:
             spec = task.action_space(aid)
             if spec.shape != (2,) or not (np.all(spec.low == -1) and np.all(spec.high == 1)):
@@ -58,9 +60,11 @@ class NativeRaceTorchRLEnv(EnvBase):
         self.snapshot: TaskSnapshot | None = None
         self.last_step: TaskStep | None = None
         self.on_physics_step = None
+        self.on_reset = None
+        self.on_decision = None
         self._pending_seed = None
         n, p = len(self.agent_ids), len(self.physical_agent_ids)
-        self._observations = np.zeros((n, next(iter(widths))[0]), dtype=np.float32)
+        self._observations = np.zeros((n, max(width[0] for width in widths)), dtype=np.float32)
         self._terminated = np.zeros((n, 1), dtype=bool)
         self._truncated = np.zeros((n, 1), dtype=bool)
 
@@ -124,8 +128,10 @@ class NativeRaceTorchRLEnv(EnvBase):
         self._truncated.fill(False)
         self.snapshot, self.last_step = snapshot, None
         for i, aid in enumerate(self.agent_ids):
-            self._observations[i] = snapshot.observations[aid]
+            self._observations[i, :len(snapshot.observations[aid])] = snapshot.observations[aid]
         output = self._output(snapshot)
+        if self.on_reset is not None:
+            self.on_reset(snapshot)
         if self.render_mode == "human":
             self.task.render()
         return output
@@ -152,11 +158,14 @@ class NativeRaceTorchRLEnv(EnvBase):
         for i, aid in enumerate(self.agent_ids):
             decision = result.decisions.get(aid)
             if decision is not None:
-                self._observations[i] = decision.next_observation
+                self._observations[i, :len(decision.next_observation)] = decision.next_observation
                 self._terminated[i] = decision.terminated
                 self._truncated[i] = decision.truncated
         self.snapshot, self.last_step = result.after, result
-        return self._output(result.after, result)
+        output = self._output(result.after, result)
+        if self.on_decision is not None:
+            self.on_decision(result)
+        return output
 
     @staticmethod
     def _physical_boundary(result):

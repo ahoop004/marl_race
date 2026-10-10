@@ -9,7 +9,7 @@ import pytest
 pytest.importorskip("torchrl")
 
 
-def test_serial_ppo_uses_gymnasium_without_importing_gym_sb3_or_tensorflow():
+def test_native_ppo_does_not_import_external_training_adapters():
     # A fresh interpreter prevents earlier tests from hiding transitive imports.
     script = '''
 import sys
@@ -21,10 +21,11 @@ def guard(event, args):
 sys.addaudithook(guard)
 
 from pathlib import Path
+sys.path.insert(0, str(Path("src").resolve()))
 from core.scenario import load_and_expand_scenario
 from core.task_builder import create_race_task
 from training.algorithms import create_learner, learner_params
-from training.torchrl_ppo_trainer import TorchRLPPOTrainer
+from training.on_policy import OnPolicyTrainer as TorchRLPPOTrainer
 
 directory = Path("scenarios")
 scenario = load_and_expand_scenario(str(directory / "ppo_lap_completion_pretrain.yaml"))
@@ -39,6 +40,8 @@ try:
     trainer.train(total_steps=2)
     assert trainer.collected_steps == 2
     assert not blocked.intersection(sys.modules)
+    assert "adapters.gymnasium" not in sys.modules
+    assert "adapters.pettingzoo" not in sys.modules
 finally:
     task.close()
 '''

@@ -11,7 +11,7 @@ from torchrl.objectives.value import MultiAgentGAE
 
 from agents.common.mappo_policy import MAPPOPolicy
 from agents.torchrl_mappo import TorchRLMAPPOAgent
-from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
+from training.on_policy import OnPolicyTrainer as TorchRLMAPPOTrainer
 from test_race_task import ScriptedEnv, TickReward
 from test_torchrl_ppo import Capture
 from wrappers.actions.composer import ActionComposer
@@ -34,17 +34,31 @@ def learner(**extra):
     return TorchRLMAPPOAgent(1, 1, *BOUNDS, IDS, params(**extra))
 
 
-def store(agent, ids, step, reward, terminal):
-    observations = {aid: np.array([step], dtype=np.float32) for aid in ids}
+def transition(agent, ids, step, reward, terminal, next_state=None, observations=None):
+    from tensordict import TensorDict
+    observations = observations or {aid: np.full(agent.obs_dim, step, dtype=np.float32) for aid in ids}
     output = agent.sample_batch(ids, observations)
-    actions, log_probs = output.actions, output.log_probs
-    agent.store_batch(
-        ids, observations=observations, global_state=np.array([step], dtype=np.float32),
-        actions=actions, log_probs=log_probs, rewards=dict.fromkeys(ids, reward),
-        values=dict.fromkeys(ids, 0), terminated={aid: aid == "car_0" or terminal for aid in ids},
-        truncated=dict.fromkeys(ids, False), raw_actions=output.raw_actions,
-    )
-    agent.store_team_step(ids, reward=reward, value=0, terminal=terminal)
+    n = len(IDS)
+    agents = TensorDict({
+        "observation": torch.zeros(n, agent.obs_dim), "action": torch.zeros(n, agent.action_dim),
+        "raw_action": torch.zeros(n, agent.action_dim), "raw_log_prob": torch.zeros(n),
+        "index": torch.arange(n), "active": torch.zeros(n, 1, dtype=torch.bool),
+    }, [n])
+    for aid in ids:
+        row = IDS.index(aid)
+        agents["observation"][row] = torch.tensor(observations[aid])
+        agents["action"][row] = torch.tensor(output.actions[aid])
+        agents["raw_action"][row] = torch.tensor(output.raw_actions[aid])
+        agents["raw_log_prob"][row] = output.log_probs[aid]
+        agents["active"][row] = True
+    return TensorDict({"agents": agents, "state": torch.full((agent.global_state_dim,), float(step)),
+        "next": TensorDict({
+            "state": torch.full((agent.global_state_dim,), float(step + 1 if next_state is None else next_state)),
+            "agents": TensorDict({"index": torch.arange(n)}, [n]),
+            "team_reward": torch.tensor([float(reward)]),
+            "learning": TensorDict({"done": torch.tensor([terminal]),
+                                    "terminated": torch.tensor([terminal])}, []),
+        }, [])}, [])
 
 
 def test_native_team_gae_continues_retired_credit_and_filters_actor_padding(monkeypatch):
@@ -54,8 +68,8 @@ def test_native_team_gae_continues_retired_credit_and_filters_actor_padding(monk
     with torch.no_grad():
         for parameter in agent.critic.parameters():
             parameter.zero_()
-    for step, ids in enumerate((IDS, ["car_1"], ["car_1"])):
-        store(agent, ids, step, step + 1, terminal=step == 2)
+    data = torch.stack([transition(agent, ids, step, step + 1, terminal=step == 2)
+                        for step, ids in enumerate((IDS, ["car_1"], ["car_1"]))])
     captured = []
 
     def capture(agent, data, **kwargs):
@@ -63,13 +77,12 @@ def test_native_team_gae_continues_retired_credit_and_filters_actor_padding(monk
         return {}
 
     monkeypatch.setattr("agents.torchrl_mappo.optimize_ppo", capture)
-    metrics = agent.update(np.array([1000], dtype=np.float32))
+    metrics = agent.update(data)
     data = captured[0]
     assert data.batch_size == (4,)
     assert data["agents", "index"].flatten().tolist() == [0, 1, 1, 1]
     torch.testing.assert_close(data["agents", "value_target"].flatten(), torch.tensor([5.23, 5.23, 4.7, 3.]))
     assert metrics["train/rollout_agent_samples"] == 4
-    assert agent.buffers["car_0"].size() == 1 and agent.buffers["car_1"].size() == 3
 
 
 def test_budget_cut_bootstraps_one_shared_global_value(monkeypatch):
@@ -77,10 +90,10 @@ def test_budget_cut_bootstraps_one_shared_global_value(monkeypatch):
     with torch.no_grad():
         agent.critic.net[0].weight.fill_(1)
         agent.critic.net[0].bias.zero_()
-    store(agent, IDS, 2, 1, terminal=False)
+    data = torch.stack([transition(agent, IDS, 2, 1, terminal=False, next_state=3)])
     captured = []
     monkeypatch.setattr("agents.torchrl_mappo.optimize_ppo", lambda agent, data, **kwargs: captured.append(data.clone()) or {})
-    agent.update(np.array([3], dtype=np.float32))
+    agent.update(data)
     torch.testing.assert_close(captured[0]["agents", "advantage"].flatten(), torch.tensor([1.7, 1.7]))
     torch.testing.assert_close(captured[0]["agents", "value_target"].flatten(), torch.tensor([3.7, 3.7]))
 
@@ -99,10 +112,10 @@ def test_native_update_routes_actors_and_retains_checkpoint_compatibility(actor_
     agent = learner(**extra)
     if actor_mode == "lora":
         agent.load_pretrained_actor(str(source))
-    store(agent, ["car_1"], 0, 1, terminal=False)
-    store(agent, ["car_1"], 1, 2, terminal=True)
+    data = torch.stack([transition(agent, ["car_1"], 0, 1, terminal=False),
+                        transition(agent, ["car_1"], 1, 2, terminal=True)])
     before = {key: value.clone() for key, value in agent.actor.state_dict().items()}
-    metrics = agent.update(np.array([2], dtype=np.float32))
+    metrics = agent.update(data)
     assert all(np.isfinite(value) for value in metrics.values())
     assert any(not torch.equal(before[key], value) for key, value in agent.actor.state_dict().items())
     if actor_mode == "independent":
@@ -124,12 +137,15 @@ def test_native_update_routes_actors_and_retains_checkpoint_compatibility(actor_
     agent.load(str(path))
 
 
-def test_pettingzoo_training_preserves_team_rewards_and_fixed_only_continuation():
+def test_native_training_preserves_team_rewards_and_fixed_only_continuation():
     class Core(ScriptedEnv):
         possible_agents = (*IDS, "car_2", "car_3")
         trainable_agents = tuple(IDS)
         fixed_policy_agents = ("car_2", "car_3")
         render_mode = None
+
+        def close(self):
+            pass
 
     class Reward(TickReward):
         team_contract = ["tick"]
@@ -166,12 +182,8 @@ def test_native_fragments_preserve_masks_and_bootstrap_independently(actor_mode,
             parameter.zero_()
     fragments = []
     for ids_per_step, rewards in (((IDS, ["car_1"]), (1, 2)), ((IDS,), (100,))):
-        for step, ids in enumerate(ids_per_step):
-            store(agent, ids, step, rewards[step], terminal=False)
-            agent.set_next_state(np.array([step + 1]))
-        fragments.append(torch.stack(agent._steps).clone())
-        agent.clear_buffers()
-        assert not agent._steps and all(buf.size() == 0 for buf in agent.buffers.values())
+        fragments.append(torch.stack([transition(agent, ids, step, rewards[step], terminal=False)
+                                      for step, ids in enumerate(ids_per_step)]))
     captured = []
     monkeypatch.setattr("agents.torchrl_mappo.optimize_ppo",
                         lambda agent, data, **kwargs: captured.append(data.clone()) or {})
@@ -223,15 +235,10 @@ def test_legacy_ppo_transfer_extends_inputs_keeps_fresh_critic_and_updates(actor
     torch.testing.assert_close(mean, expected_mean)
     torch.testing.assert_close(scale, expected_scale.expand_as(scale))
     before = {key: value.clone() for key, value in agent.actor.state_dict().items()}
-    for step in range(2):
-        obs = {aid: observations[i].numpy() for i, aid in enumerate(IDS)}
-        output = agent.sample_batch(IDS, obs)
-        agent.store_batch(IDS, observations=obs, global_state=np.full(3, step, dtype=np.float32),
-                          actions=output.actions, log_probs=output.log_probs, raw_actions=output.raw_actions,
-                          rewards=dict.fromkeys(IDS, 1), values=dict.fromkeys(IDS, 0),
-                          terminated=dict.fromkeys(IDS, step == 1), truncated=dict.fromkeys(IDS, False))
-        agent.store_team_step(IDS, reward=1, value=0, terminal=step == 1)
-    assert agent.update(np.full(3, 2, dtype=np.float32))["train/optimizer_steps"] > 0
+    obs = {aid: observations[i].numpy() for i, aid in enumerate(IDS)}
+    data = torch.stack([transition(agent, IDS, step, 1, terminal=step == 1, observations=obs)
+                        for step in range(2)])
+    assert agent.update(data)["train/optimizer_steps"] > 0
     if actor_mode == "lora":
         assert all(not p.requires_grad for p in agent.actor.net.parameters())
         assert all(torch.equal(before[key], value) for key, value in agent.actor.state_dict().items()

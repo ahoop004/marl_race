@@ -129,25 +129,14 @@ def test_joint_team_credit_continues_after_an_individual_learner_finishes():
     with torch.no_grad():
         for parameter in agent.critic.parameters():
             parameter.zero_()
-    for index, ids in enumerate((LEARNERS, ["car_1"], ["car_1"])):
-        terminal = index == 2
-        agent.store_batch(
-            ids, observations={aid: np.zeros(2, dtype=np.float32) for aid in ids},
-            global_state=np.zeros(1, dtype=np.float32),
-            actions={aid: np.zeros(2, dtype=np.float32) for aid in ids},
-            rewards=dict.fromkeys(ids, float(index + 1)),
-            log_probs=dict.fromkeys(ids, 0.0), values=dict.fromkeys(ids, 0.0),
-            terminated={aid: terminal or aid == "car_0" for aid in ids},
-            truncated=dict.fromkeys(ids, False),
-            raw_actions={aid: np.zeros(2, dtype=np.float32) for aid in ids},
-        )
-        agent.store_team_step(ids, reward=index + 1, value=0.0, terminal=terminal)
-    data = torch.stack(agent._steps)
+    from test_torchrl_mappo import transition
+    data = torch.stack([transition(agent, ids, index, index + 1, terminal=index == 2)
+                        for index, ids in enumerate((LEARNERS, ["car_1"], ["car_1"]))])
     with torch.no_grad():
         agent.gae(data)
     torch.testing.assert_close(data["agents", "value_target"][:, 0, 0], torch.tensor([5.23, 4.7, 3.0]))
-    assert agent.buffers["car_0"].size() == 1
-    assert agent.buffers["car_1"].size() == 3
+    assert data["agents", "active"][:, 0].sum() == 1
+    assert data["agents", "active"][:, 1].sum() == 3
 
 
 def test_integrated_action_composers_have_independent_state_and_reset():

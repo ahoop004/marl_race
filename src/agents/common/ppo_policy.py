@@ -9,6 +9,7 @@ import torch
 import torch.optim as optim
 
 from agents.common.outputs import PolicyOutput
+from agents.common.optimization import OnPolicyOptimizationSettings
 from agents.common.networks import build_actor, build_critic, resolve_network_config
 from agents.common.checkpoints import (
     restore_policy_state, transfer_network_state, validate_network_checkpoint,
@@ -16,7 +17,7 @@ from agents.common.checkpoints import (
 from utils.torch_io import resolve_device
 
 
-class PPOPolicy:
+class PPOPolicy(OnPolicyOptimizationSettings):
     """Actor/critic state shared by TorchRL training and checkpoint evaluation."""
 
     def __init__(
@@ -35,17 +36,7 @@ class PPOPolicy:
         self.observation_contract = params.get("_observation_contract")
 
         # Hyperparameters (merged from training_defaults + scenario params)
-        self.lr = float(params.get("learning_rate", 3e-4))
-        self.lr_schedule = str(params.get("lr_schedule", "constant"))
-        if self.lr_schedule not in {"constant", "linear"}:
-            raise ValueError("PPO lr_schedule must be 'constant' or 'linear'.")
-        if self.lr_schedule == "linear" and "learning_rate_end" not in params:
-            raise ValueError("Linear PPO lr_schedule requires learning_rate_end.")
-        self.lr_end = float(params.get("learning_rate_end", self.lr))
-        if not all(np.isfinite(rate) and rate > 0 for rate in (self.lr, self.lr_end)):
-            raise ValueError("PPO learning rates must be finite and positive.")
-        if self.lr_schedule == "constant" and self.lr_end != self.lr:
-            raise ValueError("A different learning_rate_end requires lr_schedule: linear.")
+        self.configure_optimization(params)
         self.gamma = float(params.get("gamma", 0.99))
         self.gae_lambda = float(params.get("gae_lambda", 0.95))
         self.clip_range = float(params.get("clip_range", 0.2))
@@ -58,12 +49,6 @@ class PPOPolicy:
         self.min_rollout_steps = int(params.get("min_rollout_steps", 1))
         if self.min_rollout_steps < 1:
             raise ValueError("min_rollout_steps must be positive")
-        self.target_kl = params.get("target_kl")
-        if self.target_kl is not None:
-            self.target_kl = float(self.target_kl)
-            if not np.isfinite(self.target_kl) or self.target_kl <= 0:
-                raise ValueError("target_kl must be finite and positive")
-
         self.network_config = resolve_network_config(params, default_hidden_dims=[64, 64])
         self.actor_hidden_dims = self.network_config["actor_hidden_dims"]
         self.critic_hidden_dims = self.network_config["critic_hidden_dims"]
@@ -79,17 +64,6 @@ class PPOPolicy:
         self.critic = build_critic(obs_dim, self.network_config).to(self.device)
         self._optim_parameters = tuple(self.actor.parameters()) + tuple(self.critic.parameters())
         self.optimizer = optim.Adam(self._optim_parameters, lr=self.lr)
-
-    def set_training_progress(self, progress: float) -> None:
-        """Set LR from the trainer's globally completed budget fraction.
-
-        Evaluation never advances this schedule.
-        """
-        if self.lr_schedule == "linear":
-            fraction = float(np.clip(progress, 0.0, 1.0))
-            rate = self.lr + fraction * (self.lr_end - self.lr)
-            for group in self.optimizer.param_groups:
-                group["lr"] = rate
 
     @torch.no_grad()
     def value_batch(self, observations: np.ndarray) -> np.ndarray:

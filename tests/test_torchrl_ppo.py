@@ -12,7 +12,7 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type
 from agents.common.ppo_policy import PPOPolicy
 from agents.torchrl_ppo import TorchRLPPOAgent
 from training.hooks import TrainingHook
-from training.torchrl_ppo_trainer import TorchRLPPOTrainer
+from training.on_policy import OnPolicyTrainer as TorchRLPPOTrainer
 from test_race_task import make_task
 
 
@@ -157,8 +157,8 @@ def test_native_trainer_exact_budget_resets_and_hook_boundaries(transitions, mon
     assert [update["train/environment_steps"] for update in hook.updates] == [4, 7]
     assert hook.ended
     data = torch.cat(fragments)
-    assert data["observation"].flatten().tolist() == [0, 1, 2, 0, 1, 2, 0]
-    assert data["next", "observation"].flatten().tolist() == [1, 2, 3, 1, 2, 3, 1]
+    assert data["agents", "observation"].flatten().tolist() == [0, 1, 2, 0, 1, 2, 0]
+    assert data["next", "agents", "observation"].flatten().tolist() == [1, 2, 3, 1, 2, 3, 1]
     assert data["next", "done"].flatten().tolist() == [False, False, True, False, False, True, False]
     assert not data["next", "terminated"].any()
     if transitions:
@@ -192,7 +192,7 @@ def test_episode_budget_flushes_a_deferred_update_with_final_learning_rate():
                                    learning_rate=1e-3, learning_rate_end=1e-4)
     training.train(n_episodes=2)
     assert training.collected_steps == 6
-    assert controller.resets == len(hook.episodes) == 2
+    assert controller.resets == 3 and len(hook.episodes) == 2
     assert len(hook.updates) == 1
     assert hook.updates[0]["train/rollout_steps"] == 6
     assert hook.updates[0]["train/updates"] == 1
@@ -252,7 +252,7 @@ def test_serial_trainers_stop_after_update_and_keep_evaluated_weights(algorithm)
             training = TorchRLPPOTrainer(task, learner, hooks=[hook])
         else:
             from agents.torchrl_mappo import TorchRLMAPPOAgent
-            from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
+            from training.on_policy import OnPolicyTrainer as TorchRLMAPPOTrainer
 
             state = task.env.get_global_state()
             params.update(critic_mode="shared_team", reward_mode="team_shared", team_return_mode="joint",

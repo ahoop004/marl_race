@@ -10,7 +10,6 @@ from torchrl.objectives.value import MultiAgentGAE
 
 from agents.common.mappo_policy import MAPPOPolicy
 from agents.torchrl_updates import optimize_ppo
-from training.rollout_storage import MAPPORolloutStorage
 
 
 class _PolicyParameters(torch.nn.Module):
@@ -35,11 +34,9 @@ class _CentralValue(torch.nn.Module):
         return self.critic(state).unsqueeze(-1).unsqueeze(-1).expand(*index.shape, 1)
 
 
-class TorchRLMAPPOAgent(MAPPOPolicy, MAPPORolloutStorage):
+class TorchRLMAPPOAgent(MAPPOPolicy):
     def __init__(self, obs_dim, global_state_dim, action_low, action_high, agent_ids, params):
         super().__init__(obs_dim, global_state_dim, action_low, action_high, agent_ids, params)
-        MAPPORolloutStorage.__init__(self, self.agent_ids, self.obs_dims, self.action_dim,
-                                    self.n_steps, self.device)
         if (self.critic_mode != "shared_team" or self.reward_mode != "team_shared"
                 or self.team_return_mode != "joint"):
             raise ValueError("TorchRL MAPPO requires shared_team critic, team_shared rewards and joint team returns")
@@ -59,6 +56,7 @@ class TorchRLMAPPOAgent(MAPPOPolicy, MAPPORolloutStorage):
             self.probabilistic_actor,
             TensorDictModule(torch.tanh, in_keys=[("agents", "raw_action")], out_keys=[("agents", "action")]),
         )
+        self.collection_policy = self.policy
         self.value_module = TensorDictModule(
             _CentralValue(self.critic), in_keys=["state", ("agents", "index")],
             out_keys=[("agents", "state_value")],
@@ -78,7 +76,8 @@ class TorchRLMAPPOAgent(MAPPOPolicy, MAPPORolloutStorage):
             average_gae=False, auto_reset_env=False, time_dim=0,
         )
         self.gae.set_keys(value=("agents", "state_value"), advantage=("agents", "advantage"),
-                          value_target=("agents", "value_target"))
+                          value_target=("agents", "value_target"), reward="team_reward",
+                          done=("learning", "done"), terminated=("learning", "terminated"))
 
     @torch.no_grad()
     def actor_actions(self, observations, agent_ids, *, deterministic=False, return_raw=False):
@@ -94,12 +93,8 @@ class TorchRLMAPPOAgent(MAPPOPolicy, MAPPORolloutStorage):
         result = (data["agents", "action"], data["agents", "raw_log_prob"])
         return (*result, data["agents", "raw_action"]) if return_raw else result
 
-    def update(self, next_global_state):
-        if not self._steps:
-            return {}
-        self._require_lora_source()
-        self.set_next_state(next_global_state)
-        return self.update_rollouts([torch.stack(self._steps)])
+    def update(self, rollout):
+        return self.update_rollouts([rollout])
 
     def update_rollouts(self, rollouts):
         self._require_lora_source()
@@ -114,10 +109,12 @@ class TorchRLMAPPOAgent(MAPPOPolicy, MAPPORolloutStorage):
         data = torch.cat(fragments, dim=0)
         # Keep retired slots in GAE for continuing team credit, then select only
         # actual decisions before advantage normalization and minibatch sampling.
-        mask = data["agents", "mask"].reshape(-1)
+        mask = data["agents", "active"].reshape(-1)
         states = data["state"].unsqueeze(-2).expand(-1, len(self.agent_ids), -1).reshape(-1, self.global_state_dim)
         selected = data["agents"].reshape(-1)[mask]
         samples = TensorDict({"agents": selected.unsqueeze(-1), "state": states[mask]}, [selected.numel()])
+        if not selected.numel():
+            return {}
         metrics = optimize_ppo(self, samples, group="agents")
         metrics["train/rollout_steps"] = data.numel()
         metrics["train/rollout_agent_samples"] = selected.numel()

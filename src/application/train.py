@@ -173,8 +173,9 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "update_version": params.get("update_version"),
     }
     provenance["collector"] = {
-        "backend": "local",
-        "task_adapter": "gymnasium" if algorithm == "ppo" else "pettingzoo_parallel",
+        "implementation": "torchrl.collectors.Collector",
+        "backend": "direct",
+        "task_adapter": "native_envbase",
         "mode": "serial",
         "num_envs": 1,
         "inference": "local",
