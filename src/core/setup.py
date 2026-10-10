@@ -1,18 +1,15 @@
-"""Training setup builder - creates environment and agents from scenario config."""
+"""Build physical environments, fixed controllers and task composers."""
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from env.RaceEnv import RaceEnv
 from core.agent_builder import (
     build_fixed_policy_agents,
-    get_fixed_agent_ids,
-    get_trainable_agent_ids,
+    AgentRoles, resolve_agent_roles,
 )
 from core.env_builder import create_environment
 from core.feature_requirements import derive_environment_feature_requirements
 from core.map_selection import apply_map_split
-from core.provenance import physics_contract
-from wrappers.actions.composer import ActionComposer
 from wrappers.observations.composer import ObservationComposer
 from wrappers.rewards.composer import RewardComposer
 
@@ -73,38 +70,17 @@ def build_reward_composers(
     }
 
 
-def resolve_training_params(agent_cfg: Dict, scenario: Dict) -> Dict:
-    """Merge training_defaults with agent params — agent params win."""
-    defaults = scenario.get("training_defaults", {})
-    params = agent_cfg.get("params", {})
-    environment = scenario.get("environment", {})
-    decision_dt = float(environment.get("timestep", 0.01)) * int(environment.get("action_repeat", 1))
-    return {**defaults, **params, "_physics_contract": physics_contract(environment),
-            "_action_contract": ActionComposer.contract_from_config(
-        agent_cfg.get("action_constraints", {}), decision_dt,
-    )}
-
-
-def create_training_setup(
+def create_environment_setup(
     scenario: Dict[str, Any],
     *,
     mode: str = "train",
     scenario_dir: Optional[Path] = None,
-) -> Tuple[RaceEnv, Dict[str, Any], Dict]:
-    """Create training setup from scenario configuration.
+    roles: Optional[AgentRoles] = None,
+) -> Tuple[RaceEnv, Dict[str, Any]]:
+    """Create physics and fixed controllers from resolved action-owner roles.
 
-    Args:
-        scenario: Expanded scenario configuration with:
-            - experiment: {name, episodes, seed}
-            - environment: {map, num_agents, max_steps, ...}
-            - agents: {agent_id: {algorithm, params, observation, reward, ...}}
-        mode: "train" or "eval" (used for map bundle splits)
-
-    Returns:
-        Tuple of (env, agents, reward_strategies):
-            - env: Env instance
-            - agents: Dict mapping agent_id -> agent instance
-            - reward_strategies: Dict mapping agent_id -> RewardStrategy (for trainable agents)
+    Mode selects map splits and physical evaluation overrides. This builder
+    neither selects a learner nor seeds process-global policy randomness.
     """
     # Extract configuration sections
     experiment_config = scenario['experiment']
@@ -142,8 +118,12 @@ def create_training_setup(
         env_config["episode_termination"] = {**env_config.get("episode_termination", {}),
                                              "mode": evaluation["episode_termination_mode"]}
     agent_configs = scenario['agents']
-    env_config.setdefault("trainable_agents", get_trainable_agent_ids(agent_configs))
-    env_config.setdefault("fixed_policy_agents", get_fixed_agent_ids(agent_configs))
+    roles = roles or resolve_agent_roles(agent_configs)
+    if (set(roles.policy_agents) & set(roles.fixed_agents)
+            or set(roles.policy_agents) | set(roles.fixed_agents) != set(agent_configs)):
+        raise ValueError("Every physical agent needs exactly one action owner")
+    env_config.setdefault("trainable_agents", list(roles.policy_agents))
+    env_config.setdefault("fixed_policy_agents", list(roles.fixed_agents))
     if scenario_dir is not None:
         requirements = derive_environment_feature_requirements(
             agent_configs,
@@ -166,22 +146,7 @@ def create_training_setup(
         ):
             env_config["centerline_features"] = True
 
-    # Set random seed if specified
     seed = experiment_config.get('seed')
-    if seed is not None:
-        import numpy as np
-        import random
-        np.random.seed(seed)
-        random.seed(seed)
-        try:
-            import torch
-        except ImportError:
-            torch = None
-        if torch is not None:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-
     env = create_environment(env_config, agent_configs, seed)
 
     # Preserve explicitly configured targets in environment lifecycle facts.
@@ -194,11 +159,12 @@ def create_training_setup(
         env.configure_agent_targets(target_mapping)
 
     try:
-        agents = build_fixed_policy_agents(agent_configs, vehicle_params=env.params)
+        agents = build_fixed_policy_agents(agent_configs, fixed_ids=roles.fixed_agents,
+                                          vehicle_params=env.params)
         for controller in agents.values():
             if hasattr(controller, "set_env"):
                 controller.set_env(env)
     except Exception:
         env.close()
         raise
-    return env, agents, {}
+    return env, agents

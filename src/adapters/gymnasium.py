@@ -12,6 +12,8 @@ class RaceGymEnv(TaskAdapter, gym.Env):
     def __init__(self, task: RaceTaskProtocol) -> None:
         if len(task.possible_agents) != 1:
             raise ValueError("The Gymnasium adapter requires exactly one policy agent")
+        if getattr(task, "team_reward_agent_id", None) is not None:
+            raise ValueError("The Gymnasium adapter exposes individual rewards; shared bonuses require a team adapter")
         super().__init__(task)
         self.agent_id = task.possible_agents[0]
         self.observation_space = box(task.observation_space(self.agent_id))

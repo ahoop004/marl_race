@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 
+from agents.common.outputs import PolicyOutput
 from agents.common.networks import Actor, Critic
 from agents.common.lora import LoRAActor, resolve_lora_config
 from agents.common.independent import IndependentActors
@@ -64,7 +65,6 @@ class MAPPOPolicy:
             raise ValueError("Independent actors cannot also use LoRA; use shared with per_agent adapters")
         self.pretrained_actor_source = None
         self._lora_ready = self.lora_config is None
-        self.last_raw_actions: Dict[str, np.ndarray] = {}
 
         self.critic_mode = str(params.get("critic_mode", "agent_conditioned")).strip().lower()
         if self.critic_mode not in {"shared_team", "agent_conditioned"}:
@@ -208,16 +208,16 @@ class MAPPOPolicy:
         )
 
     @torch.no_grad()
-    def act_batch(
+    def sample_batch(
         self,
         agent_ids: Sequence[str],
         observations: np.ndarray,
         deterministic: bool = False,
-    ) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
+    ) -> PolicyOutput:
         """Select actions for an ordered active-agent batch with one actor call."""
         ordered_ids = self._validate_agent_batch(agent_ids)
         if not ordered_ids:
-            return {}, {}
+            return PolicyOutput({}, {}, {})
         obs = self.pack_observations(ordered_ids, observations)
         if obs.shape != (len(ordered_ids), self.obs_dim):
             raise ValueError(
@@ -230,7 +230,7 @@ class MAPPOPolicy:
         )
         # One device-to-host transfer for the complete joint decision.
         result = torch.cat((action_t, log_prob_t.unsqueeze(-1), raw_t), dim=-1).cpu().numpy()
-        self.last_raw_actions = {
+        raw_actions = {
             aid: result[index, self.action_dim + 1:].copy()
             for index, aid in enumerate(ordered_ids)
         }
@@ -242,7 +242,14 @@ class MAPPOPolicy:
             agent_id: float(result[index, self.action_dim])
             for index, agent_id in enumerate(ordered_ids)
         }
-        return actions, log_probs
+        return PolicyOutput(actions, log_probs, raw_actions)
+
+    def act_batch(self, agent_ids, observations, deterministic=False):
+        output = self.sample_batch(agent_ids, observations, deterministic)
+        return output.actions, output.log_probs
+
+    def evaluation_actions(self, agent_ids, observations):
+        return self.sample_batch(agent_ids, observations, deterministic=True).actions
 
     def pack_observations(self, agent_ids, observations):
         return pack_observations(agent_ids, observations, self.obs_dims, self.obs_dim)

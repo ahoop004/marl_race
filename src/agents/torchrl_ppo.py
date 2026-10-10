@@ -8,6 +8,7 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 
+from agents.common.outputs import PolicyOutput
 from agents.common.ppo_policy import PPOPolicy
 from agents.torchrl_updates import optimize_ppo
 
@@ -70,15 +71,15 @@ class TorchRLPPOAgent(PPOPolicy):
         return self.update_rollouts([rollout])
 
     @torch.no_grad()
-    def act_batch(self, observations, deterministic=False):
+    def sample_batch(self, observations, deterministic=False):
         observation = torch.as_tensor(observations, dtype=torch.float32, device=self.device)
         data = TensorDict({"observation": observation}, [len(observation)])
         with set_exploration_type(ExplorationType.MODE if deterministic else ExplorationType.RANDOM):
             self.policy(data)
         outputs = torch.cat((data["action"], data["raw_action"], data["raw_log_prob"][:, None],
                              self.critic(observation)[:, None]), dim=1).cpu().numpy()
-        self.last_raw_actions = outputs[:, self.action_dim:2 * self.action_dim].copy()
-        return outputs[:, :self.action_dim], outputs[:, -2], outputs[:, -1]
+        return PolicyOutput(outputs[:, :self.action_dim], outputs[:, -2],
+                            outputs[:, self.action_dim:2 * self.action_dim].copy(), outputs[:, -1])
 
     def update_rollouts(self, rollouts):
         # GAE must see each race's time axis independently, before flattening.

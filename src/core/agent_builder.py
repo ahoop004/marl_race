@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Mapping
+from dataclasses import dataclass
 
 
 PYTORCH_RL_ALGOS = frozenset({"ppo", "mappo"})
@@ -52,10 +53,23 @@ def get_fixed_agent_ids(agent_configs: Mapping[str, Mapping[str, Any]]) -> List[
     return [aid for aid, cfg in agent_configs.items() if not is_trainable_agent(cfg)]
 
 
-def build_fixed_policy_agents(agent_configs: Mapping[str, Mapping[str, Any]], *, vehicle_params=None) -> Dict[str, Any]:
+@dataclass(frozen=True)
+class AgentRoles:
+    policy_agents: tuple[str, ...]
+    fixed_agents: tuple[str, ...]
+
+
+def resolve_agent_roles(agent_configs: Mapping[str, Mapping[str, Any]]) -> AgentRoles:
+    """Resolve legacy algorithm fields once, at the scenario boundary."""
+    policy = tuple(get_trainable_agent_ids(agent_configs))
+    return AgentRoles(policy, tuple(aid for aid in agent_configs if aid not in policy))
+
+
+def build_fixed_policy_agents(agent_configs: Mapping[str, Mapping[str, Any]], *,
+                             fixed_ids=None, vehicle_params=None) -> Dict[str, Any]:
     agents = {}
     nonlinear = (vehicle_params or {}).get("model") == "combined_slip_st"
-    for agent_id in get_fixed_agent_ids(agent_configs):
+    for agent_id in (get_fixed_agent_ids(agent_configs) if fixed_ids is None else fixed_ids):
         config = agent_configs[agent_id]
         params = {**config.get("params", {}), "agent_id": agent_id}
         adapter = config.get("action_adapter")

@@ -1,4 +1,4 @@
-"""Shared reward-context assembly for training loops."""
+"""Lifecycle fields for training transition records."""
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -6,7 +6,6 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from env.types import GlobalState
-from tasks.reward_context import build_reward_context, validate_team_reward_composers
 
 
 def transition_lifecycle_fields(

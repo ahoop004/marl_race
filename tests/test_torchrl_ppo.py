@@ -121,9 +121,7 @@ def trainer(hook, **params):
     task.env.render_mode = None
     task.env.close = lambda: None
     result = TorchRLPPOTrainer(
-        task.env, "learner", agent(**params), task.fixed_controllers,
-        task.obs_composers["learner"], task.reward_composers["learner"],
-        task.action_composers["learner"], hooks=[hook],
+        task, agent(**params), hooks=[hook],
     )
     return result, controller
 
@@ -181,7 +179,7 @@ def test_episode_budget_flushes_a_deferred_update_with_final_learning_rate():
 def test_parallel_fragments_use_final_observations_and_independent_gae(monkeypatch):
     from multiprocessing.reduction import ForkingPickler
     import pickle
-    from training.torchrl_collectors import PPOCollectorPolicy, deserialize_rollout, serialize_rollout
+    from training.torchrl_collectors import PPOCollectorState, deserialize_rollout, serialize_rollout
 
     learner = agent(gamma=0.9, gae_lambda=1)
     with torch.no_grad():
@@ -189,11 +187,12 @@ def test_parallel_fragments_use_final_observations_and_independent_gae(monkeypat
         learner.critic.net[0].bias.zero_()
     fragments = []
     for observations, next_observations, rewards in (([2, 3], [3, 4], [1, 2]), ([100], [7], [4])):
-        policy = PPOCollectorPolicy(2)
-        actions, log_probs, values = learner.act_batch(np.array(observations, dtype=np.float32).reshape(-1, 1))
+        policy = PPOCollectorState(2)
+        output = learner.sample_batch(np.array(observations, dtype=np.float32).reshape(-1, 1))
+        actions, log_probs, values = output.actions, output.log_probs, output.values
         for row, observation in enumerate(observations):
             policy.buffer.add([observation], actions[row], rewards[row], log_probs[row], values[row],
-                              terminated=False, truncated=False, raw_action=learner.last_raw_actions[row],
+                              terminated=False, truncated=False, raw_action=output.raw_actions[row],
                               next_observation=[next_observations[row]])
         payload = ForkingPickler.dumps(serialize_rollout(policy.pack_rollout()))
         fragments.append(deserialize_rollout(pickle.loads(payload)))
@@ -209,15 +208,13 @@ def test_parallel_fragments_use_final_observations_and_independent_gae(monkeypat
 
 def test_ppo_worker_keeps_reset_boundaries_and_final_observations_in_pooled_fragments():
     from training.ppo_collector import PPOCollector
-    from training.torchrl_collectors import PPOCollectorPolicy
+    from training.torchrl_collectors import PPOCollectorState
 
     task, controller, _ = make_task({3: ((), True, (), ("learner", "opponent"))}, repeat=1)
     hook = Capture(True)
-    policy = PPOCollectorPolicy(4)
+    policy = PPOCollectorState(4)
     collection = PPOCollector(
-        task.env, "learner", policy, task.fixed_controllers,
-        task.obs_composers["learner"], task.reward_composers["learner"],
-        task.action_composers["learner"], hooks=[hook],
+        task, policy, hooks=[hook],
     )
     fragments = []
     generator = collection.iter_train(total_steps=7)
@@ -280,9 +277,7 @@ def test_spawned_collectors_stop_at_update_barrier_and_keep_evaluated_weights(al
     try:
         if algorithm == "ppo":
             learner = TorchRLPPOAgent(obs_dim, bounds.low, bounds.high, params)
-            training = TorchRLPPOTrainer(task.env, ids[0], learner, task.fixed_controllers,
-                                        task.obs_composers[ids[0]], task.reward_composers[ids[0]],
-                                        task.action_composers[ids[0]], hooks=[hook])
+            training = TorchRLPPOTrainer(task, learner, hooks=[hook])
         else:
             from agents.torchrl_mappo import TorchRLMAPPOAgent
             from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
@@ -293,9 +288,7 @@ def test_spawned_collectors_stop_at_update_barrier_and_keep_evaluated_weights(al
                           _observation_dims={aid: task.obs_composers[aid].obs_dim for aid in ids},
                           _observation_contracts={aid: task.obs_composers[aid].contract for aid in ids})
             learner = TorchRLMAPPOAgent(obs_dim, len(state.vector), bounds.low, bounds.high, ids, params)
-            training = TorchRLMAPPOTrainer(task.env, learner, ids, task.fixed_controllers,
-                                          task.obs_composers, task.reward_composers,
-                                          task.action_composers[ids[0]], hooks=[hook], reward_mode="team_shared")
+            training = TorchRLMAPPOTrainer(task, learner, hooks=[hook])
         training.train_parallel(scenario, scenarios, 2, total_steps=7)
         assert len(hook.updates) == 1 and hook.updates[0]["train/environment_steps"] == 4
         assert hook.ended and not hook.episodes

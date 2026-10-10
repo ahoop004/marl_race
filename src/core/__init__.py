@@ -4,7 +4,7 @@ Load public exports on demand so configuration helpers do not initialize the
 simulator or fixed-policy registry merely by importing the core package.
 """
 
-__all__ = ["create_fixed_controller", "register_fixed_controller", "create_training_setup"]
+__all__ = ["create_fixed_controller", "register_fixed_controller", "create_environment_setup"]
 
 
 def __getattr__(name: str):
@@ -12,7 +12,7 @@ def __getattr__(name: str):
         from core.agent_builder import create_fixed_controller, register_fixed_controller
         return {"create_fixed_controller": create_fixed_controller,
                 "register_fixed_controller": register_fixed_controller}[name]
-    if name == "create_training_setup":
-        from core.setup import create_training_setup
-        return create_training_setup
+    if name == "create_environment_setup":
+        from core.setup import create_environment_setup
+        return create_environment_setup
     raise AttributeError(f"module 'core' has no attribute {name!r}")

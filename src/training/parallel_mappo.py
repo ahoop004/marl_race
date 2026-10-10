@@ -24,7 +24,7 @@ from training.collector_scheduling import (
     cpu_affinity_count, cpu_affinity_core_count,
 )
 from training.collector_hooks import WorkerHook
-from training.torchrl_collectors import MAPPOCollectorAgent, deserialize_rollout, serialize_rollout
+from training.torchrl_collectors import MAPPOCollectorState, deserialize_rollout, serialize_rollout
 
 
 @torch.no_grad()
@@ -69,8 +69,8 @@ def infer_requests(agent, requests):
 
 def _make_collector(scenario, scenario_dir, env_id, episodes, horizon, contract,
                     run_id, sink, record_transitions, total_steps=None):
-    from core.setup import build_obs_composers, build_reward_composers, create_training_setup
-    from wrappers.actions.composer import ActionComposer
+    from core.task_builder import create_race_task
+    from training.runtime import seed_process
 
     scenario = copy.deepcopy(scenario)
     base_seed = int(scenario["experiment"]["seed"])
@@ -80,11 +80,12 @@ def _make_collector(scenario, scenario_dir, env_id, episodes, horizon, contract,
     env_seed = env_cfg.get("seed")
     env_cfg["seed"] = ((base_seed if env_seed is None else int(env_seed)) + env_id) % (2 ** 32)
     env_cfg["render"] = False
-    env, opponents, _ = create_training_setup(scenario, scenario_dir=Path(scenario_dir))
+    seed_process(seed)
+    task = create_race_task(scenario, scenario_dir=Path(scenario_dir))
+    env = task.env
     try:
         ids = contract["agent_ids"]
-        obs = build_obs_composers(scenario["agents"], ids, env_cfg, Path(scenario_dir))
-        rewards = build_reward_composers(scenario["agents"], ids, Path(scenario_dir))
+        obs = task.obs_composers
         snapshot = env.get_global_state()
         if (len(snapshot.vector) != contract["global_state_dim"] or
                 snapshot.metadata.get("vector_contract_version", "legacy_unspecified") !=
@@ -97,19 +98,12 @@ def _make_collector(scenario, scenario_dir, env_id, episodes, horizon, contract,
                     not np.array_equal(space.low, contract["action_low"]) or
                     not np.array_equal(space.high, contract["action_high"])):
                 raise ValueError("MAPPO collector observation/action contract mismatch")
-        space = env.action_spaces[ids[0]]
-        repeat = int(env_cfg.get("action_repeat", 1))
-        actions = ActionComposer.from_config(
-            space.low, space.high, scenario["agents"][ids[0]].get("action_constraints", {}),
-            decision_dt=float(env_cfg.get("timestep", .01)) * repeat,
-        )
         from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
-        agent = MAPPOCollectorAgent(contract, horizon)
+        agent = MAPPOCollectorState(contract, horizon)
         trainer = TorchRLMAPPOTrainer(
-            env, agent, ids, opponents, obs, rewards, actions, action_repeat=repeat,
+            task, agent,
             hooks=[WorkerHook(sink, env_id, seed, record_transitions)],
-            run_id=f"{run_id}_env{env_id:04d}", reward_mode=agent.reward_mode,
-            team_reward_reduction=agent.team_reward_reduction,
+            run_id=f"{run_id}_env{env_id:04d}",
         )
         return env, agent, trainer.iter_train(episodes, parallel=True, total_steps=total_steps)
     except BaseException:

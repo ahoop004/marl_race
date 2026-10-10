@@ -3,58 +3,35 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
 
-import numpy as np
-
 from env.types import TransitionRecord
 from metrics.outcomes import determine_outcome
 from training.hooks import TrainingHook, transition_record_hooks
 from training.reward_context import transition_lifecycle_fields
 from tasks import RaceTask, TaskSnapshot
-from wrappers.actions.composer import ActionComposer
-from wrappers.observations.composer import ObservationComposer
-from wrappers.rewards.composer import RewardComposer
 
 
 class PPOTrainerBase:
     """Task ownership, hook metadata and global training progress."""
 
     def __init__(
-        self,
-        env: Any,
-        rl_agent_id: str,
-        agent: Any,
-        other_agents: Dict[str, Any],
-        obs_composer: ObservationComposer,
-        reward_composer: RewardComposer,
-        action_composer: ActionComposer,
-        action_repeat: int = 1,
-        hooks: Optional[List[TrainingHook]] = None,
-        render: bool = False,
-        run_id: str = "run",
-        spawn_plan_fn: Optional[Callable] = None,
+        self, task: RaceTask, agent: Any, *,
+        hooks: Optional[List[TrainingHook]] = None, render: bool = False,
+        run_id: str = "run", spawn_plan_fn: Optional[Callable] = None,
     ) -> None:
-        self.env = env
-        self.rl_agent_id = rl_agent_id
-        self.agent = agent
-        self.other_agents = other_agents
-        self.obs_composer = obs_composer
-        self.reward_composer = reward_composer
-        if getattr(reward_composer, "team_contract", []):
+        if len(task.possible_agents) != 1:
+            raise ValueError("PPO requires exactly one policy agent")
+        if task.team_reward_agent_id is not None:
             raise ValueError("Team race rewards require MAPPO joint team returns")
-        self.action_composer = action_composer
-        self.action_repeat = max(1, int(action_repeat))
+        self.task = task
+        self.env = task.env
+        self.rl_agent_id = task.possible_agents[0]
+        self.agent = agent
         self.hooks = hooks or []
         self._transition_hooks = transition_record_hooks(self.hooks)
         self.render = render
         self.run_id = run_id
         self.spawn_plan_fn = spawn_plan_fn
         self.collected_steps = 0
-        self.task = RaceTask(
-            env, policy_agents=[rl_agent_id], fixed_controllers=other_agents,
-            obs_composers={rl_agent_id: obs_composer},
-            reward_composers={rl_agent_id: reward_composer},
-            action_composers={rl_agent_id: action_composer}, action_repeat=self.action_repeat,
-        )
 
     def _set_training_progress(self, completed: int, total: int) -> None:
         # Remote collectors own no optimizer; the parent uses global progress.
@@ -109,8 +86,7 @@ class PPOCollector(PPOTrainerBase):
 
     def _policy_request(self, observation):
         action, log_prob, value, raw = yield "act", observation
-        self.agent.last_raw_actions = np.asarray(raw)[None]
-        return action, log_prob, value
+        return action, log_prob, value, raw
 
     def iter_train(self, n_episodes: int = 0, *, total_steps: Optional[int] = None):
         """Collect TensorDict fragments under the parent's frozen policy."""
@@ -142,9 +118,7 @@ class PPOCollector(PPOTrainerBase):
                         physics=info_dict.get(self.rl_agent_id, {}).get("physics")))
 
             while not done:
-                action_norm, log_prob, value = yield from self._policy_request(obs)
-                raw_batch = getattr(self.agent, "last_raw_actions", None)
-                raw_action = raw_batch[0].copy() if raw_batch is not None else None
+                action_norm, log_prob, value, raw_action = yield from self._policy_request(obs)
                 task_step = self.task.step(
                     {self.rl_agent_id: action_norm}, on_physics_step=self._on_physics_step,
                 )
@@ -167,7 +141,7 @@ class PPOCollector(PPOTrainerBase):
                         action_norm=action_norm,
                         action_phys=action_phys,
                         reward=reward,
-                        reward_components={},
+                        reward_components=dict(decision.reward_components),
                         next_obs=next_obs,
                         terminated=rl_term if done else False,
                         truncated=rl_trunc if done else False,

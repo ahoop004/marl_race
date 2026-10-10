@@ -57,6 +57,13 @@ class RaceTask:
         if (isinstance(action_repeat, bool) or not isinstance(action_repeat, int)
                 or action_repeat < 1):
             raise ValueError("action_repeat must be a positive integer")
+        team_contracts = [getattr(composer, "team_contract", [])
+                          for composer in reward_composers.values()]
+        if any(team_contracts):
+            if any(contract != team_contracts[0] for contract in team_contracts):
+                raise ValueError("All teammates must use identical team reward components")
+            if team_reward_agent_id is None:
+                team_reward_agent_id = self.possible_agents[0]
         if team_reward_agent_id is not None and team_reward_agent_id not in policy_set:
             raise ValueError("Team reward composer must belong to a policy agent")
         self.action_repeat = action_repeat
@@ -68,6 +75,7 @@ class RaceTask:
         self._snapshot: Optional[TaskSnapshot] = None
         self._decision_steps = 0
         self._physics_steps = 0
+        self._closed = False
 
     @property
     def agents(self):
@@ -216,4 +224,6 @@ class RaceTask:
         return self.env.render()
 
     def close(self) -> None:
-        self.env.close()
+        if not self._closed:
+            self.env.close()
+            self._closed = True

@@ -27,28 +27,27 @@ class _RemotePolicy:
     def __init__(self, connection):
         self.connection = connection
 
-    def act_batch(self, ids, observations, deterministic=False):
-        if not deterministic:
-            raise ValueError('Evaluation workers require deterministic actions')
-        self.connection.send(('act', (ids, observations)))
-        return self.connection.recv(), {}
+    def evaluation_actions(self, ids, observations):
+        self.connection.send(('act', (list(ids), observations)))
+        return self.connection.recv()
 
 
 def _worker_evaluator(connection, spec):
-    from core.setup import create_training_setup, build_obs_composers
+    from core.task_builder import create_race_task
+    from training.runtime import seed_process
 
-    scenario, kwargs = spec['scenario'], spec['kwargs']
-    directory = Path(spec['scenario_dir'])
-    env, controllers, _ = create_training_setup(scenario, mode='eval', scenario_dir=directory)
+    scenario = deepcopy(spec['scenario'])
+    for aid, config in spec['observation_agents'].items():
+        if 'observation' in config:
+            scenario['agents'][aid]['observation'] = config['observation']
+    seed_process(scenario['experiment'].get('seed'))
+    task = create_race_task(scenario, mode='eval', scenario_dir=Path(spec['scenario_dir']))
     try:
-        observations = build_obs_composers(spec['observation_agents'], kwargs['trainable_ids'],
-                                           scenario['environment'], directory)
-        evaluator = DeterministicMAPPOEvaluator(env=env, other_agents=controllers,
-            obs_composers=observations, **kwargs).bind_agent(_RemotePolicy(connection))
+        evaluator = DeterministicMAPPOEvaluator(task=task, **spec['kwargs']).bind_agent(_RemotePolicy(connection))
         evaluator.set_progress_callback(lambda row: connection.send(('progress', row)))
         return evaluator
     except BaseException:
-        env.close()
+        task.close()
         raise
 
 
@@ -95,7 +94,7 @@ def _infer_actions(agent, requests):
     through the MPC optimizer. Simulators run concurrently; inference retains
     the serial evaluator's numerics and never computes the critic.
     """
-    return {worker: agent.act_batch(ids, rows, deterministic=True)[0]
+    return {worker: agent.evaluation_actions(ids, rows)
             for worker, (ids, rows) in requests.items()}
 
 
@@ -293,9 +292,8 @@ class ParallelMAPPOEvaluator(DeterministicMAPPOEvaluator):
     def _worker_spec(self):
         return dict(scenario=self.scenario, scenario_dir=self.scenario_dir,
             observation_agents=self.observation_agents,
-            kwargs=dict(trainable_ids=self.trainable_ids, action_composer=self.actions[self.trainable_ids[0]],
-                episodes=self.episodes, base_seed=self.base_seed, action_repeat=self.action_repeat,
-                protocol_name=self.protocol_name))
+            kwargs=dict(episodes=self.episodes, base_seed=self.base_seed,
+                protocol_name=self.protocol_name, reward_mapping=self.reward_mapping))
 
     def _collect_episodes(self, protocol):
         if self.num_workers == 1 or getattr(self, 'render', False):

@@ -5,14 +5,18 @@ from gymnasium.error import ResetNeeded
 from pettingzoo import ParallelEnv
 
 from adapters.common import TaskAdapter, box
+from adapters.rewards import RewardMapping
 from tasks import RaceTaskProtocol
 
 
 class RaceParallelEnv(TaskAdapter, ParallelEnv):
-    def __init__(self, task: RaceTaskProtocol) -> None:
+    def __init__(self, task: RaceTaskProtocol, *, reward_mode="individual",
+                 team_reward_reduction="mean") -> None:
         if not task.possible_agents:
             raise ValueError("The PettingZoo adapter requires policy agents")
         super().__init__(task)
+        self.reward_mapping = RewardMapping(reward_mode, team_reward_reduction)
+        self.last_rewards = {}
         self.possible_agents = list(task.possible_agents)
         self.agents = []
         self.observation_spaces = {aid: box(task.observation_space(aid)) for aid in self.possible_agents}
@@ -26,6 +30,7 @@ class RaceParallelEnv(TaskAdapter, ParallelEnv):
 
     def reset(self, seed=None, options=None):
         snapshot = self._reset_task(seed, options)
+        self.last_rewards = {}
         self.agents = list(snapshot.agents)
         observations = {aid: snapshot.observations[aid].copy() for aid in self.agents}
         return observations, {aid: self._info(aid) for aid in self.agents}
@@ -41,7 +46,20 @@ class RaceParallelEnv(TaskAdapter, ParallelEnv):
                                   for aid, action in actions.items()})
         self.agents = list(result.after.agents)
         observations = {aid: decision.next_observation.copy() for aid, decision in result.decisions.items()}
-        rewards = {aid: decision.individual_reward for aid, decision in result.decisions.items()}
+        rewards = self.reward_mapping.from_step(result, self.possible_agents)
+        self.last_rewards = rewards
         terminated = {aid: decision.terminated for aid, decision in result.decisions.items()}
         truncated = {aid: decision.truncated for aid, decision in result.decisions.items()}
         return observations, rewards, terminated, truncated, {aid: self._info(aid) for aid in result.decisions}
+
+    def _info(self, agent):
+        info = super()._info(agent)
+        info.update(learning_reward=self.last_rewards.get(agent, 0.0),
+                    reward_mode=self.reward_mapping.mode,
+                    team_reward_reduction=self.reward_mapping.reduction)
+        return info
+
+    def advance_fixed_agents(self):
+        result = super().advance_fixed_agents()
+        self.last_rewards = {}
+        return result

@@ -5,7 +5,7 @@ import torch
 
 from env.collision_state import RaceLifecycle, apply_episode_termination_policy
 from env.types import AgentRaceStatus
-from training.mappo_race_trainer import map_mappo_learning_rewards
+from adapters.rewards import RewardMapping
 from wrappers.actions.composer import ActionComposer
 from wrappers.rewards.composer import RewardComposer
 
@@ -49,10 +49,7 @@ def test_finishing_learners_can_leave_fixed_opponents_active(mode, done):
 
 
 def test_team_mean_keeps_configured_denominator_after_one_learner_retires():
-    rewards = map_mappo_learning_rewards(
-        {"car_1": 6.0}, trainable_ids=LEARNERS,
-        reward_mode="team_shared", team_reward_reduction="mean",
-    )
+    rewards = RewardMapping("team_shared", "mean").map({"car_1": 6.0}, LEARNERS)
     assert rewards == {"car_1": 3.0}
 
 

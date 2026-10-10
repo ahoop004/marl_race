@@ -1,4 +1,4 @@
-"""Contract for the shared RaceTask to be extracted from the existing trainers.
+"""Contract for RaceTask, library adapters and task-driven collectors.
 
 Ownership
 ---------
@@ -6,10 +6,9 @@ RaceEnv owns physical cars, maps, spawning, sensing, race lifecycle, physical
 terminal-car behavior, and the scenario's episode-ending policy. RaceTask owns
 per-policy-agent observation, action, and reward composers, fixed controllers,
 and advancing one joint policy decision. Gymnasium/PettingZoo adapters translate
-this contract; learners own policies, value estimates, learning-reward mapping,
-returns, buffers, updates, budgets, checkpoints, and training hooks. RaceEnv
-does not inherit from either library. This module declares the interface only;
-it does not implement the task or change the current trainers.
+this contract and explicitly map individual/shared learning rewards; learners own
+policies, value estimates, returns, buffers, updates, budgets and checkpoints. RaceEnv
+does not inherit from either library. Training hooks and evaluation reporting stay outside the task.
 
 Agent identities
 ----------------
@@ -57,7 +56,7 @@ Composed observations are made once at reset and once after each decision.
 Rewards and boundaries
 ----------------------
 AgentDecision.individual_reward excludes shared components. TaskStep.team_reward
-is their accumulated bonus, not the mean/sum of individual rewards. The learner
+is their accumulated bonus, not the mean/sum of individual rewards. The adapter
 preserves current mapping: individual mode uses individual rewards; team_shared
 uses their sum or their sum divided by the configured team size, then adds the
 shared bonus once. Inactive teammates contribute zero to that fixed denominator.
@@ -101,7 +100,7 @@ state is a separate GlobalState with its existing ordering, masks, and vector
 version; actors do not receive it through their composed observations. Snapshots
 retain raw observations/infos for all physical cars, but exposed policy observation
 keys exactly match their active agents. Returned arrays and nested payloads must
-remain stable across later steps/resets: stage 2 must detach reused buffers or
+remain stable across later steps/resets: the task detaches reused buffers or
 share immutable snapshots. Frozen dataclasses alone do not enforce deep ownership.
 
 One TaskStep counts as one joint environment decision, len(decisions) counts
@@ -116,7 +115,7 @@ Preserve observation layout and checkpoint action/physics contracts, existing
 reward contexts, fixed-controller units and zero-action exception fallback,
 substep event ordering, and seeded map/spawn behavior during extraction. Changes
 to controller failure handling or numerical behavior belong in separate changes.
-Stage 2 must compare deterministic action traces through current trainers and
+Regression checks compare deterministic action traces through trainers and
 RaceTask, covering terminal reward delivery, survivors, repeat interruption,
 fixed-only continuation, shared credit, reset ownership, and snapshot stability.
 """
@@ -221,7 +220,7 @@ class TaskStep:
 
 
 class RaceTaskProtocol(Protocol):
-    """Interface for stage 2's concrete RaceTask and subsequent library adapters."""
+    """Interface for RaceTask and library adapters."""
 
     @property
     def physical_agents(self) -> Tuple[str, ...]: ...

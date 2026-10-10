@@ -15,12 +15,13 @@ def box(spec: SpaceSpec) -> spaces.Box:
 
 class TaskAdapter:
     @classmethod
-    def from_scenario(cls, scenario, *, scenario_dir=None, mode="train", render_mode=None):
+    def from_scenario(cls, scenario, *, scenario_dir=None, mode="train", render_mode=None,
+                      **adapter_options):
         from core.task_builder import create_race_task
 
         task = create_race_task(scenario, scenario_dir=scenario_dir, mode=mode, render_mode=render_mode)
         try:
-            return cls(task)
+            return cls(task, **adapter_options)
         except BaseException:
             task.close()
             raise
@@ -37,6 +38,7 @@ class TaskAdapter:
         self.state_space = box(task.state_space())
         self.snapshot: TaskSnapshot | None = None
         self.last_step: TaskStep | None = None
+        self.on_physics_step = None
 
     def _reset_task(self, seed=None, options=None) -> TaskSnapshot:
         snapshot = self.task.reset(seed=seed, options=options)
@@ -48,6 +50,8 @@ class TaskAdapter:
         return snapshot
 
     def _on_physics_step(self, substep) -> None:
+        if self.on_physics_step is not None:
+            self.on_physics_step(substep)
         if self.render_mode == "human":
             self.task.render()
 

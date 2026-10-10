@@ -22,13 +22,13 @@ from training.collector_scheduling import (
 )
 from training.ppo_collector import PPOCollector
 from training.collector_hooks import WorkerHook
-from training.torchrl_collectors import PPOCollectorPolicy, deserialize_rollout, serialize_rollout
+from training.torchrl_collectors import PPOCollectorState, deserialize_rollout, serialize_rollout
 
 
 def _make_collector(scenario, directory, agent_id, env_id, quota, horizon,
                     run_id, sink, record, step_budget):
-    from core.setup import build_obs_composer, build_reward_composer, create_training_setup
-    from wrappers.actions.composer import ActionComposer
+    from core.task_builder import create_race_task
+    from training.runtime import seed_process
 
     scenario = copy.deepcopy(scenario)
     base_seed = int(scenario['experiment']['seed'])
@@ -38,19 +38,17 @@ def _make_collector(scenario, directory, agent_id, env_id, quota, horizon,
     env_seed = env_cfg.get('seed')
     env_cfg['seed'] = ((base_seed if env_seed is None else int(env_seed)) + env_id) % (2 ** 32)
     env_cfg['render'] = False
-    env, opponents, _ = create_training_setup(scenario, scenario_dir=Path(directory))
+    seed_process(seed)
+    task = create_race_task(scenario, scenario_dir=Path(directory))
+    env = task.env
     try:
-        cfg = scenario['agents'][agent_id]
+        if task.possible_agents != (agent_id,):
+            raise ValueError("PPO collector requires the configured policy agent")
         space = env.action_spaces[agent_id]
-        obs = build_obs_composer(cfg, env_cfg, Path(directory))
-        rewards = build_reward_composer(cfg, Path(directory))
-        policy = PPOCollectorPolicy(horizon, map_scheduler=env._map_scheduler, worker_id=env_id)
+        obs = task.obs_composers[agent_id]
+        policy = PPOCollectorState(horizon, map_scheduler=env._map_scheduler, worker_id=env_id)
         trainer = PPOCollector(
-            env, agent_id, policy, opponents, obs, rewards,
-            ActionComposer.from_config(space.low, space.high, cfg.get('action_constraints', {}),
-                decision_dt=float(env_cfg.get('timestep', .01)) * int(env_cfg.get('action_repeat', 1))),
-            action_repeat=int(env_cfg.get('action_repeat', 1)),
-            hooks=[WorkerHook(sink, env_id, seed, record)],
+            task, policy, hooks=[WorkerHook(sink, env_id, seed, record)],
             run_id=f'{run_id}_worker{env_id:03d}',
         )
         generator = trainer.iter_train(0 if step_budget else quota,
@@ -243,10 +241,10 @@ def train_parallel(trainer, scenario, directory, num_envs, n_episodes, *, total_
                     if kind == 'value':
                         responses.update(zip(keys, map(float, agent.value_batch(observations))))
                     else:
-                        actions, log_probs, values = agent.act_batch(observations)
+                        output = agent.sample_batch(observations)
                         for row, key in enumerate(keys):
-                            responses[key] = (actions[row], float(log_probs[row]), float(values[row]),
-                                              agent.last_raw_actions[row])
+                            responses[key] = (output.actions[row], float(output.log_probs[row]), float(output.values[row]),
+                                              output.raw_actions[row])
                 if len(responses) != len(requests):
                     raise RuntimeError('Unknown PPO inference request')
                 for worker_id in sorted({key[0] for key in requests}):

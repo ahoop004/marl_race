@@ -6,8 +6,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from agents.common.mappo_policy import MAPPOPolicy
-from agents.torchrl_mappo import TorchRLMAPPOAgent
+from training.rollout_storage import MAPPORolloutStorage
 
 
 def serialize_rollout(rollout):
@@ -49,7 +48,7 @@ class _DecisionBuffer:
         }, []))
 
 
-class PPOCollectorPolicy:
+class PPOCollectorState:
     """CPU decision storage and parent control; workers own no policy networks."""
 
     def __init__(self, n_steps, *, map_scheduler=None, worker_id=0):
@@ -77,26 +76,14 @@ class PPOCollectorPolicy:
         return reply["metrics"]
 
 
-class MAPPOCollectorAgent:
-    # Workers own no networks. Reuse the serial native transition contract;
-    # the learner computes MultiAgentGAE before pooling independent fragments.
-    store_batch = TorchRLMAPPOAgent.store_batch
-    store_team_step = TorchRLMAPPOAgent.store_team_step
-    set_next_state = TorchRLMAPPOAgent.set_next_state
-    any_buffer_full = TorchRLMAPPOAgent.any_buffer_full
-    clear_buffers = TorchRLMAPPOAgent.clear_buffers
-    _validate_agent_batch = MAPPOPolicy._validate_agent_batch
-    pack_observations = MAPPOPolicy.pack_observations
+class MAPPOCollectorState(MAPPORolloutStorage):
+    """CPU rollout storage and worker counters; inference stays in the parent."""
 
     def __init__(self, contract, horizon):
         for name, value in contract.items():
             setattr(self, name, value)
-        self.n_steps = horizon
-        self.device = torch.device("cpu")
-        self._agent_index = {aid: index for index, aid in enumerate(self.agent_ids)}
-        self.buffers = TorchRLMAPPOAgent._make_buffers(self)
+        super().__init__(self.agent_ids, self.obs_dims, self.action_dim, horizon)
         self.fragments = []
-        self.last_raw_actions = {}
         self.policy_version = 0
         self.physics_steps_collected = 0
 

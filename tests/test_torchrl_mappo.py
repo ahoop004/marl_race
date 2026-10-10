@@ -36,12 +36,13 @@ def learner(**extra):
 
 def store(agent, ids, step, reward, terminal):
     observations = {aid: np.array([step], dtype=np.float32) for aid in ids}
-    actions, log_probs = agent.act_batch(ids, observations)
+    output = agent.sample_batch(ids, observations)
+    actions, log_probs = output.actions, output.log_probs
     agent.store_batch(
         ids, observations=observations, global_state=np.array([step], dtype=np.float32),
         actions=actions, log_probs=log_probs, rewards=dict.fromkeys(ids, reward),
         values=dict.fromkeys(ids, 0), terminated={aid: aid == "car_0" or terminal for aid in ids},
-        truncated=dict.fromkeys(ids, False), raw_actions=agent.last_raw_actions,
+        truncated=dict.fromkeys(ids, False), raw_actions=output.raw_actions,
     )
     agent.store_team_step(ids, reward=reward, value=0, terminal=terminal)
 
@@ -135,11 +136,12 @@ def test_pettingzoo_training_preserves_team_rewards_and_fixed_only_continuation(
     hooks = Capture(True)
     opponents = {aid: SimpleNamespace(act=lambda obs: np.zeros(2, dtype=np.float32))
                  for aid in core.fixed_policy_agents}
-    training = TorchRLMAPPOTrainer(
-        core, learner(), IDS, opponents,
-        {aid: ObservationComposer([LidarComponent(1, 10, normalize=False)]) for aid in IDS},
-        {aid: Reward() for aid in IDS}, ActionComposer([]), hooks=[hooks], reward_mode="team_shared",
-    )
+    from tasks import RaceTask
+    task = RaceTask(core, policy_agents=IDS, fixed_controllers=opponents,
+        obs_composers={aid: ObservationComposer([LidarComponent(1, 10, normalize=False)]) for aid in IDS},
+        reward_composers={aid: Reward() for aid in IDS},
+        action_composers={aid: ActionComposer([]) for aid in IDS}, team_reward_agent_id=IDS[0])
+    training = TorchRLMAPPOTrainer(task, learner(), hooks=[hooks])
     training.train(total_steps=6)
     assert training._environment_steps == training._physics_steps == training._agent_steps == 6
     assert len(hooks.steps) == 6
@@ -155,7 +157,7 @@ def test_pettingzoo_training_preserves_team_rewards_and_fixed_only_continuation(
 def test_parallel_native_fragments_preserve_masks_and_do_not_mix_races(monkeypatch):
     from multiprocessing.reduction import ForkingPickler
     import pickle
-    from training.torchrl_collectors import MAPPOCollectorAgent, deserialize_rollout, serialize_rollout
+    from training.torchrl_collectors import MAPPOCollectorState, deserialize_rollout, serialize_rollout
 
     agent = learner()
     with torch.no_grad():
@@ -166,12 +168,13 @@ def test_parallel_native_fragments_preserve_masks_and_do_not_mix_races(monkeypat
     )}
     fragments = []
     for ids_per_step, rewards in (((IDS, ["car_1"]), (1, 2)), ((IDS,), (100,))):
-        collector = MAPPOCollectorAgent(contract, 2)
+        collector = MAPPOCollectorState(contract, 2)
         for step, ids in enumerate(ids_per_step):
             observations = {aid: np.array([step], dtype=np.float32) for aid in ids}
-            actions, log_probs = agent.act_batch(ids, observations)
+            output = agent.sample_batch(ids, observations)
+            actions, log_probs = output.actions, output.log_probs
             collector.store_batch(ids, observations=observations, global_state=np.array([step]),
-                                  actions=actions, log_probs=log_probs, raw_actions=agent.last_raw_actions,
+                                  actions=actions, log_probs=log_probs, raw_actions=output.raw_actions,
                                   rewards={}, values={}, terminated={}, truncated={})
             collector.store_team_step(ids, reward=rewards[step], value=0, terminal=False)
             collector.set_next_state(np.array([step + 1]))

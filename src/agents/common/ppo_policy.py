@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 
+from agents.common.outputs import PolicyOutput
 from agents.common.networks import Actor, Critic
 from utils.torch_io import resolve_device
 
@@ -124,7 +125,7 @@ class PPOPolicy:
         return actions[0], float(log_probs[0]), float(values[0])
 
     @torch.no_grad()
-    def act_batch(self, observations: np.ndarray, deterministic: bool = False):
+    def sample_batch(self, observations: np.ndarray, deterministic: bool = False):
         obs_t = torch.as_tensor(observations, dtype=torch.float32, device=self.device)
         actions, log_probs, raw_actions = self.actor.get_action(
             obs_t, deterministic=deterministic, return_raw=True
@@ -132,8 +133,18 @@ class PPOPolicy:
         values = self.critic(obs_t)
         # One device-to-host transfer for all environments and policy outputs.
         outputs = torch.cat((actions, raw_actions, log_probs[:, None], values[:, None]), dim=1).cpu().numpy()
-        self.last_raw_actions = outputs[:, self.action_dim:2 * self.action_dim].copy()
-        return outputs[:, :self.action_dim], outputs[:, -2], outputs[:, -1]
+        return PolicyOutput(outputs[:, :self.action_dim], outputs[:, -2],
+                            outputs[:, self.action_dim:2 * self.action_dim].copy(), outputs[:, -1])
+
+    def act_batch(self, observations, deterministic=False):
+        output = self.sample_batch(observations, deterministic)
+        return output.actions, output.log_probs, output.values
+
+    def evaluation_actions(self, agent_ids, observations):
+        if len(agent_ids) != 1:
+            raise ValueError("PPO inference requires one active policy agent")
+        aid = agent_ids[0]
+        return {aid: self.predict(observations[aid])}
 
     def save(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)

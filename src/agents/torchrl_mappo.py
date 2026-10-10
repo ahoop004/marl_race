@@ -11,6 +11,7 @@ from torchrl.objectives.value import MultiAgentGAE
 
 from agents.common.mappo_policy import MAPPOPolicy
 from agents.torchrl_updates import optimize_ppo
+from training.rollout_storage import MAPPORolloutStorage
 
 
 class _PolicyParameters(torch.nn.Module):
@@ -35,22 +36,11 @@ class _CentralValue(torch.nn.Module):
         return self.critic(state).unsqueeze(-1).unsqueeze(-1).expand(*index.shape, 1)
 
 
-class _DecisionCount:
-    def __init__(self):
-        self.count = 0
-
-    def size(self):
-        return self.count
-
-
-class TorchRLMAPPOAgent(MAPPOPolicy):
-    def _make_buffers(self):
-        self._steps = []
-        return {aid: _DecisionCount() for aid in self.agent_ids}
-
+class TorchRLMAPPOAgent(MAPPOPolicy, MAPPORolloutStorage):
     def __init__(self, obs_dim, global_state_dim, action_low, action_high, agent_ids, params):
         super().__init__(obs_dim, global_state_dim, action_low, action_high, agent_ids, params)
-        self.buffers = self._make_buffers()
+        MAPPORolloutStorage.__init__(self, self.agent_ids, self.obs_dims, self.action_dim,
+                                    self.n_steps, self.device)
         if (self.critic_mode != "shared_team" or self.reward_mode != "team_shared"
                 or self.team_return_mode != "joint"):
             raise ValueError("TorchRL MAPPO requires shared_team critic, team_shared rewards and joint team returns")
@@ -92,76 +82,6 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
                           value_target=("agents", "value_target"))
 
     @torch.no_grad()
-    def act_batch(self, agent_ids, observations, deterministic=False):
-        self._require_lora_source()
-        ids = self._validate_agent_batch(agent_ids)
-        if not ids:
-            return {}, {}
-        agents = TensorDict({
-            "observation": torch.tensor(self.pack_observations(ids, observations), device=self.device),
-            "index": torch.tensor([self._agent_index[aid] for aid in ids], device=self.device),
-        }, [len(ids)])
-        data = TensorDict({"agents": agents}, [])
-        with set_exploration_type(ExplorationType.MODE if deterministic else ExplorationType.RANDOM):
-            self.policy(data)
-        actions, raw, log_probs = (data["agents", name].cpu().numpy()
-                                   for name in ("action", "raw_action", "raw_log_prob"))
-        self.last_raw_actions = {aid: raw[i].copy() for i, aid in enumerate(ids)}
-        return ({aid: actions[i].copy() for i, aid in enumerate(ids)},
-                {aid: float(log_probs[i]) for i, aid in enumerate(ids)})
-
-    def store_batch(self, agent_ids, *, observations, global_state, actions, rewards,
-                    log_probs, values, terminated, truncated, raw_actions=None):
-        ids = self._validate_agent_batch(agent_ids)
-        if not ids:
-            return
-        if raw_actions is None:
-            raise ValueError("TorchRL MAPPO requires stored pre-tanh actions")
-        state = torch.tensor(np.asarray(global_state).copy(), dtype=torch.float32, device=self.device)
-        if self._steps:
-            self._steps[-1]["next", "state"] = state
-        n = len(self.agent_ids)
-        agents = TensorDict({
-            "observation": torch.zeros(n, self.obs_dim, device=self.device),
-            "action": torch.zeros(n, self.action_dim, device=self.device),
-            "raw_action": torch.zeros(n, self.action_dim, device=self.device),
-            "raw_log_prob": torch.zeros(n, device=self.device),
-            "index": torch.arange(n, device=self.device),
-            "mask": torch.zeros(n, dtype=torch.bool, device=self.device),
-        }, [n])
-        packed = self.pack_observations(ids, observations)
-        for i, aid in enumerate(ids):
-            row = self._agent_index[aid]
-            for name, value in (("observation", packed[i]), ("action", actions[aid]),
-                                ("raw_action", raw_actions[aid]), ("raw_log_prob", log_probs[aid])):
-                agents[name][row] = torch.as_tensor(value, dtype=torch.float32, device=self.device)
-            agents["mask"][row] = True
-            self.buffers[aid].count += 1
-        self._steps.append(TensorDict({
-            "agents": agents, "state": state,
-            "next": TensorDict({"state": state.clone(), "agents": TensorDict({"index": agents["index"].clone()}, [n])}, []),
-        }, []))
-
-    def store_team_step(self, agent_ids, *, reward, value, terminal):
-        if not self._steps:
-            raise ValueError("Store agent decisions before their joint team step")
-        self._steps[-1]["next"].update({
-            "reward": torch.tensor([reward], dtype=torch.float32, device=self.device),
-            "done": torch.tensor([terminal], device=self.device),
-            # Joint returns end when no teammate can act, including the finite
-            # race horizon. Individual retirement never ends shared team credit.
-            "terminated": torch.tensor([terminal], device=self.device),
-        })
-
-    def any_buffer_full(self):
-        return len(self._steps) >= self.n_steps
-
-    def set_next_state(self, state):
-        self._steps[-1]["next", "state"] = torch.tensor(
-            np.asarray(state).copy(), dtype=torch.float32, device=self.device,
-        )
-
-    @torch.no_grad()
     def actor_actions(self, observations, agent_ids, *, deterministic=False, return_raw=False):
         # Parallel inference may repeat the same actor across independent races.
         self._require_lora_source()
@@ -175,11 +95,6 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
             self.policy(data)
         result = (data["agents", "action"], data["agents", "raw_log_prob"])
         return (*result, data["agents", "raw_action"]) if return_raw else result
-
-    def clear_buffers(self):
-        self._steps.clear()
-        for buffer in self.buffers.values():
-            buffer.count = 0
 
     def update(self, next_global_state):
         if not self._steps:
