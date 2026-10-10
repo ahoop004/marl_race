@@ -126,11 +126,13 @@ def test_stage_timers_are_exclusive_and_optional(monkeypatch):
     assert training.stage_calls["warmup"] == dict(physics=1, lidar=1)
 
 
-def test_stage_profiling_preserves_updates_and_restores_instance_methods():
+@pytest.mark.parametrize("measure_mpc", [False, True])
+def test_stage_profiling_preserves_updates_and_restores_instance_methods(measure_mpc):
     plain_capture, measured_capture = Capture(False), Capture(False)
     plain, _ = trainer(plain_capture)
     measured, _ = trainer(measured_capture)
     measured.measure_stages = True
+    measured.measure_mpc = measure_mpc
     for module in ("actor", "critic"):
         getattr(measured.agent, module).load_state_dict(getattr(plain.agent, module).state_dict())
     rng = torch.random.get_rng_state()
@@ -239,3 +241,215 @@ def test_fixed_only_final_budget_reports_counters_without_a_fake_update(algorith
     assert final["metadata"]["progress"] == training.checkpoint_progress()
     with (tmp_path / "update_metrics.csv").open() as stream:
         assert len(list(csv.DictReader(stream))) == updates
+
+
+@pytest.fixture
+def shooting_controller(monkeypatch):
+    """Exercise MPC control flow with a cheap shooting function and counted solver."""
+    import numpy as np
+    from agents.mpc import racing
+
+    traffic = np.zeros((1, 5))
+    clearance = [1.0]
+    shoots, solves = [], []
+
+    def shoot(controls, *args, record_trajectory=True):
+        shoots.append(record_trajectory)
+        return float(np.sum(controls**2)), clearance[0], np.zeros((2, 8))
+
+    shoot.signatures = []
+
+    def minimize(objective, flat, **kwargs):
+        solves.append(kwargs)
+        for _ in range(3):
+            objective(flat)
+        return SimpleNamespace(x=flat.copy(), nfev=3, nit=2, success=False, status=1)
+
+    monkeypatch.setattr(racing, "_shoot", shoot)
+    monkeypatch.setattr(racing, "minimize", minimize)
+
+    def make(aid="car_2"):
+        controller = racing.RacingMPCAgent(dict(agent_id=aid))
+        controller.env = SimpleNamespace(
+            params={"mu": 1.0},
+            get_agent_state=lambda _: SimpleNamespace(velocity=[1., 0.], angular_velocity=0.),
+            get_global_state=lambda: SimpleNamespace(metadata={}))
+        controller.p = np.ones(13)
+        controller.dt, controller.radius = .05, .1
+        controller.steer_min, controller.steer_max = -.4, .4
+        controller.path = np.column_stack((np.arange(150)*.1, np.zeros(150)))
+        controller.field = np.ones((2, 2))
+        controller.origin, controller.resolution = np.zeros(3), .1
+        controller.footprint = np.zeros((1, 2))
+        controller._map = lambda: None
+        controller._traffic = lambda *args: traffic
+        return controller
+
+    obs = dict(pose=np.zeros(3), velocity=np.array([1., 0.]), steering_angle=0.,
+               wheel_speed=10., wheel_speed_reference=10., steering_reference=0.)
+    return SimpleNamespace(make=make, obs=obs, shoots=shoots, solves=solves, clearance=clearance)
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_mpc_profile_counts_solver_calls_and_preserves_actions(shooting_controller, monkeypatch, fallback):
+    import numpy as np
+    from agents.mpc import racing
+
+    fixture = shooting_controller
+    fixture.clearance[0] = -1. if fallback else 1.
+    plain, measured = fixture.make(), fixture.make()
+    records = []
+    measured.profile_mpc = records.append
+    clock = racing.perf_counter
+    # Disabled instrumentation must not read the clock, including inside objective.
+    monkeypatch.setattr(racing, "perf_counter", lambda: pytest.fail("disabled MPC read the clock"))
+    expected = plain.act(fixture.obs)
+    monkeypatch.setattr(racing, "perf_counter", clock)
+    fixture.shoots.clear()
+    fixture.solves.clear()
+    actual = measured.act(fixture.obs)
+    np.testing.assert_array_equal(actual, expected)
+    row = records[-1]
+    assert row["optimization_starts"] == len(fixture.solves) == 3
+    assert row["nfev"] == fixture.shoots.count(False)-1 == 9
+    assert row["nit"] == 6 and row["solver_failures"] == 3
+    assert row["solver_statuses"] == {"1": 3}
+    assert row["outside_trajectory_evaluations"] == fixture.shoots.count(True)+1 == 10
+    assert row["alternative_starts"] == 2 and row["alternative_start_decisions"] == 1
+    assert row["braking_fallback"] == fallback
+    assert row["braking_selected"] == 1
+    assert not row["warm_available"] and not row["warm_used"] and row["new_plan"]
+    assert row["cold_start"] == 1
+    assert row["solver_seconds"] >= row["objective_seconds"] > 0
+    assert sum(row["stages"].values()) == pytest.approx(row["seconds"], abs=1e-12)
+    assert all(math.isfinite(value) and value >= 0 for value in row["stages"].values())
+    measured.act(fixture.obs)
+    assert records[-1]["warm_used"] == (not fallback)
+    assert not records[-1]["cold_start"]
+    assert records[-1]["optimization_starts"] == (3 if fallback else 1)
+    measured.reset()
+    assert measured.profile_mpc is not None
+    measured.act(fixture.obs)
+    assert len(records) == 3 and records[-1]["cold_start"]
+    assert not records[-1]["warm_used"]
+
+
+def test_mpc_profile_adapter_aggregation_tracks_live_retirement(shooting_controller):
+    from contextlib import ExitStack
+    from env.collision_state import RaceLifecycle
+    from wrappers.actions.composer import WheelReferenceAdapter
+
+    fixture = shooting_controller
+    training, _ = trainer(Capture(False))
+    training.trainable_ids = ["car_0", "car_1"]
+    training.measure_mpc = training.measure_stages = True
+    controllers = {aid: fixture.make(aid) for aid in ("car_2", "car_3")}
+    training.task.fixed_controllers = {aid: WheelReferenceAdapter(controller, dict(
+        wheel_radius=.1, steering_min=-.4, steering_max=.4, wheel_speed_min=0., wheel_speed_max=100.))
+        for aid, controller in controllers.items()}
+    lifecycle = RaceLifecycle(("car_0", "car_1", "car_2", "car_3"), target_laps=1)
+    with ExitStack() as resources:
+        training._instrument_mpc(resources)
+        training._timing_phase = "warmup"
+        for removed in (None, "car_0", "car_1", "car_2"):
+            if removed:
+                if removed == "car_1":
+                    lifecycle.record_lap_crossing(removed, step=0)
+                else:
+                    lifecycle.record_collision(removed, step=0)
+            training.task.env.agents = list(lifecycle.active_agents)
+            for aid, adapter in training.task.fixed_controllers.items():
+                if aid in training.task.env.agents:
+                    training.measure_stage("fixed_controller", adapter.act, fixture.obs)
+            training.mpc_environment_decisions["warmup"] = training.mpc_environment_decisions.get("warmup", 0)+1
+        summary = training.mpc_summary()
+        assert summary["overall"]["calls"] == training.stage_calls["warmup"]["fixed_controller"] == 7
+        assert summary["agent"]["car_2"]["calls"] == 3
+        assert summary["agent"]["car_3"]["calls"] == 4
+        assert {key: row["calls"] for key, row in summary["active_vehicles"].items()} == {
+            "4": 2, "3": 2, "2": 2, "1": 1}
+        assert summary["active_learners"]["0"]["calls"] == 3
+        assert summary["active_mpc"]["1"]["calls"] == 1
+        assert summary["traffic"]["1"]["calls"] == 7
+        assert summary["overall"]["environment_decisions"] == 4
+        assert summary["overall"]["mean_nfev_per_optimization"] == 3
+        assert summary["overall"]["solver_failure_rate"] == 1
+        assert summary["phase"]["initialization"]["calls"] == 0
+        assert summary["overall"]["seconds"] <= training.stage_seconds["warmup"]["fixed_controller"]
+        json.dumps(summary, allow_nan=False)
+    assert all(controller.profile_mpc is None for controller in controllers.values())
+    assert len(fixture.solves) == summary["overall"]["optimization_starts"]
+
+
+@pytest.mark.parametrize("warmup_updates", [0, 1])
+def test_mpc_profile_phase_boundary_and_run_reset_without_stage_timing(tmp_path, warmup_updates):
+    training, _ = trainer(Capture(False))
+    training.measure_mpc = True
+    training.profiling_warmup_updates = warmup_updates
+    training.hooks.append(CSVHook(CSVLogger(tmp_path)))
+    training.train(total_steps=9)
+    assert training.mpc_environment_decisions == ({"warmup": 4, "steady": 5} if warmup_updates else {"steady": 9})
+    assert training.mpc_summary()["overall"]["calls"] == 0  # No racing MPC in this fixture.
+    assert json.loads((tmp_path / "run_summary.json").read_text())["mpc_profile"]["overall"]["environment_decisions"] == 9
+    training.hooks.clear()
+    training.train(total_steps=12)
+    assert sum(training.mpc_environment_decisions.values()) == 3
+    assert training.mpc_totals == {}
+
+
+def test_mpc_map_change_invalidates_warm_plan_without_resetting_run_measurement(shooting_controller):
+    fixture = shooting_controller
+    controller = fixture.make()
+    records = []
+    controller.profile_mpc = records.append
+    controller.act(fixture.obs)
+    assert controller._warm is not None
+    controller._map = lambda: setattr(controller, "_warm", None)
+    controller.act(fixture.obs)
+    assert records[-1]["warm_available"] == 1
+    assert records[-1]["warm_used"] == 0 and records[-1]["new_plan"] == 1
+    assert len(records) == 2
+
+
+@pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
+def test_mpc_instrumentation_preserves_policy_optimizer_results(shooting_controller, algorithm):
+    from test_native_torchrl_env import team_task
+    from test_torchrl_mappo import params, BOUNDS
+    from agents.torchrl_mappo import TorchRLMAPPOAgent
+    from training.on_policy import OnPolicyTrainer
+    from wrappers.actions.composer import WheelReferenceAdapter
+
+    fixture = shooting_controller
+
+    def make():
+        if algorithm == "ppo":
+            training, _ = trainer(Capture(False))
+        else:
+            task = team_task({3: (("car_0", "car_1", "car_2", "car_3"), True,
+                                      ("car_0", "car_1", "car_2", "car_3"), ())})
+            policy = TorchRLMAPPOAgent(1, task.state_space().shape[0], *BOUNDS, IDS, params(n_steps=4))
+            training = OnPolicyTrainer(task, policy, hooks=[Capture(False)])
+        for aid in training.task.fixed_controllers:
+            controller = fixture.make(aid)
+            act = controller.act
+            controller.act = lambda obs, act=act: act(fixture.obs)
+            training.task.fixed_controllers[aid] = WheelReferenceAdapter(controller, dict(
+                wheel_radius=.1, steering_min=-.4, steering_max=.4, wheel_speed_min=0., wheel_speed_max=100.))
+        return training
+
+    plain, measured = make(), make()
+    measured.measure_mpc = True
+    for module in ("actor", "critic"):
+        getattr(measured.agent, module).load_state_dict(getattr(plain.agent, module).state_dict())
+    rng = torch.random.get_rng_state()
+    plain.train(total_steps=9)
+    torch.random.set_rng_state(rng)
+    measured.train(total_steps=9)
+    assert plain.checkpoint_progress() == measured.checkpoint_progress()
+    for module in ("actor", "critic"):
+        for key, value in getattr(plain.agent, module).state_dict().items():
+            torch.testing.assert_close(value, getattr(measured.agent, module).state_dict()[key], rtol=0, atol=0)
+    summary = measured.mpc_summary()
+    assert summary["overall"]["calls"] == 9*(1 if algorithm == "ppo" else 2)
+    assert sum(summary["phase"][phase]["calls"] for phase in summary["phase"]) == summary["overall"]["calls"]
+    assert all(adapter.controller.profile_mpc is None for adapter in measured.task.fixed_controllers.values())

@@ -25,9 +25,15 @@ class _CollectionBoundary:
 
 
 class OnPolicyTrainer:
+    _MPC_COUNTERS = ("seconds", "solver_seconds", "objective_seconds", "optimization_starts",
+                     "nfev", "nit", "solver_failures", "outside_trajectory_evaluations",
+                     "alternative_start_decisions", "alternative_starts", "braking_fallback",
+                     "braking_selected", "warm_available", "warm_used", "new_plan", "cold_start",
+                     "new_shoot_signatures")
+
     def __init__(self, task, agent, *, hooks=None, render=False, run_id="run",
                  focal_agent_id=None, algorithm=None, measure_services=False,
-                 measure_stages=False, profiling_warmup_updates=1):
+                 measure_stages=False, measure_mpc=False, profiling_warmup_updates=1):
         self.task, self.agent = task, agent
         self.algorithm = algorithm or ("mappo" if hasattr(agent, "global_state_dim") else "ppo")
         if self.algorithm not in {"ppo", "mappo"}:
@@ -41,6 +47,11 @@ class OnPolicyTrainer:
             raise ValueError("measure_stages must be a boolean")
         if type(profiling_warmup_updates) is not int or profiling_warmup_updates < 0:
             raise ValueError("profiling_warmup_updates must be a nonnegative integer")
+        if type(measure_mpc) is not bool:
+            raise ValueError("measure_mpc must be a boolean")
+        self.measure_mpc = measure_mpc
+        self.mpc_totals = {}
+        self.mpc_environment_decisions = {}
         self.measure_stages = measure_stages
         self.profiling_warmup_updates = profiling_warmup_updates
         self.stage_seconds = {phase: {} for phase in ("initialization", "warmup", "steady")}
@@ -157,6 +168,114 @@ class OnPolicyTrainer:
         resources.callback(setattr, self.agent, "profile_call", None)
         resources.callback(setattr, self.env, "profile_call", None)
 
+    def _instrument_mpc(self, resources):
+        from agents.mpc.racing import RacingMPCAgent
+        from wrappers.actions.composer import WheelReferenceAdapter
+
+        self._mpc_ids = []
+        for aid, adapter in self.task.fixed_controllers.items():
+            controller = adapter.controller if isinstance(adapter, WheelReferenceAdapter) else adapter
+            if not isinstance(controller, RacingMPCAgent):
+                continue
+            self._mpc_ids.append(aid)
+            self.mpc_totals.setdefault("agent", {}).setdefault(aid, {})
+            original = controller.profile_mpc
+            controller.profile_mpc = self._record_mpc
+            resources.callback(setattr, controller, "profile_mpc", original)
+
+    def _record_mpc(self, record):
+        # Read the same live physical lifecycle used by RaceTask.step. Retired
+        # wrecks can still be nearby traffic; they are not active vehicles.
+        active = self.task.env.agents
+        context = dict(phase=self._timing_phase, agent=record["agent_id"],
+                       active_vehicles=len(active),
+                       active_learners=sum(aid in active for aid in self.trainable_ids),
+                       active_mpc=sum(aid in active for aid in self._mpc_ids),
+                       traffic=record["traffic_count"], starts=record["optimization_starts"],
+                       warm_used=record["warm_used"], cold_start=record["cold_start"],
+                       new_shoot_signatures=int(record["new_shoot_signatures"] > 0))
+        groups = [("all", "all"), *context.items(),
+                  ("agent_phase", f"{context['agent']}/{context['phase']}")]
+        for dimension, key in groups:
+            bucket = self.mpc_totals.setdefault(dimension, {}).setdefault(str(key), {})
+            bucket["calls"] = bucket.get("calls", 0)+1
+            for name in self._MPC_COUNTERS:
+                bucket[name] = bucket.get(name, 0)+record[name]
+            for name in ("stages", "solver_statuses"):
+                totals = bucket.setdefault(name, {})
+                for stage, value in record[name].items():
+                    totals[stage] = totals.get(stage, 0)+value
+
+    @classmethod
+    def _mpc_statistics(cls, bucket):
+        result = {name: bucket.get(name, 0) for name in cls._MPC_COUNTERS}
+        result["solver_statuses"] = dict(bucket.get("solver_statuses", {}))
+        calls, seconds = bucket.get("calls", 0), bucket.get("seconds", 0.0)
+        starts, nfev = bucket.get("optimization_starts", 0), bucket.get("nfev", 0)
+        result.update(calls=calls, seconds=seconds,
+                      mean_ms_per_call=1000*seconds/calls if calls else 0.0,
+                      mean_nfev_per_optimization=nfev/starts if starts else 0.0,
+                      mean_nit_per_optimization=bucket.get("nit", 0)/starts if starts else 0.0,
+                      solver_failure_rate=bucket.get("solver_failures", 0)/starts if starts else 0.0,
+                      mean_solver_ms=1000*bucket.get("solver_seconds", 0)/starts if starts else 0.0,
+                      mean_objective_ms=1000*bucket.get("objective_seconds", 0)/nfev if nfev else 0.0)
+        for name in ("braking_fallback", "braking_selected", "alternative_start_decisions", "warm_used"):
+            result[f"{name}_rate"] = bucket.get(name, 0)/calls if calls else 0.0
+        result["stages"] = {name: dict(seconds=value,
+            mean_ms_per_call=1000*value/calls if calls else 0.0,
+            percent_mpc=100*value/seconds if seconds else 0.0)
+            for name, value in bucket.get("stages", {}).items()}
+        return result
+
+    def mpc_summary(self):
+        if not self.measure_mpc:
+            return {}
+        groups = {dimension: {key: self._mpc_statistics(bucket) for key, bucket in values.items()}
+                  for dimension, values in self.mpc_totals.items()}
+        overall = groups.pop("all", {}).get("all", self._mpc_statistics({}))
+        for dimension, keys in (("phase", self.stage_seconds), ("active_vehicles", range(1, 5))):
+            values = groups.setdefault(dimension, {})
+            for key in keys:
+                values.setdefault(str(key), self._mpc_statistics({}))
+        decisions = sum(self.mpc_environment_decisions.values())
+        now = self._run_finished or time.perf_counter()
+        elapsed = max(now-self._run_started, 0.0) if self._run_started is not None else 0.0
+        overall.update(environment_decisions=decisions,
+                       ms_per_environment_decision=1000*overall["seconds"]/decisions if decisions else 0.0,
+                       end_to_end_seconds=elapsed,
+                       percent_end_to_end=100*overall["seconds"]/elapsed if elapsed else 0.0)
+        for phase, values in groups["phase"].items():
+            count = self.mpc_environment_decisions.get(phase, 0)
+            values["environment_decisions"] = count
+            values["ms_per_environment_decision"] = 1000*values["seconds"]/count if count else 0.0
+        return dict(overall=overall, **groups, definitions={
+            "scope": "Training collection only; totals reset at each train() call and accumulate across episodes.",
+            "seconds": "Wall time inside RacingMPCAgent.act, excluding adapter and post-call aggregation.",
+            "stages": "Exclusive seconds; scipy_optimization excludes objective_evaluation. other includes bookkeeping.",
+            "solver_seconds": "Inclusive minimize wall time; diagnostic only, do not add to exclusive stages.",
+            "nfev_nit": "Summed SciPy OptimizeResult metadata; means divide by optimization_starts.",
+            "environment_decisions": "All training joint decisions, including decisions with no active MPC opponents.",
+            "percent_end_to_end": "MPC seconds / trainer wall time, including collection, updates, and hooks; excludes application setup.",
+            "activity": "RaceEnv.agents; nearby traffic can include retired stationary vehicles.",
+            "braking": "fallback means no feasible candidate; selected also counts feasible braking candidates.",
+            "phase": "Collector initialization, then profiling_warmup_updates completed updates, then steady.",
+            "cold_start": "First MPC decision of each episode; map/JIT work is included in its phase.",
+            "new_shoot_signatures": "Calls adding Numba shooting signatures, including cache loads; not isolated JIT compile time.",
+            "groups": "Each grouping is an independent partition; do not sum different dimensions."})
+
+    def mpc_metrics(self):
+        if not self.measure_mpc:
+            return {}
+        summary = self.mpc_summary()
+        result = {}
+        for prefix, values in [("all", summary["overall"]),
+                               *[(f"agent/{key}", value) for key, value in summary.get("agent", {}).items()],
+                               *[(f"phase/{key}", value) for key, value in summary["phase"].items()]]:
+            for key, value in values.items():
+                if isinstance(value, (int, float)):
+                    result[f"perf/mpc/{prefix}/{key}"] = value
+        return result
+
     def _rate_counters(self):
         return (self._environment_steps, self._physics_steps, self._agent_steps, self._optimizer_steps)
 
@@ -181,6 +300,7 @@ class OnPolicyTrainer:
                 duration = max(now - self._steady_started, 1e-9)
                 result.update({f"perf/steady_{name}_per_second": (value - base) / duration
                     for name, value, base in zip(names, self._rate_counters(), self._steady_baseline)})
+        result.update(self.mpc_metrics())
         return result
 
     def call_hook(self, hook, method, *args):
@@ -266,6 +386,9 @@ class OnPolicyTrainer:
         self._run_started, self._run_finished = time.perf_counter(), None
         self._rate_baseline = self._rate_counters()
         self._initial_updates = self._updates
+        self._timing_phase = "initialization"
+        self.mpc_totals = {}
+        self.mpc_environment_decisions = {}
         if total_steps is not None and (type(total_steps) is not int or total_steps <= 0):
             raise ValueError("total_steps must be a positive integer")
         if total_steps is None and (type(n_episodes) is not int or n_episodes < 0):
@@ -345,6 +468,8 @@ class OnPolicyTrainer:
 
         stage_resources = ExitStack()
         try:
+            if self.measure_mpc:
+                self._instrument_mpc(stage_resources)
             if self.measure_stages:
                 self._instrument_stages(stage_resources)
             require_source = getattr(self.agent, "_require_lora_source", None)
@@ -397,7 +522,7 @@ class OnPolicyTrainer:
                     self.reports.dispatch(metrics)
                     if updated:
                         checkpoint_boundary()
-                        if (self.measure_stages and self._timing_phase == "warmup"
+                        if ((self.measure_stages or self.measure_mpc) and self._timing_phase == "warmup"
                                 and self._updates - self._initial_updates >= self.profiling_warmup_updates):
                             self._timing_phase = "steady"
                             self._steady_started, self._steady_baseline = time.perf_counter(), self._rate_counters()

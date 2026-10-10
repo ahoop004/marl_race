@@ -8,6 +8,7 @@ Traffic uses range-limited, perfect simulator states with constant world velocit
 """
 from __future__ import annotations
 
+from time import perf_counter
 from pathlib import Path
 from weakref import WeakValueDictionary
 
@@ -258,6 +259,8 @@ class RacingMPCAgent:
                 or self.steering_reference_rate <= 0 or not 0 < self.grip_utilization <= 1):
             raise ValueError('Invalid racing_mpc horizon, optimization, or physical limits')
         self.env = None
+        # Installed only for measured runs; episode reset preserves the callback.
+        self.profile_mpc = None
         self.reset()
 
     def set_env(self, env):
@@ -325,7 +328,21 @@ class RacingMPCAgent:
     def act(self, obs, deterministic=False, aid=None):
         if self.env is None:
             raise ValueError('Call set_env before using racing_mpc')
+        profile = self.profile_mpc
+        if profile is not None:
+            started = boundary = perf_counter()
+            stages = {}
+            warm_available = self._warm is not None
+            cold_start = self._decisions == 0
+            shoot_signatures = len(_shoot.signatures)
+            solver_seconds = objective_seconds = 0.0
+            nfev = nit = failures = candidate_evaluations = 0
+            statuses = {}
         self._map()
+        if profile is not None:
+            now = perf_counter()
+            stages['map_preparation'] = now-boundary
+            boundary = now
         agent_id = aid if aid is not None else self.agent_id
         ego = self.env.get_agent_state(agent_id)
         physics = self.env.get_global_state().metadata.get('physics', {})
@@ -340,6 +357,10 @@ class RacingMPCAgent:
                             float(obs['steering_reference'])])
         if not np.isfinite(initial).all():
             raise ValueError('Nonfinite racing_mpc observation')
+        if profile is not None:
+            now = perf_counter()
+            stages['state_preparation'] = now-boundary
+            boundary = now
         nearest = int(np.argmin(np.sum((self.path-pose[:2])**2, axis=1)))
         count = int(np.ceil((self.max_speed*self.horizon*self.dt+4.)/.10))+10
         points = self.path[(np.arange(-5, count)+nearest) % len(self.path)]
@@ -347,7 +368,15 @@ class RacingMPCAgent:
         speeds = _speed_profile(points, self.max_speed, self.p[7],
                                 self.grip_utilization, self.acceleration)
         local = np.column_stack((points, arc, speeds))
+        if profile is not None:
+            now = perf_counter()
+            stages['reference_generation'] = now-boundary
+            boundary = now
         traffic = self._traffic(pose, aid if aid is not None else self.agent_id)
+        if profile is not None:
+            now = perf_counter()
+            stages['traffic_preparation'] = now-boundary
+            boundary = now
         repeat = self.horizon//self.knots
         args = (initial, local, self.field, self.origin, self.resolution,
                 self.footprint, traffic, self.p, self.dt, repeat, self.max_speed,
@@ -355,6 +384,14 @@ class RacingMPCAgent:
                 self.grip_utilization)
         def objective(flat):
             return _shoot(flat.reshape(self.knots, 2), *args, record_trajectory=False)[0]
+        if profile is not None:
+            # No wrapper, clock reads, or counters in the disabled objective.
+            def objective(flat):
+                nonlocal objective_seconds
+                objective_started = perf_counter()
+                value = _shoot(flat.reshape(self.knots, 2), *args, record_trajectory=False)[0]
+                objective_seconds += perf_counter()-objective_started
+                return value
         # Curvature-based seed gives the optimizer useful steering from rest.
         seed = np.zeros((self.knots, 2))
         seed[:, 1] = self.max_speed
@@ -364,6 +401,8 @@ class RacingMPCAgent:
             turn = np.arctan2(u[0]*v[1]-u[1]*v[0], np.dot(u, v))/.10
             seed[k, 1] = speeds[idx]
             seed[k, 0] = np.clip(np.arctan(self.p[0]*turn), self.steer_min, self.steer_max)
+        if profile is not None:
+            warm_used = self._warm is not None  # Map reload may invalidate a plan.
         if self._warm is not None:
             seed = self._warm.copy()
         candidates = []
@@ -372,7 +411,15 @@ class RacingMPCAgent:
         # Re-solving all three starts at every decision wastes most traffic CPU
         # time after a safe passing trajectory has already been found. Retry
         # when the warm plan becomes unsafe, or periodically when following slowly.
+        if profile is not None:
+            now = perf_counter()
+            stages['seed_preparation'] = now-boundary
+            boundary = now
         warm_clearance = _shoot(seed, *args, record_trajectory=False)[1]
+        if profile is not None:
+            now = perf_counter()
+            stages['initial_trajectory_check'] = now-boundary
+            boundary = now
         retry_pass = (self._decisions % 10 == 0 and initial[3] < .6*self.max_speed)
         if len(traffic) and (warm_clearance < 0. or retry_pass):
             for bias in (-.12, .12):
@@ -380,17 +427,40 @@ class RacingMPCAgent:
                 variant[:2, 0] = np.clip(variant[:2, 0]+bias, self.steer_min, self.steer_max)
                 starts.append(variant)
         bounds = [(self.steer_min, self.steer_max), (0., self.max_speed)]*self.knots
+        if profile is not None:
+            now = perf_counter()
+            stages['start_preparation'] = now-boundary
+            stages['candidate_evaluation'] = 0.0
         for start in starts:
+            if profile is not None:
+                solver_started = perf_counter()
             result = minimize(objective, start.ravel(), method='L-BFGS-B', bounds=bounds,
                               options={'maxiter': self.iterations, 'maxfun': self.max_evaluations,
                                        'ftol': 1e-5, 'eps': 1e-4, 'maxls': 6})
+            if profile is not None:
+                now = perf_counter()
+                solver_seconds += now-solver_started
+                nfev += int(result.nfev)
+                nit += int(result.nit)
+                failures += int(not result.success)
+                status = str(result.status)
+                statuses[status] = statuses.get(status, 0)+1
+                boundary = perf_counter()
             # The best iterate may be useful even when the iteration budget expires.
             for flat in (start.ravel(), result.x):
                 if np.isfinite(flat).all():
                     controls = flat.reshape(self.knots, 2)
                     cost, clearance, traj = _shoot(controls, *args)
+                    if profile is not None:
+                        candidate_evaluations += 1
                     if np.isfinite(cost):
                         candidates.append((cost, clearance, controls.copy(), traj))
+            if profile is not None:
+                stages['candidate_evaluation'] += perf_counter()-boundary
+        if profile is not None:
+            stages['objective_evaluation'] = objective_seconds
+            stages['scipy_optimization'] = max(0.0, solver_seconds-objective_seconds)
+            boundary = perf_counter()
         # Evaluate braking while following the plan, holding steering, and
         # straightening. Select the safest braking trajectory if none is feasible.
         braking_candidates = []
@@ -398,6 +468,10 @@ class RacingMPCAgent:
             brake = np.column_stack((steering, np.zeros(self.knots)))
             cost, clearance, traj = _shoot(brake, *args)
             braking_candidates.append((cost, clearance, brake, traj))
+        if profile is not None:
+            now = perf_counter()
+            stages['braking_evaluation'] = now-boundary
+            boundary = now
         candidates.extend(braking_candidates)
         feasible = [c for c in candidates if c[1] >= 0.]
         selected = (min(feasible, key=lambda c: c[0]) if feasible else
@@ -419,4 +493,24 @@ class RacingMPCAgent:
                           'optimization_starts': len(starts),
                           'trajectory': selected[3]}
         self._decisions += 1
-        return action.astype(np.float32)
+        action = action.astype(np.float32)
+        if profile is not None:
+            now = perf_counter()
+            stages['final_selection'] = now-boundary
+            duration = now-started
+            # Includes timer/diagnostic bookkeeping and gaps between stages.
+            stages['other'] = max(0.0, duration-sum(stages.values()))
+            profile(dict(agent_id=agent_id, seconds=duration, stages=stages,
+                         solver_seconds=solver_seconds, objective_seconds=objective_seconds,
+                         optimization_starts=len(starts), nfev=nfev, nit=nit,
+                         solver_failures=failures, solver_statuses=statuses,
+                         outside_trajectory_evaluations=1+candidate_evaluations+len(braking_candidates),
+                         alternative_start_decisions=int(len(starts) > 1),
+                         alternative_starts=len(starts)-1,
+                         braking_fallback=int(fallback),
+                         braking_selected=int(any(selected is c for c in braking_candidates)),
+                         traffic_count=len(traffic), warm_available=int(warm_available),
+                         warm_used=int(warm_used), new_plan=int(not warm_used),
+                         cold_start=int(cold_start),
+                         new_shoot_signatures=len(_shoot.signatures)-shoot_signatures))
+        return action

@@ -293,7 +293,8 @@ class CSVHook(TrainingHook):
     def on_training_end(self) -> None:
         trainer = getattr(self, "_trainer", None)
         if trainer is not None:
-            self._csv.save_summary({**trainer.checkpoint_progress(), **trainer.performance_metrics()})
+            self._csv.save_summary({**trainer.checkpoint_progress(), **trainer.performance_metrics(),
+                                   **({"mpc_profile": trainer.mpc_summary()} if trainer.measure_mpc else {})})
         self._csv.close()
 
 

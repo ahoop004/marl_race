@@ -170,6 +170,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "torch_threads": exp_cfg.get("torch_threads", 1),
         "measure_services": exp_cfg.get("measure_services", False),
         "measure_stages": exp_cfg.get("measure_stages", False),
+        "measure_mpc": exp_cfg.get("measure_mpc", False),
         "profiling_warmup_updates": exp_cfg.get("profiling_warmup_updates", 1),
     }
     provenance["algorithm_implementation"] = {
@@ -242,6 +243,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id,
                              measure_services=exp_cfg.get("measure_services", False),
                              measure_stages=exp_cfg.get("measure_stages", False),
+                             measure_mpc=exp_cfg.get("measure_mpc", False),
                              profiling_warmup_updates=exp_cfg.get("profiling_warmup_updates", 1))
     trainer.initialization_seconds = time.perf_counter() - initialization_started
     if recovery_state is not None:
@@ -252,7 +254,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     console.print_info(f"Starting {algorithm.upper()} training for {budget}")
     options = {"total_steps": total_steps} if total_steps is not None else {}
     trainer.train(episodes, **options)
-    if trainer.measure_services or trainer.measure_stages:
+    if trainer.measure_services or trainer.measure_stages or trainer.measure_mpc:
         # Include end-of-run service work, especially latest/final checkpoint saves.
         csv_logger.save_summary({**trainer.checkpoint_progress(), **trainer.service_metrics(),
-                                 **trainer.performance_metrics()})
+                                 **trainer.performance_metrics(),
+                                 **({"mpc_profile": trainer.mpc_summary()} if trainer.measure_mpc else {})})

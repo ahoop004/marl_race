@@ -308,6 +308,10 @@ def test_real_physics_seeded_task_parity_specs_and_short_rollouts(name, repeat, 
     mode = "team_shared" if team else "individual"
     native = NativeRaceTorchRLEnv.from_scenario(config, scenario_dir=ROOT / "scenarios", reward_mode=mode)
     reference = create_race_task(config, scenario_dir=ROOT / "scenarios")
+    mpc_records = []
+    if name == "mappo_serial_profile":
+        for adapter in reference.fixed_controllers.values():
+            adapter.controller.profile_mpc = mpc_records.append
     try:
         assert native.task._snapshot is None and reference._snapshot is None
         for episode_index, seed in enumerate((42, 42) if profiling else (7, 19), start=2):
@@ -365,6 +369,12 @@ def test_real_physics_seeded_task_parity_specs_and_short_rollouts(name, repeat, 
                 assert native.last_step.physics_steps == expected.physics_steps
                 assert native.last_step.team_reward == expected.team_reward
                 current = step_mdp(transition)
+        if name == "mappo_serial_profile":
+            assert {row["agent_id"] for row in mpc_records} == {"car_2", "car_3"}
+            assert len(mpc_records) == 24
+            for row in mpc_records:
+                assert row["nfev"] > 0 and row["seconds"] > 0
+                assert sum(row["stages"].values()) == pytest.approx(row["seconds"])
         check_env_specs(native, seed=17)
         native.set_seed(17)
         rollout = native.rollout(6, zero_policy, break_when_any_done=True)

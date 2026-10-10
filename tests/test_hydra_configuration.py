@@ -31,6 +31,9 @@ def parity_fingerprints(config, source, params=None):
 
     task = {k: deepcopy(config[k]) for k in ("experiment", "environment", "agents", "evaluation", "wandb")
             if k in config}
+    # A disabled diagnostic does not change the task or learner contract.
+    if task["experiment"].get("measure_mpc") is False:
+        task["experiment"].pop("measure_mpc")
     if "mappo" in config:
         task["mappo"] = deepcopy(config["mappo"])
     env = task["environment"]
@@ -290,6 +293,7 @@ def test_serial_profiling_presets_keep_production_settings_separate(algorithm, t
     assert not config["environment"]["render"] and config["environment"]["max_steps"] > 0
     assert config["checkpoint"]["every_steps"] is None
     assert config["experiment"]["measure_services"] and not config["logging"]["physics_episodes"]
+    assert not config["experiment"]["measure_mpc"]
     assert not config["experiment"]["measure_stages"] and config["experiment"]["profiling_warmup_updates"] == 1
     environment = config["environment"]
     assert {key: environment[key] for key in ("timestep", "action_repeat", "max_speed", "lidar_beams", "lidar_range")} == {
@@ -305,7 +309,8 @@ def test_serial_profiling_presets_keep_production_settings_separate(algorithm, t
             assert agent["params"]["max_speed"] == 8.
     assert production["environment"]["friction"]["train"] == dict(mode="gaussian", relative_std=.02)
     overridden = load_and_expand_scenario(f"scenarios/{algorithm}_serial_profile.yaml", overrides=[
-        "experiment.total_steps=9", "execution.params.device=cuda"])
+        "experiment.total_steps=9", "experiment.measure_mpc=true", "execution.params.device=cuda"])
+    assert overridden["experiment"]["measure_mpc"] is True
     assert overridden["experiment"]["total_steps"] == 9
     assert overridden["training_defaults"]["device"] == "cuda"
     assert load_and_expand_scenario(production_path) == production
@@ -346,3 +351,11 @@ def test_adaptation_arms_resolve_one_configurable_checkpoint_outside_cwd(tmp_pat
         "paths.pretrained_checkpoint=outputs/shared-source/best.pt", "reward=solo_transfer_metres"])
     assert config["experiment"]["checkpoint"] == str(PROJECT_ROOT / "outputs/shared-source/best.pt")
     assert config["agents"]["car_0"]["reward"]["reward"]["progress_delta_bonus"]["units"] == "metres"
+
+
+@pytest.mark.parametrize("value", ["1", "null", "yes"])
+def test_mpc_profiling_requires_boolean(value):
+    config = load_and_expand_scenario("scenarios/mappo_serial_profile.yaml", overrides=[
+        f"experiment.measure_mpc={value}"])
+    with pytest.raises(ScenarioError, match="measure_mpc must be boolean"):
+        validate_experiment_scenario(config)

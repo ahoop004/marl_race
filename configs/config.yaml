@@ -21,6 +21,7 @@ paths:
   pretrained_checkpoint: ${paths.output_root}/pretrain/best.pt
 experiment:
   name: race
+  measure_mpc: false  # Opt in with experiment.measure_mpc=true.
   seed: ${execution.experiment.seed}
   total_steps: ${execution.experiment.total_steps}
   torch_threads: ${execution.experiment.torch_threads}
