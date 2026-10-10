@@ -51,7 +51,7 @@ def _run_heuristic(
     )
     set_run_id_env(run_id)
     output_dir = args.output_dir or os.path.join(
-        "outputs", exp_cfg.get("name", "unnamed"), run_id
+        scenario.get("paths", {}).get("output_root", "outputs"), exp_cfg.get("name", "unnamed"), run_id
     )
     provenance = build_run_provenance(
         scenario,

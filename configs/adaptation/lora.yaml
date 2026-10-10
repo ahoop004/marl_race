@@ -1,0 +1,11 @@
+mode: lora
+checkpoint: ${paths.project_root}/outputs/pretrain/best_model.pt
+load_scope: ${algorithm.transfer_scope}
+actor_sharing: shared
+observation_extension: ${algorithm.observation_extension}
+lora:
+  mode: per_agent
+  rank: 4
+  alpha: 4.0
+  train_log_std: true
+  per_agent_log_std: true

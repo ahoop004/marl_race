@@ -1,0 +1,35 @@
+# @package _global_
+defaults:
+- algorithm: ppo
+- network: mlp
+- adaptation: scratch
+- vehicle: combined_slip
+- simulation: default
+- scenario: solo_lap_completion
+- maps: solo_pretrain
+- evaluation: solo_pretrain
+- execution: ppo_pretrain
+- controllers: racing_mpc
+- _self_
+paths:
+  project_root: ???
+  config_root: ${paths.project_root}/configs
+  source_root: ${paths.project_root}/src
+  scenario_root: ${paths.project_root}/scenarios
+  output_root: ${paths.project_root}/outputs
+experiment:
+  name: race
+  seed: ${execution.experiment.seed}
+  total_steps: ${execution.experiment.total_steps}
+  torch_threads: ${execution.experiment.torch_threads}
+training_defaults: {}
+environment:
+  map_dir: ${maps.root}
+  map_bundles: ${maps.available}
+  map_bundles_train: ${maps.train}
+  map_bundles_eval: ${maps.selection}
+  map_cycle: ${maps.cycle}
+  map_pick: ${maps.pick}
+hydra:
+  job:
+    chdir: false

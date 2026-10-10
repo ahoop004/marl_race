@@ -1,0 +1,26 @@
+name: mappo
+backend: torchrl
+loss: mappo
+optimizer: adam
+advantage_estimator: multi_agent_gae
+critic_loss: l2
+observation_extension: frenet_neighbors
+critic_input: global_state
+critic_sharing: shared_team
+transfer_scope: actor_only
+params:
+  update_version: torchrl-mappo-batch512-v1
+  progress_unit: environment_steps
+  n_steps: 2048
+  action_repeat: 1
+  n_epochs: 10
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  batch_size: 512
+  learning_rate: 0.0001
+  gamma: 0.99
+  team_return_mode: joint
+  checkpoint_every: 100

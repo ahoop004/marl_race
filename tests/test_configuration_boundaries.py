@@ -44,7 +44,8 @@ def test_legacy_scenarios_resolve_the_same_action_owners():
 def test_cli_parameter_overrides_preserve_action_ownership_and_cpu_threads():
     from application.cli import apply_cli_overrides
 
-    scenario = ppo_scenario()
+    scenario = load_and_expand_scenario(str(SCENARIOS / "ppo_lap_completion_pretrain.yaml"),
+                                       overrides=["++agents.car_0.params.n_steps=7"])
     scenario["agents"]["car_0"].pop("trainable", None)
     args = SimpleNamespace(
         seed=None, episodes=None, wandb=False, no_wandb=False,
@@ -93,7 +94,9 @@ def test_removed_parallel_settings_fail_clearly_after_cli_overrides(setting):
 
     args = SimpleNamespace(seed=None, episodes=None, wandb=False, no_wandb=False,
                            render=False, no_render=False, parameter_overrides=[setting])
-    scenario = apply_cli_overrides(ppo_scenario(), args)
+    scenario = load_and_expand_scenario(str(SCENARIOS / "ppo_lap_completion_pretrain.yaml"),
+                                       overrides=[f"++{setting}"])
+    scenario = apply_cli_overrides(scenario, args)
     with pytest.raises(ScenarioError, match="Unsupported parallel setting") as error:
         validate_experiment_scenario(scenario)
     assert setting.split("=", 1)[0] in str(error.value)

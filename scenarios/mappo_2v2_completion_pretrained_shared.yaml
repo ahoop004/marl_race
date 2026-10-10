@@ -1,11 +1,26 @@
-# Optional parameter-sharing control using the same PPO source and race task.
-includes:
-- mappo_2v2_completion_pretrained.yaml
+# @package _global_
+defaults:
+- /config
+- override /algorithm: mappo
+- override /scenario: cooperative_2v2_completion
+- override /adaptation: full_finetune
+- override /maps: team_completion
+- override /evaluation: team_completion
+- override /execution: mappo
+- _self_
 experiment:
   name: mappo_2v2_completion_pretrained_shared
-mappo:
-  actor_mode: shared
 wandb:
+  logging:
+    profile: auto
+    groups:
+      train: true
+      eval: true
+      performance: true
+  enabled: true
+  project: marl-f110-complete
+  group: mappo-2v2-completion
+  job_type: mappo-team
   tags:
   - mappo
   - torchrl
@@ -14,5 +29,8 @@ wandb:
   - full-finetune
   - shared-actor
   - racing-mpc-opponents
-  notes: 'Optional shared full-finetuning control: the same pretrained PPO source,
-    one fully trainable shared actor, and a fresh shared team critic.'
+  notes: 'Optional shared full-finetuning control: the same pretrained PPO source, one fully trainable
+    shared actor, and a fresh shared team critic.'
+network:
+  actor:
+    parameter_sharing: shared

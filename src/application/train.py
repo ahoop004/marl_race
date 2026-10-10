@@ -48,7 +48,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         seed=exp_cfg.get("seed"),
     )
     output_dir = args.output_dir or os.path.join(
-        "outputs", exp_cfg.get("name", "unnamed"), run_id
+        scenario.get("paths", {}).get("output_root", "outputs"), exp_cfg.get("name", "unnamed"), run_id
     )
     if initial_checkpoint is not None and Path(output_dir).resolve() == initial_checkpoint.parent:
         raise ValueError("Use a new --output-dir for PPO transfer to preserve the source checkpoints.")

@@ -1,14 +1,26 @@
-# Full fine-tuning; inherits the entire completion task and serial training settings.
-# Override the source with --pretrained-actor /path/to/run_or_checkpoint.
-# Use exactly the same checkpoint for this arm and the LoRA arm.
-includes:
-- mappo_2v2_completion_scratch.yaml
+# @package _global_
+defaults:
+- /config
+- override /algorithm: mappo
+- override /scenario: cooperative_2v2_completion
+- override /adaptation: full_finetune
+- override /maps: team_completion
+- override /evaluation: team_completion
+- override /execution: mappo
+- _self_
 experiment:
   name: mappo_2v2_completion_pretrained
-training_defaults:
-  pretrained_actor_checkpoint: ../outputs/pretrain/best_model.pt
-  require_pretrained_actor: true
 wandb:
+  logging:
+    profile: auto
+    groups:
+      train: true
+      eval: true
+      performance: true
+  enabled: true
+  project: marl-f110-complete
+  group: mappo-2v2-completion
+  job_type: mappo-team
   tags:
   - mappo
   - torchrl
@@ -17,5 +29,5 @@ wandb:
   - full-finetune
   - vehicle-ids
   - racing-mpc-opponents
-  notes: 'Matched completion comparison: two independent full actors initialized from
-    the same pretrained driving policy, fresh shared team critic.'
+  notes: 'Matched completion comparison: two independent full actors initialized from the same pretrained
+    driving policy, fresh shared team critic.'

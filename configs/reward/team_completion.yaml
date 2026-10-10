@@ -1,0 +1,28 @@
+task:
+  name: race_team_2v2_lap_completion
+  description: Mean signed lap progress and clean finishes, with a shared both-finish bonus.
+reward:
+  progress_delta_bonus:
+    enabled: true
+    weight: 1.0
+    units: lap_fraction
+    positive_only: false
+    max_delta: 0.025
+    boundary_penalty: -0.05
+    collision_penalty: -2.0
+  lap_completion:
+    enabled: true
+    bonus: 2.0
+    require_clean: true
+  timeout_penalty:
+    enabled: true
+    penalty: -1.0
+  step_time_penalty:
+    enabled: true
+    per_second: -0.00025
+    apply_on_terminal: true
+  team_race_result:
+    enabled: true
+    objective: combined
+    rank_bonus: 0.0
+    both_finish_bonus: 2.0

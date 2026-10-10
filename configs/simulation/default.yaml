@@ -1,0 +1,22 @@
+# @package _global_
+environment:
+  timestep: 0.05
+  lidar_beams: 108
+  lidar_range: 10.0
+  render: false
+  centerline_autoload: true
+  walls_autoload: true
+  track_preview:
+    points: 20
+    spacing: 0.3
+  action_repeat: 1
+  centerline_features: true
+  friction:
+    version: 1
+    scope: shared
+    train:
+      mode: gaussian
+      relative_std: 0.02
+    eval:
+      mode: fixed
+      mu: 1.0489

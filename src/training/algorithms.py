@@ -12,7 +12,13 @@ def resolve_training_params(agent_cfg: dict, scenario: dict) -> dict:
     params = agent_cfg.get("params", {})
     environment = scenario.get("environment", {})
     decision_dt = float(environment.get("timestep", 0.01)) * int(environment.get("action_repeat", 1))
-    return {"network": scenario.get("network", {}), **defaults, **params,
+    network = scenario.get("network", {})
+    # Routing/input choices are validated at the application boundary; the
+    # existing MLP factory accepts these four architecture fields.
+    if "_configuration" in scenario and "algorithm" in scenario:
+        network = {key: value for key, value in network.items() if key in {
+            "architecture", "actor_hidden_dims", "critic_hidden_dims", "activation"}}
+    return {"network": network, **defaults, **params,
             "_physics_contract": physics_contract(environment),
             "_action_contract": ActionComposer.contract_from_config(
         agent_cfg.get("action_constraints", {}), decision_dt,

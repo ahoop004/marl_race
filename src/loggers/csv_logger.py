@@ -245,6 +245,8 @@ class CSVLogger:
 
         with open(config_file, 'w') as f:
             json.dump(snapshot, f, indent=2)
+        from omegaconf import OmegaConf
+        OmegaConf.save(OmegaConf.create(config), self.output_dir / "resolved_config.yaml")
 
     def save_summary(self, summary: Dict[str, Any]):
         """Save final training summary to JSON.

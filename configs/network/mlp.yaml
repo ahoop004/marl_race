@@ -1,0 +1,17 @@
+architecture: mlp
+actor_hidden_dims:
+- 256
+- 256
+critic_hidden_dims:
+- 512
+- 512
+activation: leaky_relu
+encoder: identity
+actor:
+  architecture: mlp
+  distribution: tanh_normal
+  parameter_sharing: ${adaptation.actor_sharing}
+critic:
+  architecture: mlp
+  input_type: ${algorithm.critic_input}
+  parameter_sharing: ${algorithm.critic_sharing}

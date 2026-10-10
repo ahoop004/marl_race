@@ -66,6 +66,9 @@ def resolve_evaluation_protocol(scenario: Dict[str, Any], protocol: str) -> Dict
     target_laps = config.get("target_laps")
     if target_laps is not None:
         result["target_laps"] = target_laps
+    if "maps" in scenario:
+        result["map_bundles"] = list(scenario["maps"][
+            "selection" if protocol == "selection" else "final_test"])
     return result
 
 

@@ -1,0 +1,10 @@
+available:
+- circle_map
+train:
+- circle_map
+selection:
+- circle_map
+final_test: ${maps.selection}
+cycle: per_episode
+pick: round_robin
+root: ${paths.project_root}/maps

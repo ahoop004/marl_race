@@ -1,0 +1,74 @@
+# @package _global_
+defaults:
+- /observation: team
+- /reward: team_completion
+- _self_
+environment:
+  max_speed: 8.0
+  episode_termination:
+    mode: all_trainable
+    lap_completion: true
+  terminal_agents:
+    remain_collidable: true
+    crashed_behavior: stationary
+    finished_behavior: coast_then_stop
+    finish_clearance_steps: 40
+  agent_teams:
+    car_0: learners
+    car_1: learners
+    car_2: opponents
+    car_3: opponents
+  target_laps: 1
+  max_steps: 16000
+  random_spawn:
+    enabled: true
+    allow_reuse: false
+  lap_counting:
+    count_initial_crossing_as_lap: false
+  terminate_on_collision: true
+  track_limits:
+    enabled: true
+    terminate: false
+agents:
+  car_0:
+    algorithm: ${algorithm.name}
+    trainable: true
+    role: racer
+    target_id: car_2
+    observation: ${observation}
+    reward: ${reward}
+    params: {}
+    action_constraints:
+      speed_control: wheel_acceleration
+      max_wheel_acceleration: 100.0
+      max_wheel_deceleration: 100.0
+      prevent_reverse: true
+      speed_index: 1
+  car_1:
+    algorithm: ${algorithm.name}
+    trainable: true
+    role: racer
+    target_id: car_3
+    observation: ${observation}
+    reward: ${reward}
+    params: {}
+    action_constraints:
+      speed_control: wheel_acceleration
+      max_wheel_acceleration: 100.0
+      max_wheel_deceleration: 100.0
+      prevent_reverse: true
+      speed_index: 1
+  car_2:
+    algorithm: racing_mpc
+    trainable: false
+    role: opponent
+    target_id: car_0
+    params: ${controllers.racing_mpc}
+    action_adapter: rolling_speed_to_wheel_v1
+  car_3:
+    algorithm: racing_mpc
+    trainable: false
+    role: opponent
+    target_id: car_1
+    params: ${controllers.racing_mpc}
+    action_adapter: rolling_speed_to_wheel_v1

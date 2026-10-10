@@ -70,6 +70,8 @@ def _run_evaluation(
         scenario["experiment"]["episodes"] = protocol["episodes"]
         scenario["environment"]["max_steps"] = protocol["max_steps"]
         scenario.setdefault("evaluation", {})["max_steps"] = protocol["max_steps"]
+        if "map_bundles" in protocol:
+            scenario["environment"]["map_bundles_eval"] = protocol["map_bundles"]
         if "target_laps" in protocol:
             scenario["evaluation"]["target_laps"] = protocol["target_laps"]
     exp_cfg = scenario.get("experiment", {})
@@ -155,8 +157,10 @@ def _run_evaluation(
 
     run_id = args.run_id or resolve_run_id(
         scenario_name=exp_cfg.get("name"), algorithm=f"{algorithm}-eval", seed=base_seed)
-    output_dir = Path(args.output_dir) if args.output_dir else Path("outputs") / exp_cfg.get("name", "unnamed") / "evaluation" / run_id
+    output_dir = Path(args.output_dir) if args.output_dir else Path(scenario.get("paths", {}).get("output_root", "outputs")) / exp_cfg.get("name", "unnamed") / "evaluation" / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
+    from omegaconf import OmegaConf
+    OmegaConf.save(OmegaConf.create(scenario), output_dir / "resolved_config.yaml")
     evaluation_provenance = build_run_provenance(scenario, scenario_path=args.scenario,
         run_id=run_id, algorithm=algorithm, trainable_agents=trainable_ids)
     all_agent_ids = list(getattr(env, "possible_agents", list(agent_configs)))

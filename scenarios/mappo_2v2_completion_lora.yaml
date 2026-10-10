@@ -1,19 +1,26 @@
-# Per-learner LoRA; inherits the checkpoint, completion task and serial training settings.
-# Override the source with --pretrained-actor /path/to/run_or_checkpoint.
-includes:
-- mappo_2v2_completion_pretrained.yaml
+# @package _global_
+defaults:
+- /config
+- override /algorithm: mappo
+- override /scenario: cooperative_2v2_completion
+- override /adaptation: lora
+- override /maps: team_completion
+- override /evaluation: team_completion
+- override /execution: mappo
+- _self_
 experiment:
   name: mappo_2v2_completion_lora
-training_defaults:
-  lora:
-    mode: per_agent
-    rank: 4
-    alpha: 4.0
-    train_log_std: true
-    per_agent_log_std: true
-mappo:
-  actor_mode: shared
 wandb:
+  logging:
+    profile: auto
+    groups:
+      train: true
+      eval: true
+      performance: true
+  enabled: true
+  project: marl-f110-complete
+  group: mappo-2v2-completion
+  job_type: mappo-team
   tags:
   - mappo
   - torchrl
@@ -22,6 +29,5 @@ wandb:
   - per-agent-lora
   - vehicle-ids
   - racing-mpc-opponents
-  notes: 'Matched completion comparison: frozen pretrained base, separate car_0/car_1
-    LoRA adapters and exploration vectors, fresh shared team critic. Inherits the
-    identical pretrained source and task.'
+  notes: 'Matched completion comparison: frozen pretrained base, separate car_0/car_1 LoRA adapters and
+    exploration vectors, fresh shared team critic. Inherits the identical pretrained source and task.'

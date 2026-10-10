@@ -1,0 +1,6 @@
+mode: full_finetune
+checkpoint: ${paths.project_root}/outputs/pretrain/best_model.pt
+load_scope: ${algorithm.transfer_scope}
+actor_sharing: independent
+observation_extension: ${algorithm.observation_extension}
+lora: null

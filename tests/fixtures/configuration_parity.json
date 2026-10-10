@@ -1,0 +1,101 @@
+{
+  "scenarios/mappo_2v2_completion_lora.yaml": {
+    "task": "396c28935a5993887015c8eda455cf77433a28c97f0224ced202e0418d720af2",
+    "learner": "586c12b7c7049f2b52e0716973d00191a85182f1e0b8a3ea1ed259bcde81d2e3",
+    "observation_order": {
+      "car_0": [
+        "lidar",
+        "frenet_vehicle_track",
+        "frenet_neighbors"
+      ],
+      "car_1": [
+        "lidar",
+        "frenet_vehicle_track",
+        "frenet_neighbors"
+      ]
+    }
+  },
+  "scenarios/mappo_2v2_completion_pretrained.yaml": {
+    "task": "3881ae1f475f78be3e759db151b5be2c4fc7965ae0964826af1243f2d4866f18",
+    "learner": "fb80b9b88da1ec69f5772afb4d518b365bc5ea769cbe88da9a619a25fe5657b7",
+    "observation_order": {
+      "car_0": [
+        "lidar",
+        "frenet_vehicle_track",
+        "frenet_neighbors"
+      ],
+      "car_1": [
+        "lidar",
+        "frenet_vehicle_track",
+        "frenet_neighbors"
+      ]
+    }
+  },
+  "scenarios/mappo_2v2_completion_pretrained_shared.yaml": {
+    "task": "31934892fc1c268c250fb4277af444a035927dd5136f068bb739a7551b8bffd8",
+    "learner": "fb80b9b88da1ec69f5772afb4d518b365bc5ea769cbe88da9a619a25fe5657b7",
+    "observation_order": {
+      "car_0": [
+        "lidar",
+        "frenet_vehicle_track",
+        "frenet_neighbors"
+      ],
+      "car_1": [
+        "lidar",
+        "frenet_vehicle_track",
+        "frenet_neighbors"
+      ]
+    }
+  },
+  "scenarios/mappo_2v2_completion_scratch.yaml": {
+    "task": "f0b8afe059292aa3d5adff710304714599b11e2f478ed76448c71b3981636c7b",
+    "learner": "63a5194b75f64511b58e9e2271175b4e6d19f011ff9b2ed3304d6bd1908d3d64",
+    "observation_order": {
+      "car_0": [
+        "lidar",
+        "frenet_vehicle_track",
+        "frenet_neighbors"
+      ],
+      "car_1": [
+        "lidar",
+        "frenet_vehicle_track",
+        "frenet_neighbors"
+      ]
+    }
+  },
+  "scenarios/ppo_lap_completion_pretrain.yaml": {
+    "task": "e29701a4def2a2f58b1b07068b0aa2231b8afdb0f775fd0fb5cb81e6974ba08d",
+    "learner": "65eb6248461ca3a506d6873a494002b5eae5ba3d857c40dfdea4f0013b1525ba",
+    "observation_order": {
+      "car_0": [
+        "lidar",
+        "frenet_vehicle_track"
+      ]
+    }
+  },
+  "scenarios/ppo_lap_completion_transfer.yaml": {
+    "task": "dd1207558b5a7156e0819eb29dd87e20db81d445e874f8078371297d6e3f8429",
+    "learner": "a277c2ca311fd061fa77d30fd55077dc29e8438bfc09a7fdfdbae5a08491c16d",
+    "observation_order": {
+      "car_0": [
+        "lidar",
+        "frenet_vehicle_track"
+      ]
+    }
+  },
+  "scenarios/ppo_lap_completion_transfer_3lap.yaml": {
+    "task": "422b51a03993f7aed5b49581e685c2cfaa4a481152801ff110263fc9e031921b",
+    "learner": "a277c2ca311fd061fa77d30fd55077dc29e8438bfc09a7fdfdbae5a08491c16d",
+    "observation_order": {
+      "car_0": [
+        "lidar",
+        "frenet_vehicle_track"
+      ]
+    }
+  },
+  "scenarios/render/racing_mpc.yaml": {
+    "task": "3af70dce0b73e43152b91ee7a5052dd4235655de60326f9c72ed623b4c5b5906",
+    "learner": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "observation_order": {}
+  }
+}

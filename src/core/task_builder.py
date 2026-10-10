@@ -6,6 +6,7 @@ from pathlib import Path
 from core.agent_roles import resolve_agent_roles
 from core.environment_config import resolve_environment_config
 from core.scenario import load_and_expand_scenario
+from core.configuration import source_path
 from core.setup import build_obs_composers, build_reward_composers, create_environment_setup
 from tasks import RaceTask
 from wrappers.actions.composer import ActionComposer
@@ -14,12 +15,15 @@ from wrappers.actions.composer import ActionComposer
 def create_race_task(scenario, *, scenario_dir=None, mode="train", render_mode=None,
                      roles=None) -> RaceTask:
     if isinstance(scenario, (str, Path)):
-        path = Path(scenario).resolve()
+        path = source_path(scenario)
         scenario = load_and_expand_scenario(str(path))
         if scenario_dir is None:
             scenario_dir = path.parent
     scenario = deepcopy(scenario)
-    scenario_dir = Path(scenario_dir) if scenario_dir is not None else Path.cwd()
+    if scenario_dir is None:
+        source = scenario.get("_configuration", {}).get("source")
+        scenario_dir = Path(source).parent if source else Path.cwd()
+    scenario_dir = Path(scenario_dir)
     if render_mode not in (None, "human", "rgb_array"):
         raise ValueError(f"Unsupported render mode: {render_mode!r}")
     scenario["environment"]["render_mode"] = render_mode

@@ -1,0 +1,10 @@
+task:
+  name: lap_completion_pretraining
+  description: Paper Eq. (3), signed distance progress or exclusive boundary penalty.
+reward:
+  progress_delta_bonus:
+    enabled: true
+    weight: 1.0
+    units: metres
+    positive_only: false
+    boundary_penalty: -1.0

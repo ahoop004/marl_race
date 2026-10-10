@@ -1,12 +1,9 @@
-"""Inherited scenario loading and algorithm-independent task validation."""
+"""Hydra scenario loading and algorithm-independent task validation."""
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 import copy
 import math
-import yaml
 from pathlib import Path
-
-
 
 class ScenarioError(Exception):
     """Exception raised for scenario configuration errors."""
@@ -46,133 +43,21 @@ def resolve_max_speed(scenario: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    """Deep-merge two dictionaries (override wins)."""
-    merged = copy.deepcopy(base)
-    for key, value in override.items():
-        if (
-            key in merged
-            and isinstance(merged[key], dict)
-            and isinstance(value, dict)
-        ):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = copy.deepcopy(value)
-    return merged
-
-
-def _load_yaml_file(path_obj: Path) -> Dict[str, Any]:
-    """Load a YAML file and ensure it returns a dict."""
-    if not path_obj.exists():
-        raise FileNotFoundError(f"Config file not found: {path_obj}")
-
+def load_yaml_config(path_obj: Path) -> Dict[str, Any]:
+    """Compose a YAML mapping using Hydra defaults; no custom include syntax."""
+    from core.configuration import compose_configuration
     try:
-        with open(path_obj, 'r') as f:
-            data = yaml.safe_load(f)
-    except yaml.YAMLError as e:
-        raise ValueError(f"Invalid YAML in config {path_obj}: {e}") from e
-
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise ValueError(f"Config must be a YAML dictionary: {path_obj}")
-    return data
+        return compose_configuration(path_obj)
+    except Exception as exc:
+        raise ScenarioError(str(exc)) from exc
 
 
-def load_yaml_config(path_obj: Path, visited: Optional[set] = None) -> Dict[str, Any]:
-    """Load YAML includes relative to each file; later values override earlier ones."""
-    path_obj = Path(path_obj).resolve()
-    visited = visited or set()
-    if path_obj in visited:
-        raise ValueError(f"Include cycle detected at: {path_obj}")
-    visited.add(path_obj)
-
-    data = _load_yaml_file(path_obj)
-    includes = data.pop('includes', None)
-
-    merged: Dict[str, Any] = {}
-    if includes:
-        if isinstance(includes, (str, Path)):
-            includes = [includes]
-        if not isinstance(includes, list):
-            raise ValueError("'includes' must be a list of file paths")
-        for include_path in includes:
-            if not isinstance(include_path, (str, Path)):
-                raise ValueError("'includes' entries must be file paths")
-            include_obj = (path_obj.parent / include_path).resolve()
-            merged = _deep_merge(merged, load_yaml_config(include_obj, visited))
-
-    merged = _deep_merge(merged, data)
-    visited.remove(path_obj)
-    return merged
-
-
-def apply_parameter_overrides(scenario: Dict[str, Any], overrides) -> Dict[str, Any]:
-    """Apply explicit dotted KEY=YAML choices; !delete removes an optional key.
-
-    A YAML list can group assignment strings for sweeps. Mapping values replace
-    the selected subtree. No scenario files are loaded.
-    The caller validates the resulting configuration after other CLI overrides.
-    """
-    result = copy.deepcopy(scenario)
-    assignments = []
-    for item in overrides or ():
-        if not isinstance(item, str):
-            raise ScenarioError("Parameter overrides must be KEY=YAML strings")
-        if item.lstrip().startswith("["):
-            try:
-                group = yaml.safe_load(item)
-            except yaml.YAMLError as exc:
-                raise ScenarioError("Invalid YAML override list") from exc
-            if not isinstance(group, list) or any(not isinstance(value, str) for value in group):
-                raise ScenarioError("An override list must contain KEY=YAML strings")
-            assignments.extend(group)
-        else:
-            assignments.append(item)
-    for item in assignments:
-        key, separator, raw = item.partition("=")
-        parts = key.split(".")
-        if not separator or any(not part or not part.replace("_", "").isalnum() for part in parts):
-            raise ScenarioError(f"Expected --set KEY=YAML with a dotted parameter name: {item!r}")
-        target = result
-        for part in parts[:-1]:
-            if part not in target:
-                target[part] = {}
-            if not isinstance(target[part], dict):
-                raise ScenarioError(f"Cannot set {key!r}: {part!r} is not a mapping")
-            target = target[part]
-        if raw.strip() == "!delete":
-            target.pop(parts[-1], None)
-        else:
-            try:
-                target[parts[-1]] = yaml.safe_load(raw)
-            except yaml.YAMLError as exc:
-                raise ScenarioError(f"Invalid YAML value for {key!r}: {raw!r}") from exc
-    return result
-
-
-def load_scenario(path: str) -> Dict[str, Any]:
-    """Load scenario from YAML file.
-
-    Args:
-        path: Path to YAML scenario file
-
-    Returns:
-        Scenario configuration dict
-
-    Raises:
-        ScenarioError: If file not found or invalid YAML
-
-    Example:
-        >>> scenario = load_scenario('scenarios/ppo_lap_completion_pretrain.yaml')
-        >>> scenario['experiment']['name']
-        'ppo_lap_completion_pretrain'
-    """
-    path_obj = Path(path)
-
+def load_scenario(path: str, *, overrides=None) -> Dict[str, Any]:
+    """Compose a scenario with Hydra defaults and overrides."""
+    from core.configuration import compose_configuration
     try:
-        return load_yaml_config(path_obj)
-    except (OSError, ValueError) as exc:
+        return compose_configuration(path, overrides)
+    except Exception as exc:
         raise ScenarioError(str(exc)) from exc
 
 
@@ -291,14 +176,14 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
 
 
 def load_and_expand_scenario(path: str, validate: bool = True, *, overrides=None) -> Dict[str, Any]:
-    """Load inherited YAML, apply overrides and validate the scenario.
+    """Compose Hydra YAML, apply overrides and validate the scenario.
 
     The historical entry-point name is retained for callers.
 
     Args:
         path: Path to scenario YAML file
         validate: Whether to validate the scenario (default: True)
-        overrides: Optional dotted KEY=YAML parameter choices, applied before validation.
+        overrides: Optional Hydra group or value overrides, applied before validation.
 
     Returns:
         Expanded scenario with validated physical/task configuration
@@ -311,7 +196,7 @@ def load_and_expand_scenario(path: str, validate: bool = True, *, overrides=None
         >>> # Training entry points additionally validate learner eligibility
     """
     # Load raw scenario
-    scenario = resolve_max_speed(apply_parameter_overrides(load_scenario(path), overrides))
+    scenario = resolve_max_speed(load_scenario(path, overrides=overrides))
 
     if validate:
         validate_scenario(scenario)
@@ -322,7 +207,6 @@ def load_and_expand_scenario(path: str, validate: bool = True, *, overrides=None
 __all__ = [
     'ScenarioError',
     'load_scenario',
-    'apply_parameter_overrides',
     'resolve_max_speed',
     'load_yaml_config',
     'validate_scenario',

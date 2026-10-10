@@ -2,8 +2,8 @@
 import argparse
 import sys
 from pathlib import Path
-from core.scenario import (ScenarioError, apply_parameter_overrides,
-                           load_and_expand_scenario, resolve_max_speed)
+from core.scenario import ScenarioError, load_and_expand_scenario, resolve_max_speed
+from core.configuration import source_path
 from application.configuration import validate_experiment_scenario
 from core.agent_roles import resolve_agent_roles
 from application.checkpoints import resolve_scenario_relative_path
@@ -13,9 +13,11 @@ from loggers.console import ConsoleLogger
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="F110 RL training")
     p.add_argument("--scenario", required=True, help="Path to scenario YAML file")
-    p.add_argument("--set", dest="parameter_overrides", action="append", default=[], metavar="KEY=YAML",
-                   help="Repeatable scenario parameter override, e.g. training_defaults.lora={mode: shared, rank: 4}; "
-                        "use !delete to remove an optional key. Dedicated CLI flags take precedence.")
+    p.add_argument("--set", dest="parameter_overrides", action="append", default=[], metavar="OVERRIDE",
+                   help="Hydra override: algorithm=ppo, network.actor_hidden_dims=[128,128], "
+                        "+key=value to add, ~key to delete. Dedicated flags take precedence.")
+    p.add_argument("overrides", nargs="*", help="Hydra configuration group and value overrides")
+    p.add_argument("--resolve-config", action="store_true", help="Print the resolved configuration and exit")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--render", action="store_true")
@@ -54,8 +56,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def apply_cli_overrides(scenario: dict, args: argparse.Namespace) -> dict:
-    if getattr(args, "parameter_overrides", None):
-        scenario = apply_parameter_overrides(scenario, args.parameter_overrides)
     if getattr(args, "max_speed", None) is not None:
         scenario.setdefault("environment", {})["max_speed"] = args.max_speed
     if args.seed is not None:
@@ -83,6 +83,24 @@ def apply_cli_overrides(scenario: dict, args: argparse.Namespace) -> dict:
     torch_threads = getattr(args, "torch_threads", None)
     if torch_threads is not None:
         scenario.setdefault("experiment", {})["torch_threads"] = torch_threads
+    checkpoint = getattr(args, "checkpoint", None)
+    pretrained_actor = getattr(args, "pretrained_actor", None)
+    if checkpoint:
+        scenario["experiment"]["checkpoint"] = str(source_path(checkpoint))
+        if not getattr(args, "eval", False) and scenario.get("algorithm", {}).get("name") == "ppo":
+            scenario["adaptation"].update(mode="full_finetune", checkpoint=str(source_path(checkpoint)))
+    if pretrained_actor and scenario.get("algorithm", {}).get("name") == "mappo":
+        checkpoint = str(source_path(pretrained_actor))
+        scenario["training_defaults"]["pretrained_actor_checkpoint"] = checkpoint
+        scenario["training_defaults"]["require_pretrained_actor"] = True
+        scenario["adaptation"]["checkpoint"] = checkpoint
+        if scenario["adaptation"]["mode"] == "scratch":
+            scenario["adaptation"]["mode"] = "full_finetune"
+    if "_configuration" in scenario:
+        scenario["_configuration"]["cli"] = {
+            key: value for key, value in vars(args).items()
+            if key not in {"parameter_overrides", "overrides", "scenario"} and value is not None
+        }
     return resolve_max_speed(scenario)
 
 
@@ -95,9 +113,9 @@ def main() -> None:
     try:
         # Apply speed choices before expansion so a CLI override can replace or
         # remove a YAML speed limit before it changes the physical/controller limits.
-        load_overrides = list(args.parameter_overrides)
+        load_overrides = [*args.parameter_overrides, *args.overrides]
         if args.max_speed is not None:
-            load_overrides.append(f"environment.max_speed={args.max_speed}")
+            load_overrides.append(f"++environment.max_speed={args.max_speed}")
         scenario = load_and_expand_scenario(args.scenario, validate=False, overrides=load_overrides)
     except (ScenarioError, FileNotFoundError) as exc:
         console.print_error(f"Failed to load scenario: {exc}")
@@ -112,13 +130,24 @@ def main() -> None:
     if scenario["experiment"].get("torch_threads") is not None:
         import torch
         torch.set_num_threads(scenario["experiment"]["torch_threads"])
-    scenario_dir = Path(args.scenario).resolve().parent
+    args.scenario = str(source_path(args.scenario))
+    scenario_dir = Path(args.scenario).parent
     if args.checkpoint is None:
         configured_checkpoint = scenario["experiment"].get("checkpoint")
         if configured_checkpoint is not None:
             args.checkpoint = str(resolve_scenario_relative_path(
                 configured_checkpoint, scenario_dir
             ))
+    elif args.checkpoint:
+        args.checkpoint = str(source_path(args.checkpoint))
+    if args.pretrained_actor:
+        args.pretrained_actor = str(source_path(args.pretrained_actor))
+    if args.output_dir:
+        args.output_dir = str(source_path(args.output_dir))
+    if args.resolve_config:
+        from omegaconf import OmegaConf
+        print(OmegaConf.to_yaml(OmegaConf.create(scenario)))
+        return
 
     roles = resolve_agent_roles(scenario["agents"])
     if args.pretrained_actor and (args.eval or not roles.policy_agents or any(

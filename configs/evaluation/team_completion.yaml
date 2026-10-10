@@ -1,0 +1,15 @@
+no_progress:
+  timeout_s: 30.0
+  min_progress_m: 1.0
+enabled: true
+every_episodes: 100
+selection_strategy: team_completion
+episodes: 90
+seed: 10042
+max_steps: 16000
+final_test:
+  episodes: 180
+  seed: 20042
+every_steps: 4096000
+episode_termination_mode: all_trainable
+target_laps: 1

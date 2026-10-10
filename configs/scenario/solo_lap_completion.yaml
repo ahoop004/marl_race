@@ -1,0 +1,54 @@
+# @package _global_
+defaults:
+- /observation: solo
+- /reward: solo_completion
+- _self_
+environment:
+  max_speed: 8.0
+  episode_termination:
+    mode: any_agent
+    lap_completion: true
+  terminal_agents:
+    remain_collidable: true
+    crashed_behavior: stationary
+    finished_behavior: coast_then_stop
+    finish_clearance_steps: 200
+  target_laps: 1
+  lap_counting:
+    require_finish_line: true
+    count_initial_crossing_as_lap: false
+  max_steps: 80000
+  centerline_render: true
+  track_limits:
+    enabled: true
+    terminate: false
+  terminate_on_collision: true
+  random_spawn:
+    enabled: true
+    allow_reuse: true
+  spawn:
+    policy: centerline_relative
+    centerline:
+      mode: random
+      min_progress: 0.0
+      max_progress: 1.0
+      avoid_finish: false
+    offsets:
+      s_offset: 0.0
+      d_offset: 0.0
+    ego:
+      speed: 0.0
+agents:
+  car_0:
+    algorithm: ${algorithm.name}
+    trainable: true
+    role: racer
+    observation: ${observation}
+    reward: ${reward}
+    params: {}
+    action_constraints:
+      speed_control: wheel_acceleration
+      max_wheel_acceleration: 100.0
+      max_wheel_deceleration: 100.0
+      prevent_reverse: true
+      speed_index: 1

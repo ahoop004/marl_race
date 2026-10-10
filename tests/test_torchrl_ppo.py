@@ -226,13 +226,12 @@ def test_serial_trainers_stop_after_update_and_keep_evaluated_weights(algorithm)
 
     scenarios = Path(__file__).resolve().parents[1] / "scenarios"
     filename = "ppo_lap_completion_pretrain.yaml" if algorithm == "ppo" else "mappo_2v2_completion_scratch.yaml"
-    overrides = [f"experiment.{algorithm}_backend=torchrl",
+    overrides = [f"algorithm.backend=torchrl",
                  "experiment.total_steps=7", "environment.max_steps=10", "evaluation.enabled=false",
-                 "agents.car_0.params.n_steps=4"]
+                 "++agents.car_0.params.n_steps=4"]
     if algorithm == "mappo":
         pytest.importorskip("torchrl.objectives.multiagent")
-        overrides += ["agents.car_1.params.n_steps=4", "agents.car_2.params.max_evaluations=10",
-                      "agents.car_3.params.max_evaluations=10"]
+        overrides += ["++agents.car_1.params.n_steps=4", "controllers.racing_mpc.max_evaluations=10"]
     scenario = load_and_expand_scenario(str(scenarios / filename), overrides=overrides)
     task = create_race_task(scenario, scenario_dir=scenarios)
     ids = list(task.possible_agents)

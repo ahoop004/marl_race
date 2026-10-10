@@ -1,64 +1,49 @@
-# Three-lap Budapest transfer from the current L-map PPO pretraining run.
-# Inherit the current chassis and fixed track-scaling observation contracts.
-includes:
-  - ppo_lap_completion_transfer.yaml
-
+# @package _global_
+defaults:
+- /config
+- override /algorithm: ppo
+- override /scenario: solo_lap_completion
+- override /adaptation: full_finetune
+- override /maps: solo_transfer_3lap
+- override /evaluation: solo_transfer_3lap
+- override /execution: ppo_transfer
+- override /reward: solo_transfer
+- _self_
 experiment:
   name: ppo_lap_completion_transfer_budapest_3lap
-  checkpoint: ../outputs/pretrain/best_model2.pt
-  # checkpoint: ../outputs/L_map_pretrain/checkpoint_step008192000.pt
-  # checkpoint: ../outputs/L_map_pretrain/checkpoint_step004096000.pt
-  # checkpoint: ../outputs/L_map_pretrain/checkpoint_step081920000.pt
-  # Inherit the 4,096,000-transition transfer budget.
-
+wandb:
+  logging:
+    profile: auto
+    groups:
+      train: true
+      eval: true
+      performance: true
+  enabled: true
+  project: marl-f110-complete
+  entity: ahoop004-old-dominion-university
+  name: null
+  group: ppo-lap-completion-transfer-3lap
+  job_type: track-transfer
+  tags:
+  - ppo
+  - single-agent
+  - three-lap
+  - track-transfer
+  - current-pretrain-physics
+  notes: Three-lap Budapest transfer from the current L-map pretraining run; shared physics and fixed
+    track scaling. Actor and critic loaded with a fresh optimizer.
+  mode: online
 environment:
-  # Optional shared forward limit for learners and MPCs: 5, 10, 15, or 20 m/s.
-  # Overrides wheel_speed_max and MPC max_speed; also available as --max-speed.
-  # max_speed: 5.0
-  map_bundles:
-     - Budapest_map
-     - circle_map
-    #  - L_map
-     - Melbourne_map
-     - Montreal_map
-     - Shanghai_map
-     - Silverstone_map
-     - Spa_map
-     - Spielberg_map
-  map_bundles_train:
-     - Budapest_map
-     - circle_map
-    #  - L_map
-     - Melbourne_map
-     - Montreal_map
-     - Shanghai_map
-     - Silverstone_map
-     - Spa_map
-     - Spielberg_map
-  map_bundles_eval:
-    - Budapest_map
-    - circle_map
-    # - L_map
-    - Melbourne_map
-    - Montreal_map
-    - Shanghai_map
-    - Silverstone_map
-    - Spa_map
-    - Spielberg_map
-  target_laps: 3
-  max_steps: 16000  # 800 simulation seconds; bounds stalled episodes
-  episode_termination: {mode: any_agent, lap_completion: true}
-  track_limits: {enabled: true, terminate: true}
-  terminate_on_collision: false  # geometric boundary resets, matching pretraining
-
-evaluation:
   target_laps: 3
   max_steps: 16000
-  terminate_on_track_limit: true
-  terminate_on_collision: true
-  selection_strategy: completion_progress
-
-wandb:
-  group: ppo-lap-completion-transfer-3lap
-  tags: [ppo, single-agent, three-lap, track-transfer, current-pretrain-physics]
-  notes: "Three-lap Budapest transfer from the current L-map pretraining run; shared physics and fixed track scaling. Actor and critic loaded with a fresh optimizer."
+  track_limits:
+    enabled: true
+    terminate: true
+  terminate_on_collision: false
+  max_speed: null
+algorithm:
+  params:
+    learning_rate: 0.0001
+    lr_schedule: constant
+adaptation:
+  checkpoint: ${paths.project_root}/outputs/pretrain/best_model2.pt

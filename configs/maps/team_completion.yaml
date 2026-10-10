@@ -1,0 +1,18 @@
+available:
+- circle_map
+- Budapest_map
+- Hockenheim_map
+- Melbourne_map
+- Montreal_map
+- Shanghai_map
+- Silverstone_map
+- Spa_map
+- Spielberg_map
+train:
+- circle_map
+selection:
+- circle_map
+final_test: ${maps.selection}
+cycle: per_episode
+pick: round_robin
+root: ${paths.project_root}/maps
