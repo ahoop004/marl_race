@@ -210,6 +210,16 @@ class MARLTrainer:
         from training.parallel_mappo import train_parallel
         train_parallel(self, scenario, scenario_dir, num_envs, n_episodes, total_steps=total_steps)
 
+    def _reset_task(self):
+        return self.task.reset()
+
+    def _step_task(self, actions, on_physics_step):
+        return self.task.step(actions, on_physics_step=on_physics_step)
+
+    def _should_stop(self):
+        return bool(getattr(self.agent, "should_stop", False)) or any(
+            getattr(hook, "should_stop", False) for hook in self.hooks)
+
     def iter_train(self, n_episodes: int, *, parallel: bool = False,
                    total_steps: Optional[int] = None):
         """Shared race loop; a budget cut bootstraps without ending the race."""
@@ -220,7 +230,9 @@ class MARLTrainer:
         started_training = time.perf_counter()
         collection_started = started_training
         while (collected < total_steps if total_steps is not None else episode < n_episodes):
-            snapshot = self.task.reset()
+            if self._should_stop():
+                break
+            snapshot = self._reset_task()
             info_dict = snapshot.infos
             global_state = snapshot.global_state.vector
             self.agent.clear_buffers()
@@ -275,7 +287,7 @@ class MARLTrainer:
                     except Exception:
                         pass
 
-            while not episode_done:
+            while not episode_done and not self._should_stop():
                 decision_policy = getattr(self.agent, "policy_version", self._updates)
                 # --- Act: all trainable agents via shared actor ---
                 active_trainable_ids = list(self.task.agents)
@@ -296,7 +308,7 @@ class MARLTrainer:
                     else:
                         actions_norm, log_probs = {}, {}
                     values = self.agent.evaluate_states(global_state, active_trainable_ids)
-                task_step = self.task.step(actions_norm, on_physics_step=on_physics_step)
+                task_step = self._step_task(actions_norm, on_physics_step=on_physics_step)
                 info_dict = task_step.after.infos
                 actions_phys = {aid: decision.action_physical for aid, decision in task_step.decisions.items()}
                 accumulated_individual_rewards = {

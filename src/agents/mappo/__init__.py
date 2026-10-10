@@ -316,7 +316,11 @@ class MAPPOAgent:
             self.critic.parameters())
         self.optimizer = optim.Adam(self._optim_parameters, lr=self.lr)
 
-        # Per-agent rollout buffers
+        self.buffers = self._make_buffers()
+
+    def _make_buffers(self):
+        obs_dim, global_state_dim = self.obs_dim, self.global_state_dim
+        agent_ids = self.agent_ids
         rollout_row_dim = obs_dim + global_state_dim + self.action_dim + 5
         self._rollout_storage = torch.zeros(
             len(self.agent_ids), self.n_steps, rollout_row_dim, device=self.device
@@ -326,7 +330,7 @@ class MAPPOAgent:
                 len(self.agent_ids), dtype=torch.long, device=self.device
             )
         }
-        self.buffers: Dict[str, MAPPORolloutBuffer] = {
+        return {
             aid: MAPPORolloutBuffer(
                 self.n_steps,
                 obs_dim,

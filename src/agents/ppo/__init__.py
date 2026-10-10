@@ -150,7 +150,10 @@ class PPOAgent:
         self._optim_parameters = tuple(self.actor.parameters()) + tuple(self.critic.parameters())
         self.optimizer = optim.Adam(self._optim_parameters, lr=self.lr)
 
-        self.buffer = RolloutBuffer(self.n_steps, obs_dim, self.action_dim, self.device)
+        self.buffer = self._make_buffer()
+
+    def _make_buffer(self):
+        return RolloutBuffer(self.n_steps, self.obs_dim, self.action_dim, self.device)
 
     # ------------------------------------------------------------------
     # Agent protocol

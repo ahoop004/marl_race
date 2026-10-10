@@ -80,6 +80,10 @@ def parse_args() -> argparse.Namespace:
                    help="Serve all collectors together or serve ready workers without a per-step barrier")
     p.add_argument("--torch-threads", type=int, default=None,
                    help="Parent PyTorch CPU threads; parallel collectors use one each")
+    p.add_argument("--ppo-backend", choices=("torch", "torchrl"), default=None,
+                   help="PPO implementation; TorchRL currently requires one environment")
+    p.add_argument("--mappo-backend", choices=("torch", "torchrl"), default=None,
+                   help="MAPPO implementation; TorchRL currently requires one environment")
     p.add_argument("--eval", action="store_true", help="Run evaluation instead of training")
     p.add_argument("--checkpoint", type=str, default=None,
                    help="Checkpoint file or run directory (best_model.pt): evaluate with --eval, "
@@ -132,6 +136,10 @@ def apply_cli_overrides(scenario: Dict, args: argparse.Namespace) -> Dict:
         value = getattr(args, name, None)
         if value is not None:
             scenario.setdefault("experiment", {})[name] = value
+    if getattr(args, "ppo_backend", None) is not None:
+        scenario.setdefault("experiment", {})["ppo_backend"] = args.ppo_backend
+    if getattr(args, "mappo_backend", None) is not None:
+        scenario.setdefault("experiment", {})["mappo_backend"] = args.mappo_backend
     horizon = getattr(args, "rollout_steps_per_env", None)
     if horizon is not None:
         if horizon <= 0:
@@ -1247,6 +1255,15 @@ def _run_on_policy(
     from agents.ppo import PPOAgent
     from training.on_policy_trainer import OnPolicyTrainer
 
+    backend = exp_cfg.get("ppo_backend", "torch")
+    if backend == "torchrl":
+        from agents.torchrl_ppo import TorchRLPPOAgent
+        from training.torchrl_ppo_trainer import TorchRLPPOTrainer
+
+        agent_class, trainer_class = TorchRLPPOAgent, TorchRLPPOTrainer
+    else:
+        agent_class, trainer_class = PPOAgent, OnPolicyTrainer
+
     # A step budget takes precedence, including when episodes is explicitly null.
     n_episodes = 0 if exp_cfg.get("total_steps") is not None else int(exp_cfg.get("episodes", 1000))
 
@@ -1318,7 +1335,7 @@ def _run_on_policy(
             action_repeat=int(eval_scenario["environment"].get("action_repeat", 1)),
         )
 
-    agent = PPOAgent(
+    agent = agent_class(
         obs_dim=obs_composer.obs_dim,
         action_low=action_space.low,
         action_high=action_space.high,
@@ -1363,7 +1380,7 @@ def _run_on_policy(
             f"strategy={eval_cfg.get('selection_strategy', 'completion_progress')}."
         )
 
-    trainer = OnPolicyTrainer(
+    trainer = trainer_class(
         env=env,
         rl_agent_id=rl_agent_id,
         agent=agent,
@@ -1407,6 +1424,14 @@ def _run_mappo(
     from training.marl_trainer import MARLTrainer
     from training.hooks import MAPPOConsoleHook
 
+    if exp_cfg.get("mappo_backend", "torch") == "torchrl":
+        from agents.torchrl_mappo import TorchRLMAPPOAgent
+        from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
+
+        agent_class, trainer_class = TorchRLMAPPOAgent, TorchRLMAPPOTrainer
+    else:
+        agent_class, trainer_class = MAPPOAgent, MARLTrainer
+
     # A step budget takes precedence, including when episodes is explicitly null.
     n_episodes = 0 if exp_cfg.get("total_steps") is not None else int(exp_cfg.get("episodes", 1000))
     compact_laps = MetricPolicy((scenario or {}).get("wandb", {}).get("logging"), scenario).lap_completion
@@ -1438,7 +1463,7 @@ def _run_mappo(
 
     # Merge training params for focal agent (already done by caller, but resolve again
     # to give MAPPOAgent the final merged dict).
-    agent = MAPPOAgent(
+    agent = agent_class(
         obs_dim=obs_dim,
         global_state_dim=global_state_dim,
         action_low=action_low,
@@ -1465,7 +1490,7 @@ def _run_mappo(
         if hasattr(hook, "_agent") and hook._agent is None:
             hook._agent = agent
 
-    trainer = MARLTrainer(
+    trainer = trainer_class(
         env=env,
         agent=agent,
         trainable_ids=trainable_ids,

@@ -309,6 +309,10 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     if total_steps is not None and (isinstance(total_steps, bool)
             or not isinstance(total_steps, int) or total_steps <= 0):
         raise ScenarioError("'experiment.total_steps' must be a positive integer or null.")
+    if experiment.get("ppo_backend", "torch") not in {"torch", "torchrl"}:
+        raise ScenarioError("experiment.ppo_backend must be torch or torchrl")
+    if experiment.get("mappo_backend", "torch") not in {"torch", "torchrl"}:
+        raise ScenarioError("experiment.mappo_backend must be torch or torchrl")
 
     environment = scenario["environment"]
     
@@ -424,6 +428,16 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
         raise ScenarioError("Mixed trainable algorithms are unsupported; use one PPO agent or a MAPPO team.")
     if trainable_algos == {"ppo"} and len(agents) != 1:
         raise ScenarioError("PPO completion experiments require one vehicle")
+    if experiment.get("ppo_backend") == "torchrl":
+        if trainable_algos != {"ppo"}:
+            raise ScenarioError("The TorchRL PPO backend requires one PPO learner")
+        if experiment.get("num_envs", 1) != 1:
+            raise ScenarioError("TorchRL PPO currently requires num_envs=1")
+    if experiment.get("mappo_backend") == "torchrl":
+        if trainable_algos != {"mappo"}:
+            raise ScenarioError("The TorchRL MAPPO backend requires MAPPO learners")
+        if experiment.get("num_envs", 1) != 1:
+            raise ScenarioError("TorchRL MAPPO currently requires num_envs=1")
     evaluation_strategy = scenario.get("evaluation", {}).get("selection_strategy")
     if evaluation_strategy is not None:
         supported = {"team_completion"} if trainable_algos == {"mappo"} else {"completion_progress", "lap_time"}
