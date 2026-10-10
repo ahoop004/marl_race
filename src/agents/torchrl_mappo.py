@@ -9,7 +9,7 @@ from torchrl.modules import IndependentNormal, ProbabilisticActor
 from torchrl.objectives.multiagent import MAPPOLoss
 from torchrl.objectives.value import MultiAgentGAE
 
-from agents.mappo import MAPPOAgent
+from agents.common.mappo_policy import MAPPOPolicy
 from agents.torchrl_updates import optimize_ppo
 
 
@@ -43,15 +43,14 @@ class _DecisionCount:
         return self.count
 
 
-class TorchRLMAPPOAgent(MAPPOAgent):
-    collection_backend = "torchrl"
-
+class TorchRLMAPPOAgent(MAPPOPolicy):
     def _make_buffers(self):
         self._steps = []
         return {aid: _DecisionCount() for aid in self.agent_ids}
 
     def __init__(self, obs_dim, global_state_dim, action_low, action_high, agent_ids, params):
         super().__init__(obs_dim, global_state_dim, action_low, action_high, agent_ids, params)
+        self.buffers = self._make_buffers()
         if (self.critic_mode != "shared_team" or self.reward_mode != "team_shared"
                 or self.team_return_mode != "joint"):
             raise ValueError("TorchRL MAPPO requires shared_team critic, team_shared rewards and joint team returns")

@@ -1,19 +1,4 @@
-"""Multi-agent training loop for MAPPO (and future MARL algorithms).
-
-``MARLTrainer`` drives an episode-based training loop for scenarios with
-multiple trainable agents sharing one :class:`~agents.mappo.MAPPOAgent`.
-
-Key differences from :class:`~training.on_policy_trainer.OnPolicyTrainer`
---------------------------------------------------------------------------
-- Actions are collected for **all** trainable agents each step via the
-  shared actor.  Fixed-policy opponents are still polled via ``other_agents``.
-- The centralized critic uses ``env.get_global_state().vector`` — a flat
-  concatenation of all agents' state — rather than local observations.
-- Per-agent factual rewards are computed independently, then either retained
-  or reduced to one shared team learning reward according to the MAPPO config.
-- The buffer-full / update trigger is checked across all agents: when **any**
-  agent's buffer is full, an update is triggered for all.
-"""
+"""Race collection and reporting shared by TorchRL MAPPO and CPU workers."""
 from __future__ import annotations
 
 import copy
@@ -22,7 +7,6 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from agents.mappo import MAPPOAgent
 from env.types import TransitionRecord
 from metrics.outcomes import determine_outcome
 from training.hooks import TrainingHook, transition_record_hooks
@@ -52,7 +36,7 @@ def map_mappo_learning_rewards(
     return {aid: team_reward for aid in individual_rewards}
 
 
-class MARLTrainer:
+class MAPPORaceTrainer:
     """Episode-based MAPPO training loop.
 
     Parameters
@@ -60,7 +44,7 @@ class MARLTrainer:
     env:
         The F110 parallel environment.
     agent:
-        A :class:`~agents.mappo.MAPPOAgent` with shared actor and centralized critic.
+        A TorchRL MAPPO policy with shared actor and centralized critic.
     trainable_ids:
         Ordered list of agent IDs that are being trained.
     other_agents:
@@ -89,7 +73,7 @@ class MARLTrainer:
     def __init__(
         self,
         env: Any,
-        agent: MAPPOAgent,
+        agent: Any,
         trainable_ids: List[str],
         other_agents: Dict[str, Any],
         obs_composers: Dict[str, ObservationComposer],
@@ -145,15 +129,15 @@ class MARLTrainer:
         agent_ids = getattr(agent, "agent_ids", None)
         if agent_ids is not None and list(agent_ids) != self.trainable_ids:
             raise ValueError(
-                "MARLTrainer trainable_ids must exactly match the MAPPO agent ID order."
+                "MAPPORaceTrainer trainable_ids must exactly match the MAPPO agent ID order."
             )
         for field in ("reward_mode", "team_reward_reduction"):
             agent_value = getattr(agent, field, None)
             trainer_value = getattr(self, field)
             if agent_value is not None and agent_value != trainer_value:
                 raise ValueError(
-                    f"MARLTrainer {field}={trainer_value!r} does not match "
-                    f"MAPPOAgent {field}={agent_value!r}."
+                    f"MAPPORaceTrainer {field}={trainer_value!r} does not match "
+                    f"MAPPO policy {field}={agent_value!r}."
                 )
 
         self.task = RaceTask(

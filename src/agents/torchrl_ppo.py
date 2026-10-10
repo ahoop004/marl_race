@@ -8,7 +8,7 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 
-from agents.ppo import PPOAgent
+from agents.common.ppo_policy import PPOPolicy
 from agents.torchrl_updates import optimize_ppo
 
 
@@ -31,13 +31,7 @@ class _Value(torch.nn.Module):
         return self.critic(observation).unsqueeze(-1)
 
 
-class TorchRLPPOAgent(PPOAgent):
-    collection_backend = "torchrl"
-
-    def _make_buffer(self):
-        # Collection and storage use TensorDicts instead of the legacy buffer.
-        return None
-
+class TorchRLPPOAgent(PPOPolicy):
     def __init__(self, obs_dim, action_low, action_high, params):
         super().__init__(obs_dim, action_low, action_high, params)
         if min(self.n_steps, self.n_epochs, self.batch_size) < 1:
@@ -70,6 +64,7 @@ class TorchRLPPOAgent(PPOAgent):
             average_gae=False, auto_reset_env=False,
         )
         self._pending_batches = []
+        self._pending_steps = 0
 
     def update(self, rollout: TensorDictBase):
         return self.update_rollouts([rollout])

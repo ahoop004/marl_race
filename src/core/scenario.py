@@ -192,9 +192,9 @@ def load_scenario(path: str) -> Dict[str, Any]:
         ScenarioError: If file not found or invalid YAML
 
     Example:
-        >>> scenario = load_scenario('scenarios/legacy/ppo.yaml')
+        >>> scenario = load_scenario('scenarios/ppo_lap_completion_pretrain.yaml')
         >>> scenario['experiment']['name']
-        'gaplock_ppo'
+        'ppo_lap_completion_pretrain'
     """
     path_obj = Path(path)
 
@@ -309,10 +309,10 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     if total_steps is not None and (isinstance(total_steps, bool)
             or not isinstance(total_steps, int) or total_steps <= 0):
         raise ScenarioError("'experiment.total_steps' must be a positive integer or null.")
-    if experiment.get("ppo_backend", "torch") not in {"torch", "torchrl"}:
-        raise ScenarioError("experiment.ppo_backend must be torch or torchrl")
-    if experiment.get("mappo_backend", "torch") not in {"torch", "torchrl"}:
-        raise ScenarioError("experiment.mappo_backend must be torch or torchrl")
+    if experiment.get("ppo_backend", "torchrl") != "torchrl":
+        raise ScenarioError("Legacy PPO backends have been removed; experiment.ppo_backend must be torchrl")
+    if experiment.get("mappo_backend", "torchrl") != "torchrl":
+        raise ScenarioError("Legacy MAPPO backends have been removed; experiment.mappo_backend must be torchrl")
 
     environment = scenario["environment"]
     
@@ -543,7 +543,7 @@ def load_and_expand_scenario(path: str, validate: bool = True, *, overrides=None
         ScenarioError: If scenario is invalid
 
     Example:
-        >>> scenario = load_and_expand_scenario('scenarios/legacy/ppo.yaml')
+        >>> scenario = load_and_expand_scenario('scenarios/ppo_lap_completion_pretrain.yaml')
         >>> # Ready to use for training
     """
     # Load raw scenario

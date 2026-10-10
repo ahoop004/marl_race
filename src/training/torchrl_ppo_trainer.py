@@ -9,11 +9,11 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type
 from adapters import RaceGymEnv
 from env.types import TransitionRecord
 from metrics.outcomes import determine_outcome
-from training.on_policy_trainer import OnPolicyTrainer
+from training.ppo_collector import PPOTrainerBase
 from training.reward_context import transition_lifecycle_fields
 
 
-class TorchRLPPOTrainer(OnPolicyTrainer):
+class TorchRLPPOTrainer(PPOTrainerBase):
     def train_parallel(self, scenario, scenario_dir, num_envs, n_episodes=0, *, total_steps=None):
         from training.parallel_ppo import train_parallel
         return train_parallel(self, scenario, scenario_dir, num_envs, n_episodes, total_steps=total_steps)

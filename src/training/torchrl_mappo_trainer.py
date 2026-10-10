@@ -1,5 +1,5 @@
 from adapters import RaceParallelEnv
-from training.marl_trainer import MARLTrainer
+from training.mappo_race_trainer import MAPPORaceTrainer
 
 
 class _TrainingParallelEnv(RaceParallelEnv):
@@ -10,7 +10,7 @@ class _TrainingParallelEnv(RaceParallelEnv):
             self.on_physics_step(substep)
 
 
-class TorchRLMAPPOTrainer(MARLTrainer):
+class TorchRLMAPPOTrainer(MAPPORaceTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.parallel_env = _TrainingParallelEnv(self.task)

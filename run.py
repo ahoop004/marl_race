@@ -80,10 +80,6 @@ def parse_args() -> argparse.Namespace:
                    help="Serve all collectors together or serve ready workers without a per-step barrier")
     p.add_argument("--torch-threads", type=int, default=None,
                    help="Parent PyTorch CPU threads; parallel collectors use one each")
-    p.add_argument("--ppo-backend", choices=("torch", "torchrl"), default=None,
-                   help="PPO implementation")
-    p.add_argument("--mappo-backend", choices=("torch", "torchrl"), default=None,
-                   help="MAPPO implementation")
     p.add_argument("--eval", action="store_true", help="Run evaluation instead of training")
     p.add_argument("--checkpoint", type=str, default=None,
                    help="Checkpoint file or run directory (best_model.pt): evaluate with --eval, "
@@ -136,10 +132,6 @@ def apply_cli_overrides(scenario: Dict, args: argparse.Namespace) -> Dict:
         value = getattr(args, name, None)
         if value is not None:
             scenario.setdefault("experiment", {})[name] = value
-    if getattr(args, "ppo_backend", None) is not None:
-        scenario.setdefault("experiment", {})["ppo_backend"] = args.ppo_backend
-    if getattr(args, "mappo_backend", None) is not None:
-        scenario.setdefault("experiment", {})["mappo_backend"] = args.mappo_backend
     horizon = getattr(args, "rollout_steps_per_env", None)
     if horizon is not None:
         if horizon <= 0:
@@ -554,11 +546,9 @@ def main() -> None:
         env_seed = env_cfg.get("seed")
         env_seed = exp_cfg["seed"] if env_seed is None else env_seed
         provenance["ppo_collection"] = {
-            "backend": exp_cfg.get("ppo_backend", "torch"),
-            "advantage_estimator": "torchrl.GAE" if exp_cfg.get("ppo_backend") == "torchrl" else "legacy_gae",
-            "mode": ("synchronous_grouped_workers_v1" if (int(exp_cfg.get("num_workers", num_envs)) < num_envs
-                       or exp_cfg.get("collector_scheduling") == "ready")
-                     else "synchronous_workers_v1"),
+            "backend": "torchrl",
+            "advantage_estimator": "torchrl.GAE",
+            "mode": "synchronous_grouped_workers_v1",
             "num_envs": num_envs, "worker_threads": 1,
             "collector_scheduling": exp_cfg.get("collector_scheduling", "synchronous"),
             "num_workers": min(num_envs, int(exp_cfg.get("num_workers", num_envs))),
@@ -568,9 +558,8 @@ def main() -> None:
         }
     if num_envs > 1 and algorithm == "mappo":
         provenance["mappo_collection"] = {
-            "backend": exp_cfg.get("mappo_backend", "torch"),
-            "advantage_estimator": ("torchrl.MultiAgentGAE" if exp_cfg.get("mappo_backend") == "torchrl"
-                                    else "legacy_gae"),
+            "backend": "torchrl",
+            "advantage_estimator": "torchrl.MultiAgentGAE",
             "mode": "synchronous_grouped_workers_v1", "num_envs": num_envs,
             "num_workers": min(num_envs, int(exp_cfg.get("num_workers", num_envs))),
             "worker_threads": 1,
@@ -654,7 +643,7 @@ def main() -> None:
                 provenance=provenance, wandb_logger=wandb_logger,
             )
         elif algorithm == "ppo":
-            _run_on_policy(
+            _run_ppo(
                 env, rl_agent_id, agent_cfg, other_agents,
                 obs_composer, reward_composer, action_composer, params,
                 action_repeat, render, hooks, exp_cfg, output_dir, console,
@@ -730,8 +719,8 @@ def _run_eval(
     scenario_dir: Path,
 ) -> None:
     """Evaluate a trained PPO or MAPPO checkpoint with deterministic actions."""
-    from agents.mappo import MAPPOAgent
-    from agents.ppo import PPOAgent
+    from agents.common.mappo_policy import MAPPOPolicy
+    from agents.common.ppo_policy import PPOPolicy
     from metrics.racing_eval import (
         aggregate_eval_episodes,
         create_episode_facts,
@@ -740,7 +729,7 @@ def _run_eval(
         capture_spawn_context,
         update_agent_step_facts,
     )
-    from training.marl_trainer import map_mappo_learning_rewards
+    from training.mappo_race_trainer import map_mappo_learning_rewards
     from utils.torch_io import resolve_device
 
     checkpoint = args.checkpoint
@@ -849,7 +838,7 @@ def _run_eval(
     global_state_dim = int(global_snapshot.vector.shape[0])
 
     if algorithm == "ppo":
-        agent = PPOAgent(
+        agent = PPOPolicy(
             obs_dim=obs_composers[focal_agent_id].obs_dim,
             action_low=action_low,
             action_high=action_high,
@@ -862,7 +851,7 @@ def _run_eval(
                 "vector_contract_version", "legacy_unspecified"
             ),
         }
-        agent = MAPPOAgent(
+        agent = MAPPOPolicy(
             obs_dim=obs_composers[focal_agent_id].obs_dim,
             global_state_dim=global_state_dim,
             action_low=action_low,
@@ -1247,7 +1236,7 @@ def _run_eval(
     console.print_info(f"Evaluation report: {report_path}")
 
 
-def _run_on_policy(
+def _run_ppo(
     env, rl_agent_id, agent_cfg, other_agents,
     obs_composer, reward_composer, action_composer, params,
     action_repeat, render, hooks, exp_cfg, output_dir, console,
@@ -1257,17 +1246,8 @@ def _run_on_policy(
     provenance: Optional[Dict[str, Any]] = None,
     wandb_logger: Optional[WandbLogger] = None,
 ) -> None:
-    from agents.ppo import PPOAgent
-    from training.on_policy_trainer import OnPolicyTrainer
-
-    backend = exp_cfg.get("ppo_backend", "torch")
-    if backend == "torchrl":
-        from agents.torchrl_ppo import TorchRLPPOAgent
-        from training.torchrl_ppo_trainer import TorchRLPPOTrainer
-
-        agent_class, trainer_class = TorchRLPPOAgent, TorchRLPPOTrainer
-    else:
-        agent_class, trainer_class = PPOAgent, OnPolicyTrainer
+    from agents.torchrl_ppo import TorchRLPPOAgent
+    from training.torchrl_ppo_trainer import TorchRLPPOTrainer
 
     # A step budget takes precedence, including when episodes is explicitly null.
     n_episodes = 0 if exp_cfg.get("total_steps") is not None else int(exp_cfg.get("episodes", 1000))
@@ -1340,7 +1320,7 @@ def _run_on_policy(
             action_repeat=int(eval_scenario["environment"].get("action_repeat", 1)),
         )
 
-    agent = agent_class(
+    agent = TorchRLPPOAgent(
         obs_dim=obs_composer.obs_dim,
         action_low=action_space.low,
         action_high=action_space.high,
@@ -1385,7 +1365,7 @@ def _run_on_policy(
             f"strategy={eval_cfg.get('selection_strategy', 'completion_progress')}."
         )
 
-    trainer = trainer_class(
+    trainer = TorchRLPPOTrainer(
         env=env,
         rl_agent_id=rl_agent_id,
         agent=agent,
@@ -1425,17 +1405,9 @@ def _run_mappo(
     run_id="run",
     scenario=None, scenario_dir=None, provenance=None, wandb_logger=None,
 ) -> None:
-    from agents.mappo import MAPPOAgent
-    from training.marl_trainer import MARLTrainer
+    from agents.torchrl_mappo import TorchRLMAPPOAgent
+    from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
     from training.hooks import MAPPOConsoleHook
-
-    if exp_cfg.get("mappo_backend", "torch") == "torchrl":
-        from agents.torchrl_mappo import TorchRLMAPPOAgent
-        from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
-
-        agent_class, trainer_class = TorchRLMAPPOAgent, TorchRLMAPPOTrainer
-    else:
-        agent_class, trainer_class = MAPPOAgent, MARLTrainer
 
     # A step budget takes precedence, including when episodes is explicitly null.
     n_episodes = 0 if exp_cfg.get("total_steps") is not None else int(exp_cfg.get("episodes", 1000))
@@ -1467,8 +1439,8 @@ def _run_mappo(
     }
 
     # Merge training params for focal agent (already done by caller, but resolve again
-    # to give MAPPOAgent the final merged dict).
-    agent = agent_class(
+    # to give the TorchRL MAPPO agent the final merged dict).
+    agent = TorchRLMAPPOAgent(
         obs_dim=obs_dim,
         global_state_dim=global_state_dim,
         action_low=action_low,
@@ -1495,7 +1467,7 @@ def _run_mappo(
         if hasattr(hook, "_agent") and hook._agent is None:
             hook._agent = agent
 
-    trainer = trainer_class(
+    trainer = TorchRLMAPPOTrainer(
         env=env,
         agent=agent,
         trainable_ids=trainable_ids,

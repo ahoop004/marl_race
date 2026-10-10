@@ -5,7 +5,12 @@ import math
 import torch
 from torchrl.data import LazyTensorStorage, SamplerWithoutReplacement, TensorDictReplayBuffer
 
-from agents.common import mean_update_metrics
+
+def mean_update_metrics(rows):
+    """Transfer averaged optimizer metrics to the CPU once."""
+    names = ("train/policy_loss", "train/value_loss", "train/entropy", "train/approx_kl")
+    means = torch.stack(rows).mean(dim=0).cpu().tolist() if rows else [0.0] * len(names)
+    return dict(zip(names, means))
 
 
 def optimize_ppo(agent, data, *, group=None):

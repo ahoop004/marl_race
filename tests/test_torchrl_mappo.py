@@ -9,7 +9,7 @@ pytest.importorskip("torchrl.objectives.multiagent")
 from torchrl.objectives.multiagent import MAPPOLoss
 from torchrl.objectives.value import MultiAgentGAE
 
-from agents.mappo import MAPPOAgent
+from agents.common.mappo_policy import MAPPOPolicy
 from agents.torchrl_mappo import TorchRLMAPPOAgent
 from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
 from test_race_task import ScriptedEnv, TickReward
@@ -88,11 +88,11 @@ def test_budget_cut_bootstraps_one_shared_global_value(monkeypatch):
 def test_native_update_routes_actors_and_retains_checkpoint_compatibility(actor_mode, tmp_path):
     extra = {"actor_mode": actor_mode, "hidden_dims": [4]}
     if actor_mode == "lora":
-        from agents.ppo import PPOAgent
+        from agents.common.ppo_policy import PPOPolicy
 
         extra["actor_mode"] = "shared"
         extra["lora"] = {"mode": "per_agent", "rank": 1, "alpha": 2}
-        solo = PPOAgent(1, *BOUNDS, {"hidden_dims": [4], "device": "cpu"})
+        solo = PPOPolicy(1, *BOUNDS, {"hidden_dims": [4], "device": "cpu"})
         source = tmp_path / "solo.pt"
         solo.save(str(source))
     agent = learner(**extra)
@@ -109,13 +109,13 @@ def test_native_update_routes_actors_and_retains_checkpoint_compatibility(actor_
                    if key.startswith("actors.car_0."))
     path = tmp_path / "mappo.pt"
     agent.save(str(path))
-    legacy = MAPPOAgent(1, 1, *BOUNDS, IDS, params(**extra))
-    legacy.load(str(path))
+    evaluation_policy = MAPPOPolicy(1, 1, *BOUNDS, IDS, params(**extra))
+    evaluation_policy.load(str(path))
     expected, _ = agent.act_batch(IDS, np.zeros((2, 1), dtype=np.float32), deterministic=True)
-    actual, _ = legacy.act_batch(IDS, np.zeros((2, 1), dtype=np.float32), deterministic=True)
+    actual, _ = evaluation_policy.act_batch(IDS, np.zeros((2, 1), dtype=np.float32), deterministic=True)
     for aid in IDS:
         np.testing.assert_array_equal(actual[aid], expected[aid])
-    legacy.save(str(path))
+    evaluation_policy.save(str(path))
     agent.load(str(path))
 
 

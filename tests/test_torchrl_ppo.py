@@ -9,7 +9,7 @@ pytest.importorskip("torchrl")
 from tensordict import TensorDict
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
-from agents.ppo import PPOAgent
+from agents.common.ppo_policy import PPOPolicy
 from agents.torchrl_ppo import TorchRLPPOAgent
 from training.hooks import TrainingHook
 from training.torchrl_ppo_trainer import TorchRLPPOTrainer
@@ -83,11 +83,11 @@ def test_native_update_handles_partial_minibatches_and_legacy_checkpoints(vf_coe
     assert all(math.isfinite(value) for value in metrics.values())
     checkpoint = tmp_path / "model.pt"
     learner.save(str(checkpoint))
-    legacy = PPOAgent(1, learner.action_low, learner.action_high, {"hidden_dims": [], "device": "cpu"})
-    legacy.load(str(checkpoint))
+    evaluation_policy = PPOPolicy(1, learner.action_low, learner.action_high, {"hidden_dims": [], "device": "cpu"})
+    evaluation_policy.load(str(checkpoint))
     observation = np.array([0.3], dtype=np.float32)
-    np.testing.assert_array_equal(legacy.predict(observation), learner.predict(observation))
-    legacy.save(str(checkpoint))
+    np.testing.assert_array_equal(evaluation_policy.predict(observation), learner.predict(observation))
+    evaluation_policy.save(str(checkpoint))
     restored = agent(vf_coef=vf_coef)
     restored.load(str(checkpoint))
     assert restored.optimizer.state_dict()["state"]
@@ -189,13 +189,13 @@ def test_parallel_fragments_use_final_observations_and_independent_gae(monkeypat
         learner.critic.net[0].bias.zero_()
     fragments = []
     for observations, next_observations, rewards in (([2, 3], [3, 4], [1, 2]), ([100], [7], [4])):
-        policy = PPOCollectorPolicy(None, 2, 1, 2, 0.9, 1)
+        policy = PPOCollectorPolicy(2)
         actions, log_probs, values = learner.act_batch(np.array(observations, dtype=np.float32).reshape(-1, 1))
         for row, observation in enumerate(observations):
             policy.buffer.add([observation], actions[row], rewards[row], log_probs[row], values[row],
                               terminated=False, truncated=False, raw_action=learner.last_raw_actions[row],
                               next_observation=[next_observations[row]])
-        payload = ForkingPickler.dumps(serialize_rollout(policy.pack_rollout(0)))
+        payload = ForkingPickler.dumps(serialize_rollout(policy.pack_rollout()))
         fragments.append(deserialize_rollout(pickle.loads(payload)))
         policy.buffer.clear()
     captured = []
@@ -207,8 +207,47 @@ def test_parallel_fragments_use_final_observations_and_independent_gae(monkeypat
     torch.testing.assert_close(log_probs, captured[0]["raw_log_prob"])
 
 
-@pytest.mark.parametrize("algorithm,scheduling", [("ppo", "ready"), ("mappo", "synchronous")])
-def test_spawned_collectors_stop_at_update_barrier_and_keep_evaluated_weights(algorithm, scheduling):
+def test_ppo_worker_keeps_reset_boundaries_and_final_observations_in_pooled_fragments():
+    from training.ppo_collector import PPOCollector
+    from training.torchrl_collectors import PPOCollectorPolicy
+
+    task, controller, _ = make_task({3: ((), True, (), ("learner", "opponent"))}, repeat=1)
+    hook = Capture(True)
+    policy = PPOCollectorPolicy(4)
+    collection = PPOCollector(
+        task.env, "learner", policy, task.fixed_controllers,
+        task.obs_composers["learner"], task.reward_composers["learner"],
+        task.action_composers["learner"], hooks=[hook],
+    )
+    fragments = []
+    generator = collection.iter_train(total_steps=7)
+    response = None
+    while True:
+        try:
+            kind, payload = generator.send(response)
+        except StopIteration:
+            break
+        if kind == "act":
+            response = (np.zeros(2, dtype=np.float32), 0., 0., np.zeros(2, dtype=np.float32))
+        else:
+            assert kind == "rollout"
+            fragments.append(payload.clone())
+            response = {}
+
+    assert [fragment.numel() for fragment in fragments] == [4, 3]
+    data = torch.cat(fragments)
+    assert data["observation"].flatten().tolist() == [0, 1, 2, 0, 1, 2, 0]
+    assert data["next", "observation"].flatten().tolist() == [1, 2, 3, 1, 2, 3, 1]
+    assert data["next", "done"].flatten().tolist() == [False, False, True, False, False, True, False]
+    assert not data["next", "terminated"].any()
+    assert controller.calls == collection.collected_steps == len(hook.steps) == 7
+    assert len(hook.episodes) == 2 and hook.ended
+
+
+@pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
+@pytest.mark.parametrize("scheduling", ["synchronous", "ready"])
+@pytest.mark.parametrize("workers", [1, 2])
+def test_spawned_collectors_stop_at_update_barrier_and_keep_evaluated_weights(algorithm, scheduling, workers):
     from pathlib import Path
     import multiprocessing as mp
     from core.scenario import load_and_expand_scenario
@@ -217,7 +256,7 @@ def test_spawned_collectors_stop_at_update_barrier_and_keep_evaluated_weights(al
     scenarios = Path(__file__).resolve().parents[1] / "scenarios"
     filename = "ppo_lap_completion_pretrain.yaml" if algorithm == "ppo" else "mappo_2v2_completion_scratch.yaml"
     overrides = [f"experiment.{algorithm}_backend=torchrl", "experiment.num_envs=2",
-                 "experiment.num_workers=1", f"experiment.collector_scheduling={scheduling}",
+                 f"experiment.num_workers={workers}", f"experiment.collector_scheduling={scheduling}",
                  "experiment.total_steps=7", "environment.max_steps=10", "evaluation.enabled=false",
                  "training_defaults.rollout_steps_per_env=2", "agents.car_0.params.n_steps=4"]
     if algorithm == "mappo":

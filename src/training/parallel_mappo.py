@@ -15,7 +15,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from agents.mappo import MAPPOAgent, MAPPORolloutBuffer
 from training.hooks import ConsoleHook, transition_record_hooks
 from training.collector_progress import CollectorProgress
 from loggers.metric_policy import MetricPolicy
@@ -24,80 +23,8 @@ from training.collector_scheduling import (
     _close_collectors, _report_worker_error, _worker_startup_settings,
     cpu_affinity_count, cpu_affinity_core_count,
 )
-from training.on_policy_trainer import _WorkerHook
-
-
-class CollectorAgent:
-    """MAPPO rollout state without networks, optimizer, or a CUDA context."""
-
-    store_team_step = MAPPOAgent.store_team_step
-    compute_team_gae = MAPPOAgent.compute_team_gae
-    clear_buffers = MAPPOAgent.clear_buffers
-    any_buffer_full = MAPPOAgent.any_buffer_full
-    pack_observations = MAPPOAgent.pack_observations
-
-    def __init__(self, contract, horizon):
-        for name, value in contract.items():
-            setattr(self, name, value)
-        self.n_steps = horizon
-        self.device = torch.device("cpu")
-        self.obs_dims = contract.get("obs_dims", {aid: self.obs_dim for aid in self.agent_ids})
-        self.buffers = {
-            aid: MAPPORolloutBuffer(horizon, self.obs_dim, self.global_state_dim,
-                                   self.action_dim, self.device)
-            for aid in self.agent_ids
-        }
-        self._team_rollout = []
-        self._team_step_indices = {aid: [] for aid in self.agent_ids}
-        self.fragments = []
-        self.last_raw_actions = {}
-        self.policy_version = 0
-        self.physics_steps_collected = 0
-
-    def store_batch(self, agent_ids, *, observations, global_state, actions,
-                    rewards, log_probs, values, terminated, truncated, raw_actions=None):
-        # Environment snapshots are read-only; own one writable CPU copy before
-        # handing the same state to each teammate's tensor buffer.
-        global_state = np.array(global_state, dtype=np.float32, copy=True)
-        packed = self.pack_observations(agent_ids, observations)
-        for index, aid in enumerate(agent_ids):
-            self.buffers[aid].add(
-                packed[index], global_state, actions[aid], rewards[aid],
-                log_probs[aid], values[aid], terminated[aid], truncated[aid],
-                None if raw_actions is None else raw_actions[aid],
-            )
-
-    def finish_fragment(self, next_values):
-        ids = [aid for aid in self.agent_ids if self.buffers[aid].size()]
-        if not ids:
-            return {}
-        team_gae = (self.compute_team_gae(next_values[ids[0]])
-                    if self.team_return_mode == "joint" else None)
-        for aid in ids:
-            buf = self.buffers[aid]
-            n = buf.size()
-            if team_gae is None:
-                adv, ret = buf.compute_gae(next_values[aid], self.gamma, self.gae_lambda)
-            else:
-                indices = self._team_step_indices[aid]
-                if len(indices) != n:
-                    raise ValueError("Joint team indices must match actual decisions")
-                adv, ret = (values[indices] for values in team_gae)
-            critic = buf.global_states[:n]
-            if self.critic_mode == "agent_conditioned":
-                identity = torch.zeros(n, len(self.agent_ids))
-                identity[:, self.agent_ids.index(aid)] = 1
-                critic = torch.cat((critic, identity), dim=1)
-            packed = torch.cat((buf.obs[:n], critic, buf.actions[:n],
-                                buf.log_probs[:n, None], adv[:, None], ret[:, None]), dim=1)
-            self.fragments.append((packed.numpy(), buf.raw_actions[:n].numpy().copy(),
-                                   np.full(n, self.agent_ids.index(aid), dtype=np.int64)))
-        self.clear_buffers()
-        return {}
-
-    def take_fragments(self):
-        result, self.fragments = self.fragments, []
-        return result
+from training.collector_hooks import WorkerHook
+from training.torchrl_collectors import MAPPOCollectorAgent, deserialize_rollout, serialize_rollout
 
 
 @torch.no_grad()
@@ -143,7 +70,6 @@ def infer_requests(agent, requests):
 def _make_collector(scenario, scenario_dir, env_id, episodes, horizon, contract,
                     run_id, sink, record_transitions, total_steps=None):
     from core.setup import build_obs_composers, build_reward_composers, create_training_setup
-    from training.marl_trainer import MARLTrainer
     from wrappers.actions.composer import ActionComposer
 
     scenario = copy.deepcopy(scenario)
@@ -177,15 +103,11 @@ def _make_collector(scenario, scenario_dir, env_id, episodes, horizon, contract,
             space.low, space.high, scenario["agents"][ids[0]].get("action_constraints", {}),
             decision_dt=float(env_cfg.get("timestep", .01)) * repeat,
         )
-        agent_class, trainer_class = CollectorAgent, MARLTrainer
-        if contract.get("collection_backend") == "torchrl":
-            from training.torchrl_collectors import MAPPOCollectorAgent
-            from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
-            agent_class, trainer_class = MAPPOCollectorAgent, TorchRLMAPPOTrainer
-        agent = agent_class(contract, horizon)
-        trainer = trainer_class(
+        from training.torchrl_mappo_trainer import TorchRLMAPPOTrainer
+        agent = MAPPOCollectorAgent(contract, horizon)
+        trainer = TorchRLMAPPOTrainer(
             env, agent, ids, opponents, obs, rewards, actions, action_repeat=repeat,
-            hooks=[_WorkerHook(sink, env_id, seed, record_transitions)],
+            hooks=[WorkerHook(sink, env_id, seed, record_transitions)],
             run_id=f"{run_id}_env{env_id:04d}", reward_mode=agent.reward_mode,
             team_reward_reduction=agent.team_reward_reduction,
         )
@@ -251,13 +173,7 @@ def _collect_worker(connection, scenario, scenario_dir, assignments, horizon,
                     else:
                         advance(env_id, response)
             fragments = [fragment for agent in agents.values() for fragment in agent.take_fragments()]
-            if contract.get("collection_backend") == "torchrl":
-                from training.torchrl_collectors import serialize_rollout
-                pooled = [serialize_rollout(fragment) for fragment in fragments] or None
-            else:
-                pooled = None if not fragments else tuple(
-                    np.concatenate([fragment[i] for fragment in fragments]) for i in range(3)
-                )
+            pooled = [serialize_rollout(fragment) for fragment in fragments] or None
             physics = sum(a.physics_steps_collected for a in agents.values()) - physics_start
             connection.send(("rollout", (pooled, sum(counts.values()), physics, sink.take())))
             metrics = connection.recv()  # Policy update barrier, including an empty final rollout.
@@ -298,15 +214,12 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
     scheduler = CollectorScheduler(experiment.get("collector_scheduling", "synchronous"),
                                    startup["worker_response_timeout_s"])
     agent = trainer.agent
-    native = getattr(agent, "collection_backend", None) == "torchrl"
     contract = {name: getattr(agent, name) for name in (
         "agent_ids", "obs_dim", "global_state_dim", "global_state_contract_version",
         "obs_dims", "observation_contracts",
         "action_dim", "action_low", "action_high", "observation_contract", "gamma",
         "gae_lambda", "critic_mode", "reward_mode", "team_return_mode", "team_reward_reduction",
     )}
-    if native:
-        contract["collection_backend"] = "torchrl"
     record_hooks = transition_record_hooks(trainer.hooks)
     connections, processes, process_by_worker = {}, [], {}
     completed, collected, actor_samples, updates = 0, 0, 0, 0
@@ -506,12 +419,8 @@ def train_parallel(trainer, scenario, scenario_dir, num_envs, n_episodes=0, *, t
                 progress.finish_collection()
                 steps = sum(item[1] for item in waiting.values())
                 rollouts = [waiting[i][0] for i in sorted(waiting) if waiting[i][0] is not None]
-                if native:
-                    from training.torchrl_collectors import deserialize_rollout
-                    rollouts = [deserialize_rollout(fragment) for worker in rollouts for fragment in worker]
-                    samples = sum(int(item["agents", "mask"].sum()) for item in rollouts)
-                else:
-                    samples = sum(len(item[0]) for item in rollouts)
+                rollouts = [deserialize_rollout(fragment) for worker in rollouts for fragment in worker]
+                samples = sum(int(item["agents", "mask"].sum()) for item in rollouts)
                 collected += steps
                 physics_collected += sum(item[2] for item in waiting.values())
                 actor_samples += samples

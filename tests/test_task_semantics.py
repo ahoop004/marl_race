@@ -3,11 +3,9 @@ import numpy as np
 import pytest
 import torch
 
-from agents.common import compute_gae
-from agents.mappo import MAPPOAgent
 from env.collision_state import RaceLifecycle, apply_episode_termination_policy
 from env.types import AgentRaceStatus
-from training.marl_trainer import map_mappo_learning_rewards
+from training.mappo_race_trainer import map_mappo_learning_rewards
 from wrappers.actions.composer import ActionComposer
 from wrappers.rewards.composer import RewardComposer
 
@@ -82,29 +80,48 @@ def test_shared_finish_rewards_are_incremental_and_reset_for_the_next_race():
     assert composer.compute(context, team=True)[0] == 30.0
 
 
+def native_gae(rewards, values, next_values, terminated, truncated):
+    pytest.importorskip("torchrl")
+    from tensordict import TensorDict
+    from torchrl.objectives.value import GAE
+
+    n = len(rewards)
+    data = TensorDict({
+        "state_value": torch.tensor(values).reshape(n, 1),
+        "next": TensorDict({
+            "state_value": torch.tensor(next_values).reshape(n, 1),
+            "reward": torch.tensor(rewards).reshape(n, 1),
+            "terminated": torch.tensor(terminated).reshape(n, 1),
+            "done": torch.tensor([a or b for a, b in zip(terminated, truncated)]).reshape(n, 1),
+        }, [n]),
+    }, [n])
+    GAE(gamma=0.9, lmbda=1.0, value_network=None)(data)
+    return data["advantage"].flatten(), data["value_target"].flatten()
+
+
 def test_truncation_bootstraps_final_state_without_credit_from_the_next_episode():
-    advantages, returns = compute_gae(
-        rewards=torch.tensor([1.0, 2.0]), values=torch.tensor([2.0, 1000.0]),
-        terminated=torch.tensor([0.0, 1.0]), truncated=torch.tensor([1.0, 0.0]),
-        next_value=999.0, gamma=0.9, gae_lambda=1.0,
-        final_values=torch.tensor([3.0, float("nan")]),
+    advantages, returns = native_gae(
+        rewards=[1., 2.], values=[2., 1000.], next_values=[3., 999.],
+        terminated=[False, True], truncated=[True, False],
     )
     torch.testing.assert_close(advantages, torch.tensor([1.7, -998.0]))
     torch.testing.assert_close(returns, torch.tensor([3.7, 2.0]))
 
 
 def test_collection_cut_bootstraps_without_a_task_boundary():
-    advantages, returns = compute_gae(
-        rewards=torch.tensor([1.0]), values=torch.tensor([2.0]),
-        terminated=torch.tensor([0.0]), truncated=torch.tensor([0.0]),
-        next_value=3.0, gamma=0.9, gae_lambda=1.0,
+    advantages, returns = native_gae(
+        rewards=[1.], values=[2.], next_values=[3.],
+        terminated=[False], truncated=[False],
     )
     torch.testing.assert_close(advantages, torch.tensor([1.7]))
     torch.testing.assert_close(returns, torch.tensor([3.7]))
 
 
 def test_joint_team_credit_continues_after_an_individual_learner_finishes():
-    agent = MAPPOAgent(
+    pytest.importorskip("torchrl.objectives.multiagent")
+    from agents.torchrl_mappo import TorchRLMAPPOAgent
+
+    agent = TorchRLMAPPOAgent(
         obs_dim=2, global_state_dim=1,
         action_low=np.full(2, -1, dtype=np.float32),
         action_high=np.ones(2, dtype=np.float32), agent_ids=LEARNERS,
@@ -112,6 +129,9 @@ def test_joint_team_credit_continues_after_an_individual_learner_finishes():
                 "critic_mode": "shared_team", "reward_mode": "team_shared",
                 "team_return_mode": "joint", "gamma": 0.9, "gae_lambda": 1.0},
     )
+    with torch.no_grad():
+        for parameter in agent.critic.parameters():
+            parameter.zero_()
     for index, ids in enumerate((LEARNERS, ["car_1"], ["car_1"])):
         terminal = index == 2
         agent.store_batch(
@@ -122,10 +142,13 @@ def test_joint_team_credit_continues_after_an_individual_learner_finishes():
             log_probs=dict.fromkeys(ids, 0.0), values=dict.fromkeys(ids, 0.0),
             terminated={aid: terminal or aid == "car_0" for aid in ids},
             truncated=dict.fromkeys(ids, False),
+            raw_actions={aid: np.zeros(2, dtype=np.float32) for aid in ids},
         )
         agent.store_team_step(ids, reward=index + 1, value=0.0, terminal=terminal)
-    _, returns = agent.compute_team_gae(next_value=1000.0)
-    torch.testing.assert_close(returns, torch.tensor([5.23, 4.7, 3.0]))
+    data = torch.stack(agent._steps)
+    with torch.no_grad():
+        agent.gae(data)
+    torch.testing.assert_close(data["agents", "value_target"][:, 0, 0], torch.tensor([5.23, 4.7, 3.0]))
     assert agent.buffers["car_0"].size() == 1
     assert agent.buffers["car_1"].size() == 3
 

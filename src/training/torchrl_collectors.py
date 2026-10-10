@@ -6,9 +6,8 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from agents.mappo import MAPPOAgent
+from agents.common.mappo_policy import MAPPOPolicy
 from agents.torchrl_mappo import TorchRLMAPPOAgent
-from training.on_policy_trainer import _RemotePolicy
 
 
 def serialize_rollout(rollout):
@@ -23,8 +22,6 @@ def deserialize_rollout(payload):
 
 
 class _DecisionBuffer:
-    requires_next_observation = True
-
     def __init__(self, capacity):
         self.capacity = capacity
         self.steps = []
@@ -36,7 +33,7 @@ class _DecisionBuffer:
         return len(self.steps) >= self.capacity
 
     def add(self, obs, action, reward, log_prob, value, *, terminated,
-            truncated, raw_action, next_observation, final_value=None):
+            truncated, raw_action, next_observation):
         # Own the arrays: task snapshots and policy replies may be reused.
         def tensor(value):
             return torch.tensor(np.asarray(value).copy(), dtype=torch.float32)
@@ -52,13 +49,32 @@ class _DecisionBuffer:
         }, []))
 
 
-class PPOCollectorPolicy(_RemotePolicy):
-    def __init__(self, connection, n_steps, obs_dim, action_dim, gamma, gae_lambda, **kwargs):
-        super().__init__(connection, n_steps, obs_dim, action_dim, gamma, gae_lambda,
-                         buffer=_DecisionBuffer(n_steps), **kwargs)
+class PPOCollectorPolicy:
+    """CPU decision storage and parent control; workers own no policy networks."""
 
-    def pack_rollout(self, next_value):
+    def __init__(self, n_steps, *, map_scheduler=None, worker_id=0):
+        self.buffer = _DecisionBuffer(n_steps)
+        self.map_scheduler = map_scheduler
+        self.worker_id = worker_id
+        self.should_stop = False
+        self._training_bundles = None
+
+    def pack_rollout(self):
         return torch.stack(self.buffer.steps)
+
+    def apply_reply(self, reply):
+        if "collector_control" not in reply:
+            return reply
+        control = reply["collector_control"]
+        self.should_stop = bool(control["stop"])
+        bundles = tuple(control.get("training_bundles", ()))
+        if bundles and bundles != self._training_bundles:
+            if self.map_scheduler is None:
+                raise RuntimeError("Collector received map curriculum without a scheduler")
+            offset = self.worker_id % len(bundles)
+            self.map_scheduler.set_training_bundles(list(bundles[offset:] + bundles[:offset]))
+            self._training_bundles = bundles
+        return reply["metrics"]
 
 
 class MAPPOCollectorAgent:
@@ -69,8 +85,8 @@ class MAPPOCollectorAgent:
     set_next_state = TorchRLMAPPOAgent.set_next_state
     any_buffer_full = TorchRLMAPPOAgent.any_buffer_full
     clear_buffers = TorchRLMAPPOAgent.clear_buffers
-    _validate_agent_batch = MAPPOAgent._validate_agent_batch
-    pack_observations = MAPPOAgent.pack_observations
+    _validate_agent_batch = MAPPOPolicy._validate_agent_batch
+    pack_observations = MAPPOPolicy.pack_observations
 
     def __init__(self, contract, horizon):
         for name, value in contract.items():
