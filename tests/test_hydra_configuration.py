@@ -238,15 +238,36 @@ def test_task_factory_loads_project_relative_scenarios_outside_project(tmp_path,
 
 def test_resolved_config_and_choices_are_saved_with_experiments(tmp_path):
     from loggers.csv_logger import CSVLogger
+    from core.provenance import build_run_provenance
+    from wrappers.observations.composer import ObservationComposer
+    import torch
 
     config = load_and_expand_scenario(TEAM, overrides=["adaptation=lora", "adaptation.lora.rank=2"])
-    logger = CSVLogger(tmp_path, config)
+    original = deepcopy(config)
+    contracts = {aid: ObservationComposer.from_config(agent["observation"], config["environment"]).contract
+                 for aid, agent in config["agents"].items() if agent["trainable"]}
+    provenance = build_run_provenance(config, scenario_path=source_path(TEAM), run_id="metadata-test",
+        algorithm="mappo", trainable_agents=contracts, observation_contracts=contracts)
+    logger = CSVLogger(tmp_path, config, provenance=provenance)
     logger.close()
     snapshot = yaml.safe_load((tmp_path / "resolved_config.yaml").read_text())
     assert snapshot == config and "${" not in (tmp_path / "resolved_config.yaml").read_text()
     assert snapshot["_configuration"]["choices"]["adaptation"] == "lora"
     assert snapshot["adaptation"]["lora"]["rank"] == 2
     assert json.loads((tmp_path / "config_snapshot.json").read_text())["config"] == config
+    saved = json.loads((tmp_path / "config_snapshot.json").read_text())["provenance"]
+    assert saved == provenance and config == original
+    assert saved["resolved_config_sha256"] == digest(config)
+    assert saved["observation_contracts"] == contracts and saved["physics_contract"]["version"] == 1
+    assert saved["seed"] == 42 and len(saved["git"]["commit"]) == 40
+    runtime = saved["runtime"]
+    assert runtime["python"] and runtime["packages"]["tensordict"] and runtime["packages"]["torchrl"]
+    assert runtime["torch_threads"] == torch.get_num_threads()
+    assert runtime["cuda"]["available"] == torch.cuda.is_available()
+    for details in saved["map_protocols"].values():
+        assert set(details["assets"]) == {"image", "centerline", "walls"}
+        for asset in details["assets"].values():
+            assert asset["sha256"] == hashlib.sha256(Path(asset["path"]).read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize("algorithm,target,rate", [("ppo", 4096, .001), ("mappo", 2048, .0001)])
@@ -269,6 +290,7 @@ def test_serial_profiling_presets_keep_production_settings_separate(algorithm, t
     assert not config["environment"]["render"] and config["environment"]["max_steps"] > 0
     assert config["checkpoint"]["every_steps"] is None
     assert config["experiment"]["measure_services"] and not config["logging"]["physics_episodes"]
+    assert not config["experiment"]["measure_stages"] and config["experiment"]["profiling_warmup_updates"] == 1
     environment = config["environment"]
     assert {key: environment[key] for key in ("timestep", "action_repeat", "max_speed", "lidar_beams", "lidar_range")} == {
         "timestep": .05, "action_repeat": 1, "max_speed": 8., "lidar_beams": 108, "lidar_range": 10.}
@@ -287,6 +309,17 @@ def test_serial_profiling_presets_keep_production_settings_separate(algorithm, t
     assert overridden["experiment"]["total_steps"] == 9
     assert overridden["training_defaults"]["device"] == "cuda"
     assert load_and_expand_scenario(production_path) == production
+
+
+def test_map_provenance_uses_explicit_geometry_paths(tmp_path):
+    from core.provenance import collect_map_protocols
+    config = load_and_expand_scenario(PRETRAIN)
+    centerline = tmp_path / "custom_centerline.csv"
+    centerline.write_text("custom geometry fingerprint\n")
+    config["environment"].update(centerline_csv=str(centerline), walls_autoload=False)
+    assets = collect_map_protocols(config["environment"])["circle_map"]["assets"]
+    assert assets["centerline"] == dict(path=str(centerline), sha256=hashlib.sha256(centerline.read_bytes()).hexdigest())
+    assert "walls" not in assets
 
 
 @pytest.mark.parametrize("path", [path for path in GOLDEN if "completion" in path])

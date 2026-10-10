@@ -37,5 +37,12 @@ def validate_resume_experiment(metadata, scenario):
     fields = ("algorithm", "network", "environment", "agents", "controllers", "maps", "evaluation", "mappo")
     validate_checkpoint_compatibility(stored, {key: scenario[key] for key in fields if key in scenario})
     validate_checkpoint_compatibility(stored["experiment"], {"seed": scenario["experiment"].get("seed")})
-    validate_checkpoint_compatibility(metadata["provenance"], {
-        "map_protocols": collect_map_protocols(scenario["environment"])})
+    current_maps = collect_map_protocols(scenario["environment"])
+    stored_provenance = metadata["provenance"]
+    # Older provenance only recorded YAML. Retain those checks without making
+    # additive geometry metadata invalidate otherwise compatible recovery.
+    if stored_provenance.get("version") in (None, "1.0"):
+        for name, details in stored_provenance.get("map_protocols", {}).items():
+            if "assets" not in details and name in current_maps:
+                current_maps[name].pop("assets", None)
+    validate_checkpoint_compatibility(stored_provenance, {"map_protocols": current_maps})

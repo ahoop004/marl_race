@@ -104,7 +104,9 @@ class TorchRLPPOAgent(PPOPolicy):
             raise TypeError("TorchRL PPO requires a TensorDict rollout")
         if not rollout.batch_size.numel():
             return
-        data = rollout.to(self.device).clone()
+        profile = getattr(self, "profile_call", None)
+        data = (profile("tensor_transfer", lambda: rollout.to(self.device).clone(), device=self.device)
+                if profile else rollout.to(self.device).clone())
         environment_steps = data.numel()
         if ("agents", "observation") in data.keys(True):
             data["observation"] = data["agents", "observation"].squeeze(-2)
@@ -131,7 +133,9 @@ class TorchRLPPOAgent(PPOPolicy):
         data = torch.cat(self._pending_batches, dim=0)
         self._pending_batches.clear()
         self._pending_steps = 0
-        metrics = optimize_ppo(self, data)
+        profile = getattr(self, "profile_call", None)
+        metrics = (profile("optimization", optimize_ppo, self, data, device=self.device)
+                   if profile else optimize_ppo(self, data))
         metrics["train/rollout_agent_samples"] = data.numel()
         metrics["train/rollout_steps"] = self._pending_environment_steps
         self._pending_environment_steps = 0

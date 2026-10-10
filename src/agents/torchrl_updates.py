@@ -66,7 +66,9 @@ def optimize_ppo(agent, data, *, group=None):
                                      entropy.detach(), kl)))
         if early_stop:
             break
-    metrics = mean_update_metrics(rows)
+    profile = getattr(agent, "profile_call", None)
+    metrics = (profile("tensor_transfer", mean_update_metrics, rows, device=agent.device)
+               if profile else mean_update_metrics(rows))
     log_stds = [p.detach().reshape(-1) for name, p in agent.actor.named_parameters()
                 if name == "log_std" or name.endswith(".log_std") or name.startswith("log_stds.")]
     metrics.update({

@@ -4,6 +4,14 @@
 **Branch:** `main`  
 **Scope:** Serial, single-environment PPO/MAPPO using TorchRL
 
+**Completion status:** Tasks 1–13 complete.
+
+- Task 11: Optional exclusive stage timing, initialization/warm-up separation, and environment/physics/learner/optimizer throughput are recorded through existing metrics. Enable detailed timing with `--set execution.experiment.measure_stages=true` on a serial profile. The first update is warm-up by default and counts toward the training budget.
+- Task 12: Startup provenance records runtime versions, devices, threads, seeds, model contracts, configuration hashes, and map image/centerline/wall hashes. Older checkpoints retain their existing YAML recovery checks; new checkpoints also verify recorded geometry.
+- Task 13: Targeted validation passed: 202 tests, 2 CUDA checks skipped because CUDA is unavailable. Final timing follow-up: 30 tests passed. Nine-decision PPO/MAPPO smoke runs verified finite losses, actor/critic updates, checkpoint artifacts, counters, stage timings, and metadata. Smoke-only overrides used smaller networks and rollouts; profiling defaults remain unchanged.
+
+**Remaining constraints:** Detailed CUDA timing synchronizes stage boundaries and is disabled by default. Warm-up spans the configured first update(s), so steady-state statistics require a longer budget. Production PPO transfer from the current pretraining checkpoint requires `--max-speed 8` to match its strict wheel-speed contract. No full training experiments or expensive benchmarks were run.
+
 ## Agent guidelines
 
 - Reuse existing modules, classes, and configuration mechanisms wherever possible.

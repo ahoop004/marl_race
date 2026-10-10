@@ -1,5 +1,7 @@
 """Direct TorchRL collection and a small shared PPO/MAPPO update loop."""
 import time
+from contextlib import ExitStack
+from functools import wraps
 
 import torch
 from torchrl.collectors import Collector
@@ -24,7 +26,8 @@ class _CollectionBoundary:
 
 class OnPolicyTrainer:
     def __init__(self, task, agent, *, hooks=None, render=False, run_id="run",
-                 focal_agent_id=None, algorithm=None, measure_services=False):
+                 focal_agent_id=None, algorithm=None, measure_services=False,
+                 measure_stages=False, profiling_warmup_updates=1):
         self.task, self.agent = task, agent
         self.algorithm = algorithm or ("mappo" if hasattr(agent, "global_state_dim") else "ppo")
         if self.algorithm not in {"ppo", "mappo"}:
@@ -34,6 +37,18 @@ class OnPolicyTrainer:
             raise ValueError("measure_services must be a boolean")
         self.measure_services = measure_services
         self.service_seconds = dict(logging=0.0, evaluation=0.0, checkpoint=0.0)
+        if type(measure_stages) is not bool:
+            raise ValueError("measure_stages must be a boolean")
+        if type(profiling_warmup_updates) is not int or profiling_warmup_updates < 0:
+            raise ValueError("profiling_warmup_updates must be a nonnegative integer")
+        self.measure_stages = measure_stages
+        self.profiling_warmup_updates = profiling_warmup_updates
+        self.stage_seconds = {phase: {} for phase in ("initialization", "warmup", "steady")}
+        self.stage_calls = {phase: {} for phase in self.stage_seconds}
+        self._timing_phase = "initialization"
+        self.initialization_seconds = 0.0
+        self._run_started = self._run_finished = self._steady_started = None
+        self._rate_baseline = self._steady_baseline = None
         self.trainable_ids = list(task.possible_agents)
         self.focal_id = focal_agent_id or self.trainable_ids[0]
         if self.focal_id not in self.trainable_ids:
@@ -76,6 +91,97 @@ class OnPolicyTrainer:
         finally:
             nested = sum(self.service_seconds.values()) - previous
             self.service_seconds[category] += max(0.0, time.perf_counter() - started - nested)
+
+    def _stage_total(self):
+        return sum(sum(values.values()) for values in self.stage_seconds.values())
+
+    def measure_stage(self, category, callback, *args, device=None, **kwargs):
+        """Exclusive wall time; detailed CUDA timing synchronizes at stage boundaries."""
+        if not self.measure_stages:
+            return callback(*args, **kwargs)
+        phase = self._timing_phase
+        if device is not None:
+            synchronize_device(device)
+        previous = self._stage_total() + sum(self.service_seconds.values())
+        started = time.perf_counter()
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            if device is not None:
+                synchronize_device(device)
+            nested = self._stage_total() + sum(self.service_seconds.values()) - previous
+            values, calls = self.stage_seconds[phase], self.stage_calls[phase]
+            values[category] = values.get(category, 0.0) + max(0.0, time.perf_counter() - started - nested)
+            calls[category] = calls.get(category, 0) + 1
+
+    def _instrument_stages(self, resources):
+        # Only measured runs install wrappers. Restore existing instance methods
+        # when collection ends; no global patches or private Collector state.
+        def instrument(owner, name, category, device=None):
+            original = getattr(owner, name, None)
+            if original is None:
+                return
+            own_value = vars(owner).get(name)
+            had_value = name in vars(owner)
+            @wraps(original)
+            def timed(*args, **kwargs):
+                return self.measure_stage(category, original, *args, device=device, **kwargs)
+            setattr(owner, name, timed)
+            def restore():
+                if had_value:
+                    setattr(owner, name, own_value)
+                else:
+                    delattr(owner, name)
+            resources.callback(restore)
+
+        instrument(self.env, "step", "environment_step")
+        instrument(self.env, "reset", "environment_reset")
+        instrument(self.env, "_output", "tensor_transfer")
+        instrument(self.agent.collection_policy, "forward", "policy_inference", self.agent.device)
+        instrument(self.agent.gae, "forward", "gae", self.agent.device)
+        for composer in (*self.task.obs_composers.values(), *self.task.reward_composers.values()):
+            instrument(composer, "wrap" if hasattr(composer, "wrap") else "compute", "observation_reward")
+        for controller in self.task.fixed_controllers.values():
+            instrument(controller, "act", "fixed_controller")
+        for name in ("_split_obs", "_update_centerline_observation_facts", "_attach_central_state"):
+            instrument(self.task.env, name, "observation_reward")
+        simulator = getattr(self.task.env, "sim", None)
+        if simulator is not None:
+            instrument(simulator, "step", "physics")
+            instrument(simulator, "refresh_scans", "lidar")
+            instrument(simulator.scan_simulator, "scan", "lidar")
+            for vehicle in simulator.agents:
+                instrument(vehicle, "ray_cast_agents", "lidar")
+        self.agent.profile_call = self.measure_stage
+        self.env.profile_call = self.measure_stage
+        resources.callback(setattr, self.agent, "profile_call", None)
+        resources.callback(setattr, self.env, "profile_call", None)
+
+    def _rate_counters(self):
+        return (self._environment_steps, self._physics_steps, self._agent_steps, self._optimizer_steps)
+
+    def performance_metrics(self):
+        if self._run_started is None:
+            return {}
+        now = self._run_finished or time.perf_counter()
+        elapsed = max(now - self._run_started, 1e-9)
+        names = ("environment_steps", "physics_steps", "learner_samples", "optimizer_steps")
+        result = {f"perf/{name}_per_second": (value - base) / elapsed
+                  for name, value, base in zip(names, self._rate_counters(), self._rate_baseline)}
+        result["perf/elapsed_seconds"] = elapsed
+        result["perf/end_to_end_env_steps_per_second"] = result["perf/environment_steps_per_second"]
+        if self.measure_stages:
+            result.update({f"perf/stages/{phase}/{name}_seconds": seconds
+                for phase, values in self.stage_seconds.items() for name, seconds in values.items()})
+            result.update({f"perf/stages/{phase}/{name}_calls": calls
+                for phase, values in self.stage_calls.items() for name, calls in values.items()})
+            result["perf/initialization_seconds"] = self.initialization_seconds + sum(self.stage_seconds["initialization"].values())
+            result["perf/warmup_seconds"] = sum(self.stage_seconds["warmup"].values())
+            if self._steady_started is not None:
+                duration = max(now - self._steady_started, 1e-9)
+                result.update({f"perf/steady_{name}_per_second": (value - base) / duration
+                    for name, value, base in zip(names, self._rate_counters(), self._steady_baseline)})
+        return result
 
     def call_hook(self, hook, method, *args):
         callback = getattr(hook, method, None)
@@ -157,6 +263,9 @@ class OnPolicyTrainer:
             setter(completed / max(total, 1))
 
     def train(self, n_episodes=0, *, total_steps=None):
+        self._run_started, self._run_finished = time.perf_counter(), None
+        self._rate_baseline = self._rate_counters()
+        self._initial_updates = self._updates
         if total_steps is not None and (type(total_steps) is not int or total_steps <= 0):
             raise ValueError("total_steps must be a positive integer")
         if total_steps is None and (type(n_episodes) is not int or n_episodes < 0):
@@ -177,8 +286,10 @@ class OnPolicyTrainer:
         self.env.on_reset = self.reports.reset
         self.env.on_decision = self.reports.decision
         self.env.on_physics_step = self.reports.physics
+        if self.measure_stages:
+            self.initialization_seconds += time.perf_counter() - self._run_started
         pending = []
-        started = collection_started = time.perf_counter()
+        collection_started = time.perf_counter()
         collection_service_seconds = sum(self.service_seconds.values())
         metrics = {}
         collector = None
@@ -196,14 +307,14 @@ class OnPolicyTrainer:
                 updated.update({
                     **self.counter_metrics(),
                     **self.service_metrics(),
+                    **self.performance_metrics(),
                     "train/update_environment_steps": self._environment_steps - update_environment_steps,
                     "train/update_physics_steps": self._physics_steps - update_physics_steps,
                     "train/update_agent_samples": self._agent_steps - update_agent_steps,
                     "perf/update_seconds": time.perf_counter() - update_started,
                     "perf/collection_seconds": max(0.0, update_started - collection_started - (
                         sum(self.service_seconds.values()) - collection_service_seconds)),
-                    "perf/elapsed_seconds": time.perf_counter() - started,
-                    "perf/end_to_end_env_steps_per_second": self._environment_steps / max(time.perf_counter() - started, 1e-9)})
+                })
                 update_environment_steps = self._environment_steps
                 update_physics_steps = self._physics_steps
                 update_agent_steps = self._agent_steps
@@ -222,15 +333,20 @@ class OnPolicyTrainer:
             self._set_progress()
             synchronize_device(self.agent.device)
             update_started = time.perf_counter()
-            updated = self.agent.update(data)
+            updated = (self.measure_stage("update", self.agent.update, data, device=self.agent.device)
+                       if self.measure_stages else self.agent.update(data))
             # The trainer owns cadence, including final rollouts smaller than
             # the legacy PPO minimum used by direct update_rollouts callers.
             if not updated and getattr(self.agent, "_pending_batches", []):
-                updated = self.agent.flush_pending_update()
+                updated = (self.measure_stage("update", self.agent.flush_pending_update, device=self.agent.device)
+                           if self.measure_stages else self.agent.flush_pending_update())
             synchronize_device(self.agent.device)
             return report_update(updated, update_started)
 
+        stage_resources = ExitStack()
         try:
+            if self.measure_stages:
+                self._instrument_stages(stage_resources)
             require_source = getattr(self.agent, "_require_lora_source", None)
             if require_source:
                 require_source()
@@ -240,19 +356,31 @@ class OnPolicyTrainer:
                 # collector state, manual stepping, or artificial truncation.
                 if self._resume_state is not None:
                     self.env.set_seed(self._resume_state["recovery_seed"])
-                collector = Collector(
-                    self.env, self.agent.collection_policy, backend="direct",
-                    frames_per_batch=self.agent.frames_per_batch, total_frames=-1,
-                    policy_device=self.agent.device, env_device="cpu", storing_device="cpu",
-                    reset_at_each_iter=False, set_truncated=False, use_buffers=True,
-                    auto_register_policy_transforms=False,
-                    # Buffered interruption pads unused rows with traj_ids=-1.
-                    postproc=lambda batch: batch[batch["collector", "traj_ids"] >= 0],
-                    interruptor=_CollectionBoundary(self))
+                def create_collector():
+                    return Collector(
+                        self.env, self.agent.collection_policy, backend="direct",
+                        frames_per_batch=self.agent.frames_per_batch, total_frames=-1,
+                        policy_device=self.agent.device, env_device="cpu", storing_device="cpu",
+                        reset_at_each_iter=False, set_truncated=False, use_buffers=True,
+                        auto_register_policy_transforms=False,
+                        # Buffered interruption pads unused rows with traj_ids=-1.
+                        postproc=lambda batch: batch[batch["collector", "traj_ids"] >= 0],
+                        interruptor=_CollectionBoundary(self))
+                collector = (self.measure_stage("collector_initialize", create_collector)
+                             if self.measure_stages else create_collector())
+                self._timing_phase = "warmup" if self.profiling_warmup_updates else "steady"
+                if self.measure_stages and self._timing_phase == "steady":
+                    self._steady_started, self._steady_baseline = time.perf_counter(), self._rate_counters()
                 if self._resume_state is not None:
                     from agents.common.checkpoints import restore_rng
                     restore_rng(self._resume_state["rng"])
-                for data in collector:
+                iterator = iter(collector)
+                while True:
+                    try:
+                        data = (self.measure_stage("collector", next, iterator)
+                                if self.measure_stages else next(iterator))
+                    except StopIteration:
+                        break
                     self.checkpoint_ready = False
                     updated = False
                     metrics = {}
@@ -269,6 +397,10 @@ class OnPolicyTrainer:
                     self.reports.dispatch(metrics)
                     if updated:
                         checkpoint_boundary()
+                        if (self.measure_stages and self._timing_phase == "warmup"
+                                and self._updates - self._initial_updates >= self.profiling_warmup_updates):
+                            self._timing_phase = "steady"
+                            self._steady_started, self._steady_baseline = time.perf_counter(), self._rate_counters()
                     if self.budget_reached() or self._should_stop():
                         break
                 if not self._should_stop() and pending:
@@ -279,7 +411,9 @@ class OnPolicyTrainer:
             for hook in self.hooks:
                 self.call_hook(hook, "on_training_end")
         finally:
+            stage_resources.close()
             if collector is not None:
                 collector.shutdown()
             else:
                 self.env.close()
+            self._run_finished = time.perf_counter()

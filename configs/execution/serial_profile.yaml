@@ -3,6 +3,8 @@ experiment:
   seed: 42
   torch_threads: 1
   measure_services: true
+  measure_stages: false  # Opt in with execution.experiment.measure_stages=true.
+  profiling_warmup_updates: 1  # Included in the budget; separated from steady state.
 params:
   device: cpu  # CUDA: execution.params.device=cuda
 checkpoint_every_steps: null

@@ -4,6 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import os
+import platform
+from importlib.metadata import version
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping
@@ -11,9 +14,10 @@ from typing import Any, Dict, Iterable, Mapping
 import yaml
 
 from core.map_selection import resolve_bundle_yaml
+from utils.map_loader import resolve_map_asset_paths
 
 
-PROVENANCE_VERSION = "1.0"
+PROVENANCE_VERSION = "1.1"
 
 
 def physics_contract(environment: Mapping[str, Any]) -> dict | None:
@@ -61,27 +65,38 @@ def _configured_bundles(environment: Mapping[str, Any]) -> Iterable[str]:
         value = environment.get(key)
         if isinstance(value, str):
             bundles.add(value)
+    if not bundles and environment.get("map_yaml"):
+        bundles.add(str(environment["map_yaml"]))
     return sorted(bundle for bundle in bundles if bundle)
 
 
 def collect_map_protocols(environment: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Hash every configured map YAML and capture its finish-line contract."""
+    """Hash configured YAML, images, centerlines and walls once at startup."""
     map_root = Path(str(environment.get("map_dir") or environment.get("map_root") or "maps"))
     if not map_root.is_absolute():
         map_root = (Path.cwd() / map_root).resolve()
 
     protocols: Dict[str, Dict[str, Any]] = {}
+    hashes = {}
+    def asset_hash(path):
+        path = path.resolve()
+        if path not in hashes:
+            hashes[path] = _sha256_bytes(path.read_bytes()) if path.is_file() else None
+        return {"path": str(path), "sha256": hashes[path]}
     for bundle in _configured_bundles(environment):
         try:
             yaml_path = resolve_bundle_yaml(map_root, bundle)
         except FileNotFoundError:
             continue
-        metadata = yaml.safe_load(yaml_path.read_text()) or {}
+        yaml_bytes = yaml_path.read_bytes()
+        metadata = yaml.safe_load(yaml_bytes) or {}
         finish = (metadata.get("annotations") or {}).get("finish_line", {})
         protocols[bundle] = {
             "yaml_path": str(yaml_path),
-            "yaml_sha256": _sha256_bytes(yaml_path.read_bytes()),
+            "yaml_sha256": _sha256_bytes(yaml_bytes),
             "finish_line_version": int(finish.get("version", 1)),
+            "assets": {name: asset_hash(path) for name, path in
+                       resolve_map_asset_paths(map_root, yaml_path, metadata, environment).items()},
         }
     return protocols
 
@@ -116,15 +131,33 @@ def build_run_provenance(
     run_id: str,
     algorithm: str,
     trainable_agents: Iterable[str],
+    observation_contracts=None,
 ) -> Dict[str, Any]:
     """Build one JSON-safe provenance block after CLI overrides are applied."""
     source = Path(scenario_path).expanduser().resolve()
     environment = scenario.get("environment", {}) or {}
     experiment = scenario.get("experiment", {}) or {}
     repo_root = Path(__file__).resolve().parents[2]
+    import torch
+    trainable_agents = list(trainable_agents)
+    cuda_available = torch.cuda.is_available()
     return {
         "version": PROVENANCE_VERSION,
         "physics_contract": physics_contract(environment),
+        "observation_contracts": observation_contracts or {
+            aid: scenario.get("agents", {}).get(aid, {}).get("observation", {}) for aid in trainable_agents},
+        "runtime": {
+            "python": platform.python_version(), "platform": platform.platform(),
+            "machine": platform.machine(), "processor": platform.processor(), "cpu_count": os.cpu_count(),
+            "packages": {name: version(name) for name in ("torch", "torchrl", "tensordict", "numba")},
+            "torch_threads": torch.get_num_threads(), "torch_interop_threads": torch.get_num_interop_threads(),
+            "cuda": {"available": cuda_available, "runtime": torch.version.cuda,
+                "cudnn": torch.backends.cudnn.version(), "devices": [
+                    {"index": index, "name": torch.cuda.get_device_name(index),
+                     "capability": list(torch.cuda.get_device_capability(index)),
+                     "total_memory": torch.cuda.get_device_properties(index).total_memory}
+                    for index in range(torch.cuda.device_count() if cuda_available else 0)]},
+        },
         "behavior_contracts": {
             "fixed_opponent_episode_reset": "1.0",
             "seeded_map_schedule": "1.0",
@@ -143,7 +176,7 @@ def build_run_provenance(
         "scenario_source_sha256": _sha256_bytes(source.read_bytes()),
         "resolved_config_sha256": _canonical_config_hash(scenario),
         "seed": experiment.get("seed"),
-        "trainable_agents": list(trainable_agents),
+        "trainable_agents": trainable_agents,
         "target_laps": environment.get("target_laps", 1),
         "max_steps": environment.get("max_steps"),
         "training_total_steps": experiment.get("total_steps"),
@@ -174,13 +207,14 @@ def provenance_mismatches(
         if not isinstance(value, Mapping):
             return {}
         return {
-            str(name): details.get("yaml_sha256")
+            str(name): {"yaml": details.get("yaml_sha256"),
+                        "assets": {key: asset.get("sha256") for key, asset in details.get("assets", {}).items()}}
             for name, details in value.items()
             if isinstance(details, Mapping)
         }
 
     if map_hashes(stored.get("map_protocols")) != map_hashes(current.get("map_protocols")):
-        mismatches.append("map_protocols: configured map names or YAML hashes differ")
+        mismatches.append("map_protocols: configured map names, YAML or geometry hashes differ")
     return mismatches
 
 

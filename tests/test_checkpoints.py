@@ -83,7 +83,8 @@ def test_historical_and_arbitrary_object_checkpoints_have_no_loading_fallback(tm
         safe_load(path)
 
 
-def test_application_recovery_rejects_changed_map_yaml_hashes():
+@pytest.mark.parametrize("asset", ["yaml", "image", "centerline", "walls"])
+def test_application_recovery_rejects_changed_map_yaml_hashes(asset):
     from core.provenance import collect_map_protocols
     from core.scenario import load_and_expand_scenario
 
@@ -92,9 +93,23 @@ def test_application_recovery_rejects_changed_map_yaml_hashes():
         "map_protocols": collect_map_protocols(scenario["environment"])}}
     validate_resume_experiment(metadata, scenario)
     first = next(iter(metadata["provenance"]["map_protocols"].values()))
-    first["yaml_sha256"] = "changed_map_contents"
+    if asset == "yaml":
+        first["yaml_sha256"] = "changed_map_contents"
+    else:
+        first["assets"][asset]["sha256"] = "changed_map_contents"
     with pytest.raises(ValueError, match="map_protocols"):
         validate_resume_experiment(metadata, scenario)
+
+
+def test_old_provenance_recovers_with_its_existing_yaml_checks():
+    from core.provenance import collect_map_protocols
+    from core.scenario import load_and_expand_scenario
+    scenario = load_and_expand_scenario("scenarios/ppo_lap_completion_pretrain.yaml")
+    maps = collect_map_protocols(scenario["environment"])
+    for details in maps.values():
+        details.pop("assets")
+    validate_resume_experiment({"configuration": scenario, "provenance": {
+        "version": "1.0", "map_protocols": maps}}, scenario)
 
 
 def test_explicit_ppo_transfer_restores_models_with_fresh_optimizer_and_schedule(tmp_path):

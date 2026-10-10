@@ -1,6 +1,7 @@
 """Assemble one task and learner, then run training with owned resources."""
 from contextlib import ExitStack
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,7 @@ def run_training(scenario, args, console, scenario_dir, roles):
 
 
 def _run_training(scenario, args, console, scenario_dir, roles, resources):
+    initialization_started = time.perf_counter()
     agent_configs = scenario["agents"]
     exp_cfg = scenario["experiment"]
     env_cfg = scenario["environment"]
@@ -150,6 +152,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         run_id=run_id,
         algorithm=algorithm,
         trainable_agents=trainable_ids,
+        observation_contracts=spec.observation_contracts,
     )
     if learner.source_checkpoint:
         provenance["pretrained_source"] = learner.source_checkpoint
@@ -166,6 +169,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "update_device": str(learner.device),
         "torch_threads": exp_cfg.get("torch_threads", 1),
         "measure_services": exp_cfg.get("measure_services", False),
+        "measure_stages": exp_cfg.get("measure_stages", False),
+        "profiling_warmup_updates": exp_cfg.get("profiling_warmup_updates", 1),
     }
     provenance["algorithm_implementation"] = {
         "backend": "torchrl",
@@ -235,7 +240,10 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         console.print_info(f"Selection evaluation: {evaluator.episodes} fixed-seed races; "
                            f"completion={evaluator.completion}")
     trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id,
-                             measure_services=exp_cfg.get("measure_services", False))
+                             measure_services=exp_cfg.get("measure_services", False),
+                             measure_stages=exp_cfg.get("measure_stages", False),
+                             profiling_warmup_updates=exp_cfg.get("profiling_warmup_updates", 1))
+    trainer.initialization_seconds = time.perf_counter() - initialization_started
     if recovery_state is not None:
         trainer.restore_training_state(recovery_state)
     total_steps = exp_cfg.get("total_steps")
@@ -244,6 +252,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     console.print_info(f"Starting {algorithm.upper()} training for {budget}")
     options = {"total_steps": total_steps} if total_steps is not None else {}
     trainer.train(episodes, **options)
-    if trainer.measure_services:
+    if trainer.measure_services or trainer.measure_stages:
         # Include end-of-run service work, especially latest/final checkpoint saves.
-        csv_logger.save_summary({**trainer.checkpoint_progress(), **trainer.service_metrics()})
+        csv_logger.save_summary({**trainer.checkpoint_progress(), **trainer.service_metrics(),
+                                 **trainer.performance_metrics()})

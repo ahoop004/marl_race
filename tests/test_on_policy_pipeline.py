@@ -112,6 +112,48 @@ def test_service_timers_exclude_nested_work_and_record_failures(monkeypatch):
     assert training.service_seconds["checkpoint"] == 3.
 
 
+def test_stage_timers_are_exclusive_and_optional(monkeypatch):
+    training, _ = trainer(Capture(False))
+    monkeypatch.setattr("training.on_policy.time.perf_counter", lambda: pytest.fail("disabled timer read the clock"))
+    assert training.measure_stage("physics", lambda: 7) == 7
+    assert training._stage_total() == 0
+    training.measure_stages = True
+    training._timing_phase = "warmup"
+    ticks = iter([0., 1., 3., 5.])
+    monkeypatch.setattr("training.on_policy.time.perf_counter", lambda: next(ticks))
+    training.measure_stage("physics", lambda: training.measure_stage("lidar", lambda: None))
+    assert training.stage_seconds["warmup"] == dict(physics=3., lidar=2.)
+    assert training.stage_calls["warmup"] == dict(physics=1, lidar=1)
+
+
+def test_stage_profiling_preserves_updates_and_restores_instance_methods():
+    plain_capture, measured_capture = Capture(False), Capture(False)
+    plain, _ = trainer(plain_capture)
+    measured, _ = trainer(measured_capture)
+    measured.measure_stages = True
+    for module in ("actor", "critic"):
+        getattr(measured.agent, module).load_state_dict(getattr(plain.agent, module).state_dict())
+    rng = torch.random.get_rng_state()
+    plain.train(total_steps=9)
+    torch.random.set_rng_state(rng)
+    measured.train(total_steps=9)
+    assert plain.checkpoint_progress() == measured.checkpoint_progress()
+    for module in ("actor", "critic"):
+        for key, value in getattr(plain.agent, module).state_dict().items():
+            torch.testing.assert_close(value, getattr(measured.agent, module).state_dict()[key], rtol=0, atol=0)
+    stages = measured.stage_seconds
+    for phase in ("warmup", "steady"):
+        assert all(stages[phase][name] > 0 for name in ("collector", "environment_step", "policy_inference", "gae", "optimization", "tensor_transfer"))
+    assert measured.stage_calls["warmup"]["optimization"] == 1
+    assert measured.stage_calls["steady"]["optimization"] == 2
+    assert "forward" not in vars(measured.agent.collection_policy)
+    assert measured.agent.profile_call is None
+    metrics = measured.performance_metrics()
+    assert metrics["perf/initialization_seconds"] >= 0 and metrics["perf/warmup_seconds"] > 0
+    assert all(metrics[f"perf/{name}_per_second"] > 0 for name in (
+        "environment_steps", "physics_steps", "learner_samples", "optimizer_steps"))
+
+
 @pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
 def test_kl_gate_preserves_parameters_before_first_optimizer_step(algorithm):
     policy = agent(target_kl=1e-6) if algorithm == "ppo" else learner(target_kl=1e-6)

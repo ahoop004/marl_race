@@ -117,6 +117,7 @@ def _run_evaluation(
             run_id="evaluation",
             algorithm=algorithm,
             trainable_agents=trainable_ids,
+            observation_contracts=spec.observation_contracts,
         )
         mismatches = provenance_mismatches(stored_provenance, current_provenance)
         if mismatches:
@@ -148,7 +149,8 @@ def _run_evaluation(
     from omegaconf import OmegaConf
     OmegaConf.save(OmegaConf.create(scenario), output_dir / "resolved_config.yaml")
     evaluation_provenance = build_run_provenance(scenario, scenario_path=args.scenario,
-        run_id=run_id, algorithm=algorithm, trainable_agents=trainable_ids)
+        run_id=run_id, algorithm=algorithm, trainable_agents=trainable_ids,
+        observation_contracts=spec.observation_contracts)
     all_agent_ids = list(getattr(env, "possible_agents", list(agent_configs)))
     opponent_ids = [aid for aid in all_agent_ids if aid not in trainable_set]
     target_id = str(focal_cfg.get("target_id", "") or "")

@@ -103,7 +103,9 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
         for rollout in rollouts:
             if not rollout.batch_size.numel():
                 continue
-            fragment = rollout.to(self.device).clone()
+            profile = getattr(self, "profile_call", None)
+            fragment = (profile("tensor_transfer", lambda: rollout.to(self.device).clone(), device=self.device)
+                        if profile else rollout.to(self.device).clone())
             with torch.no_grad():
                 self.gae(fragment)
             fragments.append(fragment)
@@ -120,7 +122,9 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
         if not n_samples:
             return {}
         samples = TensorDict({"agents": selected.unsqueeze(-1), "state": states[mask]}, [n_samples])
-        metrics = optimize_ppo(self, samples, group="agents")
+        profile = getattr(self, "profile_call", None)
+        metrics = (profile("optimization", optimize_ppo, self, samples, group="agents", device=self.device)
+                   if profile else optimize_ppo(self, samples, group="agents"))
         metrics["train/rollout_steps"] = data.numel()
         metrics["train/rollout_agent_samples"] = n_samples
         return metrics

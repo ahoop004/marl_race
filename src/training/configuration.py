@@ -40,6 +40,11 @@ def validate_training_scenario(scenario):
     agents = scenario["agents"]
     if type(experiment.get("measure_services", False)) is not bool:
         raise ScenarioError("experiment.measure_services must be boolean")
+    if type(experiment.get("measure_stages", False)) is not bool:
+        raise ScenarioError("experiment.measure_stages must be boolean")
+    warmup = experiment.get("profiling_warmup_updates", 1)
+    if type(warmup) is not int or warmup < 0:
+        raise ScenarioError("experiment.profiling_warmup_updates must be a nonnegative integer")
     logging_config = scenario.get("logging", {}) or {}
     if not isinstance(logging_config, dict) or type(logging_config.get("physics_episodes", True)) is not bool:
         raise ScenarioError("logging.physics_episodes must be boolean")

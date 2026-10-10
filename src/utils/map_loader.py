@@ -12,6 +12,24 @@ import yaml
 from PIL import Image
 
 
+def resolve_map_asset_paths(map_dir: Path, yaml_path: Path, metadata: Dict, env_cfg: Dict) -> Dict[str, Path]:
+    """Resolve the same image/geometry assets for loading and provenance."""
+    image = metadata.get("image")
+    fallback = env_cfg.get("map_image")
+    paths = {"image": ((yaml_path.parent / image).expanduser().resolve() if image else
+        (map_dir / fallback).expanduser().resolve() if fallback else
+        yaml_path.with_suffix(env_cfg.get("map_ext", ".png")))}
+    for name in ("centerline", "walls"):
+        explicit = env_cfg.get(f"{name}_csv")
+        auto = env_cfg.get(f"{name}_autoload", True)
+        if explicit or (name == "centerline" and explicit is not None) or auto is None or auto:
+            candidate = ((map_dir / Path(explicit)).resolve() if explicit else
+                         yaml_path.with_name(f"{yaml_path.stem}_{name}.csv"))
+            if candidate.is_file():
+                paths[name] = candidate
+    return paths
+
+
 def parse_surface_metadata(value: Any) -> Optional[Dict[str, Any]]:
     """Validate optional uniform surface metadata, without applying tire forces.
 
@@ -130,15 +148,8 @@ class MapLoader:
             metadata = cached.metadata
             spawn_points = cached.spawn_points
 
-        image_rel = metadata.get("image")
-        fallback_image = env_cfg.get("map_image")
-        if image_rel:
-            image_path = (map_yaml_path.parent / image_rel).expanduser().resolve()
-        elif fallback_image:
-            image_path = (map_dir / fallback_image).expanduser().resolve()
-        else:
-            map_ext = env_cfg.get("map_ext", ".png")
-            image_path = map_yaml_path.with_suffix(map_ext)
+        asset_paths = resolve_map_asset_paths(map_dir, map_yaml_path, metadata, env_cfg)
+        image_path = asset_paths["image"]
 
         if not image_path.exists():
             raise FileNotFoundError(f"Map image not found: {image_path}")
@@ -192,22 +203,7 @@ class MapLoader:
         if cached.spawn_points is not spawn_points:
             cached.spawn_points = spawn_points
 
-        centerline_path: Optional[Path] = None
-        explicit = env_cfg.get("centerline_csv")
-        auto_flag_raw = env_cfg.get("centerline_autoload", True)
-        auto_flag = True if auto_flag_raw is None else bool(auto_flag_raw)
-        centerline_enabled = auto_flag or explicit is not None
-        if centerline_enabled:
-            if explicit:
-                candidate_path = Path(explicit)
-                if candidate_path.is_absolute():
-                    candidate = candidate_path.resolve()
-                else:
-                    candidate = (map_dir / candidate_path).resolve()
-            else:
-                candidate = cached.yaml_path.with_name(f"{cached.yaml_path.stem}_centerline.csv")
-            if candidate.exists():
-                centerline_path = candidate
+        centerline_path = asset_paths.get("centerline")
 
         centerline: Optional[np.ndarray] = None
         if centerline_path is not None:
@@ -227,22 +223,8 @@ class MapLoader:
             else:
                 centerline = cached_cl
 
-        walls_path: Optional[Path] = None
+        walls_path = asset_paths.get("walls")
         walls: Optional[Dict[int, np.ndarray]] = None
-        walls_auto_raw = env_cfg.get("walls_autoload", True)
-        walls_auto = True if walls_auto_raw is None else bool(walls_auto_raw)
-        explicit_walls = env_cfg.get("walls_csv")
-        if explicit_walls or walls_auto:
-            if explicit_walls:
-                candidate_path = Path(explicit_walls)
-                if candidate_path.is_absolute():
-                    candidate = candidate_path.resolve()
-                else:
-                    candidate = (map_dir / candidate_path).resolve()
-            else:
-                candidate = cached.yaml_path.with_name(f"{cached.yaml_path.stem}_walls.csv")
-            if candidate.exists():
-                walls_path = candidate
 
         if walls_path is not None:
             wl_mtime = walls_path.stat().st_mtime_ns

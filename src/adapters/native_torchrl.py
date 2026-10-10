@@ -62,6 +62,7 @@ class NativeRaceTorchRLEnv(EnvBase):
         self.on_physics_step = None
         self.on_reset = None
         self.on_decision = None
+        self.profile_call = None
         self._pending_seed = None
         n, p = len(self.agent_ids), len(self.physical_agent_ids)
         self._observations = np.zeros((n, max(width[0] for width in widths)), dtype=np.float32)
@@ -151,8 +152,11 @@ class NativeRaceTorchRLEnv(EnvBase):
         if action.dtype != torch.float32:
             raise ValueError("agents.action must have dtype float32")
         active = set(self.snapshot.agents)
-        actions = {aid: action[i].detach().cpu().numpy().copy()
-                   for i, aid in enumerate(self.agent_ids) if aid in active}
+        def policy_actions():
+            return {aid: action[i].detach().cpu().numpy().copy()
+                    for i, aid in enumerate(self.agent_ids) if aid in active}
+        actions = (self.profile_call("tensor_transfer", policy_actions, device=action.device)
+                   if self.profile_call else policy_actions())
         # RaceTask validates all active actions before any composer/controller runs.
         result = self.task.step(actions, on_physics_step=self._on_physics_step)
         for i, aid in enumerate(self.agent_ids):
