@@ -1,8 +1,7 @@
 """Routed MAPPO policy setup, inference, transfer and checkpoint contracts."""
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -13,7 +12,7 @@ from agents.common.optimization import OnPolicyOptimizationSettings
 from agents.common.networks import build_actor, build_critic, resolve_network_config, route_actor
 from agents.common.lora import resolve_lora_config
 from agents.common.checkpoints import (
-    restore_policy_state, transfer_network_state, validate_network_checkpoint,
+    save_checkpoint, load_for_evaluation, initialize_from_checkpoint, resume_training,
 )
 from agents.common.observations import pack_observations
 from utils.torch_io import resolve_device
@@ -21,6 +20,9 @@ from utils.torch_io import resolve_device
 
 class MAPPOPolicy(OnPolicyOptimizationSettings):
     """Local actors and a centralized critic without rollout or update code."""
+
+    algorithm = "mappo"
+    implementation = "torchrl.mappo.v1"
 
     def __init__(
         self,
@@ -30,6 +32,7 @@ class MAPPOPolicy(OnPolicyOptimizationSettings):
         action_high: np.ndarray,
         agent_ids: List[str],
         params: Dict,
+        *, training: bool = False,
     ) -> None:
         if not agent_ids:
             raise ValueError("MAPPO requires at least one trainable agent ID.")
@@ -42,7 +45,7 @@ class MAPPOPolicy(OnPolicyOptimizationSettings):
         self.obs_dim = obs_dim = max(self.obs_dims.values())
         self.global_state_dim = global_state_dim
         self.global_state_contract_version = str(
-            params.get("_global_state_contract_version", "legacy_unspecified")
+            params.get("_global_state_contract_version", "unspecified")
         )
         self.action_low = np.asarray(action_low, dtype=np.float32)
         self.action_high = np.asarray(action_high, dtype=np.float32)
@@ -54,7 +57,6 @@ class MAPPOPolicy(OnPolicyOptimizationSettings):
             aid: self.observation_contract for aid in agent_ids})
         if set(self.observation_contracts) != set(agent_ids):
             raise ValueError("Observation contracts must name every learner")
-        self.pretrained_actor_observation_extension = params.get("pretrained_actor_observation_extension")
         self.agent_ids = list(agent_ids)
         self._agent_index = {aid: idx for idx, aid in enumerate(self.agent_ids)}
         self.actor_mode = str(params.get("actor_mode", "shared"))
@@ -66,7 +68,7 @@ class MAPPOPolicy(OnPolicyOptimizationSettings):
             raise ValueError("Different observation dimensions require per_agent LoRA")
         if self.actor_mode == "independent" and self.lora_config is not None:
             raise ValueError("Independent actors cannot also use LoRA; use shared with per_agent adapters")
-        self.pretrained_actor_source = None
+        self.source_checkpoint = None
         self._lora_ready = self.lora_config is None
 
         self.critic_mode = str(params.get("critic_mode", "agent_conditioned")).strip().lower()
@@ -155,7 +157,7 @@ class MAPPOPolicy(OnPolicyOptimizationSettings):
                 self.lora_contract["observation_dims"] = dict(self.obs_dims)
         self._optim_parameters = tuple(p for p in self.actor.parameters() if p.requires_grad) + tuple(
             self.critic.parameters())
-        self.optimizer = optim.Adam(self._optim_parameters, lr=self.lr)
+        self.optimizer = optim.Adam(self._optim_parameters, lr=self.lr) if training else None
 
     @property
     def per_agent_adapters(self) -> bool:
@@ -337,146 +339,7 @@ class MAPPOPolicy(OnPolicyOptimizationSettings):
             for index, agent_id in enumerate(ordered_ids)
         }
 
-    def load_pretrained_actor(self, path: str) -> None:
-        """Initialize actors from checkpoint weights, retaining critic and optimizer."""
-        from utils.torch_io import safe_load, validate_checkpoint_compatibility
-
-        ckpt = safe_load(path, map_location=self.device)
-        validate_network_checkpoint(ckpt, self.network_config, actor_only=True)
-        validate_checkpoint_compatibility(ckpt, {
-            "algorithm": "ppo",
-            "action_dim": self.action_dim,
-            "action_low": self.action_low,
-            "action_high": self.action_high,
-            "actor_hidden_dims": self.actor_hidden_dims,
-            "activation": self.activation,
-            "physics_contract": self.physics_contract,
-            "action_contract": self.action_contract,
-        })
-        if not isinstance(ckpt.get("actor"), Mapping):
-            raise ValueError("Pretrained PPO checkpoint has no actor state")
-        source_width = ckpt.get("obs_dim")
-        if isinstance(source_width, bool) or not isinstance(source_width, int) or source_width <= 0:
-            raise ValueError("Pretrained PPO checkpoint requires a positive obs_dim")
-        source_contract = ckpt.get("observation_contract")
-        for aid in self.agent_ids:
-            width = self.obs_dims[aid]
-            destination = self.observation_contracts[aid]
-            if source_width == width:
-                validate_checkpoint_compatibility(ckpt, {"observation_contract": destination})
-            elif source_width < width and self.pretrained_actor_observation_extension == "frenet_neighbors":
-                # Only appended neighbor inputs may extend the solo driving prefix.
-                from agents.common.observations import observation_layout
-                common, driving, total = observation_layout(source_contract)
-                dest_common, dest_driving, dest_total = observation_layout(destination)
-                if (source_width != driving or total != driving
-                        or dest_driving != driving or dest_total != width
-                        or not destination["observation"].get("frenet_neighbors", {}).get("enabled")):
-                    raise ValueError(f"Unsupported frenet_neighbors observation extension for {aid}")
-                validate_checkpoint_compatibility({"observation_prefix": common},
-                                                  {"observation_prefix": dest_common})
-            else:
-                raise ValueError(f"Unsupported pretrained observation width {source_width} → {width} for {aid}; "
-                                 "wider inputs require an explicit frenet_neighbors extension")
-
-        recipient = (self.actor.actors[self.agent_ids[0]]
-                     if self.actor_mode == "independent" else self.actor)
-        expected = (recipient.base_state_dict() if self.lora_config is not None
-                    else recipient.state_dict())
-        actor_state = transfer_network_state(
-            ckpt["actor"], expected, self.network_config,
-            source_width=source_width, expand_inputs=source_width < self.obs_dim,
-        )
-        validate_checkpoint_compatibility(ckpt, {}, states=[("actor", actor_state, expected)])
-        import hashlib
-        source = {
-            "path": str(Path(path).resolve()),
-            "algorithm": "ppo",
-            "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
-        }
-        # All contracts and tensors have passed before any model state changes.
-        if self.lora_config is not None:
-            self.actor.reset_adapters()
-            if self.lora_config.get("per_agent_log_std"):
-                actor_state.update({f"log_stds.{i}": actor_state["log_std"].clone()
-                                    for i in range(len(self.agent_ids))})
-            actor_state = {**self.actor.state_dict(), **actor_state}
-        if self.actor_mode == "independent":
-            for actor in self.actor.actors.values():
-                actor.load_state_dict(actor_state, strict=True)
-        else:
-            self.actor.load_state_dict(actor_state, strict=True)
-        self.pretrained_actor_source = source
-        self._lora_ready = True
-
-    def save(self, path: str) -> None:
-        self._require_lora_source()
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                **({"actors": {aid: actor.state_dict() for aid, actor in self.actor.actors.items()}}
-                   if self.actor_mode == "independent" else {"actor": self.actor.state_dict()}),
-                "actor_mode": self.actor_mode,
-                "actor_routing": dict(self._agent_index),
-                "advantage_normalization": ("per_agent" if self.routed_actor and self.team_return_mode == "per_agent" else "pooled"),
-                "critic": self.critic.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "algorithm": "mappo",
-                "network": self.network_config,
-                "agent_ids": self.agent_ids,
-                "obs_dim": self.obs_dim,
-                "obs_dims": self.obs_dims,
-                "action_dim": self.action_dim,
-                "action_low": self.action_low,
-                "action_high": self.action_high,
-                "action_contract": self.action_contract,
-                "physics_contract": self.physics_contract,
-                "observation_contract": self.observation_contract,
-                "observation_contracts": self.observation_contracts,
-                "global_state_dim": self.global_state_dim,
-                "global_state_contract_version": self.global_state_contract_version,
-                "critic_input_dim": self.critic_input_dim,
-                "critic_mode": self.critic_mode,
-                "reward_mode": self.reward_mode,
-                "team_reward_reduction": self.team_reward_reduction,
-                "team_return_mode": self.team_return_mode,
-                "actor_hidden_dims": self.actor_hidden_dims,
-                "critic_hidden_dims": self.critic_hidden_dims,
-                "activation": self.activation,
-                "lora_contract": self.lora_contract,
-                "pretrained_actor_source": self.pretrained_actor_source,
-            },
-            path,
-        )
-
-    def load(self, path: str, *, load_optimizer: bool = True) -> None:
-        from utils.torch_io import safe_load, validate_checkpoint_compatibility
-        ckpt = safe_load(path, map_location=self.device)
-        validate_network_checkpoint(ckpt, self.network_config)
-        fields = (
-            "actor_mode", "agent_ids", "actor_hidden_dims", "critic_hidden_dims",
-            "activation", "critic_mode", "global_state_dim", "global_state_contract_version",
-            "critic_input_dim", "obs_dim", "obs_dims", "observation_contract",
-            "observation_contracts", "action_dim", "action_low", "action_high",
-            "action_contract", "physics_contract", "lora_contract", "reward_mode",
-            "team_reward_reduction", "team_return_mode",
-        )
-        validate_checkpoint_compatibility(ckpt, {
-            "algorithm": "mappo", "actor_routing": self._agent_index,
-            **{field: getattr(self, field) for field in fields},
-        })
-        if self.actor_mode == "independent":
-            actors = ckpt.get("actors")
-            if not isinstance(actors, Mapping) or set(actors) != set(self.agent_ids):
-                raise ValueError("Checkpoint actors must name every learner")
-            if not all(isinstance(state, Mapping) for state in actors.values()):
-                raise ValueError("Checkpoint actors must contain complete actor states")
-            actor_state = {f"actors.{aid}.{key}": value
-                           for aid, state in actors.items() for key, value in state.items()}
-        else:
-            actor_state = ckpt.get("actor")
-        restore_policy_state(ckpt, self.actor, self.critic, self.optimizer,
-                             actor_state=actor_state, load_optimizer=load_optimizer)
-        self.pretrained_actor_source = ckpt.get("pretrained_actor_source")
-        self._lora_ready = True
-
+    save_checkpoint = save_checkpoint
+    load_for_evaluation = load_for_evaluation
+    initialize_from_checkpoint = initialize_from_checkpoint
+    resume_training = resume_training

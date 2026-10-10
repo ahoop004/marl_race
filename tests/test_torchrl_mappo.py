@@ -99,7 +99,7 @@ def test_budget_cut_bootstraps_one_shared_global_value(monkeypatch):
 
 
 @pytest.mark.parametrize("actor_mode", ["shared", "independent", "lora"])
-def test_native_update_routes_actors_and_retains_checkpoint_compatibility(actor_mode, tmp_path):
+def test_native_update_routes_actors_and_reloads_versioned_checkpoints(actor_mode, tmp_path):
     extra = {"actor_mode": actor_mode, "hidden_dims": [4]}
     if actor_mode == "lora":
         from agents.common.ppo_policy import PPOPolicy
@@ -108,10 +108,10 @@ def test_native_update_routes_actors_and_retains_checkpoint_compatibility(actor_
         extra["lora"] = {"mode": "per_agent", "rank": 1, "alpha": 2}
         solo = PPOPolicy(1, *BOUNDS, {"hidden_dims": [4], "device": "cpu"})
         source = tmp_path / "solo.pt"
-        solo.save(str(source))
+        solo.save_checkpoint(source)
     agent = learner(**extra)
     if actor_mode == "lora":
-        agent.load_pretrained_actor(str(source))
+        agent.initialize_from_checkpoint(source, scope="actor_only")
     data = torch.stack([transition(agent, ["car_1"], 0, 1, terminal=False),
                         transition(agent, ["car_1"], 1, 2, terminal=True)])
     before = {key: value.clone() for key, value in agent.actor.state_dict().items()}
@@ -122,19 +122,18 @@ def test_native_update_routes_actors_and_retains_checkpoint_compatibility(actor_
         assert all(torch.equal(before[key], value) for key, value in agent.actor.state_dict().items()
                    if key.startswith("actors.car_0."))
     path = tmp_path / "mappo.pt"
-    agent.save(str(path))
+    agent.save_checkpoint(path)
     evaluation_policy = MAPPOPolicy(1, 1, *BOUNDS, IDS, params(**extra))
-    evaluation_policy.load(str(path))
-    payload = torch.load(path, weights_only=False)
-    assert payload.pop("network")["architecture"] == "mlp"
-    torch.save(payload, path)
-    evaluation_policy.load(str(path))
+    evaluation_policy.load_for_evaluation(path)
+    assert evaluation_policy.optimizer is None
+    payload = torch.load(path, weights_only=True)
+    assert payload["metadata"]["network"]["architecture"] == "mlp"
+    assert payload["metadata"]["structure"]["routing"] == {
+        aid: (index if actor_mode == "independent" else 0) for index, aid in enumerate(IDS)}
     expected, _ = agent.act_batch(IDS, np.zeros((2, 1), dtype=np.float32), deterministic=True)
     actual, _ = evaluation_policy.act_batch(IDS, np.zeros((2, 1), dtype=np.float32), deterministic=True)
     for aid in IDS:
         np.testing.assert_array_equal(actual[aid], expected[aid])
-    evaluation_policy.save(str(path))
-    agent.load(str(path))
 
 
 def test_native_training_preserves_team_rewards_and_fixed_only_continuation():
@@ -197,7 +196,7 @@ def test_native_fragments_preserve_masks_and_bootstrap_independently(actor_mode,
 
 
 @pytest.mark.parametrize("actor_mode", ["shared", "independent", "lora"])
-def test_legacy_ppo_transfer_extends_inputs_keeps_fresh_critic_and_updates(actor_mode, tmp_path):
+def test_ppo_transfer_extends_inputs_keeps_fresh_critic_and_updates(actor_mode, tmp_path):
     from pathlib import Path
     from agents.common.ppo_policy import PPOPolicy
     from core.scenario import load_and_expand_scenario
@@ -212,11 +211,8 @@ def test_legacy_ppo_transfer_extends_inputs_keeps_fresh_critic_and_updates(actor
         assert composer.obs_dim == (158 if len(contracts) == 1 else 192)
     source = PPOPolicy(158, *BOUNDS, {"hidden_dims": [8], "device": "cpu",
                                     "_observation_contract": contracts[0]})
-    path = tmp_path / "legacy-ppo.pt"
-    source.save(str(path))
-    checkpoint = torch.load(path, weights_only=False)
-    checkpoint.pop("network")
-    torch.save(checkpoint, path)
+    path = tmp_path / "ppo.pt"
+    source.save_checkpoint(path)
     options = params(hidden_dims=[8], vf_hidden_dims=[6],
                      actor_mode="shared" if actor_mode == "lora" else actor_mode,
                      _observation_contract=contracts[1],
@@ -225,7 +221,7 @@ def test_legacy_ppo_transfer_extends_inputs_keeps_fresh_critic_and_updates(actor
         options["lora"] = {"mode": "per_agent", "rank": 2, "per_agent_log_std": True}
     agent = TorchRLMAPPOAgent(192, 3, *BOUNDS, IDS, options)
     fresh_critic = {key: value.clone() for key, value in agent.critic.state_dict().items()}
-    agent.load_pretrained_actor(str(path))
+    agent.initialize_from_checkpoint(path, scope="actor_only", observation_extension="frenet_neighbors")
     assert all(torch.equal(value, fresh_critic[key]) for key, value in agent.critic.state_dict().items())
     assert not agent.optimizer.state
     observations = torch.randn(2, 192)

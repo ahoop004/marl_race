@@ -1,5 +1,5 @@
 mode: lora
-checkpoint: ${paths.project_root}/outputs/pretrain/best_model.pt
+checkpoint: ${paths.project_root}/outputs/pretrain/best.pt
 load_scope: ${algorithm.transfer_scope}
 actor_sharing: shared
 observation_extension: ${algorithm.observation_extension}

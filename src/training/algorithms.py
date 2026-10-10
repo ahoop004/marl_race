@@ -39,8 +39,8 @@ def select_algorithm(scenario, policy_agents):
 def learner_params(scenario, spec, algorithm):
     focal = spec.agent_ids[0]
     params = resolve_training_params(scenario["agents"][focal], scenario)
-    params["_observation_contract"] = (
-        spec.observation_contracts[focal] if params["_physics_contract"] is not None else None)
+    params["_agent_ids"] = list(spec.agent_ids)
+    params["_observation_contract"] = spec.observation_contracts[focal]
     if algorithm == "mappo":
         params.update(resolve_mappo_config(scenario))
         params.update(_observation_dims=spec.observation_dims,

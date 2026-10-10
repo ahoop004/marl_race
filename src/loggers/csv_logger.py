@@ -40,6 +40,7 @@ class CSVLogger:
         scenario_config: Optional[Dict[str, Any]] = None,
         provenance: Optional[Dict[str, Any]] = None,
         enabled: bool = True,
+        append: bool = False,
     ):
         """Initialize CSV logger.
 
@@ -50,6 +51,7 @@ class CSVLogger:
         """
         self.output_dir = Path(output_dir)
         self.enabled = enabled
+        self.append = append
         self.scenario_config = scenario_config
         self.provenance = dict(provenance or {})
         self._tables = {}
@@ -177,12 +179,19 @@ class CSVLogger:
         path = self.output_dir / filename
         stream = self._jsonl.get(path)
         if stream is None:
-            stream = self._jsonl[path] = path.open("w", encoding="utf-8")
+            stream = self._jsonl[path] = path.open("a" if self.append else "w", encoding="utf-8")
         stream.write(json.dumps(row, sort_keys=True) + "\n")
         self._maybe_flush()
 
     def _write_row(self, path: Path, row: Dict[str, Any]):
-        table = self._tables.setdefault(path, {"fields": [], "pending": [], "stream": None})
+        if path not in self._tables:
+            fields, stream = [], None
+            if self.append and path.exists() and path.stat().st_size:
+                with path.open(newline="") as previous:
+                    fields = next(csv.reader(previous))
+                stream = path.open("a", newline="")
+            self._tables[path] = {"fields": fields, "pending": [], "stream": stream}
+        table = self._tables[path]
         table["pending"].append(dict(row))
         self._maybe_flush()
 

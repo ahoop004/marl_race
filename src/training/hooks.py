@@ -265,99 +265,67 @@ class CSVHook(TrainingHook):
 
 
 class CheckpointHook(TrainingHook):
-    """Saves agent checkpoints periodically and on best reward."""
+    """Atomically save latest recovery state and the final budget model."""
 
-    def __init__(
-        self,
-        agent: Any,
-        output_dir: str,
-        save_every: int = 100,
-        provenance: Optional[Dict[str, Any]] = None,
-        save_best_training_reward: bool = True,
-        save_every_steps: Optional[int] = None,
-        save_final: bool = False,
-    ) -> None:
+    def __init__(self, agent, output_dir, *, provenance=None, configuration=None,
+                 save_every_steps=None, save_every_updates=None):
         from pathlib import Path
         self._agent = agent
         self._dir = Path(output_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
-        self._save_every = max(1, save_every)
-        self._best_reward = float("-inf")
-        self._recent_rewards: Deque[float] = deque(maxlen=50)
         self._provenance = dict(provenance or {})
-        self._save_best_training_reward = bool(save_best_training_reward)
-        self._save_final = bool(save_final)
-        if save_every_steps is not None and (isinstance(save_every_steps, bool)
-                or not isinstance(save_every_steps, int) or save_every_steps <= 0):
-            raise ValueError("save_every_steps must be a positive integer")
-        self._save_every_steps = save_every_steps
-        self._next_save_step = save_every_steps
-        self._environment_steps = 0
-        self._policy_version = 0
+        self._configuration = dict(configuration or {})
+        for name, value in (("save_every_steps", save_every_steps), ("save_every_updates", save_every_updates)):
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"{name} must be a positive integer")
+        self._save_every_steps, self._save_every_updates = save_every_steps, save_every_updates
+        self._environment_steps = self._policy_version = self._latest_update = 0
+        self._due = False
+        self._trainer = None
 
-    def on_update(self, metrics: Dict[str, float]) -> None:
-        self._environment_steps = int(metrics.get("train/environment_steps", self._environment_steps))
-        self._policy_version = int(metrics.get("train/updates", self._policy_version + 1))
-        if self._next_save_step is not None and self._environment_steps >= self._next_save_step:
-            self._save(self._dir / f"checkpoint_step{self._environment_steps:09d}.pt",
-                       metadata={"environment_steps": self._environment_steps,
-                                 "policy_version": self._policy_version})
-            self._next_save_step = (self._environment_steps // self._save_every_steps + 1) * self._save_every_steps
+    def bind_trainer(self, trainer):
+        self._trainer = trainer
 
-    def on_training_end(self) -> None:
-        if self._save_every_steps is not None or self._save_final:
-            self._save(self._dir / "final_model.pt",
-                       metadata={"environment_steps": self._environment_steps,
-                                 "policy_version": self._policy_version})
+    def state_dict(self):
+        return {"latest_update": self._latest_update}
 
-    def _save(self, path: Any, metadata: Optional[Dict[str, Any]] = None) -> None:
-        """Save atomically enough to preserve the original agent checkpoint on error."""
-        if not self._provenance and not metadata:
-            self._agent.save(str(path))
+    def load_state_dict(self, state):
+        self._latest_update = state["latest_update"]
+
+    def on_update(self, metrics):
+        previous_steps, previous_updates = self._environment_steps, self._policy_version
+        self._environment_steps = int(metrics["train/environment_steps"])
+        self._policy_version = int(metrics["train/updates"])
+        self._due = ((self._save_every_steps is not None and
+                      self._environment_steps // self._save_every_steps > previous_steps // self._save_every_steps)
+                     or (self._save_every_updates is not None and
+                         self._policy_version // self._save_every_updates > previous_updates // self._save_every_updates))
+
+    def on_checkpoint_boundary(self):
+        if self._due:
+            self._latest_update = self._policy_version
+            self._save(self._dir / "latest.pt", resumable=True)
+            self._due = False
+
+    def on_training_end(self):
+        if self._trainer is None:
             return
+        if self._trainer.checkpoint_ready and self._policy_version > self._latest_update:
+            self._latest_update = self._policy_version
+            self._save(self._dir / "latest.pt", resumable=True)
+        if self._trainer.budget_reached():
+            self._save(self._dir / "final.pt")
 
-        import torch
-        from pathlib import Path
-        from utils.torch_io import safe_load
-
-        target = Path(path)
-        unannotated = target.with_name(f".{target.name}.unannotated")
-        annotated = target.with_name(f".{target.name}.annotated")
-        try:
-            self._agent.save(str(unannotated))
-            checkpoint = safe_load(str(unannotated), map_location="cpu")
-            if not isinstance(checkpoint, dict):
-                raise TypeError("Agent checkpoint must be a dictionary to attach provenance.")
-            if self._provenance:
-                checkpoint["provenance"] = dict(self._provenance)
-            if metadata:
-                checkpoint.update(metadata)
-            torch.save(checkpoint, annotated)
-            annotated.replace(target)
-        finally:
-            unannotated.unlink(missing_ok=True)
-            annotated.unlink(missing_ok=True)
-
-    def on_episode_end(self, episode: int, reward: float, info: Dict, metrics: Dict) -> None:
-        if self._save_every_steps is not None:
-            return
-        self._recent_rewards.append(reward)
-        mean = float(np.mean(self._recent_rewards))
-
-        if episode % self._save_every == 0:
-            self._save(self._dir / f"checkpoint_ep{episode:06d}.pt")
-
-        if (
-            self._save_best_training_reward
-            and mean > self._best_reward
-            and len(self._recent_rewards) >= 10
-        ):
-            self._best_reward = mean
-            self._save(self._dir / "best_model.pt")
+    def _save(self, path, *, selection=None, resumable=False):
+        training = self._trainer.checkpoint_state() if resumable else None
+        progress = self._trainer.checkpoint_progress() if self._trainer else {
+            "environment_steps": self._environment_steps, "updates": self._policy_version}
+        self._agent.save_checkpoint(path, provenance=self._provenance, configuration=self._configuration,
+                                    progress=progress, selection=selection, training_state=training)
 
 
 class EvaluationCheckpointHook(CheckpointHook):
-    """Select ``best_model.pt`` using deterministic racing outcomes.
+    """Select ``best.pt`` using deterministic racing outcomes.
 
     Completion selection uses earned progress, clean finishes and lap times.
     Outcomes come from simulator facts rather than reward values.
@@ -374,17 +342,12 @@ class EvaluationCheckpointHook(CheckpointHook):
         wandb_logger: Optional[WandbLogger] = None,
         selection_strategy: str = "completion_progress",
         evaluate_every_steps: Optional[int] = None,
+        configuration: Optional[Dict[str, Any]] = None,
     ) -> None:
         if selection_strategy not in EVALUATION_STRATEGIES:
             raise ValueError(f"Unknown checkpoint selection strategy: {selection_strategy!r}")
         self._selection_strategy = selection_strategy
-        super().__init__(
-            agent=agent,
-            output_dir=output_dir,
-            save_every=2**63 - 1,
-            provenance=provenance,
-            save_best_training_reward=False,
-        )
+        super().__init__(agent, output_dir, provenance=provenance, configuration=configuration)
         self._evaluator = evaluator
         self._evaluate_every = max(1, int(evaluate_every))
         if evaluate_every_steps is not None and (isinstance(evaluate_every_steps, bool)
@@ -401,6 +364,23 @@ class EvaluationCheckpointHook(CheckpointHook):
         self._policy_version = 0
         if console is not None and selection_strategy == "team_completion":
             console.print_info("Checkpoint priority: " + self.selection_priority(selection_strategy))
+
+    def on_checkpoint_boundary(self):
+        pass
+
+    def on_training_end(self):
+        pass
+
+    def state_dict(self):
+        return {"best_score": self._best_score, "evaluation_count": self._evaluation_count,
+                "evaluation_seconds": self.evaluation_seconds}
+
+    def load_state_dict(self, state):
+        self._best_score = state["best_score"]
+        self._evaluation_count = state["evaluation_count"]
+        self.evaluation_seconds = state["evaluation_seconds"]
+        if self._evaluate_every_steps is not None:
+            self._next_evaluation_step = (self._environment_steps // self._evaluate_every_steps + 1) * self._evaluate_every_steps
 
     @staticmethod
     def selection_priority(strategy):
@@ -533,8 +513,8 @@ class EvaluationCheckpointHook(CheckpointHook):
         if is_best:
             self._best_score = score
             self._save(
-                self._dir / "best_model.pt",
-                metadata={"checkpoint_selection": record},
+                self._dir / "best.pt",
+                selection=record,
             )
 
 

@@ -36,7 +36,7 @@ class _CentralValue(torch.nn.Module):
 
 class TorchRLMAPPOAgent(MAPPOPolicy):
     def __init__(self, obs_dim, global_state_dim, action_low, action_high, agent_ids, params):
-        super().__init__(obs_dim, global_state_dim, action_low, action_high, agent_ids, params)
+        super().__init__(obs_dim, global_state_dim, action_low, action_high, agent_ids, params, training=True)
         if (self.critic_mode != "shared_team" or self.reward_mode != "team_shared"
                 or self.team_return_mode != "joint"):
             raise ValueError("TorchRL MAPPO requires shared_team critic, team_shared rewards and joint team returns")

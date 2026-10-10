@@ -1,13 +1,12 @@
 """Assemble one task and learner, then run training with owned resources."""
 from contextlib import ExitStack
-import hashlib
 import os
 from pathlib import Path
 from typing import Optional
 
-from application.checkpoints import resolve_checkpoint_path, resolve_scenario_relative_path
+from application.checkpoints import resolve_checkpoint_path, resolve_scenario_relative_path, validate_resume_experiment
+from agents.common.checkpoints import read_checkpoint
 from core.task_builder import create_race_task
-from training.algorithms import resolve_training_params
 from core.run_id import resolve_run_id, set_run_id_env
 from core.provenance import build_run_provenance
 from loggers.csv_logger import CSVLogger
@@ -30,8 +29,13 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     exp_cfg = scenario["experiment"]
     env_cfg = scenario["environment"]
     trainable_ids = list(roles.policy_agents)
+    resume_path = scenario.get("checkpoint", {}).get("resume")
+    resume_path = resolve_checkpoint_path(resume_path, operation="resume") if resume_path else None
+    resume_payload = read_checkpoint(resume_path) if resume_path else None
+    if resume_payload:
+        validate_resume_experiment(resume_payload["metadata"], scenario)
     initial_checkpoint = None
-    if args.checkpoint:
+    if args.checkpoint and not resume_path:
         if len(trainable_ids) != 1 or str(
             agent_configs[trainable_ids[0]]["algorithm"]
         ).strip().lower() != "ppo":
@@ -40,14 +44,13 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
 
     rl_agent_id = trainable_ids[0]
     algorithm = select_algorithm(scenario, trainable_ids)
-    agent_cfg = agent_configs[rl_agent_id]
 
-    run_id = args.run_id or resolve_run_id(
+    run_id = args.run_id or (resume_payload["metadata"]["provenance"].get("run_id") if resume_payload else None) or resolve_run_id(
         scenario_name=exp_cfg.get("name"),
         algorithm=algorithm,
         seed=exp_cfg.get("seed"),
     )
-    output_dir = args.output_dir or os.path.join(
+    output_dir = args.output_dir or (str(resume_path.parent) if resume_path else None) or os.path.join(
         scenario.get("paths", {}).get("output_root", "outputs"), exp_cfg.get("name", "unnamed"), run_id
     )
     if initial_checkpoint is not None and Path(output_dir).resolve() == initial_checkpoint.parent:
@@ -70,6 +73,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
             notes=wandb_cfg.get("notes"),
             mode=wandb_cfg.get("mode", "online"),
             logging_config=wandb_cfg.get("logging"),
+            **({"id": resume_payload["metadata"]["provenance"]["wandb_run_id"], "resume": "must"}
+               if resume_payload and resume_payload["metadata"]["provenance"].get("wandb_run_id") else {}),
             run_id=run_id,
         )
         resources.callback(wandb_logger.finish)
@@ -79,38 +84,30 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     task = create_race_task(scenario, scenario_dir=scenario_dir, roles=roles,
                             render_mode="human" if render else None)
     resources.callback(task.close)
-    # Preserve the legacy MAPPO training reset sequence; current physics needs
-    # no sizing reset and exposes the state contract before episode zero.
-    if algorithm == "mappo" and resolve_training_params(agent_cfg, scenario)["_physics_contract"] is None:
-        task.env.reset()
     spec = task.spec
     params = learner_params(scenario, spec, algorithm)
-    if initial_checkpoint is not None:
-        params["_initial_checkpoint_sha256"] = hashlib.sha256(initial_checkpoint.read_bytes()).hexdigest()
 
     pretrained_actor_path: Optional[Path] = None
     if getattr(args, "pretrained_actor", None):
         params["pretrained_actor_checkpoint"] = str(resolve_checkpoint_path(args.pretrained_actor))
     pretrained_actor_value = params.get("pretrained_actor_checkpoint")
-    if algorithm == "mappo" and pretrained_actor_value:
+    if algorithm == "mappo" and pretrained_actor_value and not resume_path:
         pretrained_actor_path = resolve_scenario_relative_path(
             str(pretrained_actor_value), scenario_dir
         )
         if pretrained_actor_path.is_dir():
-            pretrained_actor_path = pretrained_actor_path / "best_model.pt"
+            pretrained_actor_path = pretrained_actor_path / "best.pt"
         if not pretrained_actor_path.is_file():
             raise FileNotFoundError(
                 f"Pretrained actor checkpoint not found: {pretrained_actor_path}"
             )
-        params["_resolved_pretrained_actor_checkpoint"] = str(pretrained_actor_path)
-
-    if params.get("require_pretrained_actor", False) and pretrained_actor_path is None:
+    if params.get("require_pretrained_actor", False) and pretrained_actor_path is None and not resume_path:
         raise ValueError("This comparison requires --pretrained-actor or pretrained_actor_checkpoint for both training arms")
 
     if params.get("lora") is not None:
         if algorithm != "mappo":
             raise ValueError("LoRA is supported for MAPPO actor transfer only")
-        if pretrained_actor_path is None:
+        if pretrained_actor_path is None and not resume_path:
             raise ValueError("LoRA training requires --pretrained-actor or pretrained_actor_checkpoint")
 
     # --- Startup banner ---
@@ -134,14 +131,17 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     )
 
     learner = create_learner(algorithm, spec, params)
-    if initial_checkpoint is not None:
-        learner.load(str(initial_checkpoint), load_optimizer=False,
-                     observation_extension=params.get("pretrained_observation_extension"))
-        if hashlib.sha256(initial_checkpoint.read_bytes()).hexdigest() != params["_initial_checkpoint_sha256"]:
-            raise ValueError("Checkpoint changed while loading for training; use a stable checkpoint file.")
+    recovery_state = None
+    if resume_payload:
+        recovery_state, _ = learner.resume_training(resume_payload)
+        console.print_info(f"Recovering from {resume_path}; partial episode discarded, environment schedules restart at the training seed.")
+    elif initial_checkpoint is not None:
+        learner.initialize_from_checkpoint(initial_checkpoint, scope=scenario["adaptation"]["load_scope"],
+            observation_extension=params.get("pretrained_observation_extension"))
         console.print_info(f"Initialized PPO actor and critic from {initial_checkpoint}; fresh optimizer and schedule.")
-    if pretrained_actor_path is not None:
-        learner.load_pretrained_actor(str(pretrained_actor_path))
+    elif pretrained_actor_path is not None:
+        learner.initialize_from_checkpoint(pretrained_actor_path, scope=scenario["adaptation"]["load_scope"],
+            observation_extension=params.get("pretrained_actor_observation_extension"))
         console.print_info(f"Initialized MAPPO actors from checkpoint: {pretrained_actor_path}")
     if getattr(learner, "lora_config", None) is not None:
         trainable = sum(p.numel() for p in learner.actor.parameters() if p.requires_grad)
@@ -156,15 +156,12 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         algorithm=algorithm,
         trainable_agents=trainable_ids,
     )
-    if initial_checkpoint is not None:
-        provenance["initial_checkpoint"] = {
-            "path": str(initial_checkpoint),
-            "sha256": params["_initial_checkpoint_sha256"],
-            "load_scope": "actor_and_critic",
-            "observation_extension": params.get("pretrained_observation_extension"),
-            "optimizer_restored": False,
-            "training_progress_restored": False,
-        }
+    if learner.source_checkpoint:
+        provenance["pretrained_source"] = learner.source_checkpoint
+    if resume_payload:
+        provenance["recovery_source"] = resume_payload["_identity"]
+    if wandb_logger:
+        provenance["wandb_run_id"] = wandb_logger.wandb_run_id
     provenance["network"] = learner.network_config
     provenance["algorithm_implementation"] = {
         "backend": "torchrl",
@@ -180,18 +177,11 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "num_envs": 1,
         "inference": "local",
     }
-    if pretrained_actor_path is not None:
-        provenance["pretrained_actor"] = {
-            "path": str(pretrained_actor_path),
-            "sha256": hashlib.sha256(pretrained_actor_path.read_bytes()).hexdigest(),
-            "load_scope": "actor_only",
-            "observation_extension": params.get("pretrained_actor_observation_extension"),
-            "lora": params.get("lora"),
-        }
     csv_logger = CSVLogger(
         output_dir=output_dir,
         scenario_config=scenario,
         provenance=provenance,
+        append=bool(resume_path),
     )
 
     resources.callback(csv_logger.close)
@@ -211,18 +201,9 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
             lap_completion=compact_laps,
         ),
         CSVHook(csv_logger),
-        CheckpointHook(
-            agent=learner,
-            output_dir=output_dir,
-            save_every=int(params.get("checkpoint_every", os.environ.get("F110_CHECKPOINT_EVERY", 100))),
-            provenance=provenance,
-            save_best_training_reward=not evaluation_selection_enabled,
-            save_final=algorithm in {"ppo", "mappo"},
-            save_every_steps=(int(params.get("checkpoint_every_steps", 4096000))
-                              if exp_cfg.get("total_steps") is not None or
-                              (algorithm == "mappo" and params.get("checkpoint_every_steps") is not None)
-                              else None),
-        ),
+        CheckpointHook(learner, output_dir, provenance=provenance, configuration=scenario,
+                       save_every_steps=scenario["checkpoint"]["every_steps"],
+                       save_every_updates=scenario["checkpoint"]["every_updates"]),
     ]
     if wandb_logger:
         hooks.append(WandbHook(wandb_logger))
@@ -241,11 +222,13 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
             selection_strategy=eval_cfg.get("selection_strategy",
                 "team_completion" if algorithm == "mappo" else "completion_progress"),
             evaluate_every_steps=eval_cfg.get("every_steps"), provenance=provenance,
-            console=console, wandb_logger=wandb_logger,
+            console=console, wandb_logger=wandb_logger, configuration=scenario,
         ))
         console.print_info(f"Selection evaluation: {evaluator.episodes} fixed-seed races; "
                            f"completion={evaluator.completion}")
     trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id)
+    if recovery_state is not None:
+        trainer.restore_training_state(recovery_state)
     total_steps = exp_cfg.get("total_steps")
     episodes = 0 if total_steps is not None else int(exp_cfg.get("episodes", 1000))
     budget = f"{total_steps} joint environment decisions" if total_steps is not None else f"{episodes} episodes"

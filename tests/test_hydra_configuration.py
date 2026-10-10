@@ -143,9 +143,9 @@ def test_hydra_merge_list_null_deletion_and_addition_semantics(tmp_path):
 
 def test_explicit_consumer_field_overrides_take_precedence_over_group_defaults():
     config = load_and_expand_scenario("scenarios/ppo_lap_completion_transfer.yaml", overrides=[
-        "++experiment.checkpoint=../outputs/custom/best_model.pt", "++training_defaults.learning_rate=0.002",
+        "++experiment.checkpoint=../outputs/custom/best.pt", "++training_defaults.learning_rate=0.002",
     ])
-    assert config["experiment"]["checkpoint"] == str(PROJECT_ROOT / "outputs/custom/best_model.pt")
+    assert config["experiment"]["checkpoint"] == str(PROJECT_ROOT / "outputs/custom/best.pt")
     assert config["training_defaults"]["learning_rate"] == 0.002
     config = load_and_expand_scenario(TEAM, overrides=["++mappo.actor_mode=shared"])
     validate_experiment_scenario(config)
@@ -175,15 +175,15 @@ def test_source_map_checkpoint_and_output_paths_ignore_cwd(tmp_path, monkeypatch
     path = "scenarios/ppo_lap_completion_transfer.yaml"
     config = load_and_expand_scenario(path, overrides=["maps.root=maps"])
     assert source_path(path) == PROJECT_ROOT / path
-    assert config["experiment"]["checkpoint"] == str(PROJECT_ROOT / "outputs/pretrain/best_model.pt")
+    assert config["experiment"]["checkpoint"] == str(PROJECT_ROOT / "outputs/pretrain/best.pt")
     assert config["paths"]["source_root"] == str(PROJECT_ROOT / "src")
     assert config["paths"]["output_root"] == str(PROJECT_ROOT / "outputs")
     env = resolve_environment_config(config, mode="eval", scenario_dir=PROJECT_ROOT / "scenarios")
     assert env["map_dir"] == str(PROJECT_ROOT / "maps")
     assert Path(env["map_dir"], env["map_yaml"]).is_file()
     assert Path.cwd() == tmp_path
-    config = load_and_expand_scenario(path, overrides=["adaptation.checkpoint=outputs/source/best_model.pt"])
-    assert config["experiment"]["checkpoint"] == str(PROJECT_ROOT / "outputs/source/best_model.pt")
+    config = load_and_expand_scenario(path, overrides=["adaptation.checkpoint=outputs/source/best.pt"])
+    assert config["experiment"]["checkpoint"] == str(PROJECT_ROOT / "outputs/source/best.pt")
 
 
 @pytest.mark.parametrize("path,flag", [(PRETRAIN, "--checkpoint"), (TEAM, "--pretrained-actor")])
@@ -192,10 +192,10 @@ def test_cli_checkpoint_choices_are_present_in_resolved_configuration(path, flag
     import sys
 
     monkeypatch.setattr(sys, "argv", ["run.py", "--scenario", path, "--resolve-config",
-                                      flag, "outputs/source/best_model.pt"])
+                                      flag, "outputs/source/best.pt"])
     main()
     config = yaml.safe_load(capsys.readouterr().out)
-    expected = str(PROJECT_ROOT / "outputs/source/best_model.pt")
+    expected = str(PROJECT_ROOT / "outputs/source/best.pt")
     assert config["adaptation"]["mode"] == "full_finetune"
     assert config["adaptation"]["checkpoint"] == expected
     if flag == "--checkpoint":

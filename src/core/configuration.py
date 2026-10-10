@@ -84,6 +84,8 @@ def materialize_configuration(config):
     if checkpoint is not None:
         config["experiment"]["checkpoint"] = str((
             Path(config["_configuration"]["source"]).parent / Path(checkpoint).expanduser()).resolve())
+    if config.get("checkpoint", {}).get("resume") is not None:
+        config["checkpoint"]["resume"] = str(source_path(config["checkpoint"]["resume"]))
     return config
 
 
@@ -96,6 +98,15 @@ def validate_configuration(config):
     algorithm, network, adaptation = config["algorithm"], config["network"], config["adaptation"]
     if algorithm["name"] not in {"ppo", "mappo"} or algorithm["backend"] != "torchrl":
         raise ScenarioError("Only TorchRL PPO and MAPPO are implemented")
+    checkpoint = config.get("checkpoint", {})
+    if set(checkpoint) - {"resume", "every_steps", "every_updates"}:
+        raise ScenarioError("Unknown checkpoint setting")
+    for key in ("every_steps", "every_updates"):
+        value = checkpoint.get(key)
+        if value is not None and (type(value) is not int or value <= 0):
+            raise ScenarioError(f"checkpoint.{key} must be a positive integer or null")
+    if checkpoint.get("resume") is not None and (not isinstance(checkpoint["resume"], str) or not checkpoint["resume"].strip()):
+        raise ScenarioError("checkpoint.resume must be a path or null")
     expected_loss, expected_gae = (("clip_ppo", "gae") if algorithm["name"] == "ppo"
                                    else ("mappo", "multi_agent_gae"))
     if (algorithm["loss"] != expected_loss or algorithm["advantage_estimator"] != expected_gae

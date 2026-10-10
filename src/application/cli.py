@@ -36,16 +36,13 @@ def parse_args() -> argparse.Namespace:
                    help="PyTorch CPU threads for training and evaluation")
     p.add_argument("--eval", action="store_true", help="Run evaluation instead of training")
     p.add_argument("--checkpoint", type=str, default=None,
-                   help="Checkpoint file or run directory (best_model.pt): evaluate with --eval, "
+                   help="Checkpoint file or run directory (best.pt): evaluate with --eval, "
                         "or initialize PPO training weights with a fresh optimizer; "
                         "overrides experiment.checkpoint in the scenario")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Recover training from latest.pt or a run directory; restart a fresh episode")
     p.add_argument("--pretrained-actor", type=str, default=None,
-                   help="PPO or plain shared-MAPPO checkpoint/run directory to initialize actors; fresh critic and optimizer")
-    p.add_argument(
-        "--allow-provenance-mismatch",
-        action="store_true",
-        help="Allow --eval with a checkpoint from a different scenario/config/map contract.",
-    )
+                   help="PPO checkpoint/run directory to initialize actors; fresh critic and optimizer")
     p.add_argument("--eval-episodes", type=int, default=None, help="Evaluation episodes; defaults to --episodes")
     p.add_argument("--eval-protocol", choices=("selection", "final"), default=None,
                    help="Use fixed scenario evaluation seeds, episodes, and horizon; requires --eval.")
@@ -83,6 +80,9 @@ def apply_cli_overrides(scenario: dict, args: argparse.Namespace) -> dict:
     torch_threads = getattr(args, "torch_threads", None)
     if torch_threads is not None:
         scenario.setdefault("experiment", {})["torch_threads"] = torch_threads
+    resume = getattr(args, "resume", None)
+    if resume:
+        scenario["checkpoint"]["resume"] = str(source_path(resume))
     checkpoint = getattr(args, "checkpoint", None)
     pretrained_actor = getattr(args, "pretrained_actor", None)
     if checkpoint:
@@ -132,7 +132,10 @@ def main() -> None:
         torch.set_num_threads(scenario["experiment"]["torch_threads"])
     args.scenario = str(source_path(args.scenario))
     scenario_dir = Path(args.scenario).parent
-    if args.checkpoint is None:
+    resume = scenario.get("checkpoint", {}).get("resume")
+    if resume and (args.eval or args.checkpoint or args.pretrained_actor):
+        raise ValueError("Training resume is separate from evaluation and transfer; use --resume alone")
+    if args.checkpoint is None and not resume:
         configured_checkpoint = scenario["experiment"].get("checkpoint")
         if configured_checkpoint is not None:
             args.checkpoint = str(resolve_scenario_relative_path(

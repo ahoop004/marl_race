@@ -66,10 +66,14 @@ def test_csv_wandb_evaluation_and_checkpoint_triggers_share_exact_counters(tmp_p
     with (tmp_path / "episode_metrics.csv").open() as stream:
         assert len(list(csv.DictReader(stream))) == 3
     assert [row["train/environment_steps"] for row in messages if "train/environment_steps" in row] == [4, 8, 9]
-    assert (tmp_path / "checkpoint_step000000004.pt").exists()
-    assert (tmp_path / "checkpoint_step000000008.pt").exists()
-    final = torch.load(tmp_path / "final_model.pt", weights_only=False)
-    assert final["environment_steps"] == 9 and final["policy_version"] == 3
+    assert (tmp_path / "latest.pt").exists()
+    assert (tmp_path / "best.pt").exists()
+    final = torch.load(tmp_path / "final.pt", weights_only=True)
+    assert final["metadata"]["progress"]["environment_steps"] == 9
+    assert final["metadata"]["progress"]["updates"] == 3
+    assert final["training"] is None
+    latest = torch.load(tmp_path / "latest.pt", weights_only=True)
+    assert latest["training"]["progress"]["environment_steps"] == 9
     history = [json.loads(line) for line in (tmp_path / "evaluation_history.jsonl").read_text().splitlines()]
     assert [row["environment_steps"] for row in history] == [4, 8]
     assert history[-1]["is_best"]

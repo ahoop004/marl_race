@@ -34,7 +34,7 @@ class _Value(torch.nn.Module):
 
 class TorchRLPPOAgent(PPOPolicy):
     def __init__(self, obs_dim, action_low, action_high, params):
-        super().__init__(obs_dim, action_low, action_high, params)
+        super().__init__(obs_dim, action_low, action_high, params, training=True)
         if min(self.n_steps, self.n_epochs, self.batch_size) < 1:
             raise ValueError("PPO rollout size, epochs, and batch size must be positive")
         parameters = TensorDictModule(

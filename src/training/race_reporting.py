@@ -18,6 +18,7 @@ class RaceTrainingReports:
         self.ids = list(self.task.possible_agents)
         self.transition_hooks = transition_record_hooks(trainer.hooks)
         self.completed = 0
+        self.next_episode = 0
         self.pending_episodes = []
 
     def reset(self, snapshot):
@@ -26,7 +27,8 @@ class RaceTrainingReports:
         # frame. Do not report a new episode when the experiment has ended.
         if t.budget_reached() or t._should_stop():
             return
-        self.episode = self.completed
+        self.episode = self.next_episode
+        self.next_episode += 1
         self.episode_id = f"{t.run_id}_ep{self.episode:06d}"
         metadata = self.task.episode_metadata
         self.map_id = metadata.map_id

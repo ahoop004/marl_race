@@ -1,7 +1,6 @@
-"""PPO policy setup, inference and the existing checkpoint format."""
+"""PPO model construction and inference, independent of checkpoint serialization."""
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -12,7 +11,7 @@ from agents.common.outputs import PolicyOutput
 from agents.common.optimization import OnPolicyOptimizationSettings
 from agents.common.networks import build_actor, build_critic, resolve_network_config
 from agents.common.checkpoints import (
-    restore_policy_state, transfer_network_state, validate_network_checkpoint,
+    save_checkpoint, load_for_evaluation, initialize_from_checkpoint, resume_training,
 )
 from utils.torch_io import resolve_device
 
@@ -20,13 +19,19 @@ from utils.torch_io import resolve_device
 class PPOPolicy(OnPolicyOptimizationSettings):
     """Actor/critic state shared by TorchRL training and checkpoint evaluation."""
 
+    algorithm = "ppo"
+    implementation = "torchrl.clip_ppo.v1"
+
     def __init__(
         self,
         obs_dim: int,
         action_low: np.ndarray,
         action_high: np.ndarray,
         params: Dict,
+        *, training: bool = False,
     ) -> None:
+        self.agent_ids = list(params.get("_agent_ids", ["policy"]))
+        self.source_checkpoint = None
         self.obs_dim = obs_dim
         self.action_low = np.asarray(action_low, dtype=np.float32)
         self.action_high = np.asarray(action_high, dtype=np.float32)
@@ -63,7 +68,7 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         ).to(self.device)
         self.critic = build_critic(obs_dim, self.network_config).to(self.device)
         self._optim_parameters = tuple(self.actor.parameters()) + tuple(self.critic.parameters())
-        self.optimizer = optim.Adam(self._optim_parameters, lr=self.lr)
+        self.optimizer = optim.Adam(self._optim_parameters, lr=self.lr) if training else None
 
     @torch.no_grad()
     def value_batch(self, observations: np.ndarray) -> np.ndarray:
@@ -115,40 +120,7 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         aid = agent_ids[0]
         return {aid: self.predict(observations[aid])}
 
-    def save(self, path: str) -> None:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "actor": self.actor.state_dict(),
-                "critic": self.critic.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "algorithm": "ppo",
-                "network": self.network_config,
-                "obs_dim": self.obs_dim,
-                "action_dim": self.action_dim,
-                "action_low": self.action_low,
-                "action_high": self.action_high,
-                "action_contract": self.action_contract,
-                "physics_contract": self.physics_contract,
-                "observation_contract": self.observation_contract,
-                "actor_hidden_dims": self.actor_hidden_dims,
-                "critic_hidden_dims": self.critic_hidden_dims,
-                "activation": self.activation,
-            },
-            path,
-        )
-
-    def load(self, path: str, *, load_optimizer: bool = True, observation_extension: Optional[str] = None) -> None:
-        """Load actor/critic weights; transfer runs keep their fresh optimizer."""
-        from utils.torch_io import safe_load
-        ckpt = safe_load(path, map_location=self.device)
-        validate_network_checkpoint(ckpt, self.network_config)
-        actor_state = ckpt.get("actor")
-        if observation_extension:
-            actor_state = transfer_network_state(
-                actor_state, self.actor.state_dict(), self.network_config, expand_inputs=True)
-            ckpt = {**ckpt, "critic": transfer_network_state(
-                ckpt.get("critic"), self.critic.state_dict(), self.network_config, expand_inputs=True)}
-        restore_policy_state(ckpt, self.actor, self.critic, self.optimizer,
-                             actor_state=actor_state, load_optimizer=load_optimizer)
-
+    save_checkpoint = save_checkpoint
+    load_for_evaluation = load_for_evaluation
+    initialize_from_checkpoint = initialize_from_checkpoint
+    resume_training = resume_training

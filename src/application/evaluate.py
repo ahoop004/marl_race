@@ -2,7 +2,6 @@
 import argparse
 from contextlib import ExitStack
 import copy
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -100,17 +99,16 @@ def _run_evaluation(
         critic_mode=params.get("critic_mode", "agent_conditioned"),
         team_return_mode=params.get("team_return_mode", "per_agent"), action_repeat=action_repeat,
     )
+    from agents.common.checkpoints import read_checkpoint, evaluation_routing
+    checkpoint_payload = read_checkpoint(checkpoint_path)
+    checkpoint_hash = checkpoint_payload["_identity"]["sha256"]
+    metadata = checkpoint_payload["metadata"]
+    checkpoint_steps = metadata["progress"].get("environment_steps")
+    stored_provenance = metadata["provenance"]
+    if algorithm == "mappo":
+        params.update(evaluation_routing(checkpoint_payload))
     agent = create_learner(algorithm, spec, params, training=False)
-    from utils.torch_io import safe_load
-    checkpoint_hash = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
-    checkpoint_payload = safe_load(str(checkpoint_path), map_location="cpu")
-    selection = checkpoint_payload.get('checkpoint_selection') or {}
-    checkpoint_steps = checkpoint_payload.get('environment_steps', selection.get('environment_steps'))
-    stored_provenance = (
-        checkpoint_payload.get("provenance")
-        if isinstance(checkpoint_payload, dict)
-        else None
-    )
+    agent.load_for_evaluation(checkpoint_payload)
     mismatches = []
     if isinstance(stored_provenance, dict):
         current_provenance = build_run_provenance(
@@ -121,23 +119,11 @@ def _run_evaluation(
             trainable_agents=trainable_ids,
         )
         mismatches = provenance_mismatches(stored_provenance, current_provenance)
-        if mismatches and not args.allow_provenance_mismatch:
-            raise ValueError(
-                "Checkpoint provenance does not match the evaluation scenario: "
-                + "; ".join(mismatches)
-                + ". Pass --allow-provenance-mismatch only for an intentional cross-scenario evaluation."
-            )
         if mismatches:
-            console.print_warning("Checkpoint provenance mismatch explicitly allowed: " + "; ".join(mismatches))
+            console.print_info("Evaluation experiment provenance differs; model and physics contracts validated: "
+                               + "; ".join(mismatches))
         else:
-            console.print_info("Checkpoint provenance matches scenario/config/map hashes.")
-    else:
-        console.print_warning(
-            "Checkpoint has no provenance block; scenario/config/map compatibility cannot be verified."
-        )
-    agent.load(str(checkpoint_path))
-    if hashlib.sha256(checkpoint_path.read_bytes()).hexdigest() != checkpoint_hash:
-        raise ValueError("Checkpoint changed while loading for evaluation; use a stable checkpoint file.")
+            console.print_info("Checkpoint experiment provenance matches.")
 
     trainable_set = set(trainable_ids)
     other_agents = task.fixed_controllers

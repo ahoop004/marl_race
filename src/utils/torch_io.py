@@ -1,4 +1,4 @@
-"""Compatibility helpers around torch serialization defaults."""
+"""Safe atomic state-dictionary serialization and device selection."""
 from __future__ import annotations
 
 import os
@@ -43,35 +43,33 @@ def validate_checkpoint_compatibility(checkpoint, expected, *, states=()) -> Non
             raise ValueError(f"Incompatible checkpoint {name}: state keys differ")
         for key, value in current.items():
             source = stored[key]
-            if not isinstance(source, torch.Tensor) or source.shape != value.shape:
-                raise ValueError(f"Incompatible checkpoint {name}.{key}: tensor shape differs")
+            if not isinstance(source, torch.Tensor) or source.shape != value.shape or source.dtype != value.dtype:
+                raise ValueError(f"Incompatible checkpoint {name}.{key}: tensor shape or dtype differs")
 
 
-def safe_load(path: str, *, map_location: Any | None = None, weights_only: bool | None = None) -> Any:
-    """Call ``torch.load`` while gracefully handling version-specific kwargs.
+def safe_load(path, *, map_location="cpu"):
+    """Load only state dictionaries and primitive metadata; no pickle fallback."""
+    return torch.load(path, map_location=map_location, weights_only=True)
 
-    PyTorch 2.6 flipped the default for ``weights_only`` to ``True`` which breaks
-    checkpoints containing optimizer state dictionaries (they rely on pickled
-    Python objects). Passing ``weights_only=False`` restores the legacy behaviour,
-    but older PyTorch releases reject that keyword entirely. This helper attempts
-    the new signature first and falls back to the legacy call when needed.
-    """
 
-    load_kwargs = {}
-    if map_location is not None:
-        load_kwargs["map_location"] = map_location
+def atomic_save(payload, path):
+    """Assemble once, flush a sibling temporary file, then replace atomically."""
+    from pathlib import Path
+    import tempfile
 
-    # Explicitly request the legacy behaviour unless the caller overrides it.
-    if weights_only is None:
-        desired_weights_only = False
-    else:
-        desired_weights_only = weights_only
-
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
     try:
-        return torch.load(path, weights_only=desired_weights_only, **load_kwargs)
-    except TypeError:
-        # Older torch versions (<2.0) do not accept the weights_only kwarg.
-        return torch.load(path, **load_kwargs)
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            torch.save(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def resolve_device(preferred: Optional[Iterable[Any]] = None) -> torch.device:
@@ -108,4 +106,4 @@ def resolve_device(preferred: Optional[Iterable[Any]] = None) -> torch.device:
     return torch.device("cpu")
 
 
-__all__ = ["safe_load", "resolve_device", "validate_checkpoint_compatibility"]
+__all__ = ["safe_load", "atomic_save", "resolve_device", "validate_checkpoint_compatibility"]

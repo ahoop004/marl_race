@@ -17,7 +17,7 @@ PROVENANCE_VERSION = "1.0"
 
 
 def physics_contract(environment: Mapping[str, Any]) -> dict | None:
-    """Strict nonlinear checkpoint identity; None preserves historical loads."""
+    """Strict nonlinear physics identity; legacy dynamics have no nonlinear contract."""
     params = environment.get("vehicle_params", environment.get("params", {})) or {}
     if params.get("model", "legacy_st") == "legacy_st":
         return None
@@ -162,7 +162,7 @@ def provenance_mismatches(
     stored: Mapping[str, Any],
     current: Mapping[str, Any],
 ) -> list[str]:
-    """Describe contract mismatches between a checkpoint and evaluation run."""
+    """Describe experiment provenance differences; model contracts validate separately."""
     mismatches: list[str] = []
     for key in ("algorithm", "scenario_source_sha256", "resolved_config_sha256", "behavior_contracts"):
         if stored.get(key) != current.get(key):

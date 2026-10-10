@@ -75,26 +75,22 @@ def test_native_clipped_loss_matches_existing_objective_for_saturated_actions():
 
 
 @pytest.mark.parametrize("vf_coef", [0, 0.5])
-def test_native_update_handles_partial_minibatches_and_legacy_checkpoints(vf_coef, tmp_path):
+def test_native_update_handles_partial_minibatches_and_versioned_checkpoints(vf_coef, tmp_path):
     learner = agent(vf_coef=vf_coef)
     data = rollout(learner.policy, [0, 1, 2])
     metrics = learner.update(data)
     assert metrics["train/optimizer_steps"] == 4
     assert all(math.isfinite(value) for value in metrics.values())
     checkpoint = tmp_path / "model.pt"
-    learner.save(str(checkpoint))
+    learner.save_checkpoint(checkpoint)
     evaluation_policy = PPOPolicy(1, learner.action_low, learner.action_high, {"hidden_dims": [], "device": "cpu"})
-    evaluation_policy.load(str(checkpoint))
+    evaluation_policy.load_for_evaluation(checkpoint)
     observation = np.array([0.3], dtype=np.float32)
     np.testing.assert_array_equal(evaluation_policy.predict(observation), learner.predict(observation))
-    evaluation_policy.save(str(checkpoint))
-    payload = torch.load(checkpoint, weights_only=False)
-    assert payload.pop("network")["architecture"] == "mlp"
-    torch.save(payload, checkpoint)
-    restored = agent(vf_coef=vf_coef)
-    restored.load(str(checkpoint))
-    assert restored.optimizer.state_dict()["state"]
-    np.testing.assert_array_equal(restored.predict(observation), learner.predict(observation))
+    assert evaluation_policy.optimizer is None
+    payload = torch.load(checkpoint, weights_only=True)
+    assert payload["schema_version"] == 1 and payload["training"] is None
+    assert payload["metadata"]["network"]["architecture"] == "mlp"
 
 
 def test_prediction_uses_actor_distribution_parameters(monkeypatch):

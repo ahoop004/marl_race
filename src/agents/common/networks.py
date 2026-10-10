@@ -48,7 +48,7 @@ def make_mlp(
 
 
 class Actor(SquashedGaussianActor):
-    """MLP producing Gaussian parameters; retain legacy net/log_std keys."""
+    """MLP actor head producing Gaussian parameters and exploration scale."""
 
     def __init__(
         self,
@@ -151,3 +151,20 @@ def route_actor(actor, agent_ids, *, actor_mode="shared", lora_config=None, inpu
         from agents.common.lora import LoRAActor
         return LoRAActor(actor, lora_config, len(agent_ids), input_dims)
     return actor
+
+
+def expand_observation_inputs(state, expected, config, *, source_width, expand_inputs):
+    """Expand an explicitly validated observation prefix, preserving all weights."""
+    result = dict(state)
+    if not expand_inputs:
+        return result
+    if config["architecture"] != "mlp":
+        raise ValueError(f"Observation expansion is unsupported for {config['architecture']!r}")
+    weight, target = result.get("net.0.weight"), expected["net.0.weight"]
+    if (not isinstance(weight, torch.Tensor) or weight.shape != (target.shape[0], source_width)
+            or weight.dtype != target.dtype or source_width >= target.shape[1]):
+        raise ValueError("First-layer weights do not match the observation-prefix dimensions")
+    expanded = torch.zeros_like(target)
+    expanded[:, :source_width] = weight
+    result["net.0.weight"] = expanded
+    return result
