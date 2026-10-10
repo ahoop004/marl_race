@@ -38,6 +38,11 @@ def validate_training_scenario(scenario):
     experiment = scenario["experiment"]
     environment = scenario["environment"]
     agents = scenario["agents"]
+    if type(experiment.get("measure_services", False)) is not bool:
+        raise ScenarioError("experiment.measure_services must be boolean")
+    logging_config = scenario.get("logging", {}) or {}
+    if not isinstance(logging_config, dict) or type(logging_config.get("physics_episodes", True)) is not bool:
+        raise ScenarioError("logging.physics_episodes must be boolean")
     # Reject old execution options even when their value requested one worker.
     removed = {"num_envs", "num_workers", "rollout_steps_per_env", "collector",
                "terminal_recent_episodes", "terminal_every_updates",

@@ -18,6 +18,7 @@ paths:
   source_root: ${paths.project_root}/src
   scenario_root: ${paths.project_root}/scenarios
   output_root: ${paths.project_root}/outputs
+  pretrained_checkpoint: ${paths.output_root}/pretrain/best.pt
 experiment:
   name: race
   seed: ${execution.experiment.seed}

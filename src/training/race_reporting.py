@@ -47,10 +47,9 @@ class RaceTrainingReports:
             episode=self.episode, agent_ids=list(self.task.physical_agents),
             trainable_ids=self.ids, opponent_ids=list(self.task.fixed_controllers))
         for hook in t.hooks:
-            callback = getattr(hook, "on_episode_start", None)
-            if callback is not None:
-                callback(dict(episode_id=self.episode_id, map_id=self.map_id,
-                              physics=snapshot.infos.get(t.focal_id, {}).get("physics")))
+            t.call_hook(hook, "on_episode_start", dict(
+                episode_id=self.episode_id, map_id=self.map_id,
+                physics=snapshot.infos.get(t.focal_id, {}).get("physics")))
 
     def physics(self, substep):
         self.physics_steps += 1
@@ -98,7 +97,7 @@ class RaceTrainingReports:
                     episode_id=self.episode_id, step_idx=self.steps, agent_id=aid,
                     **transition_lifecycle_fields(info, global_state=result.after.global_state))
                 for hook in self.transition_hooks:
-                    hook.on_step(record)
+                    t.call_hook(hook, "on_step", record)
         self.steps += 1
         t._environment_steps += 1
         t._agent_steps += result.agent_steps
@@ -150,5 +149,5 @@ class RaceTrainingReports:
         for episode, reward, info, metrics in self.pending_episodes:
             metrics = {**update_metrics, **metrics}
             for hook in self.trainer.hooks:
-                hook.on_episode_end(episode, reward, info, metrics)
+                self.trainer.call_hook(hook, "on_episode_end", episode, reward, info, metrics)
         self.pending_episodes.clear()

@@ -22,6 +22,7 @@ CORE = (
     "train/*/policy_loss", "train/*/value_loss", "train/*/entropy", "train/*/approx_kl",
     "train/learning_rate", "train/*/learning_rate", "train/kl_early_stop",
     "perf/end_to_end_env_steps_per_second", "perf/update_seconds",
+    "perf/logging_seconds", "perf/evaluation_seconds", "perf/checkpoint_seconds",
     "eval/completion_rate", "eval/learner_failure_rate", "eval/timeout_rate",
     "eval/mean_net_progress", "eval/mean_clean_finish_time_s", "eval/clean_finish_count",
     "eval/race_count", "eval/evaluation_seconds", "eval/map/*/clean_completion_rate",

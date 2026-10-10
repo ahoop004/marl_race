@@ -34,7 +34,7 @@ wandb:
   mode: online
 environment:
   target_laps: 5
-  max_steps: 0
+  max_steps: 16000
   track_limits:
     enabled: true
     terminate: true
@@ -44,3 +44,4 @@ algorithm:
   params:
     learning_rate: 0.0001
     lr_schedule: constant
+    learning_rate_end: null

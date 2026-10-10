@@ -1,12 +1,14 @@
 enabled: true
 every_steps: 409600
 episodes: 8
-target_laps: 3
-max_steps: 16000
+target_laps: ${environment.target_laps}
+max_steps: ${environment.max_steps}
+episode_termination_mode: ${environment.episode_termination.mode}
+lap_completion: ${environment.episode_termination.lap_completion}
+terminate_on_collision: ${environment.terminate_on_collision}
+terminate_on_track_limit: ${environment.track_limits.terminate}
 seed: 10042
 selection_strategy: completion_progress
 final_test:
   episodes: 20
   seed: 20042
-terminate_on_track_limit: true
-terminate_on_collision: true

@@ -8,11 +8,18 @@ def resolve_scenario_relative_path(value: str, scenario_dir: Path) -> Path:
     return path if path.is_absolute() else (scenario_dir / path).resolve()
 
 
-def resolve_checkpoint_path(value: str, *, operation="evaluation") -> Path:
-    """CLI paths are relative to cwd; a run directory selects its best model."""
+def resolve_checkpoint_path(value: str, *, operation="evaluation", base_dir=None) -> Path:
+    """Directories select best.pt, or latest.pt for recovery.
+
+    CLI callers pass canonical paths. Configured relative paths may name their
+    declaring scenario directory; standalone callers retain cwd semantics.
+    """
     if operation not in {"evaluation", "transfer", "resume"}:
         raise ValueError(f"Unsupported checkpoint operation: {operation!r}")
-    path = Path(value).expanduser().resolve()
+    path = Path(value).expanduser()
+    if not path.is_absolute() and base_dir is not None:
+        path = Path(base_dir) / path
+    path = path.resolve()
     if path.is_dir():
         path = path / ("latest.pt" if operation == "resume" else "best.pt")
     if not path.is_file():

@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from application.checkpoints import resolve_checkpoint_path, resolve_scenario_relative_path, validate_resume_experiment
+from application.checkpoints import resolve_checkpoint_path, validate_resume_experiment
 from agents.common.checkpoints import read_checkpoint
 from core.task_builder import create_race_task
 from core.run_id import resolve_run_id, set_run_id_env
@@ -40,7 +40,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
             agent_configs[trainable_ids[0]]["algorithm"]
         ).strip().lower() != "ppo":
             raise ValueError("--checkpoint for training currently supports one PPO learner only.")
-        initial_checkpoint = resolve_checkpoint_path(args.checkpoint)
+        initial_checkpoint = resolve_checkpoint_path(args.checkpoint, operation="transfer")
 
     rl_agent_id = trainable_ids[0]
     algorithm = select_algorithm(scenario, trainable_ids)
@@ -53,8 +53,6 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     output_dir = args.output_dir or (str(resume_path.parent) if resume_path else None) or os.path.join(
         scenario.get("paths", {}).get("output_root", "outputs"), exp_cfg.get("name", "unnamed"), run_id
     )
-    if initial_checkpoint is not None and Path(output_dir).resolve() == initial_checkpoint.parent:
-        raise ValueError("Use a new --output-dir for PPO transfer to preserve the source checkpoints.")
     set_run_id_env(run_id)
 
     # Loggers
@@ -89,18 +87,15 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
 
     pretrained_actor_path: Optional[Path] = None
     if getattr(args, "pretrained_actor", None):
-        params["pretrained_actor_checkpoint"] = str(resolve_checkpoint_path(args.pretrained_actor))
+        params["pretrained_actor_checkpoint"] = str(resolve_checkpoint_path(args.pretrained_actor, operation="transfer"))
     pretrained_actor_value = params.get("pretrained_actor_checkpoint")
     if algorithm == "mappo" and pretrained_actor_value and not resume_path:
-        pretrained_actor_path = resolve_scenario_relative_path(
-            str(pretrained_actor_value), scenario_dir
-        )
-        if pretrained_actor_path.is_dir():
-            pretrained_actor_path = pretrained_actor_path / "best.pt"
-        if not pretrained_actor_path.is_file():
-            raise FileNotFoundError(
-                f"Pretrained actor checkpoint not found: {pretrained_actor_path}"
-            )
+        pretrained_actor_path = resolve_checkpoint_path(
+            str(pretrained_actor_value), operation="transfer", base_dir=scenario_dir)
+        params["pretrained_actor_checkpoint"] = str(pretrained_actor_path)
+    for source in (initial_checkpoint, pretrained_actor_path):
+        if source is not None and Path(output_dir).resolve() == source.parent:
+            raise ValueError("Use a new --output-dir for transfer to preserve the source checkpoints.")
     if params.get("require_pretrained_actor", False) and pretrained_actor_path is None and not resume_path:
         raise ValueError("This comparison requires --pretrained-actor or pretrained_actor_checkpoint for both training arms")
 
@@ -170,6 +165,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "rollout_storage_device": "cpu",
         "update_device": str(learner.device),
         "torch_threads": exp_cfg.get("torch_threads", 1),
+        "measure_services": exp_cfg.get("measure_services", False),
     }
     provenance["algorithm_implementation"] = {
         "backend": "torchrl",
@@ -219,7 +215,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     if wandb_logger:
         hooks.append(WandbHook(wandb_logger))
 
-    if params.get("_physics_contract") is not None:
+    if (params.get("_physics_contract") is not None
+            and (scenario.get("logging") or {}).get("physics_episodes", True)):
         from training.hooks import PhysicsEpisodeHook
         hooks.append(PhysicsEpisodeHook(output_dir))
 
@@ -237,7 +234,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         ))
         console.print_info(f"Selection evaluation: {evaluator.episodes} fixed-seed races; "
                            f"completion={evaluator.completion}")
-    trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id)
+    trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id,
+                             measure_services=exp_cfg.get("measure_services", False))
     if recovery_state is not None:
         trainer.restore_training_state(recovery_state)
     total_steps = exp_cfg.get("total_steps")
@@ -246,3 +244,6 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     console.print_info(f"Starting {algorithm.upper()} training for {budget}")
     options = {"total_steps": total_steps} if total_steps is not None else {}
     trainer.train(episodes, **options)
+    if trainer.measure_services:
+        # Include end-of-run service work, especially latest/final checkpoint saves.
+        csv_logger.save_summary({**trainer.checkpoint_progress(), **trainer.service_metrics()})

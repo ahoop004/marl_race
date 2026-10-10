@@ -36,8 +36,10 @@ class ProgressDeltaBonusComponent(RewardComponent):
         self.max_delta = _float_or_none(max_delta) if max_delta is not None else None
 
     def compute(self, step_info: dict) -> Dict[str, float]:
-        if (self.collision_penalty is not None and
-                (step_info.get("info") or {}).get("terminal_reason") == "collision"):
+        info = step_info.get("info") or {}
+        if (self.collision_penalty is not None and (
+                info.get("collision_event", info.get("collision", False))
+                or info.get("terminal_reason") == "collision")):
             return {"progress_delta/collision": float(self.collision_penalty)}
         if self.boundary_penalty is not None:
             boundary = (step_info.get("info") or {}).get("track_limits")
@@ -109,8 +111,13 @@ class LapCompletionComponent(RewardComponent):
             return {}
         if not bool(info.get("race_completed", False)):
             return {}
-
-        if self.require_clean and bool(info.get("collision", False)):
+        if info.get("terminal_reason") not in (None, "race_complete"):
+            return {}
+        if self.require_clean and (
+            info.get("collision_event", info.get("collision", False))
+            or info.get("boundary_event", False)
+            or (info.get("track_limits") or {}).get("exceeded", False)
+        ):
             return {}
 
         return {"lap_completion/bonus": self.bonus}

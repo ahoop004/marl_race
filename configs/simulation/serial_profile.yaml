@@ -1,0 +1,24 @@
+# @package _global_
+# Controlled serial baseline; production keeps simulation/default's Gaussian grip.
+environment:
+  timestep: 0.05
+  action_repeat: 1
+  max_speed: 8.0
+  lidar_beams: 108
+  lidar_range: 10.0
+  render: false
+  centerline_autoload: true
+  walls_autoload: true
+  track_preview:
+    points: 20
+    spacing: 0.3
+  centerline_features: true
+  friction:
+    version: 1
+    scope: shared
+    train:
+      mode: fixed
+      mu: 1.0489
+    eval:
+      mode: fixed
+      mu: 1.0489

@@ -24,12 +24,16 @@ class _CollectionBoundary:
 
 class OnPolicyTrainer:
     def __init__(self, task, agent, *, hooks=None, render=False, run_id="run",
-                 focal_agent_id=None, algorithm=None):
+                 focal_agent_id=None, algorithm=None, measure_services=False):
         self.task, self.agent = task, agent
         self.algorithm = algorithm or ("mappo" if hasattr(agent, "global_state_dim") else "ppo")
         if self.algorithm not in {"ppo", "mappo"}:
             raise ValueError(f"Unsupported on-policy algorithm: {self.algorithm!r}")
         self.hooks, self.render, self.run_id = hooks or [], render, run_id
+        if type(measure_services) is not bool:
+            raise ValueError("measure_services must be a boolean")
+        self.measure_services = measure_services
+        self.service_seconds = dict(logging=0.0, evaluation=0.0, checkpoint=0.0)
         self.trainable_ids = list(task.possible_agents)
         self.focal_id = focal_agent_id or self.trainable_ids[0]
         if self.focal_id not in self.trainable_ids:
@@ -61,6 +65,26 @@ class OnPolicyTrainer:
             bind = getattr(hook, "bind_trainer", None)
             if bind:
                 bind(self)
+
+    def measure_service(self, category, callback, *args, **kwargs):
+        if not self.measure_services or category is None:
+            return callback(*args, **kwargs)
+        previous = sum(self.service_seconds.values())
+        started = time.perf_counter()
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            nested = sum(self.service_seconds.values()) - previous
+            self.service_seconds[category] += max(0.0, time.perf_counter() - started - nested)
+
+    def call_hook(self, hook, method, *args):
+        callback = getattr(hook, method, None)
+        if callback:
+            return self.measure_service(getattr(hook, "service_name", None), callback, *args)
+
+    def service_metrics(self):
+        return ({f"perf/{name}_seconds": seconds for name, seconds in self.service_seconds.items()}
+                if self.measure_services else {})
 
     def checkpoint_progress(self):
         return {"environment_steps": self._environment_steps, "agent_steps": self._agent_steps,
@@ -155,6 +179,7 @@ class OnPolicyTrainer:
         self.env.on_physics_step = self.reports.physics
         pending = []
         started = collection_started = time.perf_counter()
+        collection_service_seconds = sum(self.service_seconds.values())
         metrics = {}
         collector = None
         update_environment_steps = self._environment_steps
@@ -164,32 +189,34 @@ class OnPolicyTrainer:
 
         def report_update(updated, update_started):
             nonlocal collection_started, update_environment_steps, update_physics_steps, update_agent_steps
+            nonlocal collection_service_seconds
             if updated:
                 self._updates += 1
                 self._optimizer_steps += int(updated["train/optimizer_steps"])
                 updated.update({
                     **self.counter_metrics(),
+                    **self.service_metrics(),
                     "train/update_environment_steps": self._environment_steps - update_environment_steps,
                     "train/update_physics_steps": self._physics_steps - update_physics_steps,
                     "train/update_agent_samples": self._agent_steps - update_agent_steps,
                     "perf/update_seconds": time.perf_counter() - update_started,
-                    "perf/collection_seconds": update_started - collection_started,
+                    "perf/collection_seconds": max(0.0, update_started - collection_started - (
+                        sum(self.service_seconds.values()) - collection_service_seconds)),
                     "perf/elapsed_seconds": time.perf_counter() - started,
                     "perf/end_to_end_env_steps_per_second": self._environment_steps / max(time.perf_counter() - started, 1e-9)})
                 update_environment_steps = self._environment_steps
                 update_physics_steps = self._physics_steps
                 update_agent_steps = self._agent_steps
                 for hook in self.hooks:
-                    hook.on_update(updated)
+                    self.call_hook(hook, "on_update", updated)
                 collection_started = time.perf_counter()
+                collection_service_seconds = sum(self.service_seconds.values())
             return updated
 
         def checkpoint_boundary():
             self.checkpoint_ready = True
             for hook in self.hooks:
-                callback = getattr(hook, "on_checkpoint_boundary", None)
-                if callback:
-                    callback()
+                self.call_hook(hook, "on_checkpoint_boundary")
 
         def optimize(data):
             self._set_progress()
@@ -250,7 +277,7 @@ class OnPolicyTrainer:
                     if metrics:
                         checkpoint_boundary()
             for hook in self.hooks:
-                hook.on_training_end()
+                self.call_hook(hook, "on_training_end")
         finally:
             if collector is not None:
                 collector.shutdown()

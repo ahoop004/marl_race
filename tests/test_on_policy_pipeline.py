@@ -47,9 +47,11 @@ def test_exact_decision_budgets_include_no_collector_padding(budget, frames_per_
     assert data["next", "agents", "observation"].flatten().tolist() == [i % 3 + 1 for i in range(budget)]
 
 
-def test_csv_wandb_evaluation_and_checkpoint_triggers_share_exact_counters(tmp_path):
+@pytest.mark.parametrize("measure_services", [False, True])
+def test_csv_wandb_evaluation_and_checkpoint_triggers_share_exact_counters(tmp_path, measure_services):
     hook = Capture(False)
     training, _ = trainer(hook)
+    training.measure_services = measure_services
     messages = []
     logger = SimpleNamespace(log_metrics=messages.append, should_log=lambda group: True)
     evaluation_calls = []
@@ -87,6 +89,27 @@ def test_csv_wandb_evaluation_and_checkpoint_triggers_share_exact_counters(tmp_p
     summary = json.loads((tmp_path / "run_summary.json").read_text())
     assert summary["environment_steps"] == summary["physics_steps"] == summary["agent_steps"] == 9
     assert summary["completed_episodes"] == 3 and summary["updates"] == 3
+    service_metrics = training.service_metrics()
+    if measure_services:
+        assert set(service_metrics) == {"perf/logging_seconds", "perf/evaluation_seconds", "perf/checkpoint_seconds"}
+        assert all(value > 0 for value in service_metrics.values())
+        assert all(key in hook.updates[-1] for key in service_metrics)
+    else:
+        assert service_metrics == {} and not any(training.service_seconds.values())
+
+
+def test_service_timers_exclude_nested_work_and_record_failures(monkeypatch):
+    training, _ = trainer(Capture(False))
+    training.measure_services = True
+    ticks = iter([0., 1., 3., 5., 6., 9.])
+    monkeypatch.setattr("training.on_policy.time.perf_counter", lambda: next(ticks))
+    training.measure_service("logging", lambda: training.measure_service("evaluation", lambda: None))
+    assert training.service_seconds == dict(logging=3., evaluation=2., checkpoint=0.)
+    def fail():
+        raise OSError("interrupted save")
+    with pytest.raises(OSError, match="interrupted save"):
+        training.measure_service("checkpoint", fail)
+    assert training.service_seconds["checkpoint"] == 3.
 
 
 @pytest.mark.parametrize("algorithm", ["ppo", "mappo"])

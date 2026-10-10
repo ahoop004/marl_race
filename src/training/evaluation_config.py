@@ -19,6 +19,9 @@ def resolve_evaluation_protocol(scenario: Dict[str, Any], protocol: str) -> Dict
     for key in ("terminate_on_track_limit", "terminate_on_collision", "lap_completion"):
         if key in evaluation and not isinstance(evaluation[key], bool):
             raise ScenarioError(f"evaluation.{key} must be boolean")
+    if evaluation.get("episode_termination_mode") is not None and evaluation["episode_termination_mode"] not in {
+            "any_agent", "all_agents", "all_trainable"}:
+        raise ScenarioError("evaluation.episode_termination_mode must be any_agent, all_agents, or all_trainable")
     for key in ("target_laps", "every_steps", "every_episodes"):
         value = evaluation.get(key)
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
@@ -61,11 +64,18 @@ def resolve_evaluation_protocol(scenario: Dict[str, Any], protocol: str) -> Dict
         max_steps = scenario["environment"].get("max_steps", 5000)
     if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 0:
         raise ScenarioError("Evaluation max_steps must be a nonnegative integer.")
+    environment = scenario["environment"]
+    termination = environment.get("episode_termination", {})
+    target_laps = evaluation.get("target_laps")
+    if target_laps is None:
+        target_laps = environment.get("target_laps", 1)
     result = {"name": protocol, "seed": config["seed"], "episodes": config["episodes"],
-              "max_steps": config.get("max_steps", max_steps)}
-    target_laps = config.get("target_laps")
-    if target_laps is not None:
-        result["target_laps"] = target_laps
+              "max_steps": config["max_steps"] if config.get("max_steps") is not None else max_steps,
+              "target_laps": config["target_laps"] if config.get("target_laps") is not None else target_laps,
+              "episode_termination_mode": evaluation.get("episode_termination_mode", termination.get("mode", "any_agent")),
+              "lap_completion": evaluation.get("lap_completion", termination.get("lap_completion", True)),
+              "terminate_on_collision": evaluation.get("terminate_on_collision", environment.get("terminate_on_collision", True)),
+              "terminate_on_track_limit": evaluation.get("terminate_on_track_limit", environment.get("track_limits", {}).get("terminate", False))}
     if "maps" in scenario:
         result["map_bundles"] = list(scenario["maps"][
             "selection" if protocol == "selection" else "final_test"])

@@ -53,6 +53,34 @@ def test_team_mean_keeps_configured_denominator_after_one_learner_retires():
     assert rewards == {"car_1": 3.0}
 
 
+@pytest.mark.parametrize("events,progress,expected", [
+    ({}, -.01, {"progress_delta/bonus": -.01}),
+    ({}, .1, {"progress_delta/bonus": .025}),
+    ({"collision_event": True}, .01, {"progress_delta/collision": -2.}),
+    ({"boundary_event": True}, .01, {"progress_delta/boundary": -.05}),
+    ({"lap_crossed": True, "race_completed": True, "terminal_reason": "race_complete"},
+     .01, {"progress_delta/bonus": .01, "lap_completion/bonus": 2.}),
+    ({"lap_crossed": True, "race_completed": True, "collision_event": True},
+     .01, {"progress_delta/collision": -2.}),
+    ({"lap_crossed": True, "race_completed": True, "track_limits": {"exceeded": True}},
+     .01, {"progress_delta/boundary": -.05}),
+    ({"lap_crossed": True, "race_completed": True, "terminal_reason": "time_limit"},
+     .01, {"progress_delta/bonus": .01, "timeout/penalty": -1.}),
+])
+def test_solo_transfer_and_team_local_completion_rewards_agree(events, progress, expected):
+    from core.scenario import load_yaml_config
+    configs = [load_yaml_config(f"configs/reward/{name}.yaml") for name in (
+        "solo_completion", "solo_transfer", "team_completion")]
+    assert configs[2]["reward"]["team_race_result"]["both_finish_bonus"] == 2.
+    context = dict(timestep=.05, track_length=100., info={
+        "centerline": {"progress_delta": progress}, "track_limits": {"exceeded": False}, **events})
+    expected = {**expected, "step_time/penalty": -.00025 * .05}
+    for config in configs:
+        reward, breakdown = RewardComposer.from_config(config).compute(context)
+        assert breakdown == pytest.approx(expected)
+        assert reward == pytest.approx(sum(expected.values()))
+
+
 def test_shared_finish_rewards_are_incremental_and_reset_for_the_next_race():
     composer = RewardComposer.from_config({"team_race_result": {
         "enabled": True, "objective": "combined",

@@ -27,6 +27,7 @@ class TrainingHook:
     """Base class — all methods are no-ops by default."""
 
     requires_transition_record: Optional[bool] = None
+    service_name = None
 
     def bind_trainer(self, trainer):
         self._trainer = trainer
@@ -81,6 +82,7 @@ def transition_record_hooks(hooks: List[Any]) -> List[Any]:
 
 class ConsoleHook(TrainingHook):
     """Logs per-episode stats to the console."""
+    service_name = "logging"
 
     def __init__(
         self,
@@ -191,6 +193,7 @@ class WandbHook(TrainingHook):
     """Log completed episode facts without requesting per-step transitions."""
 
     requires_transition_record = False
+    service_name = "logging"
 
     def __init__(self, wandb_logger: WandbLogger) -> None:
         self._wandb = wandb_logger
@@ -276,6 +279,7 @@ class WandbHook(TrainingHook):
 
 class CSVHook(TrainingHook):
     """Persist normal training metrics locally, independent of W&B."""
+    service_name = "logging"
 
     def __init__(self, csv_logger: "CSVLogger") -> None:
         self._csv = csv_logger
@@ -296,6 +300,7 @@ class CSVHook(TrainingHook):
 
 class CheckpointHook(TrainingHook):
     """Atomically save latest recovery state and the final budget model."""
+    service_name = "checkpoint"
 
     def __init__(self, agent, output_dir, *, provenance=None, configuration=None,
                  save_every_steps=None, save_every_updates=None):
@@ -350,8 +355,13 @@ class CheckpointHook(TrainingHook):
         training = self._trainer.checkpoint_state() if resumable else None
         progress = self._trainer.checkpoint_progress() if self._trainer else {
             "environment_steps": self._environment_steps, "updates": self._policy_version}
-        self._agent.save_checkpoint(path, provenance=self._provenance, configuration=self._configuration,
-                                    progress=progress, selection=selection, training_state=training)
+        save = self._agent.save_checkpoint
+        if self._trainer is not None:
+            self._trainer.measure_service("checkpoint", save, path, provenance=self._provenance,
+                configuration=self._configuration, progress=progress, selection=selection, training_state=training)
+        else:
+            save(path, provenance=self._provenance, configuration=self._configuration,
+                 progress=progress, selection=selection, training_state=training)
 
 
 class EvaluationCheckpointHook(CheckpointHook):
@@ -360,6 +370,8 @@ class EvaluationCheckpointHook(CheckpointHook):
     Completion selection uses earned progress, clean finishes and lap times.
     Outcomes come from simulator facts rather than reward values.
     """
+
+    service_name = "logging"  # Evaluation history/reporting excludes nested evaluation and saving.
 
     def __init__(
         self,
@@ -472,7 +484,8 @@ class EvaluationCheckpointHook(CheckpointHook):
 
     def _evaluate_checkpoint(self, completed_episodes: Optional[int]) -> None:
         started = time.perf_counter()
-        summary = dict(self._evaluator.evaluate())
+        summary = dict(self._trainer.measure_service("evaluation", self._evaluator.evaluate)
+                       if self._trainer is not None else self._evaluator.evaluate())
         summary["evaluation_seconds"] = time.perf_counter() - started
         self.evaluation_seconds += summary["evaluation_seconds"]
         summary["evaluation_seconds_total"] = self.evaluation_seconds
@@ -551,6 +564,7 @@ class EvaluationCheckpointHook(CheckpointHook):
 class PhysicsEpisodeHook(TrainingHook):
     """Write sampled episode physics through the shared provenance logger."""
     requires_transition_record = True
+    service_name = "logging"
 
     def __init__(self, output_dir, *, transition_records=False) -> None:
         from core.provenance import PhysicsEpisodeLog

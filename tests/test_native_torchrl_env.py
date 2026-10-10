@@ -293,13 +293,16 @@ def test_direct_collector_keeps_retired_slots_and_waits_for_physical_completion(
 
 @pytest.mark.parametrize("name,repeat", [("ppo_lap_completion_pretrain", 1),
                                          ("ppo_lap_completion_pretrain", 2),
-                                         ("mappo_2v2_completion_scratch", 1)])
+                                         ("mappo_2v2_completion_scratch", 1),
+                                         ("ppo_serial_profile", 1),
+                                         ("mappo_serial_profile", 1)])
 def test_real_physics_seeded_task_parity_specs_and_short_rollouts(name, repeat, monkeypatch):
     monkeypatch.chdir(ROOT)
     monkeypatch.setenv("PYGLET_HEADLESS", "true")
     config = load_and_expand_scenario(str(ROOT / "scenarios" / f"{name}.yaml"))
     config["environment"].update(max_steps=6, action_repeat=repeat)
-    config["environment"].update(map_bundles_train=["circle_map", "Budapest_map"],
+    profiling = name.endswith("serial_profile")
+    config["environment"].update(map_bundles_train=["circle_map"] if profiling else ["circle_map", "Budapest_map"],
                                  map_cycle="per_episode", map_pick="round_robin")
     team = name.startswith("mappo")
     mode = "team_shared" if team else "individual"
@@ -307,7 +310,7 @@ def test_real_physics_seeded_task_parity_specs_and_short_rollouts(name, repeat, 
     reference = create_race_task(config, scenario_dir=ROOT / "scenarios")
     try:
         assert native.task._snapshot is None and reference._snapshot is None
-        for episode_index, seed in enumerate((7, 19), start=2):
+        for episode_index, seed in enumerate((42, 42) if profiling else (7, 19), start=2):
             options = {"map_episode_index": episode_index, "spawn_episode_index": 3}
             current = native.reset(seed=seed, options=options)
             initial = current.clone()
@@ -317,7 +320,10 @@ def test_real_physics_seeded_task_parity_specs_and_short_rollouts(name, repeat, 
                 torch.testing.assert_close(current[key], initial[key], rtol=0, atol=0)
             reference_snapshot = reference.reset(seed=seed, options=options)
             assert native.task.episode_metadata.map_id == (
-                "circle_map" if episode_index == 2 else "Budapest_map")
+                "circle_map" if profiling or episode_index == 2 else "Budapest_map")
+            if profiling:
+                physics = native.snapshot.infos["car_0"]["physics"]
+                assert physics["mu"] == pytest.approx(1.0489)
             assert native.task.episode_metadata.map_id == reference.episode_metadata.map_id
             assert native.task.episode_metadata.environment_seed == seed
             for aid in native.physical_agent_ids:

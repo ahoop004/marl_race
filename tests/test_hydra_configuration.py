@@ -268,8 +268,48 @@ def test_serial_profiling_presets_keep_production_settings_separate(algorithm, t
     assert not config["evaluation"]["enabled"] and not config["wandb"]["enabled"]
     assert not config["environment"]["render"] and config["environment"]["max_steps"] > 0
     assert config["checkpoint"]["every_steps"] is None
+    assert config["experiment"]["measure_services"] and not config["logging"]["physics_episodes"]
+    environment = config["environment"]
+    assert {key: environment[key] for key in ("timestep", "action_repeat", "max_speed", "lidar_beams", "lidar_range")} == {
+        "timestep": .05, "action_repeat": 1, "max_speed": 8., "lidar_beams": 108, "lidar_range": 10.}
+    fixed_friction = dict(mode="fixed", mu=1.0489)
+    assert environment["friction"]["train"] == environment["friction"]["eval"] == fixed_friction
+    assert config["maps"]["train"] == config["maps"]["selection"] == config["maps"]["final_test"] == ["circle_map"]
+    assert config["experiment"]["seed"] == 42
+    assert environment["vehicle_params"] == production["environment"]["vehicle_params"]
+    assert environment["vehicle_params"]["wheel_actuators"]["wheel_speed_max"] == 160.
+    for agent in config["agents"].values():
+        if not agent["trainable"]:
+            assert agent["params"]["max_speed"] == 8.
+    assert production["environment"]["friction"]["train"] == dict(mode="gaussian", relative_std=.02)
     overridden = load_and_expand_scenario(f"scenarios/{algorithm}_serial_profile.yaml", overrides=[
         "experiment.total_steps=9", "execution.params.device=cuda"])
     assert overridden["experiment"]["total_steps"] == 9
     assert overridden["training_defaults"]["device"] == "cuda"
     assert load_and_expand_scenario(production_path) == production
+
+
+@pytest.mark.parametrize("path", [path for path in GOLDEN if "completion" in path])
+def test_completion_training_and_evaluation_share_horizons_and_termination(path):
+    from core.environment_config import resolve_environment_config
+    config = load_and_expand_scenario(path)
+    training = resolve_environment_config(config)
+    evaluated = resolve_environment_config(config, mode="eval")
+    for key in ("target_laps", "max_steps", "episode_termination", "terminate_on_collision", "track_limits"):
+        assert evaluated[key] == training[key]
+    for protocol in ("selection", "final"):
+        resolved = resolve_evaluation_protocol(config, protocol)
+        assert resolved["target_laps"] == training["target_laps"]
+        assert resolved["max_steps"] == training["max_steps"]
+
+
+def test_adaptation_arms_resolve_one_configurable_checkpoint_outside_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for adaptation in ("full_finetune", "lora"):
+        config = load_and_expand_scenario(TEAM, overrides=[f"adaptation={adaptation}",
+            "paths.pretrained_checkpoint=outputs/shared-source/best.pt"])
+        assert config["training_defaults"]["pretrained_actor_checkpoint"] == str(PROJECT_ROOT / "outputs/shared-source/best.pt")
+    config = load_and_expand_scenario("scenarios/ppo_lap_completion_transfer.yaml", overrides=[
+        "paths.pretrained_checkpoint=outputs/shared-source/best.pt", "reward=solo_transfer_metres"])
+    assert config["experiment"]["checkpoint"] == str(PROJECT_ROOT / "outputs/shared-source/best.pt")
+    assert config["agents"]["car_0"]["reward"]["reward"]["progress_delta_bonus"]["units"] == "metres"

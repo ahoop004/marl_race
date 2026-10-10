@@ -3,6 +3,7 @@ defaults:
 - ppo_lap_completion_pretrain
 - override /algorithm: ppo_profile
 - override /execution: serial_profile
+- override /simulation: serial_profile
 - _self_
 experiment:
   name: ppo_serial_profile
@@ -12,3 +13,5 @@ evaluation:
   enabled: false
 wandb:
   enabled: false
+logging:
+  physics_episodes: false

@@ -14,6 +14,21 @@ from test_torchrl_ppo import Capture, agent, trainer, rollout
 from utils.torch_io import atomic_save, safe_load
 
 
+def test_checkpoint_directories_select_best_for_transfer_and_latest_for_resume(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in ("best.pt", "latest.pt", "final.pt"):
+        (source / name).write_bytes(b"path resolution only")
+    monkeypatch.chdir(tmp_path.parent)
+    for operation in ("evaluation", "transfer", "resume"):
+        expected = "latest.pt" if operation == "resume" else "best.pt"
+        assert resolve_checkpoint_path("source", operation=operation, base_dir=tmp_path) == source / expected
+    assert resolve_checkpoint_path(str(source / "final.pt"), operation="transfer") == source / "final.pt"
+    (source / "best.pt").unlink()
+    with pytest.raises(FileNotFoundError, match="best.pt"):
+        resolve_checkpoint_path(str(source), operation="transfer")
+
+
 @pytest.mark.parametrize("field", ["schema", "implementation", "network", "observation", "physics", "routing", "tensor"])
 def test_incompatible_checkpoints_reject_before_model_mutation(field, tmp_path):
     source = agent()

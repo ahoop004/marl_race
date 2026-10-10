@@ -180,6 +180,21 @@ def test_resolution_preserves_source_nested_configuration():
     assert scenario == original
 
 
+def test_null_evaluation_horizons_inherit_training_and_final_overrides_are_explicit():
+    from training.evaluation_config import resolve_evaluation_protocol
+    scenario = ppo_scenario()
+    scenario["evaluation"].update(target_laps=None, max_steps=None)
+    scenario["evaluation"]["final_test"].update(target_laps=None, max_steps=None)
+    resolved = resolve_environment_config(scenario, mode="eval")
+    for protocol in ("selection", "final"):
+        values = resolve_evaluation_protocol(scenario, protocol)
+        for key in ("target_laps", "max_steps"):
+            assert values[key] == resolved[key] == scenario["environment"][key]
+    scenario["evaluation"]["final_test"].update(target_laps=3, max_steps=50)
+    final = resolve_evaluation_protocol(scenario, "final")
+    assert final["target_laps"] == 3 and final["max_steps"] == 50
+
+
 def test_network_configuration_is_separate_and_legacy_params_remain_defaults():
     from agents.common.networks import build_actor, build_critic, resolve_network_config
     from training.algorithms import resolve_training_params

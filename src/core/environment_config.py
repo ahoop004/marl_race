@@ -16,27 +16,15 @@ def resolve_environment_config(scenario, *, mode="train", scenario_dir=None, rol
     evaluation = scenario.get("evaluation", {}) or {}
     if env_config["physics_phase"] == "eval" and "no_progress" in evaluation:
         env_config["no_progress"] = evaluation["no_progress"]
-    if env_config["physics_phase"] == "eval" and "target_laps" in evaluation:
-        # Continuous training can disable finishing and timeouts. Evaluation
-        # explicitly restores a finite race for PPO and multi-agent MAPPO alike.
+    if env_config["physics_phase"] == "eval" and evaluation.get("target_laps") is not None:
         env_config["target_laps"] = int(evaluation["target_laps"])
-        env_config["episode_termination"] = {**env_config.get("episode_termination", {}),
-                                             "lap_completion": True}
-        if "max_steps" in evaluation:
-            env_config["max_steps"] = int(evaluation["max_steps"])
+    if env_config["physics_phase"] == "eval" and evaluation.get("max_steps") is not None:
+        env_config["max_steps"] = int(evaluation["max_steps"])
     if env_config["physics_phase"] == "eval" and "terminate_on_collision" in evaluation:
         env_config["terminate_on_collision"] = evaluation["terminate_on_collision"]
-    if env_config["physics_phase"] == "eval" and env_config.get("track_limits", {}).get("enabled"):
-        # Default paper evaluation records excursions; safety evaluation can
-        # explicitly retain boundary termination as well as collision checks.
-        env_config["track_limits"] = {
-            "enabled": True,
-            "terminate": bool(evaluation.get("terminate_on_track_limit", False)),
-        }
-        env_config["episode_termination"] = {**env_config.get("episode_termination", {}),
-                                             "lap_completion": True}
-        env_config["target_laps"] = int(evaluation.get("target_laps", 20))
-        env_config["max_steps"] = int(evaluation.get("max_steps", 16000))
+    if env_config["physics_phase"] == "eval" and "terminate_on_track_limit" in evaluation:
+        env_config["track_limits"] = {**env_config.get("track_limits", {}),
+                                      "terminate": evaluation["terminate_on_track_limit"]}
     if env_config["physics_phase"] == "eval" and "lap_completion" in evaluation:
         env_config["episode_termination"] = {**env_config.get("episode_termination", {}),
                                              "lap_completion": evaluation["lap_completion"]}
