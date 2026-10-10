@@ -1,4 +1,4 @@
-"""Lap summaries shared by serial episodes and parallel monitoring."""
+"""Lap summaries shared by training and evaluation."""
 
 
 def episode_lap_summary(info, metrics):

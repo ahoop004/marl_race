@@ -179,7 +179,7 @@ def test_task_assigns_one_owner_for_configured_shared_components():
     assert result.team_reward_components == {"shared": 10}
 
 
-def test_serial_and_parallel_selection_evaluation_match(monkeypatch):
+def test_selection_evaluator_repeats_fixed_seed_races_and_keeps_training_task_isolated(monkeypatch):
     from core.scenario import load_and_expand_scenario
     from core.task_builder import create_race_task
     from training.algorithms import learner_params, create_learner
@@ -188,25 +188,23 @@ def test_serial_and_parallel_selection_evaluation_match(monkeypatch):
     monkeypatch.setenv("PYGLET_HEADLESS", "true")
     config = load_and_expand_scenario(str(ROOT / "scenarios/mappo_2v2_completion_scratch.yaml"))
     config["environment"]["max_steps"] = 2
-    config["evaluation"].update(max_steps=2, episodes=3, num_workers=1)
+    config["evaluation"].update(max_steps=2, episodes=3)
     config["evaluation"].pop("protocols", None)
     config["training_defaults"].update(hidden_dims=[4], device="cpu")
     training_task = create_race_task(config, scenario_dir=ROOT / "scenarios")
-    serial = parallel = None
+    evaluator = None
     try:
         spec = training_task.spec
         params = learner_params(config, spec, "mappo")
         policy = create_learner("mappo", spec, params, training=False)
-        serial = create_selection_evaluator("mappo", config, ROOT / "scenarios", spec, params).bind_agent(policy)
-        expected = serial.evaluate()
-        config["evaluation"]["num_workers"] = 2
-        parallel = create_selection_evaluator("mappo", config, ROOT / "scenarios", spec, params).bind_agent(policy)
-        assert expected == parallel.evaluate()
+        evaluator = create_selection_evaluator("mappo", config, ROOT / "scenarios", spec, params).bind_agent(policy)
+        expected = evaluator.evaluate()
+        assert expected == evaluator.evaluate()
+        assert len(expected["episode_results"]) == 3
+        assert expected["evaluation_protocol"]["seeds"] == [10042, 10043, 10044]
         assert policy.actor.training
-        assert parallel.task._snapshot is None  # Physics runs only in worker-owned tasks.
+        assert training_task._snapshot is None
     finally:
-        if parallel is not None:
-            parallel.close()
-        if serial is not None:
-            serial.close()
+        if evaluator is not None:
+            evaluator.close()
         training_task.close()

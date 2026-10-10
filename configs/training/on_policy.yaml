@@ -6,5 +6,5 @@ experiment:
 training_defaults:
   update_version: torchrl-ppo-v1
   progress_unit: environment_steps
-  n_steps: 2048  # pooled decisions; must divide evenly across num_envs
+  n_steps: 2048  # decisions per serial rollout
   batch_size: 64

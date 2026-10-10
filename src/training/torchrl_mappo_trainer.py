@@ -1,4 +1,4 @@
-"""Race collection and reporting shared by TorchRL MAPPO and CPU workers."""
+"""Serial PettingZoo race collection and reporting for TorchRL MAPPO."""
 from __future__ import annotations
 
 import time
@@ -64,19 +64,6 @@ class TorchRLMAPPOTrainer:
     def _spawn_id(self, agent_id):
         return self.task.episode_metadata.spawn_id(agent_id)
 
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
-
-    def train(self, n_episodes: int = 0, *, total_steps: Optional[int] = None) -> None:
-        """Train to an episode count or exact joint environment-decision budget."""
-        for _ in self.iter_train(n_episodes, total_steps=total_steps):
-            pass
-
-    def train_parallel(self, scenario, scenario_dir, num_envs, n_episodes=0, *, total_steps=None):
-        from training.parallel_mappo import train_parallel
-        train_parallel(self, scenario, scenario_dir, num_envs, n_episodes, total_steps=total_steps)
-
     def _reset_task(self):
         self.parallel_env.reset()
         return self.parallel_env.snapshot
@@ -93,9 +80,8 @@ class TorchRLMAPPOTrainer:
         return bool(getattr(self.agent, "should_stop", False)) or any(
             getattr(hook, "should_stop", False) for hook in self.hooks)
 
-    def iter_train(self, n_episodes: int, *, parallel: bool = False,
-                   total_steps: Optional[int] = None):
-        """Shared race loop; a budget cut bootstraps without ending the race."""
+    def train(self, n_episodes: int = 0, *, total_steps: Optional[int] = None) -> None:
+        """Train to an episode count or exact joint environment-decision budget."""
         if total_steps is not None and (isinstance(total_steps, bool)
                 or not isinstance(total_steps, int) or total_steps <= 0):
             raise ValueError("total_steps must be a positive integer")
@@ -147,8 +133,6 @@ class TorchRLMAPPOTrainer:
                 nonlocal physics_steps
                 physics_steps += 1
                 self._physics_steps += 1
-                if parallel:
-                    self.agent.physics_steps_collected = self._physics_steps
                 update_agent_step_facts(
                     facts, step_idx=physics_steps, infos=substep.facts.info,
                     terminations=substep.facts.terminations,
@@ -168,17 +152,12 @@ class TorchRLMAPPOTrainer:
                 stacked_observations = (self.agent.pack_observations(active_trainable_ids, rows)
                     if hasattr(self.agent, "pack_observations") else np.stack(rows)
                     if rows else np.empty((0, getattr(self.agent, "obs_dim", 0)), dtype=np.float32))
-                if parallel:
-                    actions_norm, log_probs, values, raw_actions = yield (
-                        "act", (active_trainable_ids, stacked_observations, global_state)
-                    )
+                if active_trainable_ids:
+                    output = self.agent.sample_batch(active_trainable_ids, stacked_observations)
+                    actions_norm, log_probs, raw_actions = output.actions, output.log_probs, output.raw_actions
                 else:
-                    if active_trainable_ids:
-                        output = self.agent.sample_batch(active_trainable_ids, stacked_observations)
-                        actions_norm, log_probs, raw_actions = output.actions, output.log_probs, output.raw_actions
-                    else:
-                        actions_norm, log_probs, raw_actions = {}, {}, {}
-                    values = self.agent.evaluate_states(global_state, active_trainable_ids)
+                    actions_norm, log_probs, raw_actions = {}, {}, {}
+                values = self.agent.evaluate_states(global_state, active_trainable_ids)
                 task_step = self._step_task(actions_norm, on_physics_step=on_physics_step)
                 info_dict = task_step.after.infos
                 actions_phys = {aid: decision.action_physical for aid, decision in task_step.decisions.items()}
@@ -296,28 +275,21 @@ class TorchRLMAPPOTrainer:
                 collected += 1
                 budget_done = total_steps is not None and collected >= total_steps
 
-                if parallel:
-                    yield "step", next_global_state
-
                 # --- Trigger update when any buffer is full or episode ends ---
                 if self.agent.any_buffer_full() or episode_done or budget_done:
-                    if parallel:
-                        next_values = yield "value", next_global_state
-                        update_metrics = self.agent.finish_fragment(next_values)
-                    else:
-                        rollout_samples = sum(buf.size() for buf in self.agent.buffers.values())
-                        collection_seconds = time.perf_counter() - collection_started
-                        update_started = time.perf_counter()
-                        update_metrics = self.agent.update(
-                            next_global_state=next_global_state,
-                        )
-                        self._updates += bool(update_metrics)
-                        update_metrics["perf/update_seconds"] = time.perf_counter() - update_started
-                        update_metrics["perf/collection_seconds"] = collection_seconds
-                        update_metrics["perf/elapsed_seconds"] = time.perf_counter() - started_training
-                        update_metrics["train/rollout_agent_samples"] = rollout_samples
-                        update_metrics["perf/end_to_end_env_steps_per_second"] = collected / max(
-                            time.perf_counter() - started_training, 1e-9)
+                    rollout_samples = sum(buf.size() for buf in self.agent.buffers.values())
+                    collection_seconds = time.perf_counter() - collection_started
+                    update_started = time.perf_counter()
+                    update_metrics = self.agent.update(
+                        next_global_state=next_global_state,
+                    )
+                    self._updates += bool(update_metrics)
+                    update_metrics["perf/update_seconds"] = time.perf_counter() - update_started
+                    update_metrics["perf/collection_seconds"] = collection_seconds
+                    update_metrics["perf/elapsed_seconds"] = time.perf_counter() - started_training
+                    update_metrics["train/rollout_agent_samples"] = rollout_samples
+                    update_metrics["perf/end_to_end_env_steps_per_second"] = collected / max(
+                        time.perf_counter() - started_training, 1e-9)
                     self.agent.clear_buffers()
                     update_metrics["train/environment_steps"] = self._environment_steps
                     update_metrics["train/physics_steps"] = self._physics_steps

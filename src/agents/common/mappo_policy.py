@@ -169,7 +169,7 @@ class MAPPOPolicy:
             raise ValueError("LoRA requires a pretrained PPO actor or a matching MAPPO checkpoint before use")
 
     def actor_actions(self, observations, agent_ids, *, deterministic=False, return_raw=False):
-        """Route rows, including repeated IDs from independent environments."""
+        """Route observation rows to their policy agent actors."""
         self._require_lora_source()
         if len(agent_ids) != len(observations) or any(aid not in self._agent_index for aid in agent_ids):
             raise ValueError("Actor rows require matching, known agent IDs")

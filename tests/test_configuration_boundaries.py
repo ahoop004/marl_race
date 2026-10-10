@@ -41,22 +41,25 @@ def test_legacy_scenarios_resolve_the_same_action_owners():
     validate_experiment_scenario(scenario)
 
 
-def test_cli_rollout_override_uses_resolved_legacy_action_ownership():
+def test_cli_parameter_overrides_preserve_action_ownership_and_cpu_threads():
     from application.cli import apply_cli_overrides
 
     scenario = ppo_scenario()
     scenario["agents"]["car_0"].pop("trainable", None)
     args = SimpleNamespace(
         seed=None, episodes=None, wandb=False, no_wandb=False,
-        render=False, no_render=False, rollout_steps_per_env=7, num_envs=2,
+        render=False, no_render=False, torch_threads=2,
+        parameter_overrides=["agents.car_0.params.n_steps=7"],
     )
     overridden = apply_cli_overrides(scenario, args)
-    assert overridden["agents"]["car_0"]["params"]["n_steps"] == 14
+    assert overridden["agents"]["car_0"]["params"]["n_steps"] == 7
+    assert overridden["experiment"]["torch_threads"] == 2
+    assert resolve_agent_roles(overridden["agents"]).policy_agents == ("car_0",)
+    validate_experiment_scenario(overridden)
 
 
 @pytest.mark.parametrize("path,value,message", [
     (("mappo", "reward_mode"), "individual", "MAPPO completion requires"),
-    (("experiment", "collector_scheduling"), "unsupported", "collector_scheduling"),
     (("environment", "action_repeat"), 2, "joint team returns"),
     (("evaluation", "selection_strategy"), "lap_time", "Unsupported evaluation selection"),
 ])
@@ -65,6 +68,35 @@ def test_experiment_restrictions_survive_validation_split(path, value, message):
     scenario.setdefault(path[0], {})[path[1]] = value
     with pytest.raises(ScenarioError, match=message):
         validate_experiment_scenario(scenario)
+
+
+@pytest.mark.parametrize("setting", [
+    "experiment.num_envs=1",
+    "experiment.num_workers=1",
+    "experiment.collector_scheduling=synchronous",
+    "experiment.collector_progress_interval_s=15",
+    "experiment.worker_startup_batch_size=16",
+    "experiment.worker_startup_timeout_s=600",
+    "experiment.worker_response_timeout_s=120",
+    "experiment.terminal_recent_episodes=100",
+    "experiment.terminal_every_updates=1",
+    "experiment.terminal_diagnostic_every_updates=100",
+    "experiment.terminal_episode_detail=false",
+    "evaluation.num_workers=auto",
+    "training_defaults.rollout_steps_per_env=256",
+    "agents.car_0.params.rollout_steps_per_env=256",
+    "logging.collector_progress=false",
+    "wandb.logging.groups.collector=false",
+])
+def test_removed_parallel_settings_fail_clearly_after_cli_overrides(setting):
+    from application.cli import apply_cli_overrides
+
+    args = SimpleNamespace(seed=None, episodes=None, wandb=False, no_wandb=False,
+                           render=False, no_render=False, parameter_overrides=[setting])
+    scenario = apply_cli_overrides(ppo_scenario(), args)
+    with pytest.raises(ScenarioError, match="Unsupported parallel setting") as error:
+        validate_experiment_scenario(scenario)
+    assert setting.split("=", 1)[0] in str(error.value)
 
 
 def test_environment_and_observations_share_one_resolved_configuration(monkeypatch):

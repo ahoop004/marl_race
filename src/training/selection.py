@@ -30,11 +30,6 @@ def create_selection_evaluator(algorithm, scenario, scenario_dir, training_spec,
         if algorithm != "mappo":
             raise ValueError(f"Unsupported evaluation algorithm: {algorithm!r}")
         from training.mappo_evaluator import DeterministicMAPPOEvaluator
-        from training.parallel_mappo_evaluator import ParallelMAPPOEvaluator, evaluation_workers
-        workers = evaluation_workers(scenario, protocol["episodes"])
-        if workers > 1:
-            return ParallelMAPPOEvaluator(scenario=evaluation, scenario_dir=scenario_dir,
-                                          num_workers=workers, **options)
         return DeterministicMAPPOEvaluator(**options)
     except BaseException:
         task.close()

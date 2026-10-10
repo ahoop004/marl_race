@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any, List, Optional
 
 import torch
 from torchrl.envs import step_mdp
@@ -10,14 +11,49 @@ from adapters import RaceGymEnv
 from adapters.torchrl import RaceTorchRLEnv
 from env.types import TransitionRecord
 from metrics.outcomes import determine_outcome
-from training.ppo_collector import PPOTrainerBase
+from tasks import RaceTask
+from training.hooks import TrainingHook, transition_record_hooks
 from training.transition_records import transition_lifecycle_fields
 
 
-class TorchRLPPOTrainer(PPOTrainerBase):
-    def train_parallel(self, scenario, scenario_dir, num_envs, n_episodes=0, *, total_steps=None):
-        from training.parallel_ppo import train_parallel
-        return train_parallel(self, scenario, scenario_dir, num_envs, n_episodes, total_steps=total_steps)
+class TorchRLPPOTrainer:
+    """Own serial Gymnasium collection and training hook boundaries."""
+
+    def __init__(
+        self, task: RaceTask, agent: Any, *,
+        hooks: Optional[List[TrainingHook]] = None, render: bool = False,
+        run_id: str = "run",
+    ) -> None:
+        if len(task.possible_agents) != 1:
+            raise ValueError("PPO requires exactly one policy agent")
+        if task.team_reward_agent_id is not None:
+            raise ValueError("Team race rewards require MAPPO joint team returns")
+        self.task = task
+        self.rl_agent_id = task.possible_agents[0]
+        self.agent = agent
+        self.hooks = hooks or []
+        self._transition_hooks = transition_record_hooks(self.hooks)
+        self.render = render
+        self.run_id = run_id
+        self.collected_steps = 0
+
+    def _set_training_progress(self, completed: int, total: int) -> None:
+        setter = getattr(self.agent, "set_training_progress", None)
+        if setter is not None:
+            setter(completed / max(total, 1))
+
+    def _episode_id(self, episode: int) -> str:
+        return f"{self.run_id}_ep{episode:06d}"
+
+    def _map_id(self):
+        return self.task.episode_metadata.map_id
+
+    def _spawn_id(self):
+        return self.task.episode_metadata.spawn_id(self.rl_agent_id)
+
+    def _should_stop(self) -> bool:
+        return bool(getattr(self.agent, "should_stop", False)) or any(
+            getattr(hook, "should_stop", False) for hook in self.hooks)
 
     def train(self, n_episodes=0, *, total_steps=None):
         if total_steps is not None and (

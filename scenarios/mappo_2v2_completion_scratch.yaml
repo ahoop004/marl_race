@@ -4,12 +4,8 @@ experiment:
   mappo_backend: torchrl
   episodes: 5000
   seed: 42
-  num_envs: 1
   torch_threads: 1
-  terminal_every_updates: 1
-  collector_progress_interval_s: 15
   total_steps: 120000000
-  collector_scheduling: synchronous
 training_defaults:
   update_version: torchrl-mappo-batch512-v1
   progress_unit: environment_steps
@@ -34,7 +30,6 @@ training_defaults:
   pretrained_actor_observation_extension: frenet_neighbors
   device: cpu
   checkpoint_every_steps: 4096000
-  rollout_steps_per_env: 256  # joint decisions per environment in parallel
 mappo:
   actor_mode: independent
   reward_mode: team_shared
@@ -268,7 +263,6 @@ evaluation:
   every_steps: 4096000
   episode_termination_mode: all_trainable
   target_laps: 1
-  num_workers: auto
 agents:
   car_0:
     algorithm: mappo

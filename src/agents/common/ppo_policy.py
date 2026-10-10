@@ -83,8 +83,7 @@ class PPOPolicy:
     def set_training_progress(self, progress: float) -> None:
         """Set LR from the trainer's globally completed budget fraction.
 
-        Evaluation never advances this schedule. In parallel training only
-        the parent optimizer receives progress, not individual collectors.
+        Evaluation never advances this schedule.
         """
         if self.lr_schedule == "linear":
             fraction = float(np.clip(progress, 0.0, 1.0))

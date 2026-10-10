@@ -17,7 +17,7 @@ from training.algorithms import select_algorithm, learner_params, create_learner
 from training.selection import create_selection_evaluator
 from training.runtime import seed_process
 from training.hooks import (CSVHook, CheckpointHook, ConsoleHook,
-                            EvaluationCheckpointHook, MAPPOConsoleHook, WandbHook)
+                            EvaluationCheckpointHook, WandbHook)
 
 
 def run_training(scenario, args, console, scenario_dir, roles):
@@ -156,7 +156,6 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         algorithm=algorithm,
         trainable_agents=trainable_ids,
     )
-    num_envs = int(exp_cfg.get("num_envs", 1))
     if initial_checkpoint is not None:
         provenance["initial_checkpoint"] = {
             "path": str(initial_checkpoint),
@@ -174,33 +173,12 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "update_version": params.get("update_version"),
     }
     provenance["collector"] = {
-        "backend": "multiprocessing_spawn" if num_envs > 1 else "local",
+        "backend": "local",
         "task_adapter": "gymnasium" if algorithm == "ppo" else "pettingzoo_parallel",
-        "mode": "synchronous_grouped_workers_v1" if num_envs > 1 else "serial",
-        "num_envs": num_envs,
-        "inference": "centralized_batched" if num_envs > 1 else "local",
+        "mode": "serial",
+        "num_envs": 1,
+        "inference": "local",
     }
-    if num_envs > 1:
-        env_seed = env_cfg.get("seed")
-        env_seed = exp_cfg["seed"] if env_seed is None else env_seed
-        provenance["collector"].update({
-            "worker_threads": 1,
-            "collector_scheduling": exp_cfg.get("collector_scheduling", "synchronous"),
-            "num_workers": min(num_envs, int(exp_cfg.get("num_workers", num_envs))),
-            "environment_seeds": [(env_seed + i) % (2 ** 32) for i in range(num_envs)],
-            "policy_seeds": ("parent RNG; arrival ordering" if exp_cfg.get("collector_scheduling") == "ready"
-                             else "parent RNG; deterministic worker/environment ordering"),
-        })
-        if algorithm == "ppo":
-            provenance["collector"].update({
-                "worker_seeds": [(exp_cfg["seed"] + i) % (2 ** 32) for i in range(num_envs)],
-                "max_steps_per_worker_rollout": int(params.get("n_steps", 2048)) // num_envs,
-            })
-        else:
-            provenance["collector"].update({
-                "rollout_steps_per_env": scenario.get("training_defaults", {}).get("rollout_steps_per_env", 256),
-                "environment_step_unit": "joint_environment_decisions_including_opponent_only_steps",
-            })
     if pretrained_actor_path is not None:
         provenance["pretrained_actor"] = {
             "path": str(pretrained_actor_path),
@@ -230,7 +208,6 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
             log_every=int(os.environ.get("F110_LOG_EVERY", "1")),
             summary_every=int(os.environ.get("F110_SUMMARY_EVERY", "25")),
             lap_completion=compact_laps,
-            episode_only=compact_laps and num_envs > 1,
         ),
         CSVHook(csv_logger),
         CheckpointHook(
@@ -253,13 +230,6 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         from training.hooks import PhysicsEpisodeHook
         hooks.append(PhysicsEpisodeHook(output_dir))
 
-    if algorithm == "mappo" and num_envs > 1 and not compact_laps:
-        if not exp_cfg.get("terminal_episode_detail", False):
-            hooks = [hook for hook in hooks if not isinstance(hook, ConsoleHook)]
-        hooks.insert(0, MAPPOConsoleHook(console,
-            window=int(exp_cfg.get("terminal_recent_episodes", 100)),
-            every_updates=int(exp_cfg.get("terminal_every_updates", 10)),
-            diagnostic_every=int(exp_cfg.get("terminal_diagnostic_every_updates", 100))))
     if evaluation_selection_enabled:
         evaluator = create_selection_evaluator(algorithm, scenario, scenario_dir, spec, params)
         resources.callback(evaluator.close)
@@ -273,15 +243,11 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
             console=console, wandb_logger=wandb_logger,
         ))
         console.print_info(f"Selection evaluation: {evaluator.episodes} fixed-seed races; "
-                           f"completion={evaluator.completion}; workers={getattr(evaluator, 'num_workers', 1)}")
+                           f"completion={evaluator.completion}")
     trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id)
-    trainer.console = console
     total_steps = exp_cfg.get("total_steps")
     episodes = 0 if total_steps is not None else int(exp_cfg.get("episodes", 1000))
     budget = f"{total_steps} joint environment decisions" if total_steps is not None else f"{episodes} episodes"
-    console.print_info(f"Starting {algorithm.upper()} training for {budget} | num_envs={num_envs}")
+    console.print_info(f"Starting {algorithm.upper()} training for {budget}")
     options = {"total_steps": total_steps} if total_steps is not None else {}
-    if num_envs > 1:
-        trainer.train_parallel(scenario, scenario_dir, num_envs, episodes, **options)
-    else:
-        trainer.train(episodes, **options)
+    trainer.train(episodes, **options)

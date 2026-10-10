@@ -1,4 +1,4 @@
-"""Native MAPPO transition storage shared by learners and CPU collectors."""
+"""Native MAPPO transition storage for serial learner updates."""
 import numpy as np
 import torch
 from tensordict import TensorDict

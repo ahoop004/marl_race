@@ -158,61 +158,30 @@ def test_pettingzoo_training_preserves_team_rewards_and_fixed_only_continuation(
     assert hooks.ended
 
 
-def test_parallel_native_fragments_preserve_masks_and_do_not_mix_races(monkeypatch):
-    from multiprocessing.reduction import ForkingPickler
-    import pickle
-    from training.torchrl_collectors import MAPPOCollectorState, deserialize_rollout, serialize_rollout
-
-    agent = learner()
+@pytest.mark.parametrize("actor_mode", ["shared", "independent"])
+def test_native_fragments_preserve_masks_and_bootstrap_independently(actor_mode, monkeypatch):
+    agent = learner(actor_mode=actor_mode)
     with torch.no_grad():
         for parameter in agent.critic.parameters():
             parameter.zero_()
-    contract = {name: getattr(agent, name) for name in (
-        "agent_ids", "obs_dim", "obs_dims", "global_state_dim", "action_dim",
-    )}
     fragments = []
     for ids_per_step, rewards in (((IDS, ["car_1"]), (1, 2)), ((IDS,), (100,))):
-        collector = MAPPOCollectorState(contract, 2)
         for step, ids in enumerate(ids_per_step):
-            observations = {aid: np.array([step], dtype=np.float32) for aid in ids}
-            output = agent.sample_batch(ids, observations)
-            actions, log_probs = output.actions, output.log_probs
-            collector.store_batch(ids, observations=observations, global_state=np.array([step]),
-                                  actions=actions, log_probs=log_probs, raw_actions=output.raw_actions,
-                                  rewards={}, values={}, terminated={}, truncated={})
-            collector.store_team_step(ids, reward=rewards[step], value=0, terminal=False)
-            collector.set_next_state(np.array([step + 1]))
-        collector.finish_fragment({})
-        assert not collector._steps and all(buf.size() == 0 for buf in collector.buffers.values())
-        fragments.extend(deserialize_rollout(pickle.loads(ForkingPickler.dumps(serialize_rollout(fragment))))
-                         for fragment in collector.take_fragments())
+            store(agent, ids, step, rewards[step], terminal=False)
+            agent.set_next_state(np.array([step + 1]))
+        fragments.append(torch.stack(agent._steps).clone())
+        agent.clear_buffers()
+        assert not agent._steps and all(buf.size() == 0 for buf in agent.buffers.values())
     captured = []
     monkeypatch.setattr("agents.torchrl_mappo.optimize_ppo",
                         lambda agent, data, **kwargs: captured.append(data.clone()) or {})
     metrics = agent.update_rollouts(fragments)
-    torch.testing.assert_close(captured[0]["agents", "value_target"].flatten(), torch.tensor([2.8, 2.8, 2., 100., 100.]))
-    assert captured[0]["agents", "index"].flatten().tolist() == [0, 1, 1, 0, 1]
+    data = captured[0]
+    torch.testing.assert_close(data["agents", "value_target"].flatten(), torch.tensor([2.8, 2.8, 2., 100., 100.]))
+    assert data["agents", "index"].flatten().tolist() == [0, 1, 1, 0, 1]
     assert metrics["train/rollout_steps"] == 3 and metrics["train/rollout_agent_samples"] == 5
-
-
-@pytest.mark.parametrize("actor_mode", ["shared", "independent"])
-def test_parallel_inference_repeated_ids_match_native_log_probabilities(actor_mode):
-    from tensordict import TensorDict
-    from training.parallel_mappo import infer_requests
-
-    agent = learner(actor_mode=actor_mode)
-    observations = np.array([[1], [2], [3]], dtype=np.float32)
-    requests = {0: ("act", (IDS, observations[:2], np.array([0], dtype=np.float32))),
-                1: ("act", (["car_1"], observations[2:], np.array([100], dtype=np.float32)))}
-    responses = infer_requests(agent, requests)
-    rows = [(0, "car_0"), (0, "car_1"), (1, "car_1")]
-    data = TensorDict({"agents": TensorDict({
-        "observation": torch.tensor(observations), "index": torch.tensor([0, 1, 1]),
-    }, [3])}, [])
-    raw = torch.tensor(np.stack([responses[key][3][aid] for key, aid in rows]))
-    expected = agent.probabilistic_actor.get_dist(data).log_prob(raw)
-    actual = torch.tensor([responses[key][1][aid] for key, aid in rows])
-    torch.testing.assert_close(actual, expected)
+    log_probs = agent.probabilistic_actor.get_dist(data).log_prob(data["agents", "raw_action"])
+    torch.testing.assert_close(log_probs, data["agents", "raw_log_prob"])
 
 
 @pytest.mark.parametrize("actor_mode", ["shared", "independent", "lora"])

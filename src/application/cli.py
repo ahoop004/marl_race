@@ -30,16 +30,8 @@ def parse_args() -> argparse.Namespace:
                              help="Aggregate environment-decision budget for PPO/MAPPO")
     p.add_argument("--max-steps", type=int, default=None,
                    help="Positive per-episode physics-step limit for bounded testing; also caps evaluation")
-    p.add_argument("--num-envs", type=int, default=None,
-                   help="Parallel CPU environments for PPO or MAPPO training")
-    p.add_argument("--num-workers", type=int, default=None,
-                   help="PPO/MAPPO CPU worker processes; capped at num-envs")
-    p.add_argument("--rollout-steps-per-env", type=int, default=None,
-                   help="Decisions per environment per rollout; PPO pools num-envs times this value")
-    p.add_argument("--collector-scheduling", choices=("synchronous", "ready"), default=None,
-                   help="Serve all collectors together or serve ready workers without a per-step barrier")
     p.add_argument("--torch-threads", type=int, default=None,
-                   help="Parent PyTorch CPU threads; parallel collectors use one each")
+                   help="PyTorch CPU threads for training and evaluation")
     p.add_argument("--eval", action="store_true", help="Run evaluation instead of training")
     p.add_argument("--checkpoint", type=str, default=None,
                    help="Checkpoint file or run directory (best_model.pt): evaluate with --eval, "
@@ -88,24 +80,9 @@ def apply_cli_overrides(scenario: dict, args: argparse.Namespace) -> dict:
         scenario.setdefault("environment", {})["render"] = True
     elif args.no_render:
         scenario.setdefault("environment", {})["render"] = False
-    for name in ("num_envs", "num_workers", "torch_threads", "collector_scheduling"):
-        value = getattr(args, name, None)
-        if value is not None:
-            scenario.setdefault("experiment", {})[name] = value
-    horizon = getattr(args, "rollout_steps_per_env", None)
-    if horizon is not None:
-        if horizon <= 0:
-            raise ValueError("--rollout-steps-per-env must be positive")
-        num_envs = int(scenario.get("experiment", {}).get("num_envs", 1))
-        try:
-            roles = resolve_agent_roles(scenario.get("agents", {}))
-        except ValueError as exc:
-            raise ScenarioError(str(exc)) from exc
-        for aid in roles.policy_agents:
-            cfg = scenario["agents"][aid]
-            algorithm = str(cfg["algorithm"]).strip().lower()
-            cfg.setdefault("params", {})["n_steps"] = horizon * (num_envs if algorithm == "ppo" else 1)
-        scenario.setdefault("training_defaults", {})["rollout_steps_per_env"] = horizon
+    torch_threads = getattr(args, "torch_threads", None)
+    if torch_threads is not None:
+        scenario.setdefault("experiment", {})["torch_threads"] = torch_threads
     return resolve_max_speed(scenario)
 
 
@@ -116,8 +93,6 @@ def main() -> None:
         raise ValueError("--eval-protocol requires --eval and uses fixed episodes; omit --eval-episodes.")
 
     try:
-        # Validate the effective configuration after CLI overrides, so a local
-        # --num-envs 1 check can override a scenario sized for a larger machine.
         # Apply speed choices before expansion so a CLI override can replace or
         # remove a YAML speed limit before it changes the physical/controller limits.
         load_overrides = list(args.parameter_overrides)

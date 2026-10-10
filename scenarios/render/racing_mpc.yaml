@@ -3,11 +3,11 @@
 # Edit values below, or use: python3 run.py --scenario scenarios/render/racing_mpc.yaml --set key=value
 # Parameter overrides accept YAML scalars/lists/mappings; quote values containing spaces.
 # A mapping replaces that subtree; key=!delete removes an optional setting.
-# Dedicated flags (--seed, --num-envs, --episodes, etc.) take precedence over --set.
+# Dedicated flags (--seed, --episodes, etc.) take precedence over --set.
 # Agent params override training_defaults. Keep physics, actions and observation layout
 # matched to the checkpoint. The commented recipes at the end list coordinated choices.
 
-# Run identity, execution budget and CPU/GPU collection layout.
+# Run identity, execution budget and learner device settings.
 experiment:
   # Run/output name; use a distinct name for each parameter comparison.
   name: render_racing_mpc_solo
@@ -15,9 +15,7 @@ experiment:
   episodes: 2
   # Reproducible seed. Keep final-test seeds disjoint from checkpoint-selection seeds.
   seed: 10043
-  # 1 for serial/local collection; e.g. 400 for HPC. PPO n_steps must divide evenly across envs.
-  num_envs: 1
-  # PyTorch threads in the parent learner; collector processes use one thread.
+  # PyTorch CPU threads for training and evaluation.
   torch_threads: 1
 
 # Simulation, map selection, race lifecycle and sensing parameters.
@@ -314,7 +312,6 @@ wandb:
 # environment.friction.eval: {mode: grid, values: [0.8, 1.0, 1.2]}
 # Friction phases accept exactly the keys shown for the chosen mode.
 # Optional controls (uncomment at the indicated section, or use --set):
-# experiment.collector_scheduling: synchronous  # synchronous | ready; self-play retains its scheduler.
 # experiment.checkpoint: null  # PPO scratch; set a file/run directory for transfer or evaluation.
 # experiment.evaluation_only: false  # true requires --eval.
 

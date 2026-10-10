@@ -58,7 +58,6 @@ class CSVLogger:
         self._last_flush = time.monotonic()
         settings = (scenario_config or {}).get("logging", {})
         self.csv_exports = bool(settings.get("csv_exports", False))
-        self.collector_progress = bool(settings.get("collector_progress", False))
         self.flush_every = settings.get("flush_every", 64)
         self.flush_interval = settings.get("flush_interval_seconds", 10.)
         if isinstance(self.flush_every, bool) or not isinstance(self.flush_every, int) or self.flush_every < 1:
@@ -170,10 +169,6 @@ class CSVLogger:
             self._write_row(self.output_dir / "update_metrics.csv", {
                 key: value for key, value in metrics.items()
                 if isinstance(value, (str, int, float, bool)) or value is None})
-
-    def log_collector_progress(self, metrics: Dict[str, Any]):
-        if self.enabled and self.collector_progress:
-            self._write_row(self.output_dir / "collector_progress.csv", metrics)
 
     def log_jsonl(self, filename: str, row: Dict[str, Any]):
         """Keep one buffered source record; optional CSVs are debugging exports."""

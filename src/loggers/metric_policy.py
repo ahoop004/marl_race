@@ -9,7 +9,6 @@ AXES = {
     "train": "train/environment_steps",
     "perf": "train/environment_steps",
     "eval": "eval/environment_steps",
-    "collector": "collector/elapsed_seconds",
 }
 
 CORE = (
@@ -56,7 +55,7 @@ class MetricPolicy:
 
     def group_enabled(self, group):
         groups = self.config.get("groups", {})
-        default = self.debug or group not in {"collector", "reward_components"}
+        default = self.debug or group != "reward_components"
         return bool(groups.get(group, default))
 
     def accepts(self, key):
@@ -72,7 +71,7 @@ class MetricPolicy:
             rules = allowlist if isinstance(allowlist, dict) else dict.fromkeys(allowlist, True)
             matches = [bool(value) for pattern, value in rules.items() if fnmatchcase(key, pattern)]
             return bool(matches) and all(matches)
-        if self.debug or components or namespace == "collector":
+        if self.debug or components:
             return True
         if self.lap_completion and (key.startswith(("episode/reward/", "episode/individual_reward/"))
                 or key in {"episode/team/first_place", "episode/team/sweep", "episode/team/rank_score"}):

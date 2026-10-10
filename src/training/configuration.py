@@ -38,6 +38,25 @@ def validate_training_scenario(scenario):
     experiment = scenario["experiment"]
     environment = scenario["environment"]
     agents = scenario["agents"]
+    # Reject old execution options even when their value requested one worker.
+    removed = {"num_envs", "num_workers", "rollout_steps_per_env", "collector",
+               "terminal_recent_episodes", "terminal_every_updates",
+               "terminal_diagnostic_every_updates", "terminal_episode_detail"}
+    wandb_logging = (scenario.get("wandb", {}).get("logging") or {})
+    blocks = [("experiment", experiment),
+              ("evaluation", scenario.get("evaluation", {})),
+              ("training_defaults", scenario.get("training_defaults", {})),
+              ("logging", scenario.get("logging", {})),
+              ("wandb.logging", wandb_logging),
+              ("wandb.logging.groups", wandb_logging.get("groups", {}))]
+    blocks.extend((f"agents.{aid}.params", cfg.get("params", {}))
+                  for aid, cfg in agents.items() if isinstance(cfg, dict))
+    unsupported = [f"{path}.{key}" for path, block in blocks for key in (block or {})
+                   if key in removed or key.startswith(("worker_", "collector_"))]
+    if unsupported:
+        raise ScenarioError("Unsupported parallel setting(s): " + ", ".join(sorted(unsupported))
+                            + ". Training and evaluation use one environment in one process; "
+                              "remove these settings and use n_steps for rollout length.")
     if "evaluation_only" in experiment and not isinstance(experiment["evaluation_only"], bool):
         raise ScenarioError("experiment.evaluation_only must be boolean.")
     checkpoint = experiment.get("checkpoint")
@@ -108,43 +127,9 @@ def validate_training_scenario(scenario):
             raise ScenarioError(f"Unsupported evaluation selection strategy for {sorted(trainable_algos)}: {evaluation_strategy}")
     if total_steps is not None and trainable_algos not in ({"ppo"}, {"mappo"}):
         raise ScenarioError("A total_steps budget requires PPO or MAPPO.")
-    if experiment.get("collector_scheduling", "synchronous") not in {"synchronous", "ready"}:
-        raise ScenarioError("experiment.collector_scheduling must be synchronous or ready")
-    eval_workers = scenario.get("evaluation", {}).get("num_workers", 1)
-    if eval_workers != 'auto' and (isinstance(eval_workers, bool)
-            or not isinstance(eval_workers, int) or eval_workers < 1):
-        raise ScenarioError("evaluation.num_workers must be a positive integer or auto")
-    num_envs = experiment.get("num_envs", 1)
-    for name in ("num_envs", "num_workers", "torch_threads", "worker_startup_batch_size",
-                 "worker_startup_timeout_s", "worker_response_timeout_s"):
-        value = experiment.get(name, 1)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ScenarioError(f"'experiment.{name}' must be a positive integer.")
-    if num_envs > 1:
-        if trainable_algos not in ({"ppo"}, {"mappo"}):
-            raise ScenarioError("Parallel environments require PPO or MAPPO.")
-        if environment.get("render"):
-            raise ScenarioError("Parallel training requires headless training.")
-        seed = experiment.get("seed")
-        env_seed = environment.get("seed", seed)
-        if env_seed is None:
-            env_seed = seed
-        if any(isinstance(v, bool) or not isinstance(v, int) or not 0 <= v < 2 ** 32
-               for v in (seed, env_seed)):
-            raise ScenarioError("Parallel training requires explicit integer seeds in [0, 2**32).")
-        if total_steps is not None and total_steps < num_envs:
-            raise ScenarioError("Parallel training total_steps must be at least num_envs")
-        if total_steps is None and int(experiment.get("episodes", 1000)) < num_envs:
-            raise ScenarioError("Parallel training requires at least num_envs total episodes.")
-        params = {**scenario.get("training_defaults", {}), **agents[trainable_ids[0]].get("params", {})}
-        n_steps = params.get("n_steps", 2048)
-        if trainable_algos == {"ppo"} and (isinstance(n_steps, bool) or not isinstance(n_steps, int)
-                or n_steps < num_envs or n_steps % num_envs):
-            raise ScenarioError("Parallel PPO n_steps must be a positive multiple of num_envs.")
-        if trainable_algos == {"mappo"}:
-            horizon = scenario.get("training_defaults", {}).get("rollout_steps_per_env", 256)
-            if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1:
-                raise ScenarioError("MAPPO rollout_steps_per_env must be a positive integer")
+    torch_threads = experiment.get("torch_threads", 1)
+    if isinstance(torch_threads, bool) or not isinstance(torch_threads, int) or torch_threads < 1:
+        raise ScenarioError("'experiment.torch_threads' must be a positive integer.")
     if trainable_algos == {"mappo"}:
         if len(trainable_ids) != 2 or len(agents) != 4:
             raise ScenarioError("MAPPO completion experiments require two learners and two fixed opponents")

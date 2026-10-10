@@ -21,9 +21,8 @@ from physics.dynamic_models import first_order_actuator_step
 from physics.tire_models import MF61_KEYS, mf61_tire_force
 
 
-# Grouped collectors often have several controllers on the same map. Keep only
-# fields still owned by a controller, so cycling maps does not retain an entire
-# map bundle per worker. Shared fields are immutable.
+# Controllers on the same map share immutable distance fields. Keep only fields
+# still owned by a controller so cycling maps releases unused bundles.
 _DISTANCE_FIELDS = WeakValueDictionary()
 
 

@@ -3,11 +3,11 @@
 # Edit values below, or use: python3 run.py --scenario scenarios/ppo_lap_completion_pretrain.yaml --set key=value
 # Parameter overrides accept YAML scalars/lists/mappings; quote values containing spaces.
 # A mapping replaces that subtree; key=!delete removes an optional setting.
-# Dedicated flags (--seed, --num-envs, --episodes, etc.) take precedence over --set.
+# Dedicated flags (--seed, --episodes, etc.) take precedence over --set.
 # Agent params override training_defaults. Keep physics, actions and observation layout
 # matched to the checkpoint. The commented recipes at the end list coordinated choices.
 
-# Run identity, execution budget and CPU/GPU collection layout.
+# Run identity, execution budget and learner device settings.
 experiment:
   # Run/output name; use a distinct name for each parameter comparison.
   name: ppo_lap_completion_pretrain
@@ -17,16 +17,8 @@ experiment:
   total_steps: 120000000
   # Reproducible seed. Keep final-test seeds disjoint from checkpoint-selection seeds.
   seed: 42
-  # 1 for serial/local collection; e.g. 400 for HPC. PPO n_steps must divide evenly across envs.
-  num_envs: 1
-  # PyTorch threads in the parent learner; collector processes use one thread.
+  # PyTorch CPU threads for training and evaluation.
   torch_threads: 1
-  # Maximum concurrent worker starts; lower this if initialization exhausts RAM.
-  worker_startup_batch_size: 16
-  # Seconds allowed for a worker to initialize.
-  worker_startup_timeout_s: 600
-  # Seconds allowed for a live worker to respond.
-  worker_response_timeout_s: 120
 
 # Shared learner defaults. agents.<id>.params overrides these values.
 training_defaults:
@@ -34,7 +26,7 @@ training_defaults:
   progress_unit: environment_steps
   # Records the new loss/advantage implementation in resolved-config provenance.
   update_version: torchrl-ppo-v1
-  # PPO: pooled decisions across all environments.
+  # PPO: decisions per serial rollout.
   n_steps: 2048
   # Optimizer passes over each collected rollout.
   n_epochs: 10
@@ -449,7 +441,7 @@ agents:
         - 512
       # Available network activations: tanh, relu, silu, swish, leaky_relu (see agents/common/networks.py).
       activation: leaky_relu
-      # Pooled decisions across all environments; --rollout-steps-per-env overrides this.
+      # Decisions per serial rollout; override with --set agents.car_0.params.n_steps=VALUE.
       n_steps: 409600
       # Reward discount per policy decision; changing action_repeat changes its physical time horizon.
       gamma: 0.99
@@ -493,7 +485,7 @@ wandb:
       train: true
       eval: true
       performance: true
-      # collector and reward_components default off; debug enables both.
+      # reward_components default off; debug enables them.
   # true enables this component; false disables it.
   enabled: true
   # Logging project name.
@@ -532,21 +524,12 @@ wandb:
 # environment.friction.eval: {mode: grid, values: [0.8, 1.0, 1.2]}
 # Friction phases accept exactly the keys shown for the chosen mode.
 # Optional controls (uncomment at the indicated section, or use --set):
-# experiment.collector_scheduling: synchronous  # synchronous | ready
 # experiment.checkpoint: null  # PPO scratch; set a file/run directory for transfer or evaluation.
 # experiment.evaluation_only: false  # true requires --eval.
-# Local: --num-envs 1 --num-workers 1 --rollout-steps-per-env 1024
-# HPC: --num-envs 400 --num-workers 100 --rollout-steps-per-env 1024
-# The base keeps a 409600-decision rollout; use the local recipe for smaller updates.
 
 # Parameter choice: ppo_lap_completion_pretrain_local
 # Apply these assignments together to reproduce the previous settings:
 # --set agents.car_0.params.n_steps=1024
-
-# Parameter choice: ppo_lap_completion_pretrain_hpc
-# Apply these assignments together to reproduce the previous settings:
-# --set experiment.num_envs=400
-# --set experiment.num_workers=100
 
 # Parameter choice: ppo_lap_completion_validate
 # Apply these assignments together to reproduce the previous settings:

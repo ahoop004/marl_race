@@ -52,10 +52,6 @@ class TrainingHook:
     def on_update(self, metrics: Dict[str, float]) -> None:
         pass
 
-    def on_collector_progress(self, metrics: Dict) -> None:
-        """Liveness telemetry; does not advance the optimizer or episode count."""
-        pass
-
     def on_training_end(self) -> None:
         pass
 
@@ -89,7 +85,6 @@ class ConsoleHook(TrainingHook):
         log_every: int = 1,
         summary_every: int = 25,
         lap_completion: bool = False,
-        episode_only: bool = False,
     ) -> None:
         self._log = logger
         self._log_every = max(1, log_every)
@@ -98,7 +93,6 @@ class ConsoleHook(TrainingHook):
         self._outcomes: Deque[str] = deque(maxlen=self._summary_every)
         self._agent_outcomes: Dict[str, Deque[str]] = {}
         self._lap_completion = lap_completion
-        self._episode_only = episode_only
 
     def on_episode_end(self, episode: int, reward: float, info: Dict, metrics: Dict) -> None:
         self._rewards.append(reward)
@@ -122,9 +116,8 @@ class ConsoleHook(TrainingHook):
                 laps, lap_time, outcomes = episode_lap_summary(info, metrics)
                 laps_text = "n/a" if laps is None else f"{laps:g}"
                 time_text = "n/a" if lap_time is None else f"{lap_time:.2f}s"
-                mean_text = "" if self._episode_only else f"mean={mean_r:+.2f}  "
                 self._log.print_info(
-                    f"ep {episode:>6}  reward={reward:+.2f}  {mean_text}"
+                    f"ep {episode:>6}  reward={reward:+.2f}  mean={mean_r:+.2f}  "
                     f"laps={laps_text}  lap_time={time_text}  outcome={outcomes}")
             elif isinstance(agent_rewards, dict) and len(agent_rewards) > 1:
                 rewards_str = "  ".join(
@@ -160,7 +153,7 @@ class ConsoleHook(TrainingHook):
                     f"laps={laps_str}  lap_time={lap_time_str}  outcome={outcome}"
                 )
 
-        if not self._episode_only and episode % self._summary_every == 0 and self._outcomes:
+        if episode % self._summary_every == 0 and self._outcomes:
             from collections import Counter
             if self._lap_completion and len(self._agent_outcomes) > 1:
                 counts = Counter(value for outcomes in self._agent_outcomes.values() for value in outcomes)
@@ -173,104 +166,6 @@ class ConsoleHook(TrainingHook):
                     break
                 agent_counts = Counter(outcomes)
                 self._log.print_info(f"    {aid} outcomes: {dict(agent_counts)}")
-
-
-class MAPPOConsoleHook(TrainingHook):
-    """Bounded completed-episode window; update-driven even during long races."""
-
-    def __init__(self, logger, *, window=100, every_updates=10, diagnostic_every=100,
-                 lap_completion=False):
-        if min(window, every_updates) < 1 or diagnostic_every < 0:
-            raise ValueError("Monitoring window/cadence must be positive; diagnostics may be zero")
-        self._log = logger
-        self._races = deque(maxlen=window)
-        self._every = every_updates
-        self._diagnostic_every = diagnostic_every
-        self._metrics = {}
-        self._episodes = 0
-        self._last_printed = None
-        self._lap_completion = lap_completion
-
-    def on_episode_end(self, episode, reward, info, metrics):
-        if "race_record" in metrics:
-            self._races.append(metrics["race_record"])
-            self._episodes += 1
-
-    def on_update(self, metrics):
-        self._metrics = dict(metrics)
-        update = int(metrics.get("train/updates", 0))
-        if update == 1 or update % self._every == 0:
-            self._print()
-        if self._diagnostic_every and update % self._diagnostic_every == 0:
-            values = " ".join(f"{key}={value:.4g}" for key, value in metrics.items()
-                              if isinstance(value, (float, int)) and any(
-                                  token in key for token in ("loss", "entropy", "kl", "clip", "explained_variance")))
-            if values:
-                self._log.print_info("MAPPO diagnostics  " + values)
-
-    def _print(self):
-        m, rows = self._metrics, list(self._races)
-        identity = (m.get("train/environment_steps"), self._episodes)
-        if identity == self._last_printed:
-            return
-        self._last_printed = identity
-        text = (f"MAPPO update={m.get('train/updates', 0)} "
-                f"env_steps={m.get('train/environment_steps', 0)} "
-                f"env_steps/s={m.get('perf/end_to_end_env_steps_per_second', m.get('perf/round_env_steps_per_second', 0)):.1f} "
-                f"completed_window={len(rows)} completed_total={self._episodes}")
-        if self._lap_completion:
-            text = (f"MAPPO train steps={m.get('train/environment_steps', 0)} "
-                    f"episodes={self._episodes} recent={len(rows)} "
-                    f"env_steps/s={m.get('perf/end_to_end_env_steps_per_second', 0):.1f}")
-        if not self._lap_completion and 'perf/collection_seconds' in m:
-            text += (f" collect_s={m['perf/collection_seconds']:.2f} "
-                     f"update_s={m.get('perf/update_seconds', 0):.2f} "
-                     f"round_steps/s={m.get('perf/round_env_steps_per_second', 0):.1f}")
-            if 'perf/inference_seconds' in m:
-                text += (f" infer_s={m['perf/inference_seconds']:.2f} "
-                         f"receive_s={m.get('perf/worker_receive_seconds', 0):.2f} "
-                         f"wait_s={m.get('perf/worker_wait_seconds', 0):.2f}")
-        def mean(key):
-            values = [r[key] for r in rows if r.get(key) is not None]
-            return float(np.mean(values)) if values else None
-        def number(key):
-            value = mean(key)
-            return "n/a" if value is None else f"{value:.2f}"
-        if rows:
-            text += (f" reward={rows[-1]['training_return']:+.2f} mean={number('training_return')}"
-                     if self._lap_completion else f" return={number('training_return')}")
-            if self._lap_completion:
-                text += f" laps={number('mean_learner_laps')}"
-                times = [episode_lap_summary({}, {"race_record": r})[1] for r in rows]
-                times = [value for value in times if value is not None]
-                text += " lap_time=" + (f"{np.mean(times):.2f}s" if times else "n/a")
-                value = mean("both_finished")
-                if value is not None:
-                    text += f" finished={value:.1%}"
-                learners = [a for r in rows for a in r["agents"].values() if a["team"] == "trainable"]
-                for label, keys in (("failed", ("collision_dnf", "boundary_dnf")), ("timeout", ("timeout",))):
-                    if learners:
-                        text += f" {label}={np.mean([any(a.get(k, False) for k in keys) for a in learners]):.1%}"
-            elif rows[-1]["race_mode"] == "continuous":
-                text += (f" progress_laps={number('mean_net_progress_laps')} "
-                         f"laps={number('mean_learner_laps')} duration_s={number('duration_s')} "
-                         f"collision_dnfs={sum(r['own_collision_dnf_count'] for r in rows)} "
-                         f"boundary_dnfs={sum(r['own_boundary_dnf_count'] for r in rows)}")
-            else:
-                for label, key in (("both_finished", "both_finished"), ("first_place", "first_place"),
-                                   ("sweep", "sweep"), ("collision_dnf", "any_learner_collision_dnf")):
-                    value = mean(key)
-                    text += f" {label}=" + ("n/a" if value is None else f"{value:.1%}")
-                for aid, agent in rows[-1]["agents"].items():
-                    if agent["team"] == "trainable":
-                        rate = np.mean([r["agents"][aid]["finished"] for r in rows])
-                        text += f" {aid}_finished={rate:.1%}"
-        elif self._lap_completion:
-            text += " reward=pending (no completed episodes yet)"
-        self._log.print_info(text)
-
-    def on_training_end(self):
-        self._print()
 
 
 class WandbHook(TrainingHook):
@@ -290,7 +185,7 @@ class WandbHook(TrainingHook):
         learners = {aid: facts for aid, facts in race.get("agents", {}).items()
                     if facts["team"] == "trainable"}
         log = {"episode/reward": reward, "episode/number": episode}
-        for key in ("worker_id", "worker_seed", "worker_episode", "outcome", "map_bundle"):
+        for key in ("outcome", "map_bundle"):
             value = info.get(key)
             if value is not None:
                 log[f"episode/{key}"] = value
@@ -347,9 +242,6 @@ class WandbHook(TrainingHook):
                 log[f"episode/team_reward_component/{component}"] = value
         self._wandb.log_metrics(log)
 
-    def on_collector_progress(self, metrics: Dict) -> None:
-        self._wandb.log_metrics(metrics)
-
     def on_update(self, metrics: Dict[str, float]) -> None:
         self._update += 1
         self._wandb.log_metrics({"train/updates": self._update, **metrics})
@@ -366,9 +258,6 @@ class CSVHook(TrainingHook):
 
     def on_update(self, metrics: Dict[str, float]) -> None:
         self._csv.log_update(metrics)
-
-    def on_collector_progress(self, metrics: Dict) -> None:
-        self._csv.log_collector_progress(metrics)
 
     def on_training_end(self) -> None:
         self._csv.close()
@@ -647,11 +536,6 @@ class EvaluationCheckpointHook(CheckpointHook):
                 self._dir / "best_model.pt",
                 metadata={"checkpoint_selection": record},
             )
-
-    def set_evaluation_progress(self, callback):
-        """Connect parallel console monitoring without changing evaluation metrics."""
-        setter = getattr(self._evaluator, 'set_progress_callback', None)
-        return setter(callback) if setter is not None else None
 
 
 class PhysicsEpisodeHook(TrainingHook):

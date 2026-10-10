@@ -82,7 +82,6 @@ class TorchRLMAPPOAgent(MAPPOPolicy, MAPPORolloutStorage):
 
     @torch.no_grad()
     def actor_actions(self, observations, agent_ids, *, deterministic=False, return_raw=False):
-        # Parallel inference may repeat the same actor across independent races.
         self._require_lora_source()
         if len(agent_ids) != len(observations) or any(aid not in self._agent_index for aid in agent_ids):
             raise ValueError("Actor rows require matching, known agent IDs")

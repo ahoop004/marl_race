@@ -137,9 +137,17 @@ def trainer(hook, **params):
 
 
 @pytest.mark.parametrize("transitions", [False, True])
-def test_native_trainer_exact_budget_resets_and_hook_boundaries(transitions):
+def test_native_trainer_exact_budget_resets_and_hook_boundaries(transitions, monkeypatch):
     hook = Capture(transitions)
     training, controller = trainer(hook)
+    fragments = []
+    update = training.agent.update
+
+    def capture(data):
+        fragments.append(data.clone())
+        return update(data)
+
+    monkeypatch.setattr(training.agent, "update", capture)
     training.train(total_steps=7)
     assert training.collected_steps == controller.calls == 7
     assert controller.resets == len(hook.starts) == 3
@@ -148,6 +156,11 @@ def test_native_trainer_exact_budget_resets_and_hook_boundaries(transitions):
     assert [update["train/rollout_steps"] for update in hook.updates] == [4, 3]
     assert [update["train/environment_steps"] for update in hook.updates] == [4, 7]
     assert hook.ended
+    data = torch.cat(fragments)
+    assert data["observation"].flatten().tolist() == [0, 1, 2, 0, 1, 2, 0]
+    assert data["next", "observation"].flatten().tolist() == [1, 2, 3, 1, 2, 3, 1]
+    assert data["next", "done"].flatten().tolist() == [False, False, True, False, False, True, False]
+    assert not data["next", "terminated"].any()
     if transitions:
         assert len(hook.steps) == 7
         assert [record.step_idx for record in hook.steps] == [0, 1, 2, 0, 1, 2, 0]
@@ -186,86 +199,36 @@ def test_episode_budget_flushes_a_deferred_update_with_final_learning_rate():
     assert hook.updates[0]["train/learning_rate"] == pytest.approx(1e-4)
 
 
-def test_parallel_fragments_use_final_observations_and_independent_gae(monkeypatch):
-    from multiprocessing.reduction import ForkingPickler
-    import pickle
-    from training.torchrl_collectors import PPOCollectorState, deserialize_rollout, serialize_rollout
-
+def test_rollout_fragments_bootstrap_independently_with_native_log_probabilities(monkeypatch):
     learner = agent(gamma=0.9, gae_lambda=1)
     with torch.no_grad():
         learner.critic.net[0].weight.fill_(1)
         learner.critic.net[0].bias.zero_()
     fragments = []
     for observations, next_observations, rewards in (([2, 3], [3, 4], [1, 2]), ([100], [7], [4])):
-        policy = PPOCollectorState(2)
-        output = learner.sample_batch(np.array(observations, dtype=np.float32).reshape(-1, 1))
-        actions, log_probs, values = output.actions, output.log_probs, output.values
-        for row, observation in enumerate(observations):
-            policy.buffer.add([observation], actions[row], rewards[row], log_probs[row], values[row],
-                              terminated=False, truncated=False, raw_action=output.raw_actions[row],
-                              next_observation=[next_observations[row]])
-        payload = ForkingPickler.dumps(serialize_rollout(policy.pack_rollout()))
-        fragments.append(deserialize_rollout(pickle.loads(payload)))
-        policy.buffer.clear()
+        data = rollout(learner.policy, observations)
+        data["next", "observation"] = torch.tensor(next_observations, dtype=torch.float32).reshape(-1, 1)
+        data["next", "reward"] = torch.tensor(rewards, dtype=torch.float32).reshape(-1, 1)
+        fragments.append(data)
     captured = []
     monkeypatch.setattr("agents.torchrl_ppo.optimize_ppo", lambda agent, data: captured.append(data.clone()) or {})
     learner.update_rollouts(fragments)
     torch.testing.assert_close(captured[0]["value_target"].flatten(), torch.tensor([6.04, 5.6, 10.3]))
-    # Parallel inference uses the same latent log-probability as the native loss.
     log_probs = learner.probabilistic_actor.get_dist(captured[0]).log_prob(captured[0]["raw_action"])
     torch.testing.assert_close(log_probs, captured[0]["raw_log_prob"])
 
 
-def test_ppo_worker_keeps_reset_boundaries_and_final_observations_in_pooled_fragments():
-    from training.ppo_collector import PPOCollector
-    from training.torchrl_collectors import PPOCollectorState
-
-    task, controller, _ = make_task({3: ((), True, (), ("learner", "opponent"))}, repeat=1)
-    hook = Capture(True)
-    policy = PPOCollectorState(4)
-    collection = PPOCollector(
-        task, policy, hooks=[hook],
-    )
-    fragments = []
-    generator = collection.iter_train(total_steps=7)
-    response = None
-    while True:
-        try:
-            kind, payload = generator.send(response)
-        except StopIteration:
-            break
-        if kind == "act":
-            response = (np.zeros(2, dtype=np.float32), 0., 0., np.zeros(2, dtype=np.float32))
-        else:
-            assert kind == "rollout"
-            fragments.append(payload.clone())
-            response = {}
-
-    assert [fragment.numel() for fragment in fragments] == [4, 3]
-    data = torch.cat(fragments)
-    assert data["observation"].flatten().tolist() == [0, 1, 2, 0, 1, 2, 0]
-    assert data["next", "observation"].flatten().tolist() == [1, 2, 3, 1, 2, 3, 1]
-    assert data["next", "done"].flatten().tolist() == [False, False, True, False, False, True, False]
-    assert not data["next", "terminated"].any()
-    assert controller.calls == collection.collected_steps == len(hook.steps) == 7
-    assert len(hook.episodes) == 2 and hook.ended
-
-
 @pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
-@pytest.mark.parametrize("scheduling", ["synchronous", "ready"])
-@pytest.mark.parametrize("workers", [1, 2])
-def test_spawned_collectors_stop_at_update_barrier_and_keep_evaluated_weights(algorithm, scheduling, workers):
+def test_serial_trainers_stop_after_update_and_keep_evaluated_weights(algorithm):
     from pathlib import Path
-    import multiprocessing as mp
     from core.scenario import load_and_expand_scenario
     from core.task_builder import create_race_task
 
     scenarios = Path(__file__).resolve().parents[1] / "scenarios"
     filename = "ppo_lap_completion_pretrain.yaml" if algorithm == "ppo" else "mappo_2v2_completion_scratch.yaml"
-    overrides = [f"experiment.{algorithm}_backend=torchrl", "experiment.num_envs=2",
-                 f"experiment.num_workers={workers}", f"experiment.collector_scheduling={scheduling}",
+    overrides = [f"experiment.{algorithm}_backend=torchrl",
                  "experiment.total_steps=7", "environment.max_steps=10", "evaluation.enabled=false",
-                 "training_defaults.rollout_steps_per_env=2", "agents.car_0.params.n_steps=4"]
+                 "agents.car_0.params.n_steps=4"]
     if algorithm == "mappo":
         pytest.importorskip("torchrl.objectives.multiagent")
         overrides += ["agents.car_1.params.n_steps=4", "agents.car_2.params.max_evaluations=10",
@@ -299,11 +262,10 @@ def test_spawned_collectors_stop_at_update_barrier_and_keep_evaluated_weights(al
                           _observation_contracts={aid: task.obs_composers[aid].contract for aid in ids})
             learner = TorchRLMAPPOAgent(obs_dim, len(state.vector), bounds.low, bounds.high, ids, params)
             training = TorchRLMAPPOTrainer(task, learner, hooks=[hook])
-        training.train_parallel(scenario, scenarios, 2, total_steps=7)
+        training.train(total_steps=7)
         assert len(hook.updates) == 1 and hook.updates[0]["train/environment_steps"] == 4
         assert hook.ended and not hook.episodes
         for key, value in learner.actor.state_dict().items():
             torch.testing.assert_close(value, hook.weights[key], rtol=0, atol=0)
-        assert not any("collector" in child.name for child in mp.active_children())
     finally:
         task.close()
