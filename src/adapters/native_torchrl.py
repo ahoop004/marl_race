@@ -153,9 +153,15 @@ class NativeRaceTorchRLEnv(EnvBase):
             raise ValueError("agents.action must have dtype float32")
         active = set(self.snapshot.agents)
         def policy_actions():
-            return {aid: action[i].detach().cpu().numpy().copy()
-                    for i, aid in enumerate(self.agent_ids) if aid in active}
-        actions = (self.profile_call("tensor_transfer", policy_actions, device=action.device)
+            actions = {}
+            for i, aid in enumerate(self.agent_ids):
+                if aid in active:
+                    detached = action[i].detach()
+                    cpu = (self.profile_call("action_device_to_cpu", detached.cpu, device=action.device)
+                           if self.profile_call and action.device.type != "cpu" else detached.cpu())
+                    actions[aid] = cpu.numpy().copy()
+            return actions
+        actions = (self.profile_call("action_conversion", policy_actions)
                    if self.profile_call else policy_actions())
         # RaceTask validates all active actions before any composer/controller runs.
         result = self.task.step(actions, on_physics_step=self._on_physics_step)
@@ -228,7 +234,9 @@ class NativeRaceTorchRLEnv(EnvBase):
             "elapsed_seconds": self._tensor([result.elapsed_seconds if result else 0], torch.float32),
         }, batch_size=(), device=self.device)
         if result is not None:
-            rewards = self.reward_mapping.from_step(result, self.agent_ids)
+            rewards = (self.profile_call("race_bookkeeping_reward", self.reward_mapping.from_step,
+                                         result, self.agent_ids)
+                       if self.profile_call else self.reward_mapping.from_step(result, self.agent_ids))
             output["agents", "reward"] = self._tensor(
                 [[rewards.get(aid, 0.0)] for aid in self.agent_ids], torch.float32)
             output["agents", "individual_reward"] = self._tensor(

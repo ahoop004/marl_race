@@ -1,8 +1,14 @@
 """Direct TorchRL collection and a small shared PPO/MAPPO update loop."""
 import time
 import math
-from contextlib import ExitStack
+import sys
+from contextlib import ExitStack, contextmanager
 from functools import wraps
+
+try:
+    import resource
+except ImportError:  # Not available on Windows.
+    resource = None
 
 import torch
 from torchrl.collectors import Collector
@@ -39,7 +45,7 @@ class OnPolicyTrainer:
     def __init__(self, task, agent, *, hooks=None, render=False, run_id="run",
                  focal_agent_id=None, algorithm=None, measure_services=False,
                  measure_stages=False, measure_mpc=False, measure_hybrid=False,
-                 profiling_warmup_updates=1):
+                 profiling_warmup_updates=1, measure_cuda_sync=False):
         self.task, self.agent = task, agent
         self.algorithm = algorithm or ("mappo" if hasattr(agent, "global_state_dim") else "ppo")
         if self.algorithm not in {"ppo", "mappo"}:
@@ -64,9 +70,16 @@ class OnPolicyTrainer:
         self.hybrid_totals = {}
         self.hybrid_environment_decisions = {}
         self.measure_stages = measure_stages
+        if type(measure_cuda_sync) is not bool:
+            raise ValueError("measure_cuda_sync must be a boolean")
+        self.measure_cuda_sync = measure_cuda_sync
         self.profiling_warmup_updates = profiling_warmup_updates
         self.stage_seconds = {phase: {} for phase in ("initialization", "warmup", "steady")}
         self.stage_calls = {phase: {} for phase in self.stage_seconds}
+        self.scope_seconds = {phase: {} for phase in self.stage_seconds}
+        self.process_cpu_seconds = {phase: 0.0 for phase in self.stage_seconds}
+        self._process_phase_started = None
+        self._peak_rss_bytes = None
         self._timing_phase = "initialization"
         self.initialization_seconds = 0.0
         self._run_started = self._run_finished = self._steady_started = None
@@ -118,23 +131,39 @@ class OnPolicyTrainer:
         return sum(sum(values.values()) for values in self.stage_seconds.values())
 
     def measure_stage(self, category, callback, *args, device=None, **kwargs):
-        """Exclusive wall time; detailed CUDA timing synchronizes at stage boundaries."""
         if not self.measure_stages:
             return callback(*args, **kwargs)
+        with self.measure_region(category, device=device):
+            return callback(*args, **kwargs)
+
+    @contextmanager
+    def measure_region(self, category, *, device=None):
+        """Exclusive wall time; extra CUDA synchronization is separately opt-in."""
+        if not self.measure_stages:
+            yield
+            return
         phase = self._timing_phase
-        if device is not None:
-            synchronize_device(device)
         previous = self._stage_total() + sum(self.service_seconds.values())
         started = time.perf_counter()
+        sync = (self.measure_cuda_sync and device is not None
+                and torch.device(device).type == "cuda")
         try:
-            return callback(*args, **kwargs)
+            if sync:
+                self.measure_stage("cuda_synchronization", synchronize_device, device)
+            yield
         finally:
-            if device is not None:
-                synchronize_device(device)
+            if sync:
+                self.measure_stage("cuda_synchronization", synchronize_device, device)
+            elapsed = time.perf_counter() - started
             nested = self._stage_total() + sum(self.service_seconds.values()) - previous
             values, calls = self.stage_seconds[phase], self.stage_calls[phase]
-            values[category] = values.get(category, 0.0) + max(0.0, time.perf_counter() - started - nested)
+            values[category] = values.get(category, 0.0) + max(0.0, elapsed - nested)
             calls[category] = calls.get(category, 0) + 1
+            # Inclusive envelopes are reported separately and never summed with stages.
+            scope = {"environment_adapter": "environment_step", "physics_overhead": "physics_step"}.get(category)
+            if scope:
+                totals = self.scope_seconds[phase]
+                totals[scope] = totals.get(scope, 0.0) + elapsed
 
     def _instrument_stages(self, resources):
         # Only measured runs install wrappers. Restore existing instance methods
@@ -156,24 +185,38 @@ class OnPolicyTrainer:
                     delattr(owner, name)
             resources.callback(restore)
 
-        instrument(self.env, "step", "environment_step")
+        instrument(self.env, "step", "environment_adapter")
         instrument(self.env, "reset", "environment_reset")
-        instrument(self.env, "_output", "tensor_transfer")
+        instrument(self.env, "_output", "tensor_construction")
+        instrument(self.task, "step", "race_bookkeeping_reward")
+        instrument(self.task.env, "step", "race_bookkeeping_reward")
         instrument(self.agent.collection_policy, "forward", "policy_inference", self.agent.device)
         instrument(self.agent.gae, "forward", "gae", self.agent.device)
-        for composer in (*self.task.obs_composers.values(), *self.task.reward_composers.values()):
-            instrument(composer, "wrap" if hasattr(composer, "wrap") else "compute", "observation_reward")
+        for composer in self.task.obs_composers.values():
+            instrument(composer, "wrap", "observation_state")
+        for composer in self.task.reward_composers.values():
+            instrument(composer, "compute", "race_bookkeeping_reward")
+        instrument(self.task, "_make_snapshot", "observation_state")
         for controller in self.task.fixed_controllers.values():
             instrument(controller, "act", "fixed_controller")
-        for name in ("_split_obs", "_update_centerline_observation_facts", "_attach_central_state"):
-            instrument(self.task.env, name, "observation_reward")
+        for name in ("_split_obs", "_update_centerline_observation_facts", "_attach_central_state", "get_global_state"):
+            instrument(self.task.env, name, "observation_state")
         simulator = getattr(self.task.env, "sim", None)
         if simulator is not None:
-            instrument(simulator, "step", "physics")
+            instrument(simulator, "step", "physics_overhead")
             instrument(simulator, "refresh_scans", "lidar")
             instrument(simulator.scan_simulator, "scan", "lidar")
             for vehicle in simulator.agents:
+                instrument(vehicle, "update_pose", "physics_dynamics")
+                instrument(vehicle, "compute_scan", "lidar")
+                instrument(vehicle, "check_ttc", "physics_collisions")
                 instrument(vehicle, "ray_cast_agents", "lidar")
+            original = getattr(simulator, "profile_region", None)
+            simulator.profile_region = self.measure_region
+            resources.callback(setattr, simulator, "profile_region", original)
+        original = getattr(self.task, "profile_region", None)
+        self.task.profile_region = self.measure_region
+        resources.callback(setattr, self.task, "profile_region", original)
         self.agent.profile_call = self.measure_stage
         self.env.profile_call = self.measure_stage
         resources.callback(setattr, self.agent, "profile_call", None)
@@ -414,6 +457,23 @@ class OnPolicyTrainer:
     def _rate_counters(self):
         return (self._environment_steps, self._physics_steps, self._agent_steps, self._optimizer_steps)
 
+    def _finish_process_phase(self):
+        if self._process_phase_started is not None:
+            self.process_cpu_seconds[self._timing_phase] += time.process_time() - self._process_phase_started
+            self._process_phase_started = None
+
+    def _set_timing_phase(self, phase):
+        self._finish_process_phase()
+        self._timing_phase = phase
+        if self.measure_stages:
+            self._process_phase_started = time.process_time()
+
+    def _sample_peak_rss(self):
+        if resource is not None:
+            # ru_maxrss is bytes on macOS and KiB on other supported Unix hosts.
+            self._peak_rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (
+                1 if sys.platform == "darwin" else 1024)
+
     def performance_metrics(self):
         if self._run_started is None:
             return {}
@@ -429,6 +489,18 @@ class OnPolicyTrainer:
                 for phase, values in self.stage_seconds.items() for name, seconds in values.items()})
             result.update({f"perf/stages/{phase}/{name}_calls": calls
                 for phase, values in self.stage_calls.items() for name, calls in values.items()})
+            result.update({f"perf/scopes/{phase}/{name}_seconds": seconds
+                for phase, values in self.scope_seconds.items() for name, seconds in values.items()})
+            cpu = dict(self.process_cpu_seconds)
+            if self._process_phase_started is not None:
+                cpu[self._timing_phase] += time.process_time() - self._process_phase_started
+            result.update({f"perf/process/{phase}_cpu_seconds": seconds for phase, seconds in cpu.items()})
+            result["perf/process/cpu_seconds"] = sum(cpu.values())
+            if self._run_finished is None:
+                self._sample_peak_rss()
+            if self._peak_rss_bytes is not None:
+                result["perf/process/peak_rss_bytes"] = self._peak_rss_bytes
+            result["perf/measure_cuda_sync"] = self.measure_cuda_sync
             result["perf/initialization_seconds"] = self.initialization_seconds + sum(self.stage_seconds["initialization"].values())
             result["perf/warmup_seconds"] = sum(self.stage_seconds["warmup"].values())
             if self._steady_started is not None:
@@ -522,7 +594,8 @@ class OnPolicyTrainer:
         self._run_started, self._run_finished = time.perf_counter(), None
         self._rate_baseline = self._rate_counters()
         self._initial_updates = self._updates
-        self._timing_phase = "initialization"
+        self.process_cpu_seconds = dict.fromkeys(self.stage_seconds, 0.0)
+        self._set_timing_phase("initialization")
         self.mpc_totals = {}
         self.mpc_environment_decisions = {}
         self.hybrid_totals = {}
@@ -592,7 +665,12 @@ class OnPolicyTrainer:
 
         def optimize(data):
             self._set_progress()
-            synchronize_device(self.agent.device)
+            def sync_update():
+                if self.measure_stages and torch.device(self.agent.device).type == "cuda":
+                    self.measure_stage("cuda_synchronization", synchronize_device, self.agent.device)
+                else:
+                    synchronize_device(self.agent.device)
+            sync_update()
             update_started = time.perf_counter()
             updated = (self.measure_stage("update", self.agent.update, data, device=self.agent.device)
                        if self.measure_stages else self.agent.update(data))
@@ -601,7 +679,7 @@ class OnPolicyTrainer:
             if not updated and getattr(self.agent, "_pending_batches", []):
                 updated = (self.measure_stage("update", self.agent.flush_pending_update, device=self.agent.device)
                            if self.measure_stages else self.agent.flush_pending_update())
-            synchronize_device(self.agent.device)
+            sync_update()
             return report_update(updated, update_started)
 
         stage_resources = ExitStack()
@@ -633,7 +711,7 @@ class OnPolicyTrainer:
                         interruptor=_CollectionBoundary(self))
                 collector = (self.measure_stage("collector_initialize", create_collector)
                              if self.measure_stages else create_collector())
-                self._timing_phase = "warmup" if self.profiling_warmup_updates else "steady"
+                self._set_timing_phase("warmup" if self.profiling_warmup_updates else "steady")
                 if self.measure_stages and self._timing_phase == "steady":
                     self._steady_started, self._steady_baseline = time.perf_counter(), self._rate_counters()
                 if self._resume_state is not None:
@@ -664,7 +742,7 @@ class OnPolicyTrainer:
                         checkpoint_boundary()
                         if ((self.measure_stages or self.measure_mpc or self.measure_hybrid) and self._timing_phase == "warmup"
                                 and self._updates - self._initial_updates >= self.profiling_warmup_updates):
-                            self._timing_phase = "steady"
+                            self._set_timing_phase("steady")
                             self._steady_started, self._steady_baseline = time.perf_counter(), self._rate_counters()
                     if self.budget_reached() or self._should_stop():
                         break
@@ -682,3 +760,6 @@ class OnPolicyTrainer:
             else:
                 self.env.close()
             self._run_finished = time.perf_counter()
+            self._finish_process_phase()
+            if self.measure_stages:
+                self._sample_peak_rss()

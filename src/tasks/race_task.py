@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import fields, is_dataclass, replace
 from typing import Any, Callable, Optional, Sequence
 
@@ -77,6 +78,7 @@ class RaceTask:
         self._decision_steps = 0
         self._physics_steps = 0
         self._closed = False
+        self.profile_region = None
         self._episode_metadata = None
 
     @property
@@ -200,23 +202,24 @@ class RaceTask:
         before = self._snapshot
         if set(actions) != set(before.agents):
             raise ValueError("Action keys must exactly match active policy agents")
-        normalized = {}
-        for aid in before.agents:
-            action = np.asarray(actions[aid])
-            if (action.dtype != np.float32 or action.shape != (2,)
-                    or not np.isfinite(action).all() or (np.abs(action) > 1).any()):
-                raise ValueError(f"{aid}: expected a finite float32 (2,) action in [-1, 1]")
-            normalized[aid] = action.copy()
-        physical = {aid: np.asarray(self.action_composers[aid].process(action.copy()),
-                                    dtype=np.float32).copy()
-                    for aid, action in normalized.items()}
-        for aid, controller in self.fixed_controllers.items():
-            if aid in before.active_physical_agents:
-                try:
-                    action = controller.act(before.raw_observations[aid])
-                except Exception:
-                    action = np.zeros(2, dtype=np.float32)
-                physical[aid] = np.asarray(action, dtype=np.float32).copy()
+        with self.profile_region("action_conversion") if self.profile_region else nullcontext():
+            normalized = {}
+            for aid in before.agents:
+                action = np.asarray(actions[aid])
+                if (action.dtype != np.float32 or action.shape != (2,)
+                        or not np.isfinite(action).all() or (np.abs(action) > 1).any()):
+                    raise ValueError(f"{aid}: expected a finite float32 (2,) action in [-1, 1]")
+                normalized[aid] = action.copy()
+            physical = {aid: np.asarray(self.action_composers[aid].process(action.copy()),
+                                        dtype=np.float32).copy()
+                        for aid, action in normalized.items()}
+            for aid, controller in self.fixed_controllers.items():
+                if aid in before.active_physical_agents:
+                    try:
+                        action = controller.act(before.raw_observations[aid])
+                    except Exception:
+                        action = np.zeros(2, dtype=np.float32)
+                    physical[aid] = np.asarray(action, dtype=np.float32).copy()
 
         rewards = dict.fromkeys(before.agents, 0.0)
         components = {aid: {} for aid in before.agents}

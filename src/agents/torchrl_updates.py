@@ -6,10 +6,16 @@ import torch
 from torchrl.data import LazyTensorStorage, SamplerWithoutReplacement, TensorDictReplayBuffer
 
 
-def mean_update_metrics(rows):
+def mean_update_metrics(rows, *, profile=None):
     """Transfer averaged optimizer metrics to the CPU once."""
     names = ("train/policy_loss", "train/value_loss", "train/entropy", "train/approx_kl")
-    means = torch.stack(rows).mean(dim=0).cpu().tolist() if rows else [0.0] * len(names)
+    if rows:
+        means = torch.stack(rows).mean(dim=0)
+        cpu = (profile("metrics_device_to_cpu", means.cpu, device=means.device)
+               if profile and means.device.type != "cpu" else means.cpu())
+        means = profile("tensor_to_python", cpu.tolist) if profile else cpu.tolist()
+    else:
+        means = [0.0] * len(names)
     return dict(zip(names, means))
 
 
@@ -67,7 +73,7 @@ def optimize_ppo(agent, data, *, group=None):
         if early_stop:
             break
     profile = getattr(agent, "profile_call", None)
-    metrics = (profile("tensor_transfer", mean_update_metrics, rows, device=agent.device)
+    metrics = (profile("metric_reduction", mean_update_metrics, rows, profile=profile, device=agent.device)
                if profile else mean_update_metrics(rows))
     log_stds = [p.detach().reshape(-1) for name, p in agent.actor.named_parameters()
                 if name == "log_std" or name.endswith(".log_std") or name.startswith("log_stds.")]

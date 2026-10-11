@@ -170,6 +170,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "torch_threads": exp_cfg.get("torch_threads", 1),
         "measure_services": exp_cfg.get("measure_services", False),
         "measure_stages": exp_cfg.get("measure_stages", False),
+        "measure_cuda_sync": exp_cfg.get("measure_cuda_sync", False),
         "measure_mpc": exp_cfg.get("measure_mpc", False),
         "measure_hybrid": exp_cfg.get("measure_hybrid", False),
         "profiling_warmup_updates": exp_cfg.get("profiling_warmup_updates", 1),
@@ -244,6 +245,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id,
                              measure_services=exp_cfg.get("measure_services", False),
                              measure_stages=exp_cfg.get("measure_stages", False),
+                             measure_cuda_sync=exp_cfg.get("measure_cuda_sync", False),
                              measure_mpc=exp_cfg.get("measure_mpc", False),
                              measure_hybrid=exp_cfg.get("measure_hybrid", False),
                              profiling_warmup_updates=exp_cfg.get("profiling_warmup_updates", 1))

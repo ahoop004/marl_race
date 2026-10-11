@@ -42,6 +42,8 @@ def validate_training_scenario(scenario):
         raise ScenarioError("experiment.measure_services must be boolean")
     if type(experiment.get("measure_stages", False)) is not bool:
         raise ScenarioError("experiment.measure_stages must be boolean")
+    if type(experiment.get("measure_cuda_sync", False)) is not bool:
+        raise ScenarioError("experiment.measure_cuda_sync must be boolean")
     if type(experiment.get("measure_mpc", False)) is not bool:
         raise ScenarioError("experiment.measure_mpc must be boolean")
     if type(experiment.get("measure_hybrid", False)) is not bool:

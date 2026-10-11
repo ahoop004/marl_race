@@ -105,8 +105,14 @@ class TorchRLPPOAgent(PPOPolicy):
         if not rollout.batch_size.numel():
             return
         profile = getattr(self, "profile_call", None)
-        data = (profile("tensor_transfer", lambda: rollout.to(self.device).clone(), device=self.device)
-                if profile else rollout.to(self.device).clone())
+        if profile:
+            moving = any(value.device != self.device for value in rollout.values(True, True)
+                         if isinstance(value, torch.Tensor))
+            category = "rollout_device_transfer" if moving else "tensor_device_conversion"
+            data = profile(category, rollout.to, self.device, device=self.device)
+            data = profile("tensor_copy", data.clone, device=self.device)
+        else:
+            data = rollout.to(self.device).clone()
         environment_steps = data.numel()
         if ("agents", "observation") in data.keys(True):
             data["observation"] = data["agents", "observation"].squeeze(-2)

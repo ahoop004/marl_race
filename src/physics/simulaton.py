@@ -1,5 +1,6 @@
 
 from typing import Optional
+from contextlib import nullcontext
 
 import numpy as np
 from numba import njit
@@ -83,6 +84,7 @@ class Simulator(object):
             None
         """
         self.num_agents = num_agents
+        self.profile_region = None
         self.wall_collision_response = bool(wall_collision_response)
         self.seed = seed
         self.time_step = time_step
@@ -222,29 +224,31 @@ class Simulator(object):
             np.copyto(state_buffer[i], agent.physics_state)
             agent.update_pose(float(control_inputs[i, 0]), float(control_inputs[i, 1]))
 
-            if self.wall_collision_response and getattr(agent, "in_collision", False):
-                if agent.nonlinear:
-                    # Stop at contact. Lifecycle handling latches a terminal
-                    # freeze; nonterminating collision experiments may resume.
-                    agent.freeze_motion(state_buffer[i], hold=False)
-                else:
-                    np.copyto(agent.state, state_buffer[i])
-                    agent.state[3] = 0.0
-                    agent.state[5] = 0.0
-                agent.compute_scan()
-                env_collision_mask[i] = True
+            with self.profile_region("physics_collisions") if self.profile_region else nullcontext():
+                if self.wall_collision_response and getattr(agent, "in_collision", False):
+                    if agent.nonlinear:
+                        # Stop at contact. Lifecycle handling latches a terminal
+                        # freeze; nonterminating collision experiments may resume.
+                        agent.freeze_motion(state_buffer[i], hold=False)
+                    else:
+                        np.copyto(agent.state, state_buffer[i])
+                        agent.state[3] = 0.0
+                        agent.state[5] = 0.0
+                    agent.compute_scan()
+                    env_collision_mask[i] = True
 
             pose_buffer[i, 0] = agent.state[0]
             pose_buffer[i, 1] = agent.state[1]
             pose_buffer[i, 2] = agent.state[4]
 
-            verts = get_vertices(
-                pose_buffer[i],
-                self.params['length'],
-                self.params['width'],
-            )
-            verts_buffer_f64[i, :, :] = verts
-            verts_buffer_f32[i, :, :] = verts
+            with self.profile_region("physics_collisions") if self.profile_region else nullcontext():
+                verts = get_vertices(
+                    pose_buffer[i],
+                    self.params['length'],
+                    self.params['width'],
+                )
+                verts_buffer_f64[i, :, :] = verts
+                verts_buffer_f32[i, :, :] = verts
 
             self.agent_poses[i, 0] = np.float32(agent.state[0])
             self.agent_poses[i, 1] = np.float32(agent.state[1])
@@ -266,17 +270,18 @@ class Simulator(object):
             np.copyto(self._scan_buffer[i], scan_row)
 
         # --- 2) agent-agent collisions (GJK)
-        visible = np.flatnonzero(self.collidable_mask)
-        if len(visible) == N:
-            col_flags, hit_idx = collision_multiple(verts_buffer_f64)
-        else:
-            flags, hits = collision_multiple(verts_buffer_f64[visible])
-            col_flags = np.zeros(N, dtype=np.float64)
-            hit_idx = np.full(N, -1, dtype=np.int64)
-            col_flags[visible] = flags
-            for local, hit in enumerate(hits):
-                if hit >= 0:
-                    hit_idx[visible[local]] = visible[int(hit)]
+        with self.profile_region("physics_collisions") if self.profile_region else nullcontext():
+            visible = np.flatnonzero(self.collidable_mask)
+            if len(visible) == N:
+                col_flags, hit_idx = collision_multiple(verts_buffer_f64)
+            else:
+                flags, hits = collision_multiple(verts_buffer_f64[visible])
+                col_flags = np.zeros(N, dtype=np.float64)
+                hit_idx = np.full(N, -1, dtype=np.int64)
+                col_flags[visible] = flags
+                for local, hit in enumerate(hits):
+                    if hit >= 0:
+                        hit_idx[visible[local]] = visible[int(hit)]
 
         # --- 3) opponent occlusions via LiDAR footprints, etc.
         if N > 1:
@@ -311,16 +316,17 @@ class Simulator(object):
                 if getattr(agent, "in_collision", False):
                     env_collision_mask[i] = True
 
-        _merge_collision_results(
-            np.asarray(col_flags, dtype=np.float64),
-            np.asarray(hit_idx, dtype=np.float64),
-            env_collision_mask,
-            self.collisions,
-            self.collision_idx,
-            ENV_COLLISION_IDX,
-        )
-        self.collisions[~self.collidable_mask] = 0.0
-        self.collision_idx[~self.collidable_mask] = -1
+        with self.profile_region("physics_collisions") if self.profile_region else nullcontext():
+            _merge_collision_results(
+                np.asarray(col_flags, dtype=np.float64),
+                np.asarray(hit_idx, dtype=np.float64),
+                env_collision_mask,
+                self.collisions,
+                self.collision_idx,
+                ENV_COLLISION_IDX,
+            )
+            self.collisions[~self.collidable_mask] = 0.0
+            self.collision_idx[~self.collidable_mask] = -1
 
         obs_dict = {
             "scans": self._scan_buffer.copy(),

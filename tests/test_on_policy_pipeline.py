@@ -145,7 +145,10 @@ def test_stage_profiling_preserves_updates_and_restores_instance_methods(measure
             torch.testing.assert_close(value, getattr(measured.agent, module).state_dict()[key], rtol=0, atol=0)
     stages = measured.stage_seconds
     for phase in ("warmup", "steady"):
-        assert all(stages[phase][name] > 0 for name in ("collector", "environment_step", "policy_inference", "gae", "optimization", "tensor_transfer"))
+        assert all(stages[phase][name] > 0 for name in (
+            "collector", "environment_adapter", "action_conversion", "race_bookkeeping_reward",
+            "observation_state", "policy_inference", "gae", "optimization",
+            "tensor_construction", "tensor_copy", "metric_reduction"))
     assert measured.stage_calls["warmup"]["optimization"] == 1
     assert measured.stage_calls["steady"]["optimization"] == 2
     assert "forward" not in vars(measured.agent.collection_policy)

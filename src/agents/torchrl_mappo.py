@@ -104,8 +104,14 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
             if not rollout.batch_size.numel():
                 continue
             profile = getattr(self, "profile_call", None)
-            fragment = (profile("tensor_transfer", lambda: rollout.to(self.device).clone(), device=self.device)
-                        if profile else rollout.to(self.device).clone())
+            if profile:
+                moving = any(value.device != self.device for value in rollout.values(True, True)
+                             if isinstance(value, torch.Tensor))
+                category = "rollout_device_transfer" if moving else "tensor_device_conversion"
+                fragment = profile(category, rollout.to, self.device, device=self.device)
+                fragment = profile("tensor_copy", fragment.clone, device=self.device)
+            else:
+                fragment = rollout.to(self.device).clone()
             with torch.no_grad():
                 self.gae(fragment)
             fragments.append(fragment)
