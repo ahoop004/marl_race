@@ -192,10 +192,11 @@ def test_hybrid_serial_preset_uses_shared_opponents_and_opt_in_metrics():
     validate_training_scenario(profile)
     assert not production["experiment"]["measure_hybrid"]
     assert not reference["experiment"]["measure_hybrid"]
-    assert reference["controllers"]["name"] == "racing_mpc"
+    assert reference["controllers"]["name"] == "hybrid_pp_ftg"
     assert profile["experiment"]["measure_hybrid"] and profile["experiment"]["measure_stages"]
     assert profile["controllers"]["hybrid_pp_ftg"]["max_speed"] == 8.
     for aid in ("car_2", "car_3"):
+        assert reference["agents"][aid] == production["agents"][aid]
         assert profile["agents"][aid] == production["agents"][aid]
     assert profile["experiment"]["total_steps"] == 16384
     assert profile["experiment"]["profiling_warmup_updates"] == 1

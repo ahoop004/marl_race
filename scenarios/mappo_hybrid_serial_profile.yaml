@@ -1,7 +1,6 @@
 # @package _global_
 defaults:
 - mappo_serial_profile
-- override /controllers: hybrid_pp_ftg
 - _self_
 experiment:
   name: mappo_hybrid_serial_profile
@@ -9,5 +8,3 @@ experiment:
 execution:
   experiment:
     measure_stages: true
-# Keep the shared hybrid settings (8 m/s cap) used by the training arms,
-# matching the MPC serial preset's speed cap.

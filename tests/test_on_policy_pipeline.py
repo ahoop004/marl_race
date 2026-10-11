@@ -35,7 +35,6 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
             "algorithm.params.n_steps=16", "algorithm.params.frames_per_batch=8",
             "algorithm.params.n_epochs=1", "algorithm.params.batch_size=8",
             f"execution.params.device={learner_device}",
-            *(["controllers.racing_mpc.max_evaluations=10"] if algorithm == "mappo" else []),
         ])
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)

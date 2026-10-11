@@ -5,15 +5,12 @@ defaults:
 - override /execution: serial_profile
 - override /simulation: serial_profile
 - override /maps: solo_pretrain
-- override /controllers: racing_mpc
+- override /controllers: hybrid_pp_ftg
 - _self_
 experiment:
   name: mappo_serial_profile
 environment:
   render: false
-controllers:
-  racing_mpc:
-    max_speed: 8.0
 evaluation:
   enabled: false
 wandb:
