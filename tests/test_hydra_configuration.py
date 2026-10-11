@@ -32,8 +32,9 @@ def parity_fingerprints(config, source, params=None):
     task = {k: deepcopy(config[k]) for k in ("experiment", "environment", "agents", "evaluation", "wandb")
             if k in config}
     # A disabled diagnostic does not change the task or learner contract.
-    if task["experiment"].get("measure_mpc") is False:
-        task["experiment"].pop("measure_mpc")
+    for name in ("measure_mpc", "measure_hybrid"):
+        if task["experiment"].get(name) is False:
+            task["experiment"].pop(name)
     if "mappo" in config:
         task["mappo"] = deepcopy(config["mappo"])
     env = task["environment"]

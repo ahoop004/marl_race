@@ -103,6 +103,9 @@ class RaceTrainingReports:
         if t.measure_mpc:
             phase = t._timing_phase
             t.mpc_environment_decisions[phase] = t.mpc_environment_decisions.get(phase, 0)+1
+        if t.measure_hybrid:
+            phase = t._timing_phase
+            t.hybrid_environment_decisions[phase] = t.hybrid_environment_decisions.get(phase, 0)+1
         t._agent_steps += result.agent_steps
         t._pending_learning_steps += result.agent_steps
         if result.after.episode_done:

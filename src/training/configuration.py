@@ -44,6 +44,8 @@ def validate_training_scenario(scenario):
         raise ScenarioError("experiment.measure_stages must be boolean")
     if type(experiment.get("measure_mpc", False)) is not bool:
         raise ScenarioError("experiment.measure_mpc must be boolean")
+    if type(experiment.get("measure_hybrid", False)) is not bool:
+        raise ScenarioError("experiment.measure_hybrid must be boolean")
     warmup = experiment.get("profiling_warmup_updates", 1)
     if type(warmup) is not int or warmup < 0:
         raise ScenarioError("experiment.profiling_warmup_updates must be a nonnegative integer")

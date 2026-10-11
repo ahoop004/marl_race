@@ -110,6 +110,50 @@ with a compact `outputs/controller_evaluation_summary.json`. The test run passed
 247 tests and skipped two GPU tests. The existing fresh-process PPO startup test
 fails because it checks `trainer.env` before `train()` initializes it.
 
+Hybrid profiling is optional (`experiment.measure_hybrid=false` by default).
+The dedicated serial preset enables internal hybrid and environment stage timing:
+
+```bash
+python3 run.py --scenario scenarios/mappo_hybrid_serial_profile.yaml \
+  --output-dir outputs/mappo_hybrid_profile
+```
+
+It keeps the shared 5 m/s hybrid settings, fixed grip, seed 42, CPU execution,
+and the same 16,384-decision MAPPO budget/update settings as the MPC serial preset.
+Add `--set controllers.hybrid_pp_ftg.max_speed=8.0` for the MPC preset's speed cap.
+For a baseline measuring profiling overhead, use the identical command with
+`--set experiment.measure_hybrid=false` and a separate output directory.
+On other scenarios, enable internal timing with `--set experiment.measure_hybrid=true`;
+environment stage timing is independent.
+
+`run_summary.json` includes `hybrid_profile`. Its exclusive stage breakdown covers
+map preparation, Pure Pursuit, curvature/stability speed planning, LiDAR
+preprocessing, traffic prediction, path checks/hysteresis, gap selection, smoothing,
+and other bookkeeping. Each stage reports total seconds, invocation count, mean
+milliseconds per controller call and per stage invocation, and percentage of
+hybrid time. Gap selection runs only when needed; Pure Pursuit is computed even
+in FTG mode. Total call timings include mean, maximum, and standard deviation.
+
+The report partitions calls by opponent, initialization/warm-up/steady phase,
+PP/FTG/invalid mode, active vehicles/learners/hybrid opponents, nearby traffic,
+blocked path, emergency braking, and episode/map startup. Counters include mode
+switches, braking/stopped commands, missing scans, invalid state, and failed gap
+searches. Mean input/target speed, absolute steering, LiDAR hits, preview samples,
+and tested gap candidates help explain workload and behavior. Mode fractions
+and rates use controller calls, including hysteresis decisions. Active counts use
+the physical lifecycle; traffic can include retired stationary wrecks.
+
+`update_metrics.csv` exports cumulative `perf/hybrid/...` scalars and stage metrics
+for overall, per-agent, phase, and mode partitions. No per-decision files or timing
+samples are retained. Totals reset per `train()` call and survive episode resets;
+callbacks are restored when training ends. Disabled hybrid profiling reads no
+controller clock. Internal seconds exclude the wheel adapter and aggregation;
+the outer `fixed_controller` stage includes both. Context partitions overlap and
+must not be added together. The first completed update is warm-up by default;
+use the full preset for representative steady-state measurements. A short smoke
+run can add `--total-steps 128 --set algorithm.params.n_steps=32
+--set algorithm.params.frames_per_batch=16` to exercise both phases.
+
 MPC profiling is optional (`experiment.measure_mpc=false` by default). Run the
 existing serial MAPPO preset with internal MPC and environment stage timing:
 
@@ -163,6 +207,7 @@ limits, controller actions, and learning configurations are unchanged.
 
 Environment `physics`, `lidar`, `observation_reward`, and `fixed_controller`
 stages separate simulation from controller costs. Hybrid runs use the same
-`fixed_controller` stage timing; `mpc_profile` only measures Racing MPC instances.
+`fixed_controller` stage timing and opt-in `hybrid_profile`; `mpc_profile` only
+measures Racing MPC instances.
 Prediction, footprint, and traffic collision costs within MPC's compiled `_shoot()`
 kernel remain combined; timing inside that kernel would require further instrumentation.

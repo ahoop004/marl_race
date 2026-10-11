@@ -1,5 +1,6 @@
 """Direct TorchRL collection and a small shared PPO/MAPPO update loop."""
 import time
+import math
 from contextlib import ExitStack
 from functools import wraps
 
@@ -25,6 +26,10 @@ class _CollectionBoundary:
 
 
 class OnPolicyTrainer:
+    _HYBRID_COUNTERS = ("seconds", "input_speed", "target_speed", "abs_steering",
+                        "blocked", "emergency_brake", "mode_switch", "no_gap",
+                        "missing_scan", "invalid_state", "stopped", "braking",
+                        "cold_start", "map_changed", "lidar_hits", "path_samples", "gap_candidates")
     _MPC_COUNTERS = ("seconds", "solver_seconds", "objective_seconds", "optimization_starts",
                      "nfev", "nit", "solver_failures", "outside_trajectory_evaluations",
                      "alternative_start_decisions", "alternative_starts", "braking_fallback",
@@ -33,7 +38,8 @@ class OnPolicyTrainer:
 
     def __init__(self, task, agent, *, hooks=None, render=False, run_id="run",
                  focal_agent_id=None, algorithm=None, measure_services=False,
-                 measure_stages=False, measure_mpc=False, profiling_warmup_updates=1):
+                 measure_stages=False, measure_mpc=False, measure_hybrid=False,
+                 profiling_warmup_updates=1):
         self.task, self.agent = task, agent
         self.algorithm = algorithm or ("mappo" if hasattr(agent, "global_state_dim") else "ppo")
         if self.algorithm not in {"ppo", "mappo"}:
@@ -52,6 +58,11 @@ class OnPolicyTrainer:
         self.measure_mpc = measure_mpc
         self.mpc_totals = {}
         self.mpc_environment_decisions = {}
+        if type(measure_hybrid) is not bool:
+            raise ValueError("measure_hybrid must be a boolean")
+        self.measure_hybrid = measure_hybrid
+        self.hybrid_totals = {}
+        self.hybrid_environment_decisions = {}
         self.measure_stages = measure_stages
         self.profiling_warmup_updates = profiling_warmup_updates
         self.stage_seconds = {phase: {} for phase in ("initialization", "warmup", "steady")}
@@ -276,6 +287,130 @@ class OnPolicyTrainer:
                     result[f"perf/mpc/{prefix}/{key}"] = value
         return result
 
+    def _instrument_hybrid(self, resources):
+        from agents.fixed.hybrid import HybridPPFTGAgent
+        from wrappers.actions.composer import WheelReferenceAdapter
+
+        self._hybrid_ids = []
+        for aid, adapter in self.task.fixed_controllers.items():
+            controller = adapter.controller if isinstance(adapter, WheelReferenceAdapter) else adapter
+            if not isinstance(controller, HybridPPFTGAgent):
+                continue
+            self._hybrid_ids.append(aid)
+            self.hybrid_totals.setdefault("agent", {}).setdefault(aid, {})
+            original = controller.profile_hybrid
+            controller.profile_hybrid = self._record_hybrid
+            resources.callback(setattr, controller, "profile_hybrid", original)
+
+    def _record_hybrid(self, record):
+        active = self.task.env.agents
+        context = dict(phase=self._timing_phase, agent=record["agent_id"],
+                       active_vehicles=len(active),
+                       active_learners=sum(aid in active for aid in self.trainable_ids),
+                       active_hybrid=sum(aid in active for aid in self._hybrid_ids),
+                       traffic=record["traffic_count"], mode=record["mode"],
+                       blocked=record["blocked"], emergency_brake=record["emergency_brake"],
+                       invalid_state=record["invalid_state"], cold_start=record["cold_start"],
+                       map_changed=record["map_changed"])
+        groups = [("all", "all"), *context.items(),
+                  ("agent_phase", f"{context['agent']}/{context['phase']}")]
+        for dimension, key in groups:
+            bucket = self.hybrid_totals.setdefault(dimension, {}).setdefault(str(key), {})
+            bucket["calls"] = bucket.get("calls", 0) + 1
+            for name in self._HYBRID_COUNTERS:
+                bucket[name] = bucket.get(name, 0) + record[name]
+            bucket["seconds_squared"] = bucket.get("seconds_squared", 0.) + record["seconds"] ** 2
+            bucket["max_seconds"] = max(bucket.get("max_seconds", 0.), record["seconds"])
+            for name in ("stages", "stage_calls"):
+                totals = bucket.setdefault(name, {})
+                for stage, value in record[name].items():
+                    totals[stage] = totals.get(stage, 0) + value
+
+    @classmethod
+    def _hybrid_statistics(cls, bucket):
+        mean_counters = {"input_speed", "target_speed", "abs_steering", "lidar_hits", "path_samples", "gap_candidates"}
+        result = {name: bucket.get(name, 0) for name in cls._HYBRID_COUNTERS if name not in mean_counters}
+        calls, seconds = bucket.get("calls", 0), bucket.get("seconds", 0.)
+        mean = seconds / calls if calls else 0.
+        result.update(calls=calls, mean_ms_per_call=1000 * mean,
+                      max_ms_per_call=1000 * bucket.get("max_seconds", 0.),
+                      std_ms_per_call=1000 * math.sqrt(max(0., bucket.get("seconds_squared", 0.) / calls - mean ** 2)) if calls else 0.)
+        for name in cls._HYBRID_COUNTERS:
+            if name == "seconds":
+                continue
+            key = f"mean_{name}" if name in mean_counters else f"{name}_rate"
+            result[key] = bucket.get(name, 0) / calls if calls else 0.
+        result["stages"] = {}
+        for name in ("map_preparation", "pure_pursuit", "speed_planning", "lidar_preprocessing",
+                     "traffic_prediction", "path_checks", "gap_selection", "smoothing", "other"):
+            value = bucket.get("stages", {}).get(name, 0.)
+            invocations = bucket.get("stage_calls", {}).get(name, 0)
+            result["stages"][name] = dict(seconds=value, calls=invocations,
+                mean_ms_per_call=1000 * value / calls if calls else 0.,
+                mean_ms_per_invocation=1000 * value / invocations if invocations else 0.,
+                percent_hybrid=100 * value / seconds if seconds else 0.)
+        return result
+
+    def hybrid_summary(self):
+        if not self.measure_hybrid:
+            return {}
+        groups = {dimension: {key: self._hybrid_statistics(bucket) for key, bucket in values.items()}
+                  for dimension, values in self.hybrid_totals.items()}
+        overall = groups.pop("all", {}).get("all", self._hybrid_statistics({}))
+        for dimension, keys in (("phase", self.stage_seconds), ("active_vehicles", range(1, 5)),
+                                ("mode", ("pp", "ftg", "invalid"))):
+            values = groups.setdefault(dimension, {})
+            for key in keys:
+                values.setdefault(str(key), self._hybrid_statistics({}))
+        decisions = sum(self.hybrid_environment_decisions.values())
+        now = self._run_finished or time.perf_counter()
+        elapsed = max(now - self._run_started, 0.) if self._run_started is not None else 0.
+        overall.update(environment_decisions=decisions,
+                       ms_per_environment_decision=1000 * overall["seconds"] / decisions if decisions else 0.,
+                       end_to_end_seconds=elapsed,
+                       percent_end_to_end=100 * overall["seconds"] / elapsed if elapsed else 0.)
+        for phase, values in groups["phase"].items():
+            count = self.hybrid_environment_decisions.get(phase, 0)
+            values["environment_decisions"] = count
+            values["ms_per_environment_decision"] = 1000 * values["seconds"] / count if count else 0.
+        for values in groups["mode"].values():
+            values["fraction"] = values["calls"] / overall["calls"] if overall["calls"] else 0.
+        return dict(overall=overall, **groups, definitions={
+            "scope": "Training collection only; totals reset at each train() call and accumulate across episodes.",
+            "seconds": "Wall time inside HybridPPFTGAgent.act, excluding adapter conversion and post-call aggregation.",
+            "stages": "Exclusive sequential seconds; other covers bookkeeping and early-return work. Pure Pursuit is computed in FTG calls too.",
+            "stage_means": "mean_ms_per_call divides by all controller calls; mean_ms_per_invocation divides by that stage's calls.",
+            "environment_decisions": "All training joint decisions, including decisions with no active hybrid opponents.",
+            "percent_end_to_end": "Hybrid seconds / trainer wall time including updates and hooks, excluding application setup.",
+            "mode": "Final decision mode; invalid labels invalid pose, velocity, yaw, steering, or grip. FTG includes hysteresis and missing-scan stops.",
+            "braking": "Commanded target speed below measured forward speed by more than 0.001 m/s; stopped means target <= 0.000001 m/s.",
+            "mode_switch": "PP/FTG transitions within valid decisions; episode/map resets are not switches.",
+            "no_gap": "FTG search returned no gap; missing scans and emergency traffic braking have separate counters.",
+            "phase": "Collector initialization, then profiling_warmup_updates completed updates, then steady.",
+            "cold_start": "First decision after episode/map reset; map preparation and any JIT/cache work remain in the calling stage.",
+            "traffic": "Forward nearby cars used by the short traffic envelope, including retired stationary wrecks; active counts use RaceEnv.agents.",
+            "dispersion": "Population standard deviation and maximum per-call time; no per-decision samples retained.",
+            "work": "Mean lidar_hits counts occupied scan returns; path_samples counts centerline preview points; gap_candidates counts tested steering arcs across gap tiers.",
+            "commands": "Mean input/target speed in m/s and absolute physical steering in radians, before adapter conversion.",
+            "groups": "Each grouping is an independent partition; do not sum different dimensions."})
+
+    def hybrid_metrics(self):
+        if not self.measure_hybrid:
+            return {}
+        summary = self.hybrid_summary()
+        result = {}
+        for prefix, values in [("all", summary["overall"]),
+                               *[(f"agent/{key}", value) for key, value in summary.get("agent", {}).items()],
+                               *[(f"phase/{key}", value) for key, value in summary["phase"].items()],
+                               *[(f"mode/{key}", value) for key, value in summary["mode"].items()]]:
+            for key, value in values.items():
+                if isinstance(value, (int, float)):
+                    result[f"perf/hybrid/{prefix}/{key}"] = value
+            for stage, fields in values["stages"].items():
+                for key, value in fields.items():
+                    result[f"perf/hybrid/{prefix}/stages/{stage}/{key}"] = value
+        return result
+
     def _rate_counters(self):
         return (self._environment_steps, self._physics_steps, self._agent_steps, self._optimizer_steps)
 
@@ -301,6 +436,7 @@ class OnPolicyTrainer:
                 result.update({f"perf/steady_{name}_per_second": (value - base) / duration
                     for name, value, base in zip(names, self._rate_counters(), self._steady_baseline)})
         result.update(self.mpc_metrics())
+        result.update(self.hybrid_metrics())
         return result
 
     def call_hook(self, hook, method, *args):
@@ -389,6 +525,8 @@ class OnPolicyTrainer:
         self._timing_phase = "initialization"
         self.mpc_totals = {}
         self.mpc_environment_decisions = {}
+        self.hybrid_totals = {}
+        self.hybrid_environment_decisions = {}
         if total_steps is not None and (type(total_steps) is not int or total_steps <= 0):
             raise ValueError("total_steps must be a positive integer")
         if total_steps is None and (type(n_episodes) is not int or n_episodes < 0):
@@ -470,6 +608,8 @@ class OnPolicyTrainer:
         try:
             if self.measure_mpc:
                 self._instrument_mpc(stage_resources)
+            if self.measure_hybrid:
+                self._instrument_hybrid(stage_resources)
             if self.measure_stages:
                 self._instrument_stages(stage_resources)
             require_source = getattr(self.agent, "_require_lora_source", None)
@@ -522,7 +662,7 @@ class OnPolicyTrainer:
                     self.reports.dispatch(metrics)
                     if updated:
                         checkpoint_boundary()
-                        if ((self.measure_stages or self.measure_mpc) and self._timing_phase == "warmup"
+                        if ((self.measure_stages or self.measure_mpc or self.measure_hybrid) and self._timing_phase == "warmup"
                                 and self._updates - self._initial_updates >= self.profiling_warmup_updates):
                             self._timing_phase = "steady"
                             self._steady_started, self._steady_baseline = time.perf_counter(), self._rate_counters()
