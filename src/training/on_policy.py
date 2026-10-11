@@ -1,7 +1,8 @@
-"""Direct TorchRL collection and a small shared PPO/MAPPO update loop."""
+"""Synchronous TorchRL collection and the shared PPO/MAPPO update loop."""
 import time
 import math
 import sys
+import os
 from contextlib import ExitStack, contextmanager
 from functools import wraps
 
@@ -45,8 +46,19 @@ class OnPolicyTrainer:
     def __init__(self, task, agent, *, hooks=None, render=False, run_id="run",
                  focal_agent_id=None, algorithm=None, measure_services=False,
                  measure_stages=False, measure_mpc=False, measure_hybrid=False,
-                 profiling_warmup_updates=1, measure_cuda_sync=False):
+                 profiling_warmup_updates=1, measure_cuda_sync=False,
+                 parallel_envs=1, scenario=None, scenario_dir=None):
         self.task, self.agent = task, agent
+        if type(parallel_envs) is not int or parallel_envs < 1:
+            raise ValueError("parallel_envs must be a positive integer")
+        if parallel_envs > 1:
+            if scenario is None:
+                raise ValueError("Process collection requires the task's scenario configuration")
+            if render:
+                raise ValueError("Process collection requires headless environments")
+        self.parallel_envs, self.scenario = parallel_envs, scenario
+        self.scenario_dir = str(scenario_dir) if scenario_dir is not None else None
+        self._worker_policy_starts = {}
         self.algorithm = algorithm or ("mappo" if hasattr(agent, "global_state_dim") else "ppo")
         if self.algorithm not in {"ppo", "mappo"}:
             raise ValueError(f"Unsupported on-policy algorithm: {self.algorithm!r}")
@@ -83,7 +95,14 @@ class OnPolicyTrainer:
         self._timing_phase = "initialization"
         self.initialization_seconds = 0.0
         self._run_started = self._run_finished = self._steady_started = None
+        self._steady_finished = None
         self._rate_baseline = self._steady_baseline = None
+        self.boundary_seconds = {phase: {} for phase in self.stage_seconds}
+        self.worker_stage_seconds = {phase: {} for phase in self.stage_seconds}
+        self.worker_stage_calls = {phase: {} for phase in self.stage_seconds}
+        self.worker_scope_seconds = {phase: {} for phase in self.stage_seconds}
+        self.worker_metrics = {}
+        self.worker_batch_metrics = {}
         self.trainable_ids = list(task.possible_agents)
         self.focal_id = focal_agent_id or self.trainable_ids[0]
         if self.focal_id not in self.trainable_ids:
@@ -102,8 +121,8 @@ class OnPolicyTrainer:
             if task.action_repeat != 1:
                 raise ValueError("Joint team returns require action_repeat=1")
         self._environment_steps = self._physics_steps = self._agent_steps = self._updates = 0
-        # n_steps targets active actor samples. A joint decision is indivisible,
-        # so MAPPO can exceed the target by at most number_of_learners - 1.
+        # n_steps targets global active actor samples. Serial MAPPO overshoots
+        # by at most learners - 1; processes stop at a physical batch boundary.
         self._pending_learning_steps = 0
         self.total_steps = self.n_episodes = None
         self.env = None
@@ -185,8 +204,18 @@ class OnPolicyTrainer:
                     delattr(owner, name)
             resources.callback(restore)
 
-        instrument(self.env, "step", "environment_adapter")
-        instrument(self.env, "reset", "environment_reset")
+        if self.parallel_envs > 1:
+            # Inference and environments live in workers. Never serialize a
+            # policy wrapper closing over the parent trainer and its hooks.
+            instrument(self.agent.gae, "forward", "gae", self.agent.device)
+            self.agent.profile_call = self.measure_stage
+            resources.callback(setattr, self.agent, "profile_call", None)
+            return
+        # Worker policy-version transforms dispatch to the native methods;
+        # the direct collector calls the public step/reset entrypoints.
+        worker_local = self.agent.collection_policy is None
+        instrument(self.env, "_step" if worker_local else "step", "environment_adapter")
+        instrument(self.env, "_reset" if worker_local else "reset", "environment_reset")
         instrument(self.env, "_output", "tensor_construction")
         instrument(self.task, "step", "race_bookkeeping_reward")
         instrument(self.task.env, "step", "race_bookkeeping_reward")
@@ -465,8 +494,36 @@ class OnPolicyTrainer:
     def _set_timing_phase(self, phase):
         self._finish_process_phase()
         self._timing_phase = phase
-        if self.measure_stages:
-            self._process_phase_started = time.process_time()
+        self._process_phase_started = time.process_time()
+
+    def _record_boundary(self, name, started):
+        values = self.boundary_seconds[self._timing_phase]
+        values[name] = values.get(name, 0.) + time.perf_counter() - started
+
+    @staticmethod
+    def _merge_profile(target, source):
+        for key, value in source.items():
+            if isinstance(value, dict):
+                OnPolicyTrainer._merge_profile(target.setdefault(key, {}), value)
+            elif key == "max_seconds":
+                target[key] = max(target.get(key, 0.), value)
+            else:
+                target[key] = target.get(key, 0) + value
+
+    def _receive_worker_profile(self, worker, packet):
+        self.worker_metrics[worker] = packet["process"]
+        for name in ("stage_seconds", "stage_calls", "scope_seconds"):
+            target = getattr(self, "worker_" + name)
+            for phase, values in packet.get(name, {}).items():
+                phase = "initialization" if phase == "initialization" else self._timing_phase
+                self._merge_profile(target[phase], values)
+        for kind in ("mpc", "hybrid"):
+            groups = packet.get(kind, {})
+            for dimension in ("phase", "agent_phase"):
+                groups[dimension] = {
+                    (self._timing_phase if dimension == "phase" else key.rsplit("/", 1)[0] + "/" + self._timing_phase): values
+                    for key, values in groups.get(dimension, {}).items()}
+            self._merge_profile(getattr(self, kind + "_totals"), groups)
 
     def _sample_peak_rss(self):
         if resource is not None:
@@ -484,6 +541,35 @@ class OnPolicyTrainer:
                   for name, value, base in zip(names, self._rate_counters(), self._rate_baseline)}
         result["perf/elapsed_seconds"] = elapsed
         result["perf/end_to_end_env_steps_per_second"] = result["perf/environment_steps_per_second"]
+        result.update({f"perf/boundaries/{phase}/{name}_seconds": seconds
+            for phase, values in self.boundary_seconds.items() for name, seconds in values.items()})
+        for worker, values in self.worker_metrics.items():
+            result.update({f"perf/workers/{worker}/{name}": value for name, value in values.items()})
+        result.update(self.worker_batch_metrics)
+        result.update({f"perf/worker_stages/{phase}/{name}_seconds": seconds
+            for phase, values in self.worker_stage_seconds.items() for name, seconds in values.items()})
+        result.update({f"perf/worker_stages/{phase}/{name}_calls": calls
+            for phase, values in self.worker_stage_calls.items() for name, calls in values.items()})
+        result.update({f"perf/worker_scopes/{phase}/{name}_seconds": seconds
+            for phase, values in self.worker_scope_seconds.items() for name, seconds in values.items()})
+        cpu = dict(self.process_cpu_seconds)
+        if self._process_phase_started is not None:
+            cpu[self._timing_phase] += time.process_time() - self._process_phase_started
+        result.update({f"perf/process/{phase}_cpu_seconds": seconds for phase, seconds in cpu.items()})
+        result["perf/process/cpu_seconds"] = sum(cpu.values())
+        result["perf/process/cpu_percent"] = 100 * sum(cpu.values()) / elapsed
+        if self._run_finished is None:
+            self._sample_peak_rss()
+        if self._peak_rss_bytes is not None:
+            result["perf/process/peak_rss_bytes"] = self._peak_rss_bytes
+        result["perf/process/cpu_affinity_count"] = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+        if self._steady_started is not None:
+            duration = max((self._steady_finished or now) - self._steady_started, 1e-9)
+            result["perf/steady_elapsed_seconds"] = duration
+            result.update({f"perf/steady_{name}": value - base
+                for name, value, base in zip(names, self._rate_counters(), self._steady_baseline)})
+            result.update({f"perf/steady_{name}_per_second": (value - base) / duration
+                for name, value, base in zip(names, self._rate_counters(), self._steady_baseline)})
         if self.measure_stages:
             result.update({f"perf/stages/{phase}/{name}_seconds": seconds
                 for phase, values in self.stage_seconds.items() for name, seconds in values.items()})
@@ -491,22 +577,9 @@ class OnPolicyTrainer:
                 for phase, values in self.stage_calls.items() for name, calls in values.items()})
             result.update({f"perf/scopes/{phase}/{name}_seconds": seconds
                 for phase, values in self.scope_seconds.items() for name, seconds in values.items()})
-            cpu = dict(self.process_cpu_seconds)
-            if self._process_phase_started is not None:
-                cpu[self._timing_phase] += time.process_time() - self._process_phase_started
-            result.update({f"perf/process/{phase}_cpu_seconds": seconds for phase, seconds in cpu.items()})
-            result["perf/process/cpu_seconds"] = sum(cpu.values())
-            if self._run_finished is None:
-                self._sample_peak_rss()
-            if self._peak_rss_bytes is not None:
-                result["perf/process/peak_rss_bytes"] = self._peak_rss_bytes
             result["perf/measure_cuda_sync"] = self.measure_cuda_sync
             result["perf/initialization_seconds"] = self.initialization_seconds + sum(self.stage_seconds["initialization"].values())
             result["perf/warmup_seconds"] = sum(self.stage_seconds["warmup"].values())
-            if self._steady_started is not None:
-                duration = max(now - self._steady_started, 1e-9)
-                result.update({f"perf/steady_{name}_per_second": (value - base) / duration
-                    for name, value, base in zip(names, self._rate_counters(), self._steady_baseline)})
         result.update(self.mpc_metrics())
         result.update(self.hybrid_metrics())
         return result
@@ -527,12 +600,18 @@ class OnPolicyTrainer:
                 "next_episode": self.reports.next_episode}
 
     def counter_metrics(self):
-        return {"train/environment_steps": self._environment_steps,
+        metrics = {"train/environment_steps": self._environment_steps,
                 "train/physics_steps": self._physics_steps,
                 "train/agent_steps": self._agent_steps,
                 "train/completed_episodes": self.reports.completed,
                 "train/updates": self._updates,
                 "train/optimizer_steps_total": self._optimizer_steps}
+        if self.parallel_envs > 1:
+            metrics.update({
+                "train/budget_step_overshoot": max(0, self._environment_steps - self.total_steps) if self.total_steps is not None else 0,
+                "train/budget_episode_overshoot": max(0, self.reports.completed - self.n_episodes) if self.total_steps is None and self.n_episodes is not None else 0,
+            })
+        return metrics
 
     def checkpoint_state(self):
         """Recovery at a completed update; the next collection starts a new race.
@@ -590,8 +669,101 @@ class OnPolicyTrainer:
                                 else (self.reports.completed, self.n_episodes))
             setter(completed / max(total, 1))
 
+    def _process_factories(self):
+        from training.process_collection import RaceEnvFactory
+        seed = (self._resume_state["recovery_seed"] if self._resume_state is not None
+                else self.scenario["experiment"].get("seed"))
+        # A missing seed still gets a reproducible worker schedule for this run.
+        seed = 0 if seed is None else seed
+        options = {name: getattr(self.agent, name, default) for name, default in (
+            ("reward_mode", "individual"), ("team_reward_reduction", "mean"),
+            ("team_return_mode", None), ("critic_mode", None))}
+        return [RaceEnvFactory(
+            self.scenario, self.scenario_dir, self.algorithm, self.run_id, worker,
+            self.parallel_envs, self.reports.next_episode, (seed + worker) % 2**32,
+            options, bool(self.reports.transition_hooks), self.focal_id,
+            dict(measure_stages=self.measure_stages, measure_mpc=self.measure_mpc,
+                 measure_hybrid=self.measure_hybrid))
+            for worker in range(self.parallel_envs)]
+
+    def _receive_process_batch(self, batch):
+        """Aggregate actual worker decisions, including fixed-only continuations."""
+        durations = []
+        for worker_data in batch.unbind(0):
+            worker = int(worker_data[0]["environment_id"].item())
+            packet = worker_data[0]["worker_profile"]
+            self._receive_worker_profile(worker, packet)
+            durations.append(packet["collection_seconds"])
+            for row in worker_data.unbind(0):
+                worker = int(row["environment_id"].item())
+                local_episode = int(row["environment_episode"].item())
+                key = worker, local_episode
+                self._worker_policy_starts.setdefault(key, self._updates)
+                self._environment_steps += 1
+                self._physics_steps += int(row["next", "decision_physics_steps"].item())
+                samples = int(row["next", "agent_steps"].item())
+                self._agent_steps += samples
+                self._pending_learning_steps += samples
+                for enabled, counts in ((self.measure_mpc, self.mpc_environment_decisions),
+                                        (self.measure_hybrid, self.hybrid_environment_decisions)):
+                    if enabled:
+                        counts[self._timing_phase] = counts.get(self._timing_phase, 0) + 1
+                for method, args in row["next", "race_events"]:
+                    if method == "on_episode_start":
+                        self.reports.next_episode = max(self.reports.next_episode, args[0]["episode"] + 1)
+                    if method == "on_episode_end":
+                        episode, reward, info, metrics = args
+                        self.reports.completed += 1
+                        race = metrics["race_record"]
+                        race.update(environment_decisions_total=self._environment_steps,
+                                    reported_at_environment_steps=self._environment_steps,
+                                    policy_version_start=self._worker_policy_starts.pop(key),
+                                    policy_version_end=self._updates)
+                        metrics.update(self.counter_metrics())
+                        self.reports.pending_episodes.append((episode, reward, info, metrics))
+                    else:
+                        hooks = self.reports.transition_hooks if method == "on_step" else self.hooks
+                        for hook in hooks:
+                            self.call_hook(hook, method, *args)
+        self.worker_batch_metrics = {
+            "perf/workers/batch_collection_min_seconds": min(durations),
+            "perf/workers/batch_collection_max_seconds": max(durations),
+            "perf/workers/batch_collection_mean_seconds": sum(durations) / len(durations),
+            "perf/workers/batch_imbalance_ratio": max(durations) / max(sum(durations) / len(durations), 1e-9),
+        }
+        values = self.boundary_seconds[self._timing_phase]
+        for name, value in (("worker_collection_sum", sum(durations)),
+                            ("worker_collection_max", max(durations)),
+                            ("worker_collection_min", min(durations)),
+                            ("worker_wait", len(durations) * max(durations) - sum(durations))):
+            values[name] = values.get(name, 0.) + value
+
+    @staticmethod
+    def _process_rollouts(pending):
+        """Join time within workers, then split races before GAE and masking."""
+        rollouts = []
+        for chunks in pending.values():
+            data = torch.cat(chunks, dim=0)
+            episodes = data["environment_episode"].squeeze(-1)
+            boundaries = (episodes[1:] != episodes[:-1]).nonzero().flatten().add(1).tolist()
+            start = 0
+            for end in [*boundaries, len(data)]:
+                race = data[start:end]
+                race = race[race["agents", "active"].any(dim=(-2, -1))]
+                if race.batch_size.numel():
+                    rollouts.append(race)
+                start = end
+        return rollouts
+
     def train(self, n_episodes=0, *, total_steps=None):
         self._run_started, self._run_finished = time.perf_counter(), None
+        self._steady_started = self._steady_finished = None
+        self.boundary_seconds = {phase: {} for phase in self.stage_seconds}
+        self.worker_stage_seconds = {phase: {} for phase in self.stage_seconds}
+        self.worker_stage_calls = {phase: {} for phase in self.stage_seconds}
+        self.worker_scope_seconds = {phase: {} for phase in self.stage_seconds}
+        self.worker_metrics = {}
+        self.worker_batch_metrics = {}
         self._rate_baseline = self._rate_counters()
         self._initial_updates = self._updates
         self.process_cpu_seconds = dict.fromkeys(self.stage_seconds, 0.0)
@@ -617,12 +789,14 @@ class OnPolicyTrainer:
             self.task, reward_mode=getattr(self.agent, "reward_mode", "individual"),
             team_reward_reduction=getattr(self.agent, "team_reward_reduction", "mean"))
         self.env.render_mode = "human" if self.render else None
-        self.env.on_reset = self.reports.reset
-        self.env.on_decision = self.reports.decision
-        self.env.on_physics_step = self.reports.physics
+        process = self.parallel_envs > 1
+        if not process:
+            self.env.on_reset = self.reports.reset
+            self.env.on_decision = self.reports.decision
+            self.env.on_physics_step = self.reports.physics
         if self.measure_stages:
             self.initialization_seconds += time.perf_counter() - self._run_started
-        pending = []
+        pending = {} if process else []
         collection_started = time.perf_counter()
         collection_service_seconds = sum(self.service_seconds.values())
         metrics = {}
@@ -649,6 +823,12 @@ class OnPolicyTrainer:
                     "perf/collection_seconds": max(0.0, update_started - collection_started - (
                         sum(self.service_seconds.values()) - collection_service_seconds)),
                 })
+                if process:
+                    updated.update({
+                        "train/update_sample_overshoot": max(0, updated["train/rollout_agent_samples"] - self.agent.n_steps),
+                        "train/collection_batch_frames": self.parallel_envs * math.ceil(self.agent.frames_per_batch / self.parallel_envs),
+                        "train/collection_batch_rounding": self.parallel_envs * math.ceil(self.agent.frames_per_batch / self.parallel_envs) - self.agent.frames_per_batch,
+                    })
                 update_environment_steps = self._environment_steps
                 update_physics_steps = self._physics_steps
                 update_agent_steps = self._agent_steps
@@ -672,21 +852,29 @@ class OnPolicyTrainer:
                     synchronize_device(self.agent.device)
             sync_update()
             update_started = time.perf_counter()
-            updated = (self.measure_stage("update", self.agent.update, data, device=self.agent.device)
-                       if self.measure_stages else self.agent.update(data))
+            update = self.agent.update_rollouts if process else self.agent.update
+            updated = (self.measure_stage("update", update, data, device=self.agent.device)
+                       if self.measure_stages else update(data))
             # The trainer owns cadence, including final rollouts smaller than
             # the legacy PPO minimum used by direct update_rollouts callers.
             if not updated and getattr(self.agent, "_pending_batches", []):
                 updated = (self.measure_stage("update", self.agent.flush_pending_update, device=self.agent.device)
                            if self.measure_stages else self.agent.flush_pending_update())
             sync_update()
+            self._record_boundary("update", update_started)
+            if process and updated:
+                # Synchronous workers are idle here. Publish the new actor before
+                # any next() call; native version tags verify worker application.
+                sync_started = time.perf_counter()
+                collector.update_policy_weights_(self.agent.collection_policy)
+                self._record_boundary("weight_sync", sync_started)
             return report_update(updated, update_started)
 
         stage_resources = ExitStack()
         try:
-            if self.measure_mpc:
+            if self.measure_mpc and not process:
                 self._instrument_mpc(stage_resources)
-            if self.measure_hybrid:
+            if self.measure_hybrid and not process:
                 self._instrument_hybrid(stage_resources)
             if self.measure_stages:
                 self._instrument_stages(stage_resources)
@@ -694,12 +882,23 @@ class OnPolicyTrainer:
             if require_source:
                 require_source()
             if not self.budget_reached():
-                # An unbounded collector plus its interruption protocol avoids
-                # 0.14's rounding of non-divisible total_frames. No private
-                # collector state, manual stepping, or artificial truncation.
+                # Serial interrupts at an exact decision boundary. Processes
+                # consume whole synchronous batches and report their overshoot.
+                # Neither path introduces artificial trajectory truncations.
                 if self._resume_state is not None:
                     self.env.set_seed(self._resume_state["recovery_seed"])
                 def create_collector():
+                    if process:
+                        from training.process_collection import pre_collect_profile, post_collect_profile
+                        return Collector(
+                            self._process_factories(), self.agent.collection_policy,
+                            backend="process", num_collectors=self.parallel_envs, sync=True,
+                            frames_per_batch=self.agent.frames_per_batch, total_frames=-1,
+                            policy_device="cpu", env_device="cpu", storing_device="cpu",
+                            reset_at_each_iter=False, set_truncated=False, use_buffers=False,
+                            auto_register_policy_transforms=False, track_policy_version=True,
+                            pre_collect_hook=pre_collect_profile, post_collect_hook=post_collect_profile,
+                            backend_options={"cat_results": "stack", "num_sub_threads": self.scenario["experiment"].get("torch_threads", 1)})
                     return Collector(
                         self.env, self.agent.collection_policy, backend="direct",
                         frames_per_batch=self.agent.frames_per_batch, total_frames=-1,
@@ -709,10 +908,12 @@ class OnPolicyTrainer:
                         # Buffered interruption pads unused rows with traj_ids=-1.
                         postproc=lambda batch: batch[batch["collector", "traj_ids"] >= 0],
                         interruptor=_CollectionBoundary(self))
+                startup_started = time.perf_counter()
                 collector = (self.measure_stage("collector_initialize", create_collector)
                              if self.measure_stages else create_collector())
+                self._record_boundary("worker_startup" if process else "collector_startup", startup_started)
                 self._set_timing_phase("warmup" if self.profiling_warmup_updates else "steady")
-                if self.measure_stages and self._timing_phase == "steady":
+                if self._timing_phase == "steady":
                     self._steady_started, self._steady_baseline = time.perf_counter(), self._rate_counters()
                 if self._resume_state is not None:
                     from agents.common.checkpoints import restore_rng
@@ -720,45 +921,68 @@ class OnPolicyTrainer:
                 iterator = iter(collector)
                 while True:
                     try:
+                        batch_started = time.perf_counter()
                         data = (self.measure_stage("collector", next, iterator)
                                 if self.measure_stages else next(iterator))
+                        self._record_boundary("collection", batch_started)
                     except StopIteration:
                         break
                     self.checkpoint_ready = False
                     updated = False
                     metrics = {}
+                    aggregation_started = time.perf_counter()
                     # Fixed-only continuation counts toward the physical budget,
                     # but follows the learner endpoint and needs no GAE rows.
-                    data = data[data["agents", "active"].any(dim=(-2, -1))]
-                    if data.batch_size.numel():
-                        pending.append(data)
+                    if process:
+                        self._receive_process_batch(data)
+                        for worker, fragment in enumerate(data.unbind(0)):
+                            fragment = fragment.exclude("race_events", ("next", "race_events"), "worker_profile")
+                            pending.setdefault(worker, []).append(fragment.clone())
+                    else:
+                        data = data[data["agents", "active"].any(dim=(-2, -1))]
+                        if data.batch_size.numel():
+                            pending.append(data)
+                    self._record_boundary("aggregation", aggregation_started)
                     ready = self._pending_learning_steps >= self.agent.n_steps or self.budget_reached()
                     if ready and pending:
-                        metrics = optimize(torch.cat(pending, dim=0))
-                        pending, self._pending_learning_steps = [], 0
+                        prepare_started = time.perf_counter()
+                        rollouts = self._process_rollouts(pending) if process else torch.cat(pending, dim=0)
+                        self._record_boundary("aggregation", prepare_started)
+                        metrics = optimize(rollouts)
+                        pending, self._pending_learning_steps = ({} if process else []), 0
                         updated = bool(metrics)
                     self.reports.dispatch(metrics)
                     if updated:
                         checkpoint_boundary()
-                        if ((self.measure_stages or self.measure_mpc or self.measure_hybrid) and self._timing_phase == "warmup"
+                        if (self._timing_phase == "warmup"
                                 and self._updates - self._initial_updates >= self.profiling_warmup_updates):
                             self._set_timing_phase("steady")
                             self._steady_started, self._steady_baseline = time.perf_counter(), self._rate_counters()
                     if self.budget_reached() or self._should_stop():
                         break
                 if not self._should_stop() and pending:
-                    metrics = optimize(torch.cat(pending, dim=0))
-                    pending, self._pending_learning_steps = [], 0
+                    prepare_started = time.perf_counter()
+                    rollouts = self._process_rollouts(pending) if process else torch.cat(pending, dim=0)
+                    self._record_boundary("aggregation", prepare_started)
+                    metrics = optimize(rollouts)
+                    pending, self._pending_learning_steps = ({} if process else []), 0
                     if metrics:
                         checkpoint_boundary()
+            self._steady_finished = time.perf_counter()
             for hook in self.hooks:
                 self.call_hook(hook, "on_training_end")
         finally:
             stage_resources.close()
+            shutdown_started = time.perf_counter()
             if collector is not None:
-                collector.shutdown()
+                try:
+                    collector.shutdown()
+                finally:
+                    if process:
+                        self.env.close()
             else:
                 self.env.close()
+            self._record_boundary("shutdown", shutdown_started)
             self._run_finished = time.perf_counter()
             self._finish_process_phase()
             if self.measure_stages:

@@ -163,11 +163,12 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     provenance["network"] = learner.network_config
     provenance["execution"] = {
         "requested_device": params.get("device", "cpu"),
-        "policy_device": str(learner.device),
+        "policy_device": "cpu" if exp_cfg.get("parallel_envs", 1) > 1 else str(learner.device),
         "environment_device": "cpu",
         "rollout_storage_device": "cpu",
         "update_device": str(learner.device),
         "torch_threads": exp_cfg.get("torch_threads", 1),
+        "parallel_envs": exp_cfg.get("parallel_envs", 1),
         "measure_services": exp_cfg.get("measure_services", False),
         "measure_stages": exp_cfg.get("measure_stages", False),
         "measure_cuda_sync": exp_cfg.get("measure_cuda_sync", False),
@@ -183,14 +184,23 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     }
     provenance["collector"] = {
         "implementation": "torchrl.collectors.Collector",
-        "backend": "direct",
+        "backend": "process" if exp_cfg.get("parallel_envs", 1) > 1 else "direct",
         "task_adapter": "native_envbase",
-        "mode": "serial",
-        "num_envs": 1,
-        "inference": "local",
+        "mode": "synchronous" if exp_cfg.get("parallel_envs", 1) > 1 else "serial",
+        "num_envs": exp_cfg.get("parallel_envs", 1),
+        "inference": "worker" if exp_cfg.get("parallel_envs", 1) > 1 else "local",
         "frames_per_batch": learner.frames_per_batch,
         "learning_sample_target": learner.n_steps,
         "learning_sample_unit": "active_learner_samples",
+        "effective_frames_per_batch": ((learner.frames_per_batch + exp_cfg.get("parallel_envs", 1) - 1)
+                                       // exp_cfg.get("parallel_envs", 1) * exp_cfg.get("parallel_envs", 1)),
+        "worker_seed_scheme": "(experiment.seed + worker_id) modulo 2**32",
+        "sync": True,
+        "reset_at_each_iter": False,
+        "set_truncated": False,
+        "use_buffers": exp_cfg.get("parallel_envs", 1) == 1,
+        "track_policy_version": exp_cfg.get("parallel_envs", 1) > 1,
+        "num_sub_threads": exp_cfg.get("torch_threads", 1),
     }
     csv_logger = CSVLogger(
         output_dir=output_dir,
@@ -243,6 +253,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         console.print_info(f"Selection evaluation: {evaluator.episodes} fixed-seed races; "
                            f"completion={evaluator.completion}")
     trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id,
+                             parallel_envs=exp_cfg.get("parallel_envs", 1),
+                             scenario=scenario, scenario_dir=scenario_dir,
                              measure_services=exp_cfg.get("measure_services", False),
                              measure_stages=exp_cfg.get("measure_stages", False),
                              measure_cuda_sync=exp_cfg.get("measure_cuda_sync", False),

@@ -1,0 +1,156 @@
+"""Serializable race construction and reports carried by process collector batches."""
+from copy import deepcopy
+from dataclasses import dataclass
+from types import SimpleNamespace
+from contextlib import ExitStack
+import time
+import sys
+
+import torch
+from tensordict import NonTensorData
+
+try:
+    import resource
+except ImportError:
+    resource = None
+
+from adapters.native_torchrl import NativeRaceTorchRLEnv
+from training.race_reporting import RaceTrainingReports
+from training.runtime import seed_process
+
+
+# Collector hooks execute in the same worker that calls the environment factory.
+# This reference is process-local; reports use TorchRL's existing batch transport.
+_worker_reports = None
+_worker_started = _collection_started = _collection_cpu_started = None
+_collection_wall = _collection_cpu = 0.
+_factory_seconds = 0.
+
+
+def pre_collect_profile():
+    global _collection_started, _collection_cpu_started
+    _collection_started, _collection_cpu_started = time.perf_counter(), time.process_time()
+    if _worker_reports.profiler is not None:
+        _worker_reports.profiler._timing_phase = "steady"
+
+
+def post_collect_profile(batch):
+    global _collection_wall, _collection_cpu
+    wall = time.perf_counter() - _collection_started
+    cpu = time.process_time() - _collection_cpu_started
+    _collection_wall += wall
+    _collection_cpu += cpu
+    process = dict(collection_seconds=_collection_wall, collection_cpu_seconds=_collection_cpu,
+                   collection_cpu_percent=100 * _collection_cpu / max(_collection_wall, 1e-9),
+                   cpu_seconds=time.process_time(), factory_seconds=_factory_seconds)
+    if resource is not None:
+        process["peak_rss_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)
+    packet = dict(collection_seconds=wall, process=process)
+    profiler = _worker_reports.profiler
+    if profiler is not None:
+        for name in ("stage_seconds", "stage_calls", "scope_seconds", "mpc_totals", "hybrid_totals"):
+            packet[name.removesuffix("_totals")] = getattr(profiler, name)
+            setattr(profiler, name, {phase: {} for phase in profiler.stage_seconds}
+                    if not name.endswith("_totals") else {})
+    batch["worker_profile"] = NonTensorData(packet, batch_size=batch.batch_size)
+
+
+class _WorkerReports:
+    """Reuse race reporting locally; send hook arguments, never execute user hooks."""
+    def __init__(self, env, *, algorithm, run_id, worker, workers, episode_offset,
+                 agent_options, transitions, focal_id, profiling=None):
+        self.env = env
+        self.requires_transition_record = transitions
+        self.trainer = SimpleNamespace(
+            task=env.task, agent=SimpleNamespace(**agent_options), env=env,
+            algorithm=algorithm, run_id=run_id, focal_id=focal_id,
+            hooks=[self], environment_id=worker, episode_stride=workers,
+            _updates=0, _environment_steps=0, _physics_steps=0, _agent_steps=0,
+            _pending_learning_steps=0, measure_mpc=False, measure_hybrid=False,
+            budget_reached=lambda: False, _should_stop=lambda: False,
+            call_hook=lambda hook, method, *args: getattr(hook, method)(*args),
+            counter_metrics=lambda: {})
+        self.profiler = None
+        if profiling and any(profiling.values()):
+            # Reuse only the trainer's instrumentation; no worker learner or
+            # optimization loop is created.
+            from training.on_policy import OnPolicyTrainer
+            agent = SimpleNamespace(**agent_options, agent_ids=list(env.agent_ids),
+                                    collection_policy=None, gae=None, device=torch.device("cpu"))
+            self.trainer = self.profiler = OnPolicyTrainer(
+                env.task, agent, hooks=[self], algorithm=algorithm, run_id=run_id,
+                focal_agent_id=focal_id, **profiling)
+            self.trainer.env = env
+            env.profile_resources = ExitStack()
+            if profiling["measure_stages"]:
+                self.profiler._instrument_stages(env.profile_resources)
+            if profiling["measure_mpc"]:
+                self.profiler._instrument_mpc(env.profile_resources)
+            if profiling["measure_hybrid"]:
+                self.profiler._instrument_hybrid(env.profile_resources)
+        self.reports = self.profiler.reports if self.profiler else RaceTrainingReports(self.trainer)
+        self.reports.environment_id, self.reports.episode_stride = worker, workers
+        self.reports.next_episode = episode_offset + worker
+
+    def on_episode_start(self, metadata):
+        metadata.update(environment_id=self.env.environment_id,
+                        environment_episode=self.env.environment_episode,
+                        episode=self.reports.episode)
+        self.env.report_events.append(("on_episode_start", (metadata,)))
+
+    def on_step(self, record):
+        record.info.update(environment_id=self.env.environment_id,
+                           environment_episode=self.env.environment_episode)
+        self.env.report_events.append(("on_step", (record,)))
+
+    def on_episode_end(self, *args):
+        self.env.report_events.append(("on_episode_end", args))
+
+    def decision(self, result):
+        self.reports.decision(result)
+        self.reports.dispatch({})
+
+
+@dataclass
+class RaceEnvFactory:
+    """Only configuration crosses the process boundary; each worker owns a race."""
+    scenario: dict
+    scenario_dir: str | None
+    algorithm: str
+    run_id: str
+    worker: int
+    workers: int
+    episode_offset: int
+    seed: int
+    agent_options: dict
+    transitions: bool
+    focal_id: str
+    profiling: dict | None = None
+
+    def __call__(self):
+        global _worker_reports, _worker_started, _collection_wall, _collection_cpu, _factory_seconds
+        _worker_started = time.perf_counter()
+        _collection_wall = _collection_cpu = 0.
+        scenario = deepcopy(self.scenario)
+        scenario["experiment"]["seed"] = self.seed
+        torch.set_num_threads(scenario["experiment"].get("torch_threads", 1))
+        seed_process(self.seed)
+        env = NativeRaceTorchRLEnv.from_scenario(
+            scenario, scenario_dir=self.scenario_dir, environment_id=self.worker,
+            reward_mode=self.agent_options["reward_mode"],
+            team_reward_reduction=self.agent_options["team_reward_reduction"])
+        try:
+            reports = _WorkerReports(
+                env, algorithm=self.algorithm, run_id=self.run_id, worker=self.worker,
+                workers=self.workers, episode_offset=self.episode_offset,
+                agent_options=self.agent_options, transitions=self.transitions,
+                focal_id=self.focal_id, profiling=self.profiling)
+            _worker_reports = reports
+            _factory_seconds = time.perf_counter() - _worker_started
+            env.on_reset = reports.reports.reset
+            env.on_physics_step = reports.reports.physics
+            env.on_decision = reports.decision
+            return env
+        except BaseException:
+            env.close()
+            raise

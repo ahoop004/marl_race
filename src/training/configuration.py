@@ -38,6 +38,9 @@ def validate_training_scenario(scenario):
     experiment = scenario["experiment"]
     environment = scenario["environment"]
     agents = scenario["agents"]
+    parallel_envs = experiment.get("parallel_envs", 1)
+    if type(parallel_envs) is not int or parallel_envs < 1:
+        raise ScenarioError("experiment.parallel_envs must be a positive integer")
     if type(experiment.get("measure_services", False)) is not bool:
         raise ScenarioError("experiment.measure_services must be boolean")
     if type(experiment.get("measure_stages", False)) is not bool:
@@ -71,8 +74,8 @@ def validate_training_scenario(scenario):
                    if key in removed or key.startswith(("worker_", "collector_"))]
     if unsupported:
         raise ScenarioError("Unsupported parallel setting(s): " + ", ".join(sorted(unsupported))
-                            + ". Training and evaluation use one environment in one process; "
-                              "remove these settings and use n_steps for rollout length.")
+                            + ". Use experiment.parallel_envs for synchronous training "
+                              "and n_steps for the global learner sample target.")
     if "evaluation_only" in experiment and not isinstance(experiment["evaluation_only"], bool):
         raise ScenarioError("experiment.evaluation_only must be boolean.")
     checkpoint = experiment.get("checkpoint")

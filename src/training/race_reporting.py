@@ -20,6 +20,9 @@ class RaceTrainingReports:
         self.completed = 0
         self.next_episode = 0
         self.pending_episodes = []
+        self.environment_id = getattr(trainer, "environment_id", 0)
+        self.episode_stride = getattr(trainer, "episode_stride", 1)
+        self.environment_episode = -1
 
     def reset(self, snapshot):
         t = self.trainer
@@ -28,7 +31,8 @@ class RaceTrainingReports:
         if t.budget_reached() or t._should_stop():
             return
         self.episode = self.next_episode
-        self.next_episode += 1
+        self.next_episode += self.episode_stride
+        self.environment_episode += 1
         self.episode_id = f"{t.run_id}_ep{self.episode:06d}"
         metadata = self.task.episode_metadata
         self.map_id = metadata.map_id
@@ -135,8 +139,8 @@ class RaceTrainingReports:
         metrics["race_record"] = {
             **episode_race_record(finalize_episode_facts(self.facts), timestep=self.task.timestep,
                                  finite_race=self.task.episode_limits.finish_on_laps),
-            "run_id": t.run_id, "environment_id": 0, "episode_id": self.episode_id,
-            "environment_episode": self.episode, "map_id": self.map_id,
+            "run_id": t.run_id, "environment_id": self.environment_id, "episode_id": self.episode_id,
+            "environment_episode": (self.environment_episode if self.episode_stride > 1 else self.episode), "map_id": self.map_id,
             "environment_seed": self.environment_seed, "spawn_ids": self.spawn_ids,
             "spawn_configuration": self.spawn_context, "environment_decisions": self.steps,
             "environment_decisions_total": t._environment_steps,
@@ -144,7 +148,7 @@ class RaceTrainingReports:
             "policy_version_start": self.start_policy, "policy_version_end": t._updates,
             "reported_at_environment_steps": t._environment_steps,
             "team_reward_components": dict(self.team_components), "training_return": self.reward}
-        if t.algorithm == "ppo":
+        if t.algorithm == "ppo" and self.episode_stride == 1:
             # Preserve PPO's existing episode CSV path and metric contract.
             metrics.pop("race_record")
         self.pending_episodes.append((self.episode, self.reward, info, metrics))

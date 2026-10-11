@@ -141,6 +141,16 @@ def build_run_provenance(
     import torch
     trainable_agents = list(trainable_agents)
     cuda_available = torch.cuda.is_available()
+    resources = {"cpu_affinity_count": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, value = line.split(":", 1)
+            if key in {"MemTotal", "MemAvailable"}:
+                resources[key + "_bytes"] = int(value.split()[0]) * 1024
+        for name in ("cpu.max", "memory.max"):
+            resources["cgroup_" + name.replace(".", "_")] = Path("/sys/fs/cgroup", name).read_text().strip()
+    except OSError:
+        pass
     return {
         "version": PROVENANCE_VERSION,
         "physics_contract": physics_contract(environment),
@@ -149,6 +159,7 @@ def build_run_provenance(
         "runtime": {
             "python": platform.python_version(), "platform": platform.platform(),
             "machine": platform.machine(), "processor": platform.processor(), "cpu_count": os.cpu_count(),
+            "resources": resources,
             "packages": {name: version(name) for name in ("torch", "torchrl", "tensordict", "numba")},
             "torch_threads": torch.get_num_threads(), "torch_interop_threads": torch.get_num_interop_threads(),
             "cuda": {"available": cuda_available, "runtime": torch.version.cuda,

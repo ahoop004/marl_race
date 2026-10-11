@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from tensordict import TensorDict, TensorDictBase
-from torchrl.data import Bounded, Categorical, Composite, Unbounded
+from tensordict import NonTensorData, TensorDict, TensorDictBase
+from torchrl.data import Bounded, Categorical, Composite, NonTensor, Unbounded
 from torchrl.envs import EnvBase
 
 from adapters.rewards import RewardMapping
@@ -40,7 +40,7 @@ class NativeRaceTorchRLEnv(EnvBase):
             raise
 
     def __init__(self, task: RaceTaskProtocol, *, reward_mode="individual",
-                 team_reward_reduction="mean", device="cpu"):
+                 team_reward_reduction="mean", device="cpu", environment_id=None):
         super().__init__(device=device, batch_size=(), run_type_checks=True)
         self.task = task
         self.agent_ids = tuple(task.possible_agents)
@@ -64,6 +64,9 @@ class NativeRaceTorchRLEnv(EnvBase):
         self.on_decision = None
         self.profile_call = None
         self._pending_seed = None
+        self.environment_id = environment_id
+        self.environment_episode = -1
+        self.report_events = []
         n, p = len(self.agent_ids), len(self.physical_agent_ids)
         self._observations = np.zeros((n, max(width[0] for width in widths)), dtype=np.float32)
         self._terminated = np.zeros((n, 1), dtype=bool)
@@ -97,6 +100,12 @@ class NativeRaceTorchRLEnv(EnvBase):
         self.action_spec = Composite(agents=Composite(
             action=Bounded(-1, 1, shape=(n, 2), dtype=torch.float32, device=self.device),
             shape=(n,), device=self.device), device=self.device)
+        if environment_id is not None:
+            self.observation_spec["environment_id"] = count((1,))
+            self.observation_spec["environment_episode"] = count((1,))
+            # Variable episode/transition reports travel with the native batch,
+            # without shared counters or a second multiprocessing channel.
+            self.observation_spec["race_events"] = NonTensor(shape=(), example_data=[])
         self.reward_spec = Composite(
             agents=Composite(reward=real((n, 1)), individual_reward=real((n, 1)),
                              shape=(n,), device=self.device),
@@ -128,6 +137,7 @@ class NativeRaceTorchRLEnv(EnvBase):
         self._terminated.fill(False)
         self._truncated.fill(False)
         self.snapshot, self.last_step = snapshot, None
+        self.environment_episode += 1
         for i, aid in enumerate(self.agent_ids):
             self._observations[i, :len(snapshot.observations[aid])] = snapshot.observations[aid]
         output = self._output(snapshot)
@@ -175,6 +185,9 @@ class NativeRaceTorchRLEnv(EnvBase):
         output = self._output(result.after, result)
         if self.on_decision is not None:
             self.on_decision(result)
+        if self.environment_id is not None:
+            output["race_events"] = NonTensorData(self.report_events)
+            self.report_events = []
         return output
 
     @staticmethod
@@ -246,6 +259,10 @@ class NativeRaceTorchRLEnv(EnvBase):
                 [next(iter(rewards.values())) if rewards and self.reward_mapping.mode == "team_shared" else 0.0],
                 torch.float32)
             output["shared_bonus"] = self._tensor([result.team_reward], torch.float32)
+        if self.environment_id is not None:
+            output["environment_id"] = self._tensor([self.environment_id], torch.int64)
+            output["environment_episode"] = self._tensor([self.environment_episode], torch.int64)
+            output["race_events"] = NonTensorData([])
         return output
 
     def render(self):
@@ -253,5 +270,8 @@ class NativeRaceTorchRLEnv(EnvBase):
 
     def close(self, *, raise_if_closed=True):
         if not self.is_closed:
+            resources = getattr(self, "profile_resources", None)
+            if resources is not None:
+                resources.close()
             self.task.close()
             super().close(raise_if_closed=raise_if_closed)

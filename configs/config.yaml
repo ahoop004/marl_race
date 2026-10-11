@@ -21,6 +21,7 @@ paths:
   pretrained_checkpoint: ${paths.output_root}/pretrain/best.pt
 experiment:
   name: race
+  parallel_envs: 1
   measure_mpc: false  # Opt in with experiment.measure_mpc=true.
   measure_hybrid: false  # Opt in with experiment.measure_hybrid=true.
   seed: ${execution.experiment.seed}
