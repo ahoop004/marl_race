@@ -128,6 +128,48 @@ with a compact `outputs/controller_evaluation_summary.json`. The test run passed
 247 tests and skipped two GPU tests. The existing fresh-process PPO startup test
 fails because it checks `trainer.env` before `train()` initializes it.
 
+For a CPU/CUDA throughput comparison, run each device sequentially with detailed
+stage and controller timing disabled. These commands use matching settings within
+each pair: seed 42, one CPU thread, and 16,384 environment decisions. MAPPO uses
+two learners and the shared hybrid opponents. Use fresh output directories for
+each repetition.
+
+```bash
+for device in cpu cuda; do
+  python3 run.py --scenario scenarios/ppo_serial_profile.yaml \
+    --set execution.params.device="$device" \
+    --set execution.experiment.measure_stages=false \
+    --seed 42 --torch-threads 1 --total-steps 16384 \
+    --output-dir "outputs/profiling/ppo_${device}_throughput" --quiet
+done
+
+for device in cpu cuda; do
+  python3 run.py --scenario scenarios/mappo_hybrid_serial_profile.yaml \
+    --set execution.params.device="$device" \
+    --set execution.experiment.measure_stages=false \
+    --set experiment.measure_hybrid=false \
+    --seed 42 --torch-threads 1 --total-steps 16384 \
+    --output-dir "outputs/profiling/mappo_hybrid_${device}_throughput" --quiet
+done
+
+python3 scripts/compare_profile_runs.py \
+  --pair PPO outputs/profiling/ppo_cpu_throughput outputs/profiling/ppo_cuda_throughput \
+  --pair MAPPO_hybrid outputs/profiling/mappo_hybrid_cpu_throughput outputs/profiling/mappo_hybrid_cuda_throughput \
+  --output outputs/profiling/throughput_comparison
+```
+
+The collector verifies matching effective configurations, completed decision
+budgets, disabled detailed/controller profiling, and actual policy/update devices
+(so a CUDA fallback is rejected). It writes CSV and JSON reports with decisions/s,
+active learner samples/s, optimizer steps/s, elapsed time, coarse collection/update
+time, and workload counters. Source data remain in `run_summary.json`,
+`update_metrics.csv`, and `config_snapshot.json` in each run directory. Coarse
+update timing still synchronizes CUDA at update boundaries; detailed per-stage
+synchronization is disabled. Elapsed time includes trainer initialization and
+in-run hooks, but excludes application setup and final artifact saving. Identical
+seeds do not guarantee identical CPU/CUDA trajectories. Compare devices within
+each pair; PPO and MAPPO have different workloads.
+
 Hybrid profiling is optional (`experiment.measure_hybrid=false` by default).
 The dedicated serial preset enables internal hybrid and environment stage timing:
 
