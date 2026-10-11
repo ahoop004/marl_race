@@ -125,6 +125,7 @@ def test_experiment_arms_share_opponents_and_mpc_remains_selectable():
         for aid in ("car_2", "car_3"):
             assert config["agents"][aid] == arms[0]["agents"][aid]
             assert config["agents"][aid]["algorithm"] == "hybrid_pp_ftg"
+            assert config["agents"][aid]["params"]["max_speed"] == 8.
     reference = load_and_expand_scenario("scenarios/mappo_2v2_completion_scratch.yaml",
                                          overrides=["controllers=racing_mpc"])
     assert reference["agents"]["car_2"]["algorithm"] == "racing_mpc"
@@ -152,11 +153,12 @@ def test_time_aligned_emergency_brakes_for_closing_car_but_allows_safe_pass(fixt
 
 
 @pytest.mark.parametrize("map_id", ["circle_map", "Budapest_map"])
-def test_real_simulation_completes_lap_and_avoids_stationary_vehicle(map_id, monkeypatch):
+@pytest.mark.parametrize("max_speed", [5., 8.])
+def test_real_simulation_completes_lap_and_avoids_stationary_vehicle(map_id, max_speed, monkeypatch):
     from application.benchmark_controllers import run_case
     monkeypatch.setenv("PYGLET_HEADLESS", "true")
     for case in ("solo", "stationary"):
-        result = run_case("hybrid_pp_ftg", map_id, 42, case, max_speed=5., max_steps=4500)
+        result = run_case("hybrid_pp_ftg", map_id, 42, case, max_speed=max_speed, max_steps=4500)
         ego = result["agents"]["car_0"]
         assert not ego["controller_errors"]
         assert ego["completed"] and ego["collisions"] == 0

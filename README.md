@@ -45,7 +45,8 @@ Commands are physical `[steering radians, target m/s]` before the existing
 `WheelReferenceAdapter` converts speed to wheel radians/second.
 
 The shared settings are in `configs/controllers/hybrid_pp_ftg.yaml`. The default
-opponent cap is **5 m/s**, with a **3 m/s cap during avoidance**. The environment's
+opponent cap is **8 m/s**, with a **3 m/s cap during avoidance**. Curvature, grip,
+and stability checks reduce the target speed when needed. The environment's
 8 m/s limit is a ceiling; lower opponent settings are preserved. To change speed:
 
 ```bash
@@ -53,8 +54,8 @@ python3 run.py --scenario scenarios/mappo_2v2_completion_scratch.yaml \
   --set controllers.hybrid_pp_ftg.max_speed=4.0
 ```
 
-Use the same controller overrides for every comparison arm. Raising the cap to
-8 m/s is supported, but narrow turns need track-specific validation. To select
+Use the same controller overrides for every comparison arm. Lower the cap when
+evaluating more conservative opponent settings. To select
 MPC instead, add `--set controllers=racing_mpc`. The existing
 `scenarios/mappo_serial_profile.yaml` explicitly keeps the 8 m/s MPC baseline.
 To view the hybrid controller alone:
@@ -68,11 +69,11 @@ Evaluate without training, policy inference, rendering, or online logging:
 ```bash
 PYTHONPATH=src PYGLET_HEADLESS=true python3 -m application.benchmark_controllers \
   --maps circle_map Budapest_map --seeds 42 43 44 \
-  --cases solo traffic stationary --output outputs/controller_quality.json
+  --cases solo traffic stationary --max-speed 8 --output outputs/controller_quality_speed8.json
 
 PYTHONPATH=src PYGLET_HEADLESS=true python3 -m application.benchmark_controllers \
   --controllers hybrid_pp_ftg racing_mpc --maps circle_map --seeds 42 \
-  --cases solo traffic --max-steps 256 --output outputs/controller_throughput.json
+  --cases solo traffic --max-steps 256 --max-speed 5 --output outputs/controller_throughput.json
 ```
 
 The quality report records per-car lap completion, collision termination, speed,
@@ -87,15 +88,32 @@ throughput and controller mean/p95. Use equal maps, seeds, speeds, step budgets,
 and warm-up counts, and run comparisons without competing workloads. A 256-step
 throughput run is too short to assess lap completion.
 
-Validation on 2026-10-11 at the default 5 m/s cap completed clean solo laps on
+Earlier validation on 2026-10-11 at a 5 m/s cap completed clean solo laps on
 all nine racing tracks. Circle/Budapest tests with seeds 42–44 completed all
 36 car runs across solo, four-car traffic, and parked-car cases without collisions
 or controller exceptions. Three-lap solo and parked-car checks passed on both
 maps. MPC also completed the matched 5 m/s solo reference laps without collisions:
-mean speeds were 4.69/4.72 m/s (circle/Budapest), versus 4.92/4.45 m/s for the hybrid. The 8 m/s solo setting also completed both maps; default-cap validation is
-broader. A 32-decision seeded `RaceTask` replay matched state arrays exactly.
+mean speeds were 4.69/4.72 m/s (circle/Budapest), versus 4.92/4.45 m/s for the hybrid.
+The initial 8 m/s solo setting also completed both maps.
+A 32-decision seeded `RaceTask` replay matched state arrays exactly.
 
-The isolated 256-decision circle benchmark measured:
+After raising the shared cap to 8 m/s, solo laps passed on all nine tracks at
+seed 42. Solo, four-car traffic, and parked-car cases across those tracks, plus
+Circle/Budapest seeds 43–44, completed **77 of 78 car runs**, with **zero collisions
+or controller exceptions**. The Spielberg parked-car case stalled until the
+6,000-decision limit; the same case also stalled at 5 m/s. This remains an obstacle
+avoidance limitation. Circle/Budapest passed all 36 car runs across three seeds.
+Mean completed-run speeds ranged from 4.62 to 7.72 m/s; an 8 m/s cap still permits
+slower cornering and avoidance. The regression suite passed 263 tests and skipped
+two GPU tests; the known PPO startup test still fails when run separately.
+A 256-decision MAPPO smoke run recorded 512 profiled hybrid calls, including PP,
+FTG, warm-up, and steady phases. Reports are in
+`outputs/controller_speed8_{all_tracks,extra_seeds,spielberg_comparison}.json`,
+with `outputs/controller_speed8_evaluation_summary.json`. These quality checks
+ran alongside other checks; their timing samples are not an isolated throughput
+comparison.
+
+The isolated 256-decision circle benchmark at a 5 m/s cap measured:
 
 | Case | Hybrid steps/s | MPC steps/s | Hybrid controller ms | MPC controller ms |
 | --- | ---: | ---: | ---: | ---: |
@@ -118,9 +136,9 @@ python3 run.py --scenario scenarios/mappo_hybrid_serial_profile.yaml \
   --output-dir outputs/mappo_hybrid_profile
 ```
 
-It keeps the shared 5 m/s hybrid settings, fixed grip, seed 42, CPU execution,
+It keeps the shared 8 m/s hybrid settings, fixed grip, seed 42, CPU execution,
 and the same 16,384-decision MAPPO budget/update settings as the MPC serial preset.
-Add `--set controllers.hybrid_pp_ftg.max_speed=8.0` for the MPC preset's speed cap.
+Both serial presets use an 8 m/s opponent cap.
 For a baseline measuring profiling overhead, use the identical command with
 `--set experiment.measure_hybrid=false` and a separate output directory.
 On other scenarios, enable internal timing with `--set experiment.measure_hybrid=true`;

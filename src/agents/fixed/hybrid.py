@@ -34,7 +34,7 @@ class HybridPPFTGAgent:
     def __init__(self, config):
         cfg = config.get("params", config)
         self.agent_id = cfg.get("agent_id")
-        defaults = dict(max_speed=5.0, lookahead_base=1.0, lookahead_time=0.3,
+        defaults = dict(max_speed=8.0, lookahead_base=1.0, lookahead_time=0.3,
                         lookahead_max=3.0, lateral_acceleration=4.0,
                         acceleration=3.0, braking=5.0, reaction_time=0.55,
                         margin=0.12, min_gap_distance=1.0, gap_fov=2.4,

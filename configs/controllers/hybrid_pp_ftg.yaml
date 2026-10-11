@@ -1,7 +1,7 @@
 name: hybrid_pp_ftg
 params: ${controllers.hybrid_pp_ftg}
 hybrid_pp_ftg:
-  max_speed: 5.0  # Conservative default; raise up to environment.max_speed (8 m/s).
+  max_speed: 8.0  # Environment ceiling; lower caps can be configured for stability.
   lookahead_base: 1.0
   lookahead_time: 0.3
   lookahead_max: 3.0

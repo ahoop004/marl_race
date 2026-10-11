@@ -9,5 +9,5 @@ experiment:
 execution:
   experiment:
     measure_stages: true
-# Keep the shared hybrid settings (5 m/s cap) used by the training arms.
-# For a matched 8 m/s MPC comparison: controllers.hybrid_pp_ftg.max_speed=8.0.
+# Keep the shared hybrid settings (8 m/s cap) used by the training arms,
+# matching the MPC serial preset's speed cap.

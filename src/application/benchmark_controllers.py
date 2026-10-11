@@ -58,7 +58,7 @@ def _obstacle_poses(env):
 
 
 def run_case(controller, map_id, seed, case, *, max_steps=8000, laps=1,
-             max_speed=5., warmup_steps=20, overrides=()):
+             max_speed=8., warmup_steps=20, overrides=()):
     config = load_and_expand_scenario("scenarios/render/hybrid_pp_ftg.yaml", overrides=[
         f"controllers={controller}", f"controllers.{controller}.max_speed={max_speed}",
         "environment.render=false", "environment.centerline_render=false",
@@ -163,7 +163,7 @@ def main():
     parser.add_argument("--cases", nargs="+", choices=["solo", "traffic", "stationary"], default=["solo", "traffic", "stationary"])
     parser.add_argument("--max-steps", type=int, default=8000)
     parser.add_argument("--laps", type=int, default=1)
-    parser.add_argument("--max-speed", type=float, default=5.)
+    parser.add_argument("--max-speed", type=float, default=8.)
     parser.add_argument("--warmup-steps", type=int, default=20)
     parser.add_argument("--set", nargs="*", default=[])
     parser.add_argument("--output", type=Path, default=Path("outputs/controller_benchmark.json"))
