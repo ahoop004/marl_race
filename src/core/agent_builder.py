@@ -11,7 +11,14 @@ def _create_racing_mpc(params: Dict[str, Any]) -> Any:
     return RacingMPCAgent(params)
 
 
-_FIXED_CONTROLLERS: Dict[str, Callable] = {"racing_mpc": _create_racing_mpc}
+def _create_hybrid_pp_ftg(params: Dict[str, Any]) -> Any:
+    from agents.fixed.hybrid import HybridPPFTGAgent
+    return HybridPPFTGAgent(params)
+
+
+_FIXED_CONTROLLERS: Dict[str, Callable] = {
+    "racing_mpc": _create_racing_mpc, "hybrid_pp_ftg": _create_hybrid_pp_ftg,
+}
 
 
 def register_fixed_controller(name: str, constructor: Callable) -> None:

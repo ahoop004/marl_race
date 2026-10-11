@@ -82,7 +82,7 @@ def test_group_choices_select_algorithms_tasks_and_networks_independently():
     validate_experiment_scenario(config)
     assert config["_configuration"]["choices"]["algorithm"] == "mappo"
     assert config["_configuration"]["choices"]["observation"] == "team"
-    assert [a["algorithm"] for a in config["agents"].values()] == ["mappo", "mappo", "racing_mpc", "racing_mpc"]
+    assert [a["algorithm"] for a in config["agents"].values()] == ["mappo", "mappo", "hybrid_pp_ftg", "hybrid_pp_ftg"]
     assert config["mappo"]["actor_mode"] == "shared"
     params = resolve_training_params(config["agents"]["car_0"], config)
     assert params["network"] == dict(architecture="mlp", actor_hidden_dims=[32,16],

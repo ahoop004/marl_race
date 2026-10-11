@@ -35,6 +35,81 @@ python run.py --scenario scenarios/mappo_2v2_completion_lora.yaml \
   --pretrained-actor outputs/pretrain/best.pt \
   --output-dir outputs/mappo_lora
 
+The MAPPO scratch, pretrained, shared pretrained, and LoRA scenarios use identical
+`hybrid_pp_ftg` opponents. They run Pure Pursuit by default, with speed-dependent
+lookahead, steering-lag compensation, curvature/grip speed limits, and LiDAR gap
+avoidance. Gap checks include vehicle width, nearby traffic, and stationary cars.
+Five clear decisions are required before returning to Pure Pursuit. Steering is
+filtered and rate limited; acceleration is smoothed, with immediate safety braking.
+Commands are physical `[steering radians, target m/s]` before the existing
+`WheelReferenceAdapter` converts speed to wheel radians/second.
+
+The shared settings are in `configs/controllers/hybrid_pp_ftg.yaml`. The default
+opponent cap is **5 m/s**, with a **3 m/s cap during avoidance**. The environment's
+8 m/s limit is a ceiling; lower opponent settings are preserved. To change speed:
+
+```bash
+python3 run.py --scenario scenarios/mappo_2v2_completion_scratch.yaml \
+  --set controllers.hybrid_pp_ftg.max_speed=4.0
+```
+
+Use the same controller overrides for every comparison arm. Raising the cap to
+8 m/s is supported, but narrow turns need track-specific validation. To select
+MPC instead, add `--set controllers=racing_mpc`. The existing
+`scenarios/mappo_serial_profile.yaml` explicitly keeps the 8 m/s MPC baseline.
+To view the hybrid controller alone:
+
+```bash
+python3 run.py --scenario scenarios/render/hybrid_pp_ftg.yaml
+```
+
+Evaluate without training, policy inference, rendering, or online logging:
+
+```bash
+PYTHONPATH=src PYGLET_HEADLESS=true python3 -m application.benchmark_controllers \
+  --maps circle_map Budapest_map --seeds 42 43 44 \
+  --cases solo traffic stationary --output outputs/controller_quality.json
+
+PYTHONPATH=src PYGLET_HEADLESS=true python3 -m application.benchmark_controllers \
+  --controllers hybrid_pp_ftg racing_mpc --maps circle_map --seeds 42 \
+  --cases solo traffic --max-steps 256 --output outputs/controller_throughput.json
+```
+
+The quality report records per-car lap completion, collision termination, speed,
+lateral motion, yaw rate, cross-track error, steering changes, FTG use, mode
+switches, and controller exceptions. `stationary` places a parked car 8 m ahead;
+`traffic` uses four controllers with the same seeded spawn procedure. The runner
+uses `RaceTask` with every car assigned a fixed controller and no policy owners.
+Controller timing includes the wheel adapter. Environment throughput includes
+`RaceTask.step` and snapshots; report aggregation is excluded. Physics/LiDAR JIT
+is primed before a seeded reset; the first 20 decisions are excluded from steady
+throughput and controller mean/p95. Use equal maps, seeds, speeds, step budgets,
+and warm-up counts, and run comparisons without competing workloads. A 256-step
+throughput run is too short to assess lap completion.
+
+Validation on 2026-10-11 at the default 5 m/s cap completed clean solo laps on
+all nine racing tracks. Circle/Budapest tests with seeds 42–44 completed all
+36 car runs across solo, four-car traffic, and parked-car cases without collisions
+or controller exceptions. Three-lap solo and parked-car checks passed on both
+maps. MPC also completed the matched 5 m/s solo reference laps without collisions:
+mean speeds were 4.69/4.72 m/s (circle/Budapest), versus 4.92/4.45 m/s for the hybrid. The 8 m/s solo setting also completed both maps; default-cap validation is
+broader. A 32-decision seeded `RaceTask` replay matched state arrays exactly.
+
+The isolated 256-decision circle benchmark measured:
+
+| Case | Hybrid steps/s | MPC steps/s | Hybrid controller ms | MPC controller ms |
+| --- | ---: | ---: | ---: | ---: |
+| Solo | 556.3 | 48.7 | 0.64 | 19.12 |
+| Four-car traffic | 113.0 | 10.1 | 1.18 | 23.61 |
+
+These are steady simulation timings, with means per controller call and no
+learner workload. They show about 11× higher environment throughput and 20–30×
+lower controller cost on this machine. Timing results will vary by host. Reports
+are saved under `outputs/controller_{tracks,quality,endurance,speed8,throughput}.json`,
+with a compact `outputs/controller_evaluation_summary.json`. The test run passed
+247 tests and skipped two GPU tests. The existing fresh-process PPO startup test
+fails because it checks `trainer.env` before `train()` initializes it.
+
 MPC profiling is optional (`experiment.measure_mpc=false` by default). Run the
 existing serial MAPPO preset with internal MPC and environment stage timing:
 
@@ -87,10 +162,7 @@ measure overhead; short timings are noisy. The Numba model, caching, solver,
 limits, controller actions, and learning configurations are unchanged.
 
 Environment `physics`, `lidar`, `observation_reward`, and `fixed_controller`
-stages already separate simulation from MPC costs. A future fixed-action baseline
-needs a small controller registered with `register_fixed_controller` (with `act`,
-`reset`, and environment injection as needed), and a separate comparison scenario
-selecting it for `car_2`/`car_3` with the existing wheel adapter. Production opponent
-and learner configurations remain unchanged. Prediction, footprint, and traffic
-collision costs within the compiled `_shoot()` kernel remain combined; timing
-inside that kernel would require further instrumentation.
+stages separate simulation from controller costs. Hybrid runs use the same
+`fixed_controller` stage timing; `mpc_profile` only measures Racing MPC instances.
+Prediction, footprint, and traffic collision costs within MPC's compiled `_shoot()`
+kernel remain combined; timing inside that kernel would require further instrumentation.

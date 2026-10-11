@@ -11,9 +11,9 @@ class ScenarioError(Exception):
 
 
 def resolve_max_speed(scenario: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply an optional shared forward speed limit to learners and MPCs.
+    """Apply an optional forward speed ceiling to learners and fixed controllers.
 
-    The shared limit takes precedence over individual forward limits. With nonlinear
+    Fixed controllers can request lower speeds for stability. With nonlinear
     physics it limits rolling-speed references, not the slipping chassis speed.
     Reverse bounds, acceleration limits and observation scales stay unchanged.
     """
@@ -39,7 +39,12 @@ def resolve_max_speed(scenario: Dict[str, Any]) -> Dict[str, Any]:
     from core.agent_builder import fixed_controller_names
     for agent in result.get("agents", {}).values():
         if str(agent.get("algorithm", "")).strip().lower() in fixed_controller_names():
-            agent.setdefault("params", {})["max_speed"] = float(speed)
+            params = agent.setdefault("params", {})
+            requested = params.get("max_speed", speed)
+            if (isinstance(requested, bool) or not isinstance(requested, (int, float))
+                    or not math.isfinite(requested) or requested <= 0):
+                raise ScenarioError("Fixed controller max_speed must be positive and finite")
+            params["max_speed"] = min(float(speed), float(requested))
     return result
 
 

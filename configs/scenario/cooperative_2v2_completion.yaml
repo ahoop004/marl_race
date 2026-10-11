@@ -59,16 +59,16 @@ agents:
       prevent_reverse: true
       speed_index: 1
   car_2:
-    algorithm: racing_mpc
+    algorithm: ${controllers.name}
     trainable: false
     role: opponent
     target_id: car_0
-    params: ${controllers.racing_mpc}
+    params: ${controllers.params}
     action_adapter: rolling_speed_to_wheel_v1
   car_3:
-    algorithm: racing_mpc
+    algorithm: ${controllers.name}
     trainable: false
     role: opponent
     target_id: car_1
-    params: ${controllers.racing_mpc}
+    params: ${controllers.params}
     action_adapter: rolling_speed_to_wheel_v1

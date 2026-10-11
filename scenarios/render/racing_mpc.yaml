@@ -63,10 +63,10 @@ environment:
       car_0: '#3288ff'
 agents:
   car_0:
-    algorithm: racing_mpc
+    algorithm: ${controllers.name}
     trainable: false
     action_adapter: rolling_speed_to_wheel_v1
-    params: ${controllers.racing_mpc}
+    params: ${controllers.params}
 paths:
   project_root: ???
   output_root: ${paths.project_root}/outputs

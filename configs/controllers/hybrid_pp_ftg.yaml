@@ -1,0 +1,21 @@
+name: hybrid_pp_ftg
+params: ${controllers.hybrid_pp_ftg}
+hybrid_pp_ftg:
+  max_speed: 5.0  # Conservative default; raise up to environment.max_speed (8 m/s).
+  lookahead_base: 1.0
+  lookahead_time: 0.3
+  lookahead_max: 3.0
+  lateral_acceleration: 4.0
+  acceleration: 3.0
+  braking: 5.0
+  reaction_time: 0.55
+  margin: 0.12
+  min_gap_distance: 1.0
+  gap_fov: 2.4
+  gap_speed: 3.0
+  clear_steps: 5
+  exit_margin: 0.35
+  steering_time_constant: 0.08
+  steering_rate: 2.5
+  curvature_spacing: 0.5
+  path_spacing: 0.2
