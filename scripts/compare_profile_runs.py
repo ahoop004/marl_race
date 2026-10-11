@@ -11,11 +11,10 @@ def read_run(directory, device):
     snapshot = json.loads((directory / "config_snapshot.json").read_text())
     summary = json.loads((directory / "run_summary.json").read_text())
     execution = snapshot["provenance"]["execution"]
-    for key in ("policy_device", "update_device"):
-        if execution[key].split(":")[0] != device:
-            raise ValueError(f"{directory}: expected {key}={device}, got {execution[key]}")
-    for key in ("measure_stages", "measure_mpc", "measure_hybrid"):
-        if execution[key]:
+    if execution["update_device"].split(":")[0] != device:
+        raise ValueError(f"{directory}: expected update_device={device}, got {execution['update_device']}")
+    for key in ("measure_stages", "measure_mpc", "measure_hybrid", "measure_cuda_sync"):
+        if execution.get(key, False):
             raise ValueError(f"{directory}: {key} must be disabled")
     if any(key.startswith("perf/stages/") for key in summary):
         raise ValueError(f"{directory}: summary contains detailed stage profiling")
@@ -27,10 +26,15 @@ def read_run(directory, device):
     config.pop("_configuration", None)
     config["execution"]["params"].pop("device")
     config["training_defaults"].pop("device")
+    for block in (config["execution"]["params"], config["training_defaults"]):
+        block.pop("collection_device", None)
     with (directory / "update_metrics.csv").open(newline="") as handle:
         updates = list(csv.DictReader(handle))
     row = {
         "device": device,
+        "collection_device": execution["policy_device"],
+        "learner_device": execution["update_device"],
+        "workers": execution.get("parallel_envs", 1),
         "directory": str(directory),
         "environment_steps": summary["environment_steps"],
         "physics_steps": summary["physics_steps"],
@@ -43,12 +47,17 @@ def read_run(directory, device):
         "physics_steps_per_second": summary["perf/physics_steps_per_second"],
         "learner_samples_per_second": summary["perf/learner_samples_per_second"],
         "optimizer_steps_per_second": summary["perf/optimizer_steps_per_second"],
+        "steady_decisions_per_second": summary.get("perf/steady_environment_steps_per_second"),
+        "steady_learner_samples_per_second": summary.get("perf/steady_learner_samples_per_second"),
         "collection_seconds": sum(float(r["perf/collection_seconds"]) for r in updates),
         "update_seconds": sum(float(r["perf/update_seconds"]) for r in updates),
         "logging_seconds": summary.get("perf/logging_seconds", 0),
         "evaluation_seconds": summary.get("perf/evaluation_seconds", 0),
         "checkpoint_seconds": summary.get("perf/checkpoint_seconds", 0),
     }
+    for name in ("rollout_device_transfer", "gae", "optimization", "weight_sync"):
+        row[name + "_seconds"] = sum(value for key, value in summary.items()
+                                      if key.startswith("perf/boundaries/") and key.endswith(f"/{name}_seconds"))
     metadata = {"runtime": snapshot["provenance"]["runtime"], "execution": execution}
     return config, row, metadata
 
@@ -90,6 +99,10 @@ def main():
             "elapsed_seconds": "Trainer wall time, including initialization and in-run hooks; excludes application setup and final artifact saving.",
             "collection_seconds": "Sum of per-update collection wall times excluding service time; first interval includes collector initialization.",
             "update_seconds": "Sum of per-update wall times, with CUDA synchronization at update boundaries.",
+            "rollout_device_transfer_seconds": "CPU-to-learner training batch copy wall time; zero for CPU learners.",
+            "gae_seconds": "GAE host wall time; normal CUDA runs include dispatch, without extra completion synchronization.",
+            "optimization_seconds": "Optimization host wall time; overall update timing includes CUDA completion.",
+            "weight_sync_seconds": "TorchRL actor publication wall time, before the next synchronous collection.",
         },
         "limitations": [
             "One run per device does not estimate run-to-run variability.",

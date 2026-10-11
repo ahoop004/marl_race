@@ -230,7 +230,7 @@ def capture_rng():
             "keys": torch.tensor(numpy[1].astype(np.int64)), "position": numpy[2],
             "has_gauss": numpy[3], "cached_gaussian": numpy[4]},
             "torch": torch.random.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []}
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else []}
 
 
 def restore_rng(state):

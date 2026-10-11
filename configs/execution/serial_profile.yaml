@@ -7,4 +7,5 @@ experiment:
   profiling_warmup_updates: 1  # Included in the budget; separated from steady state.
 params:
   device: cpu  # CUDA: execution.params.device=cuda
+  collection_device: null  # Serial: learner device; multiprocessing: CPU.
 checkpoint_every_steps: null

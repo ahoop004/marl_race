@@ -16,7 +16,7 @@ except ImportError:
 
 from adapters.native_torchrl import NativeRaceTorchRLEnv
 from training.race_reporting import RaceTrainingReports
-from training.runtime import seed_process
+from training.runtime import seed_process, CudaCollectionProfile
 
 
 # Collector hooks execute in the same worker that calls the environment factory.
@@ -25,24 +25,33 @@ _worker_reports = None
 _worker_started = _collection_started = _collection_cpu_started = None
 _collection_wall = _collection_cpu = 0.
 _factory_seconds = 0.
+_cuda_profile = None
 
 
 def pre_collect_profile():
-    global _collection_started, _collection_cpu_started
+    global _collection_started, _collection_cpu_started, _cuda_profile
     _collection_started, _collection_cpu_started = time.perf_counter(), time.process_time()
     if _worker_reports.profiler is not None:
         _worker_reports.profiler._timing_phase = "steady"
+    _cuda_profile = CudaCollectionProfile(_worker_reports.profile_cuda_collection)
+    _cuda_profile.__enter__()
 
 
 def post_collect_profile(batch):
     global _collection_wall, _collection_cpu
     wall = time.perf_counter() - _collection_started
     cpu = time.process_time() - _collection_cpu_started
+    _cuda_profile.__exit__(None, None, None)
+    _worker_reports.cuda_copy_seconds += _cuda_profile.device_to_cpu_seconds
+    _worker_reports.cuda_copy_calls += _cuda_profile.device_to_cpu_calls
     _collection_wall += wall
     _collection_cpu += cpu
     process = dict(collection_seconds=_collection_wall, collection_cpu_seconds=_collection_cpu,
                    collection_cpu_percent=100 * _collection_cpu / max(_collection_wall, 1e-9),
                    cpu_seconds=time.process_time(), factory_seconds=_factory_seconds)
+    if _cuda_profile.enabled:
+        process.update(collection_device_to_cpu_seconds=_worker_reports.cuda_copy_seconds,
+                       collection_device_to_cpu_calls=_worker_reports.cuda_copy_calls)
     if resource is not None:
         process["peak_rss_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)
     packet = dict(collection_seconds=wall, process=process)
@@ -58,7 +67,7 @@ def post_collect_profile(batch):
 class _WorkerReports:
     """Reuse race reporting locally; send hook arguments, never execute user hooks."""
     def __init__(self, env, *, algorithm, run_id, worker, workers, episode_offset,
-                 agent_options, transitions, focal_id, profiling=None):
+                 agent_options, transitions, focal_id, profiling=None, collection_device="cpu"):
         self.env = env
         self.requires_transition_record = transitions
         self.trainer = SimpleNamespace(
@@ -71,6 +80,12 @@ class _WorkerReports:
             call_hook=lambda hook, method, *args: getattr(hook, method)(*args),
             counter_metrics=lambda: {})
         self.profiler = None
+        self.collection_device = collection_device
+        self.cuda_copy_seconds = 0.
+        self.cuda_copy_calls = 0
+        self.profile_cuda_collection = (collection_device.startswith("cuda") and bool(profiling)
+                                       and profiling.get("measure_stages", False)
+                                       and profiling.get("measure_cuda_sync", False))
         if profiling and any(profiling.values()):
             # Reuse only the trainer's instrumentation; no worker learner or
             # optimization loop is created.
@@ -79,7 +94,7 @@ class _WorkerReports:
                                     collection_policy=None, gae=None, device=torch.device("cpu"))
             self.trainer = self.profiler = OnPolicyTrainer(
                 env.task, agent, hooks=[self], algorithm=algorithm, run_id=run_id,
-                focal_agent_id=focal_id, **profiling)
+                focal_agent_id=focal_id, collection_device=collection_device, **profiling)
             self.trainer.env = env
             env.profile_resources = ExitStack()
             if profiling["measure_stages"]:
@@ -126,6 +141,7 @@ class RaceEnvFactory:
     transitions: bool
     focal_id: str
     profiling: dict | None = None
+    collection_device: str = "cpu"
 
     def __call__(self):
         global _worker_reports, _worker_started, _collection_wall, _collection_cpu, _factory_seconds
@@ -144,7 +160,7 @@ class RaceEnvFactory:
                 env, algorithm=self.algorithm, run_id=self.run_id, worker=self.worker,
                 workers=self.workers, episode_offset=self.episode_offset,
                 agent_options=self.agent_options, transitions=self.transitions,
-                focal_id=self.focal_id, profiling=self.profiling)
+                focal_id=self.focal_id, profiling=self.profiling, collection_device=self.collection_device)
             _worker_reports = reports
             _factory_seconds = time.perf_counter() - _worker_started
             env.on_reset = reports.reports.reset

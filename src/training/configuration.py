@@ -41,6 +41,13 @@ def validate_training_scenario(scenario):
     parallel_envs = experiment.get("parallel_envs", 1)
     if type(parallel_envs) is not int or parallel_envs < 1:
         raise ScenarioError("experiment.parallel_envs must be a positive integer")
+    for params in [scenario.get("training_defaults", {}),
+                   *(cfg.get("params", {}) for cfg in agents.values())]:
+        value = params.get("collection_device")
+        if value is not None and (not isinstance(value, str) or (
+                value not in {"cpu", "cuda"} and not (
+                    value.startswith("cuda:") and value[5:].isdigit()))):
+            raise ScenarioError("collection_device must be cpu, cuda, cuda:<index>, or null")
     if type(experiment.get("measure_services", False)) is not bool:
         raise ScenarioError("experiment.measure_services must be boolean")
     if type(experiment.get("measure_stages", False)) is not bool:

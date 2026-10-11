@@ -267,7 +267,9 @@ def test_resolved_config_and_choices_are_saved_with_experiments(tmp_path):
     runtime = saved["runtime"]
     assert runtime["python"] and runtime["packages"]["tensordict"] and runtime["packages"]["torchrl"]
     assert runtime["torch_threads"] == torch.get_num_threads()
-    assert runtime["cuda"]["available"] == torch.cuda.is_available()
+    assert runtime["cuda"]["inspected"] is False
+    assert runtime["cuda"]["available"] is None
+    assert runtime["cuda"]["devices"] == []
     for details in saved["map_protocols"].values():
         assert set(details["assets"]) == {"image", "centerline", "walls"}
         for asset in details["assets"].values():

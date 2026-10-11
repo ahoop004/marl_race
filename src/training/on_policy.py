@@ -12,12 +12,14 @@ except ImportError:  # Not available on Windows.
     resource = None
 
 import torch
+from tensordict import TensorDict
 from torchrl.collectors import Collector
 
 from adapters.native_torchrl import NativeRaceTorchRLEnv
 from training.contracts import validate_team_reward_composers
 from training.race_reporting import RaceTrainingReports
-from utils.torch_io import synchronize_device
+from training.runtime import CudaCollectionProfile
+from utils.torch_io import synchronize_device, resolve_collection_device
 
 
 class _CollectionBoundary:
@@ -47,7 +49,7 @@ class OnPolicyTrainer:
                  focal_agent_id=None, algorithm=None, measure_services=False,
                  measure_stages=False, measure_mpc=False, measure_hybrid=False,
                  profiling_warmup_updates=1, measure_cuda_sync=False,
-                 parallel_envs=1, scenario=None, scenario_dir=None):
+                 parallel_envs=1, scenario=None, scenario_dir=None, collection_device=None):
         self.task, self.agent = task, agent
         if type(parallel_envs) is not int or parallel_envs < 1:
             raise ValueError("parallel_envs must be a positive integer")
@@ -57,6 +59,7 @@ class OnPolicyTrainer:
             if render:
                 raise ValueError("Process collection requires headless environments")
         self.parallel_envs, self.scenario = parallel_envs, scenario
+        self.collection_device = resolve_collection_device(collection_device, agent.device, parallel_envs)
         self.scenario_dir = str(scenario_dir) if scenario_dir is not None else None
         self._worker_policy_starts = {}
         self.algorithm = algorithm or ("mappo" if hasattr(agent, "global_state_dim") else "ppo")
@@ -103,6 +106,8 @@ class OnPolicyTrainer:
         self.worker_scope_seconds = {phase: {} for phase in self.stage_seconds}
         self.worker_metrics = {}
         self.worker_batch_metrics = {}
+        self.cuda_copy_seconds = 0.
+        self.cuda_copy_calls = 0
         self.trainable_ids = list(task.possible_agents)
         self.focal_id = focal_agent_id or self.trainable_ids[0]
         if self.focal_id not in self.trainable_ids:
@@ -195,7 +200,7 @@ class OnPolicyTrainer:
             had_value = name in vars(owner)
             @wraps(original)
             def timed(*args, **kwargs):
-                return self.measure_stage(category, original, *args, device=device, **kwargs)
+                return self._profile_learning(category, original, *args, device=device, **kwargs)
             setattr(owner, name, timed)
             def restore():
                 if had_value:
@@ -204,12 +209,12 @@ class OnPolicyTrainer:
                     delattr(owner, name)
             resources.callback(restore)
 
-        if self.parallel_envs > 1:
+        instrument(self.agent.gae, "forward", "gae", self.agent.device)
+        self.agent.profile_call = self._profile_learning
+        resources.callback(setattr, self.agent, "profile_call", None)
+        if self.parallel_envs > 1 or not self.measure_stages:
             # Inference and environments live in workers. Never serialize a
             # policy wrapper closing over the parent trainer and its hooks.
-            instrument(self.agent.gae, "forward", "gae", self.agent.device)
-            self.agent.profile_call = self.measure_stage
-            resources.callback(setattr, self.agent, "profile_call", None)
             return
         # Worker policy-version transforms dispatch to the native methods;
         # the direct collector calls the public step/reset entrypoints.
@@ -219,8 +224,8 @@ class OnPolicyTrainer:
         instrument(self.env, "_output", "tensor_construction")
         instrument(self.task, "step", "race_bookkeeping_reward")
         instrument(self.task.env, "step", "race_bookkeeping_reward")
-        instrument(self.agent.collection_policy, "forward", "policy_inference", self.agent.device)
-        instrument(self.agent.gae, "forward", "gae", self.agent.device)
+        if self.collection_device == self.agent.device:
+            instrument(self.agent.collection_policy, "forward", "policy_inference", self.collection_device)
         for composer in self.task.obs_composers.values():
             instrument(composer, "wrap", "observation_state")
         for composer in self.task.reward_composers.values():
@@ -246,10 +251,19 @@ class OnPolicyTrainer:
         original = getattr(self.task, "profile_region", None)
         self.task.profile_region = self.measure_region
         resources.callback(setattr, self.task, "profile_region", original)
-        self.agent.profile_call = self.measure_stage
         self.env.profile_call = self.measure_stage
-        resources.callback(setattr, self.agent, "profile_call", None)
         resources.callback(setattr, self.env, "profile_call", None)
+
+    def _profile_learning(self, category, callback, *args, device=None, **kwargs):
+        # Coarse learning timers stay enabled in benchmarks. Detailed CUDA
+        # completion timings remain opt-in through measure_cuda_sync.
+        if category not in {"rollout_device_transfer", "gae", "optimization"}:
+            return self.measure_stage(category, callback, *args, device=device, **kwargs)
+        started = time.perf_counter()
+        try:
+            return self.measure_stage(category, callback, *args, device=device, **kwargs)
+        finally:
+            self._record_boundary(category, started)
 
     def _instrument_mpc(self, resources):
         from agents.mpc.racing import RacingMPCAgent
@@ -541,6 +555,21 @@ class OnPolicyTrainer:
                   for name, value, base in zip(names, self._rate_counters(), self._rate_baseline)}
         result["perf/elapsed_seconds"] = elapsed
         result["perf/end_to_end_env_steps_per_second"] = result["perf/environment_steps_per_second"]
+        result.update({"perf/collection_device": str(self.collection_device),
+                       "perf/learner_device": str(self.agent.device),
+                       "perf/worker_count": self.parallel_envs,
+                       "perf/learning_cuda_completion_timing": self.measure_stages and self.measure_cuda_sync,
+                       "perf/action_transfer_in_collection": self.collection_device.type == "cuda"})
+        if self.measure_stages and self.measure_cuda_sync and self.collection_device.type == "cuda":
+            result["perf/cuda_collection/device_to_cpu_seconds"] = self.cuda_copy_seconds + sum(
+                values.get("collection_device_to_cpu_seconds", 0.) for values in self.worker_metrics.values())
+            result["perf/cuda_collection/device_to_cpu_calls"] = self.cuda_copy_calls + sum(
+                values.get("collection_device_to_cpu_calls", 0) for values in self.worker_metrics.values())
+        cuda_device = next((device for device in (self.agent.device, self.collection_device)
+                            if torch.device(device).type == "cuda"), None)
+        if cuda_device is not None:
+            result["perf/cuda_device_name"] = torch.cuda.get_device_name(cuda_device)
+            result["perf/cuda_device_index"] = torch.device(cuda_device).index or 0
         result.update({f"perf/boundaries/{phase}/{name}_seconds": seconds
             for phase, values in self.boundary_seconds.items() for name, seconds in values.items()})
         for worker, values in self.worker_metrics.items():
@@ -683,11 +712,17 @@ class OnPolicyTrainer:
             self.parallel_envs, self.reports.next_episode, (seed + worker) % 2**32,
             options, bool(self.reports.transition_hooks), self.focal_id,
             dict(measure_stages=self.measure_stages, measure_mpc=self.measure_mpc,
-                 measure_hybrid=self.measure_hybrid))
+                 measure_hybrid=self.measure_hybrid, measure_cuda_sync=self.measure_cuda_sync),
+            str(self.collection_device))
             for worker in range(self.parallel_envs)]
 
     def _receive_process_batch(self, batch):
         """Aggregate actual worker decisions, including fixed-only continuations."""
+        # The next-state tag is stamped at the action's environment step. The
+        # root tag can still describe the previous batch's last observation.
+        expected = self._updates - self._initial_updates
+        if not (batch["next", "policy_version"] == expected).all():
+            raise RuntimeError(f"Collected a stale policy batch; expected version {expected}")
         durations = []
         for worker_data in batch.unbind(0):
             worker = int(worker_data[0]["environment_id"].item())
@@ -764,6 +799,8 @@ class OnPolicyTrainer:
         self.worker_scope_seconds = {phase: {} for phase in self.stage_seconds}
         self.worker_metrics = {}
         self.worker_batch_metrics = {}
+        self.cuda_copy_seconds = 0.
+        self.cuda_copy_calls = 0
         self._rate_baseline = self._rate_counters()
         self._initial_updates = self._updates
         self.process_cpu_seconds = dict.fromkeys(self.stage_seconds, 0.0)
@@ -862,11 +899,14 @@ class OnPolicyTrainer:
                            if self.measure_stages else self.agent.flush_pending_update())
             sync_update()
             self._record_boundary("update", update_started)
-            if process and updated:
+            if updated and (process or self.collection_device != self.agent.device):
                 # Synchronous workers are idle here. Publish the new actor before
                 # any next() call; native version tags verify worker application.
                 sync_started = time.perf_counter()
-                collector.update_policy_weights_(self.agent.collection_policy)
+                # The TensorDict form works for both direct policy copies and
+                # process collectors in TorchRL 0.14 (the direct module form
+                # is not converted to weights by its fallback updater).
+                collector.update_policy_weights_(TensorDict.from_module(self.agent.collection_policy).data)
                 self._record_boundary("weight_sync", sync_started)
             return report_update(updated, update_started)
 
@@ -876,8 +916,7 @@ class OnPolicyTrainer:
                 self._instrument_mpc(stage_resources)
             if self.measure_hybrid and not process:
                 self._instrument_hybrid(stage_resources)
-            if self.measure_stages:
-                self._instrument_stages(stage_resources)
+            self._instrument_stages(stage_resources)
             require_source = getattr(self.agent, "_require_lora_source", None)
             if require_source:
                 require_source()
@@ -894,7 +933,8 @@ class OnPolicyTrainer:
                             self._process_factories(), self.agent.collection_policy,
                             backend="process", num_collectors=self.parallel_envs, sync=True,
                             frames_per_batch=self.agent.frames_per_batch, total_frames=-1,
-                            policy_device="cpu", env_device="cpu", storing_device="cpu",
+                            policy_device=self.collection_device, env_device="cpu", storing_device="cpu",
+                            no_cuda_sync=not self.measure_cuda_sync,
                             reset_at_each_iter=False, set_truncated=False, use_buffers=False,
                             auto_register_policy_transforms=False, track_policy_version=True,
                             pre_collect_hook=pre_collect_profile, post_collect_hook=post_collect_profile,
@@ -902,7 +942,8 @@ class OnPolicyTrainer:
                     return Collector(
                         self.env, self.agent.collection_policy, backend="direct",
                         frames_per_batch=self.agent.frames_per_batch, total_frames=-1,
-                        policy_device=self.agent.device, env_device="cpu", storing_device="cpu",
+                        policy_device=self.collection_device, env_device="cpu", storing_device="cpu",
+                        no_cuda_sync=not self.measure_cuda_sync,
                         reset_at_each_iter=False, set_truncated=False, use_buffers=True,
                         auto_register_policy_transforms=False,
                         # Buffered interruption pads unused rows with traj_ids=-1.
@@ -911,6 +952,14 @@ class OnPolicyTrainer:
                 startup_started = time.perf_counter()
                 collector = (self.measure_stage("collector_initialize", create_collector)
                              if self.measure_stages else create_collector())
+                if not process and self.measure_stages and self.collection_device != self.agent.device:
+                    # Instrument the copy only after TorchRL creates it; wrapping
+                    # the source's forward would survive deepcopy with a bound
+                    # reference to the learner on the wrong device.
+                    original_forward = collector.policy.forward
+                    collector.policy.forward = lambda *args, **kwargs: self.measure_stage(
+                        "policy_inference", original_forward, *args, device=self.collection_device, **kwargs)
+                    stage_resources.callback(setattr, collector.policy, "forward", original_forward)
                 self._record_boundary("worker_startup" if process else "collector_startup", startup_started)
                 self._set_timing_phase("warmup" if self.profiling_warmup_updates else "steady")
                 if self._timing_phase == "steady":
@@ -922,8 +971,13 @@ class OnPolicyTrainer:
                 while True:
                     try:
                         batch_started = time.perf_counter()
-                        data = (self.measure_stage("collector", next, iterator)
-                                if self.measure_stages else next(iterator))
+                        with CudaCollectionProfile(not process and self.measure_stages and self.measure_cuda_sync
+                                                   and self.collection_device.type == "cuda") as copy_profile:
+                            data = (self.measure_stage("collector", next, iterator)
+                                    if self.measure_stages else next(iterator))
+                        if copy_profile.enabled:
+                            self.cuda_copy_seconds += copy_profile.device_to_cpu_seconds
+                            self.cuda_copy_calls += copy_profile.device_to_cpu_calls
                         self._record_boundary("collection", batch_started)
                     except StopIteration:
                         break

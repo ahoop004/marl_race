@@ -113,7 +113,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     )
     maps_str = ", ".join(maps_raw) if isinstance(maps_raw, list) else str(maps_raw)
     seed_str = str(exp_cfg.get("seed", "random"))
-    from utils.torch_io import resolve_device
+    from utils.torch_io import resolve_device, resolve_collection_device
     device_str = str(resolve_device([params.get("device", "cpu")]))
     trainable_str = ", ".join(trainable_ids)
     fixed_str = ", ".join(task.fixed_policy_agents) or "none"
@@ -128,6 +128,10 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     )
 
     learner = create_learner(algorithm, spec, params)
+    collection_device = resolve_collection_device(
+        params.get("collection_device"), learner.device, exp_cfg.get("parallel_envs", 1))
+    console.print_info(f"collection_device={collection_device}  learner_device={learner.device}  "
+                       f"workers={exp_cfg.get('parallel_envs', 1)}")
     recovery_state = None
     if resume_payload:
         recovery_state, _ = learner.resume_training(resume_payload)
@@ -153,6 +157,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         algorithm=algorithm,
         trainable_agents=trainable_ids,
         observation_contracts=spec.observation_contracts,
+        devices=(learner.device, collection_device),
     )
     if learner.source_checkpoint:
         provenance["pretrained_source"] = learner.source_checkpoint
@@ -163,7 +168,10 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     provenance["network"] = learner.network_config
     provenance["execution"] = {
         "requested_device": params.get("device", "cpu"),
-        "policy_device": "cpu" if exp_cfg.get("parallel_envs", 1) > 1 else str(learner.device),
+        "requested_collection_device": params.get("collection_device"),
+        "collection_device": str(collection_device),
+        "learner_device": str(learner.device),
+        "policy_device": str(collection_device),
         "environment_device": "cpu",
         "rollout_storage_device": "cpu",
         "update_device": str(learner.device),
@@ -200,6 +208,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "set_truncated": False,
         "use_buffers": exp_cfg.get("parallel_envs", 1) == 1,
         "track_policy_version": exp_cfg.get("parallel_envs", 1) > 1,
+        "no_cuda_sync": not exp_cfg.get("measure_cuda_sync", False),
         "num_sub_threads": exp_cfg.get("torch_threads", 1),
     }
     csv_logger = CSVLogger(
@@ -253,6 +262,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         console.print_info(f"Selection evaluation: {evaluator.episodes} fixed-seed races; "
                            f"completion={evaluator.completion}")
     trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id,
+                             collection_device=str(collection_device),
                              parallel_envs=exp_cfg.get("parallel_envs", 1),
                              scenario=scenario, scenario_dir=scenario_dir,
                              measure_services=exp_cfg.get("measure_services", False),

@@ -132,6 +132,7 @@ def build_run_provenance(
     algorithm: str,
     trainable_agents: Iterable[str],
     observation_contracts=None,
+    devices=None,
 ) -> Dict[str, Any]:
     """Build one JSON-safe provenance block after CLI overrides are applied."""
     source = Path(scenario_path).expanduser().resolve()
@@ -140,7 +141,13 @@ def build_run_provenance(
     repo_root = Path(__file__).resolve().parents[2]
     import torch
     trainable_agents = list(trainable_agents)
-    cuda_available = torch.cuda.is_available()
+    if devices is None:
+        defaults = scenario.get("training_defaults", {})
+        devices = [defaults.get("device", "cpu"), defaults.get("collection_device")]
+        devices.extend(cfg.get("params", {}).get("device")
+                       for cfg in scenario.get("agents", {}).values())
+    inspect_cuda = any(str(device).startswith("cuda") or device == "gpu" for device in devices)
+    cuda_available = torch.cuda.is_available() if inspect_cuda else None
     resources = {"cpu_affinity_count": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()}
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
@@ -162,8 +169,8 @@ def build_run_provenance(
             "resources": resources,
             "packages": {name: version(name) for name in ("torch", "torchrl", "tensordict", "numba")},
             "torch_threads": torch.get_num_threads(), "torch_interop_threads": torch.get_num_interop_threads(),
-            "cuda": {"available": cuda_available, "runtime": torch.version.cuda,
-                "cudnn": torch.backends.cudnn.version(), "devices": [
+            "cuda": {"inspected": inspect_cuda, "available": cuda_available, "runtime": torch.version.cuda,
+                "cudnn": torch.backends.cudnn.version() if inspect_cuda else None, "devices": [
                     {"index": index, "name": torch.cuda.get_device_name(index),
                      "capability": list(torch.cuda.get_device_capability(index)),
                      "total_memory": torch.cuda.get_device_properties(index).total_memory}

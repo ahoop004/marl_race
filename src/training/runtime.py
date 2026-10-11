@@ -11,15 +11,14 @@ def seed_process(seed):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+        # manual_seed also seeds CUDA lazily; CPU workers need no CUDA probe.
 
 
 @contextmanager
 def preserve_random_state():
     numpy_state, python_state = np.random.get_state(), random.getstate()
     torch_state = torch.random.get_rng_state()
-    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None
     try:
         yield
     finally:
@@ -40,3 +39,31 @@ def evaluation_mode(policy):
                 yield
         finally:
             policy.actor.train(actor_was_training)
+
+
+class CudaCollectionProfile:
+    """Optional CUDA memcpy timing, including action copies owned by TorchRL.
+
+    Device-to-host events include other policy outputs stored with actions.
+    Kernel durations exclude host waiting and must not be added to wall time.
+    """
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.device_to_cpu_seconds = 0.
+        self.device_to_cpu_calls = 0
+
+    def __enter__(self):
+        if self.enabled:
+            from torch.profiler import profile, ProfilerActivity
+            self.profiler = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+            self.profiler.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        if self.enabled:
+            self.profiler.__exit__(*exc)
+            copies = [event for event in self.profiler.events()
+                      if event.device_type == torch.autograd.DeviceType.CUDA
+                      and event.name.startswith("Memcpy DtoH")]
+            self.device_to_cpu_seconds = sum(event.device_time_total for event in copies) / 1e6
+            self.device_to_cpu_calls = len(copies)

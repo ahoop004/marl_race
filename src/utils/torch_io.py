@@ -79,6 +79,16 @@ def synchronize_device(device) -> None:
         torch.cuda.synchronize(device)
 
 
+def resolve_collection_device(value, learner_device, parallel_envs=1) -> torch.device:
+    """Serial inference follows the learner; process inference defaults to CPU."""
+    if value is None:
+        return torch.device("cpu" if parallel_envs > 1 else learner_device)
+    if not isinstance(value, str) or (value not in {"cpu", "cuda"} and not (
+            value.startswith("cuda:") and value[5:].isdigit())):
+        raise ValueError("collection_device must be cpu, cuda, cuda:<index>, or null")
+    return resolve_device([value])
+
+
 def resolve_device(preferred: Optional[Iterable[Any]] = None) -> torch.device:
     """Resolve torch device from preferred values, environment, then availability."""
 
@@ -113,4 +123,5 @@ def resolve_device(preferred: Optional[Iterable[Any]] = None) -> torch.device:
     return torch.device("cpu")
 
 
-__all__ = ["safe_load", "atomic_save", "resolve_device", "synchronize_device", "validate_checkpoint_compatibility"]
+__all__ = ["safe_load", "atomic_save", "resolve_device", "resolve_collection_device",
+           "synchronize_device", "validate_checkpoint_compatibility"]
