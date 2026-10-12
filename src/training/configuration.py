@@ -38,6 +38,9 @@ def validate_training_scenario(scenario):
     experiment = scenario["experiment"]
     environment = scenario["environment"]
     agents = scenario["agents"]
+    backend = experiment.get("collection_backend", "process")
+    if not isinstance(backend, str) or backend not in {"process", "centralized"}:
+        raise ScenarioError("experiment.collection_backend must be process or centralized")
     for name in ("parallel_envs", "envs_per_worker"):
         value = experiment.get(name, 1)
         if type(value) is not int or value < 1:

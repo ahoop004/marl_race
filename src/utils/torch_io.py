@@ -79,14 +79,16 @@ def synchronize_device(device) -> None:
         torch.cuda.synchronize(device)
 
 
-def resolve_collection_device(value, learner_device, parallel_envs=1, envs_per_worker=1) -> torch.device:
+def resolve_collection_device(value, learner_device, parallel_envs=1, envs_per_worker=1,
+                              collection_backend="process") -> torch.device:
     """Serial inference follows the learner; process inference defaults to CPU."""
-    if envs_per_worker > 1:
+    if envs_per_worker > 1 and collection_backend != "centralized":
         if value is not None and value != "cpu":
             raise ValueError("Grouped environment collection requires collection_device=cpu")
         return torch.device("cpu")
     if value is None:
-        return torch.device("cpu" if parallel_envs > 1 else learner_device)
+        return torch.device("cpu" if parallel_envs * envs_per_worker > 1
+                            or collection_backend == "centralized" else learner_device)
     if not isinstance(value, str) or (value not in {"cpu", "cuda"} and not (
             value.startswith("cuda:") and value[5:].isdigit())):
         raise ValueError("collection_device must be cpu, cuda, cuda:<index>, or null")

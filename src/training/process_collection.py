@@ -20,6 +20,7 @@ from adapters.native_torchrl import NativeRaceTorchRLEnv
 from training.race_reporting import RaceTrainingReports
 from training.runtime import seed_process, CudaCollectionProfile
 from utils.cpu_affinity import cpu_placement
+from utils.torch_io import synchronize_device
 
 
 # Collector hooks execute in the same worker that calls the environment factory.
@@ -30,11 +31,51 @@ _collection_wall = _collection_cpu = 0.
 _factory_seconds = 0.
 _cuda_profile = None
 _worker_placement = {}
+_inference_profile = {}
+_inference_started = None
+
+
+def reset_inference_profile():
+    global _inference_profile
+    _inference_profile = dict(calls=0, environment_rows=0, agent_rows=0, seconds=0.)
+
+
+def inference_profile():
+    return dict(_inference_profile)
+
+
+def begin_policy_inference(module, args, *, cuda_sync=False):
+    global _inference_started
+    if not _inference_profile:
+        reset_inference_profile()
+    data = args[0]
+    if cuda_sync:
+        synchronize_device(data["agents", "observation"].device)
+    _inference_started = time.perf_counter()
+    _inference_profile["calls"] += 1
+    _inference_profile["environment_rows"] += data.numel()
+    _inference_profile["agent_rows"] += data["agents"].numel()
+
+
+def end_policy_inference(module, args, result, *, cuda_sync=False):
+    if cuda_sync:
+        synchronize_device(args[0]["agents", "observation"].device)
+    _inference_profile["seconds"] += time.perf_counter() - _inference_started
+
+
+def instrument_policy_inference(policy, resources, *, cuda_sync=False):
+    """Serializable hooks measure the actual collector policy, including copies."""
+    reset_inference_profile()
+    resources.callback(policy.register_forward_pre_hook(
+        partial(begin_policy_inference, cuda_sync=cuda_sync)).remove)
+    resources.callback(policy.register_forward_hook(
+        partial(end_policy_inference, cuda_sync=cuda_sync)).remove)
 
 
 def pre_collect_profile():
     global _collection_started, _collection_cpu_started, _cuda_profile
     _collection_started, _collection_cpu_started = time.perf_counter(), time.process_time()
+    reset_inference_profile()
     for reports in _worker_reports.values():
         reports.batch_events = []
         reports.batch_start = reports.trainer._environment_steps
@@ -45,7 +86,7 @@ def pre_collect_profile():
     _cuda_profile.__enter__()
 
 
-def post_collect_profile(batch):
+def worker_collection_report():
     global _collection_wall, _collection_cpu
     wall = time.perf_counter() - _collection_started
     cpu = time.process_time() - _collection_cpu_started
@@ -53,6 +94,8 @@ def post_collect_profile(batch):
     first = next(iter(_worker_reports.values()))
     first.cuda_copy_seconds += _cuda_profile.device_to_cpu_seconds
     first.cuda_copy_calls += _cuda_profile.device_to_cpu_calls
+    first.cuda_upload_seconds += _cuda_profile.cpu_to_device_seconds
+    first.cuda_upload_calls += _cuda_profile.cpu_to_device_calls
     _collection_wall += wall
     _collection_cpu += cpu
     process = dict(collection_seconds=_collection_wall, collection_cpu_seconds=_collection_cpu,
@@ -64,12 +107,15 @@ def post_collect_profile(batch):
     process.update(_worker_placement)
     if _cuda_profile.enabled:
         process.update(collection_device_to_cpu_seconds=first.cuda_copy_seconds,
-                       collection_device_to_cpu_calls=first.cuda_copy_calls)
+                       collection_device_to_cpu_calls=first.cuda_copy_calls,
+                       collection_cpu_to_device_seconds=first.cuda_upload_seconds,
+                       collection_cpu_to_device_calls=first.cuda_upload_calls)
     if resource is not None:
         process["peak_rss_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)
     # Sparse chronological reports share the existing batch transport. Empty
     # transitions need no NonTensorData allocation, stacking, or serialization.
     packet = dict(collection_seconds=wall, process=process,
+                  inference=inference_profile(),
                   race_events={environment: reports.batch_events
                                for environment, reports in _worker_reports.items()
                                if reports.batch_events})
@@ -80,7 +126,11 @@ def post_collect_profile(batch):
                 profiler._merge_profile(packet.setdefault(name.removesuffix("_totals"), {}), getattr(profiler, name))
                 setattr(profiler, name, {phase: {} for phase in profiler.stage_seconds}
                         if not name.endswith("_totals") else {})
-    batch["worker_profile"] = NonTensorData(packet, batch_size=batch.batch_size)
+    return packet
+
+
+def post_collect_profile(batch):
+    batch["worker_profile"] = NonTensorData(worker_collection_report(), batch_size=batch.batch_size)
 
 
 class _WorkerReports:
@@ -104,6 +154,8 @@ class _WorkerReports:
         self.collection_device = collection_device
         self.cuda_copy_seconds = 0.
         self.cuda_copy_calls = 0
+        self.cuda_upload_seconds = 0.
+        self.cuda_upload_calls = 0
         self.profile_cuda_collection = (collection_device.startswith("cuda") and bool(profiling)
                                        and profiling.get("measure_stages", False)
                                        and profiling.get("measure_cuda_sync", False))
@@ -208,6 +260,10 @@ class RaceEnvFactory:
             # own and advance its usual PolicyVersion transform for all slots.
             env = TransformedEnv(env)
         _factory_seconds = time.perf_counter() - _worker_started
+        # ParallelEnv dispatches these public methods to each worker once per
+        # collection batch, reusing the process collector's sparse transport.
+        env.begin_collection = pre_collect_profile
+        env.end_collection = worker_collection_report
         return env
 
     def _make_env(self, environment_id, seed):

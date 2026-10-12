@@ -58,3 +58,26 @@ def test_placement_uses_only_allocated_cores_and_equal_sized_masks(benchmark):
     topology[0]["core"] = None
     with pytest.raises(ValueError, match="topology"):
         benchmark["placement_masks"](placement, count=2, minimum=2)
+
+
+@pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
+def test_inference_comparisons_preserve_workload(benchmark, algorithm, tmp_path):
+    args = argparse.Namespace(algorithm=algorithm, total_steps=262144, torch_threads=1,
+                              workers=8, envs_per_worker=2, learner_device="cuda", profile=False)
+    configs = []
+    for backend, device in (("process", "cpu"), ("centralized", "cpu"), ("centralized", "cuda")):
+        command = benchmark["training_command"](args, 1024, tmp_path / device,
+                                                 backend=backend, collection_device=device)
+        scenario = command[command.index("--scenario") + 1]
+        overrides = [command[index + 1] for index, value in enumerate(command) if value == "--set"]
+        config = load_and_expand_scenario(scenario, overrides=overrides)
+        from application.configuration import validate_experiment_scenario
+        validate_experiment_scenario(config)
+        assert config["execution"]["params"].pop("collection_device") == device
+        assert config["experiment"].pop("collection_backend", "process") == backend
+        config["training_defaults"].pop("collection_device")
+        for agent in config["agents"].values():
+            agent.get("params", {}).pop("collection_device", None)
+        config.pop("_configuration", None)
+        configs.append(config)
+    assert configs[0] == configs[1] == configs[2]

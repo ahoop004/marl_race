@@ -51,6 +51,8 @@ class CudaCollectionProfile:
         self.enabled = enabled
         self.device_to_cpu_seconds = 0.
         self.device_to_cpu_calls = 0
+        self.cpu_to_device_seconds = 0.
+        self.cpu_to_device_calls = 0
 
     def __enter__(self):
         if self.enabled:
@@ -67,3 +69,8 @@ class CudaCollectionProfile:
                       and event.name.startswith("Memcpy DtoH")]
             self.device_to_cpu_seconds = sum(event.device_time_total for event in copies) / 1e6
             self.device_to_cpu_calls = len(copies)
+            copies = [event for event in self.profiler.events()
+                      if event.device_type == torch.autograd.DeviceType.CUDA
+                      and event.name.startswith("Memcpy HtoD")]
+            self.cpu_to_device_seconds = sum(event.device_time_total for event in copies) / 1e6
+            self.cpu_to_device_calls = len(copies)

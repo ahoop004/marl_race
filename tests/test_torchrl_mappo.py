@@ -163,6 +163,21 @@ def test_native_update_routes_actors_and_reloads_versioned_checkpoints(actor_mod
     actual, _ = evaluation_policy.act_batch(IDS, np.zeros((2, 1), dtype=np.float32), deterministic=True)
     for aid in IDS:
         np.testing.assert_array_equal(actual[aid], expected[aid])
+    # Central collection presents [worker, environment, agent] policy inputs.
+    from tensordict import TensorDict
+    from torchrl.envs.utils import ExplorationType, set_exploration_type
+    grouped = TensorDict({"agents": TensorDict({
+        "observation": torch.zeros(2, 4, len(IDS), agent.obs_dim),
+        "index": torch.arange(len(IDS)).expand(2, 4, -1),
+    }, [2, 4, len(IDS)]), "state": torch.zeros(2, 4, agent.global_state_dim)}, [2, 4])
+    with torch.no_grad(), set_exploration_type(ExplorationType.MODE):
+        agent.collection_policy(grouped)
+        agent.value_module(grouped)
+    for index, aid in enumerate(IDS):
+        torch.testing.assert_close(grouped["agents", "action"][:, :, index],
+                                   torch.tensor(expected[aid]).expand(2, 4, -1))
+    torch.testing.assert_close(grouped["agents", "state_value"][:, :, 0],
+                               grouped["agents", "state_value"][:, :, 1])
 
 
 @pytest.mark.parametrize("target,samples,steps", [(4, [4, 2], [3, 6]), (5, [6], [6]), (8, [6], [6])])

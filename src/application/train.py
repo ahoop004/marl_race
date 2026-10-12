@@ -131,9 +131,11 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     workers = exp_cfg.get("parallel_envs", 1)
     envs_per_worker = exp_cfg.get("envs_per_worker", 1)
     total_envs = workers * envs_per_worker
-    process_collection = total_envs > 1
+    collection_backend = exp_cfg.get("collection_backend", "process")
+    centralized = collection_backend == "centralized"
+    process_collection = total_envs > 1 or centralized
     collection_device = resolve_collection_device(
-        params.get("collection_device"), learner.device, workers, envs_per_worker)
+        params.get("collection_device"), learner.device, workers, envs_per_worker, collection_backend)
     console.print_info(f"collection_device={collection_device}  learner_device={learner.device}  "
                        f"workers={workers}  envs_per_worker={envs_per_worker}  environment_slots={total_envs}")
     recovery_state = None
@@ -182,6 +184,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "torch_threads": exp_cfg.get("torch_threads", 1),
         "parallel_envs": workers,
         "envs_per_worker": envs_per_worker,
+        "collection_backend": collection_backend,
         "total_envs": total_envs,
         "measure_services": exp_cfg.get("measure_services", False),
         "measure_stages": exp_cfg.get("measure_stages", False),
@@ -198,14 +201,15 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     }
     provenance["collector"] = {
         "implementation": "torchrl.collectors.Collector",
-        "backend": "process" if process_collection else "direct",
+        "backend": "process" if process_collection and not centralized else "direct",
         "task_adapter": "native_envbase",
         "mode": "synchronous" if process_collection else "serial",
-        "num_collectors": workers,
+        "num_collectors": 1 if centralized else workers,
         "envs_per_worker": envs_per_worker,
         "num_envs": total_envs,
-        "environment_batch": "SerialEnv" if envs_per_worker > 1 else "unbatched",
-        "inference": "worker" if process_collection else "local",
+        "environment_batch": ("ParallelEnv(SerialEnv)" if envs_per_worker > 1 else "ParallelEnv")
+                             if centralized else ("SerialEnv" if envs_per_worker > 1 else "unbatched"),
+        "inference": "centralized" if centralized else ("worker" if process_collection else "local"),
         "frames_per_batch": learner.frames_per_batch,
         "learning_sample_target": learner.n_steps,
         "learning_sample_unit": "active_learner_samples",
@@ -217,6 +221,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "reset_at_each_iter": False,
         "set_truncated": False,
         "use_buffers": not process_collection,
+        "environment_use_buffers": centralized,
         "track_policy_version": process_collection,
         "no_cuda_sync": not exp_cfg.get("measure_cuda_sync", False),
         "num_sub_threads": exp_cfg.get("torch_threads", 1),
@@ -274,6 +279,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id,
                              collection_device=str(collection_device),
                              parallel_envs=workers, envs_per_worker=envs_per_worker,
+                             collection_backend=collection_backend,
                              scenario=scenario, scenario_dir=scenario_dir,
                              measure_services=exp_cfg.get("measure_services", False),
                              measure_stages=exp_cfg.get("measure_stages", False),

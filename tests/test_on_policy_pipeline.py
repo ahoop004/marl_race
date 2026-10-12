@@ -16,14 +16,25 @@ from loggers.csv_logger import CSVLogger
 
 
 @pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
-@pytest.mark.parametrize("learner_device,collection_device,workers,envs_per_worker", [
-    ("cpu", None, 1, 1), ("cpu", None, 2, 1), ("cpu", None, 2, 2),
-    ("cpu", None, 2, 4),
-    ("cpu", None, 1, 2), ("cuda", "cpu", 2, 2),
-    ("cuda", "cpu", 2, 1), ("cuda", "cuda", 2, 1), ("cuda", "cpu", 1, 1),
+@pytest.mark.parametrize("learner_device,collection_device,workers,envs_per_worker,collection_backend", [
+    (*case, "process") for case in [
+        ("cpu", None, 1, 1), ("cpu", None, 2, 1), ("cpu", None, 2, 2),
+        ("cpu", None, 2, 4),
+        ("cpu", None, 1, 2), ("cuda", "cpu", 2, 2),
+        ("cuda", "cpu", 2, 1), ("cuda", "cuda", 2, 1), ("cuda", "cpu", 1, 1),
+    ]
+] + [
+    ("cpu", "cpu", 1, 1, "centralized"),
+    ("cpu", "cpu", 2, 1, "centralized"),
+    ("cpu", "cpu", 2, 2, "centralized"),
+    ("cpu", "cpu", 2, 4, "centralized"),
+    ("cuda", "cpu", 2, 2, "centralized"),
+    ("cuda", "cuda", 2, 2, "centralized"),
+    ("cuda", "cuda", 2, 4, "centralized"),
 ])
 def test_collection_devices_sync_batches_and_checkpoint_loading(
-        algorithm, learner_device, collection_device, workers, envs_per_worker, tmp_path, monkeypatch):
+        algorithm, learner_device, collection_device, workers, envs_per_worker, collection_backend,
+        tmp_path, monkeypatch):
     if learner_device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA hardware unavailable")
     from core.configuration import PROJECT_ROOT
@@ -44,7 +55,7 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
         ])
     if envs_per_worker > 1:
         scenario["environment"]["max_steps"] = 3
-    process = workers * envs_per_worker > 1
+    process = workers * envs_per_worker > 1 or collection_backend == "centralized"
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     task = create_race_task(scenario, scenario_dir=PROJECT_ROOT / "scenarios")
@@ -54,7 +65,10 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
     capture = Capture(envs_per_worker > 1)
     training = OnPolicyTrainer(task, policy, hooks=[capture], parallel_envs=workers,
                                envs_per_worker=envs_per_worker,
-                               scenario=scenario, collection_device=collection_device)
+                               scenario=scenario, collection_device=collection_device,
+                               collection_backend=collection_backend,
+                               measure_stages=(collection_backend == "centralized" or
+                                               (workers, envs_per_worker) == (2, 2)))
     update = policy.update_rollouts if process else policy.update
     seen_batches = []
     physical_batches = []
@@ -111,6 +125,7 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
                                                if algorithm == "ppo" else args[0]["state"].device.type))
     try:
         training.train(total_steps=23 if envs_per_worker > 1 else 24)
+        assert torch.get_num_threads() == 1
         assert seen_batches and len(capture.updates) >= 2
         assert set(gae_devices) == {learner_device}
         assert any(not torch.equal(initial[key], value) for key, value in policy.actor.state_dict().items())
@@ -118,6 +133,15 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
             assert training.collected_steps == sum(physical_batches) == 24
             assert training._agent_steps == sum(int(f["next", "agent_steps"].sum()) for f in seen_batches)
             metrics = training.performance_metrics()
+            assert metrics["perf/collection_backend"] == collection_backend
+            if training.measure_stages:
+                batch_size = workers * envs_per_worker if collection_backend == "centralized" else envs_per_worker
+                for phase, profile in training.inference_profile.items():
+                    if profile.get("calls"):
+                        assert metrics[f"perf/inference/{phase}/mean_environment_batch"] == batch_size
+                        assert metrics[f"perf/inference/{phase}/mean_agent_batch"] == batch_size * len(task.possible_agents)
+                assert sum(p.get("environment_rows", 0) for p in training.inference_profile.values()) == 24
+                assert sum(p.get("calls", 0) for p in training.inference_profile.values()) == 24 // batch_size
             assert metrics["perf/collection_batches"] == len(physical_batches)
             assert metrics["perf/last_collection_batch_frames"] == physical_batches[-1]
             parent_cpus = metrics["perf/process/cpu_affinity"]
@@ -132,6 +156,8 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
                     assert metrics[prefix + "cpu_sockets"] == metrics["perf/process/cpu_sockets"]
                     assert metrics[prefix + "numa_nodes"] == metrics["perf/process/numa_nodes"]
             assert len(worker_pids) == workers and metrics["perf/process/pid"] not in worker_pids
+            import multiprocessing
+            assert not worker_pids.intersection(child.pid for child in multiprocessing.active_children())
         if envs_per_worker > 1:
             assert training.counter_metrics()["train/budget_step_overshoot"] == 1
             assert len(capture.steps) == training._agent_steps

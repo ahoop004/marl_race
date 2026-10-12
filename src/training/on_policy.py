@@ -3,7 +3,7 @@ import time
 import math
 import sys
 from contextlib import ExitStack, contextmanager
-from functools import wraps
+from functools import partial, wraps
 
 try:
     import resource
@@ -11,13 +11,14 @@ except ImportError:  # Not available on Windows.
     resource = None
 
 import torch
-from tensordict import TensorDict
+from tensordict import NonTensorData, TensorDict
 from torchrl.collectors import Collector
+from torchrl.envs import ParallelEnv, TransformedEnv
 
 from adapters.native_torchrl import NativeRaceTorchRLEnv
 from training.contracts import validate_team_reward_composers
 from training.race_reporting import RaceTrainingReports
-from training.runtime import CudaCollectionProfile
+from training.runtime import CudaCollectionProfile, preserve_random_state
 from utils.torch_io import synchronize_device, resolve_collection_device
 from utils.cpu_affinity import cpu_placement
 
@@ -49,7 +50,8 @@ class OnPolicyTrainer:
                  focal_agent_id=None, algorithm=None, measure_services=False,
                  measure_stages=False, measure_mpc=False, measure_hybrid=False,
                  profiling_warmup_updates=1, measure_cuda_sync=False,
-                 parallel_envs=1, envs_per_worker=1, scenario=None, scenario_dir=None, collection_device=None):
+                 parallel_envs=1, envs_per_worker=1, scenario=None, scenario_dir=None, collection_device=None,
+                 collection_backend="process"):
         self.task, self.agent = task, agent
         if type(parallel_envs) is not int or parallel_envs < 1:
             raise ValueError("parallel_envs must be a positive integer")
@@ -57,7 +59,11 @@ class OnPolicyTrainer:
             raise ValueError("envs_per_worker must be a positive integer")
         self.envs_per_worker = envs_per_worker
         self.total_envs = parallel_envs * envs_per_worker
-        self.process_collection = self.total_envs > 1
+        if not isinstance(collection_backend, str) or collection_backend not in {"process", "centralized"}:
+            raise ValueError("collection_backend must be process or centralized")
+        self.collection_backend = collection_backend
+        self.centralized_collection = collection_backend == "centralized"
+        self.process_collection = self.total_envs > 1 or self.centralized_collection
         if self.process_collection:
             if scenario is None:
                 raise ValueError("Process collection requires the task's scenario configuration")
@@ -67,7 +73,8 @@ class OnPolicyTrainer:
         self._process_placement = cpu_placement()
         self._process_placement.pop("cpu_topology")
         self._collection_batches = self._last_collection_batch_frames = 0
-        self.collection_device = resolve_collection_device(collection_device, agent.device, parallel_envs, envs_per_worker)
+        self.collection_device = resolve_collection_device(
+            collection_device, agent.device, parallel_envs, envs_per_worker, collection_backend)
         self.scenario_dir = str(scenario_dir) if scenario_dir is not None else None
         self._worker_policy_starts = {}
         self.algorithm = algorithm or ("mappo" if hasattr(agent, "global_state_dim") else "ppo")
@@ -114,8 +121,11 @@ class OnPolicyTrainer:
         self.worker_scope_seconds = {phase: {} for phase in self.stage_seconds}
         self.worker_metrics = {}
         self.worker_batch_metrics = {}
+        self.inference_profile = {phase: {} for phase in self.stage_seconds}
         self.cuda_copy_seconds = 0.
         self.cuda_copy_calls = 0
+        self.cuda_upload_seconds = 0.
+        self.cuda_upload_calls = 0
         self.trainable_ids = list(task.possible_agents)
         self.focal_id = focal_agent_id or self.trainable_ids[0]
         if self.focal_id not in self.trainable_ids:
@@ -534,6 +544,7 @@ class OnPolicyTrainer:
 
     def _receive_worker_profile(self, worker, packet):
         self.worker_metrics[worker] = packet["process"]
+        self._merge_profile(self.inference_profile[self._timing_phase], packet.get("inference", {}))
         for name in ("stage_seconds", "stage_calls", "scope_seconds"):
             target = getattr(self, "worker_" + name)
             for phase, values in packet.get(name, {}).items():
@@ -564,11 +575,13 @@ class OnPolicyTrainer:
         result["perf/elapsed_seconds"] = elapsed
         result["perf/end_to_end_env_steps_per_second"] = result["perf/environment_steps_per_second"]
         result.update({"perf/collection_device": str(self.collection_device),
+                       "perf/collection_backend": self.collection_backend,
                        "perf/learner_device": str(self.agent.device),
                        "perf/worker_count": self.parallel_envs,
                        "perf/envs_per_worker": self.envs_per_worker,
                        "perf/environment_slots": self.total_envs,
                        "perf/worker_wait_overlaps_collection": True,
+                       "perf/worker_collection_includes_central_inference": self.centralized_collection,
                        "perf/learning_cuda_completion_timing": self.measure_stages and self.measure_cuda_sync,
                        "perf/action_transfer_in_collection": self.collection_device.type == "cuda"})
         if self.measure_stages and self.measure_cuda_sync and self.collection_device.type == "cuda":
@@ -576,16 +589,33 @@ class OnPolicyTrainer:
                 values.get("collection_device_to_cpu_seconds", 0.) for values in self.worker_metrics.values())
             result["perf/cuda_collection/device_to_cpu_calls"] = self.cuda_copy_calls + sum(
                 values.get("collection_device_to_cpu_calls", 0) for values in self.worker_metrics.values())
+            result["perf/cuda_collection/cpu_to_device_seconds"] = self.cuda_upload_seconds + sum(
+                values.get("collection_cpu_to_device_seconds", 0.) for values in self.worker_metrics.values())
+            result["perf/cuda_collection/cpu_to_device_calls"] = self.cuda_upload_calls + sum(
+                values.get("collection_cpu_to_device_calls", 0) for values in self.worker_metrics.values())
         cuda_device = next((device for device in (self.agent.device, self.collection_device)
                             if torch.device(device).type == "cuda"), None)
         if cuda_device is not None:
             result["perf/cuda_device_name"] = torch.cuda.get_device_name(cuda_device)
             result["perf/cuda_device_index"] = torch.device(cuda_device).index or 0
+            result["perf/cuda_parent_peak_allocated_bytes"] = torch.cuda.max_memory_allocated(cuda_device)
+            result["perf/cuda_parent_peak_reserved_bytes"] = torch.cuda.max_memory_reserved(cuda_device)
         result.update({f"perf/boundaries/{phase}/{name}_seconds": seconds
             for phase, values in self.boundary_seconds.items() for name, seconds in values.items()})
         for worker, values in self.worker_metrics.items():
             result.update({f"perf/workers/{worker}/{name}": value for name, value in values.items()})
         result.update(self.worker_batch_metrics)
+        if self.measure_stages:
+            result["perf/inference/cuda_completion_timing"] = self.measure_cuda_sync
+            result["perf/inference/worker_seconds_overlap"] = not self.centralized_collection
+            for phase, values in self.inference_profile.items():
+                if not values.get("calls"):
+                    continue
+                prefix = f"perf/inference/{phase}/"
+                result.update({prefix + name: value for name, value in values.items()})
+                result.update({prefix + "mean_environment_batch": values["environment_rows"] / values["calls"],
+                               prefix + "mean_agent_batch": values["agent_rows"] / values["calls"],
+                               prefix + "mean_latency_ms": 1000 * values["seconds"] / values["calls"]})
         result.update({f"perf/worker_stages/{phase}/{name}_seconds": seconds
             for phase, values in self.worker_stage_seconds.items() for name, seconds in values.items()})
         result.update({f"perf/worker_stages/{phase}/{name}_calls": calls
@@ -726,7 +756,7 @@ class OnPolicyTrainer:
             options, bool(self.reports.transition_hooks), self.focal_id,
             dict(measure_stages=self.measure_stages, measure_mpc=self.measure_mpc,
                  measure_hybrid=self.measure_hybrid, measure_cuda_sync=self.measure_cuda_sync),
-            str(self.collection_device), self.envs_per_worker,
+            "cpu" if self.centralized_collection else str(self.collection_device), self.envs_per_worker,
             tuple(self._process_placement["cpu_affinity"]) if self._process_placement["cpu_affinity"] is not None else None)
             for worker in range(self.parallel_envs)]
 
@@ -849,8 +879,11 @@ class OnPolicyTrainer:
         self.worker_scope_seconds = {phase: {} for phase in self.stage_seconds}
         self.worker_metrics = {}
         self.worker_batch_metrics = {}
+        self.inference_profile = {phase: {} for phase in self.stage_seconds}
         self.cuda_copy_seconds = 0.
         self.cuda_copy_calls = 0
+        self.cuda_upload_seconds = 0.
+        self.cuda_upload_calls = 0
         self._rate_baseline = self._rate_counters()
         self._initial_updates = self._updates
         self.process_cpu_seconds = dict.fromkeys(self.stage_seconds, 0.0)
@@ -888,6 +921,8 @@ class OnPolicyTrainer:
         collection_service_seconds = sum(self.service_seconds.values())
         metrics = {}
         collector = None
+        central_env = None
+        central_threads = None
         update_environment_steps = self._environment_steps
         update_physics_steps = self._physics_steps
         update_agent_steps = self._agent_steps
@@ -978,8 +1013,47 @@ class OnPolicyTrainer:
                 if self._resume_state is not None:
                     self.env.set_seed(self._resume_state["recovery_seed"])
                 def create_collector():
+                    nonlocal central_env, central_threads
+                    if self.centralized_collection:
+                        from training.process_collection import reset_inference_profile, inference_profile
+                        central_threads = torch.get_num_threads()
+                        # Shared buffers avoid per-step tensor serialization.
+                        # Metadata probes reuse factories that seed their process;
+                        # preserve the parent's policy RNG while they run.
+                        with preserve_random_state():
+                            central_env = ParallelEnv(
+                                self.parallel_envs, [partial(factory) for factory in self._process_factories()],
+                                use_buffers=True, mp_start_method="spawn", serial_for_single=False,
+                                num_threads=central_threads,
+                                num_sub_threads=self.scenario["experiment"].get("torch_threads", 1))
+
+                        def receive_reports(batch):
+                            if self.measure_stages:
+                                self._merge_profile(self.inference_profile[self._timing_phase], inference_profile())
+                            packets = central_env.end_collection()
+                            batch["worker_profile"] = torch.stack([
+                                NonTensorData(packet, batch_size=batch.batch_size[1:])
+                                for packet in packets], dim=0)
+
+                        def begin_batch():
+                            reset_inference_profile()
+                            central_env.begin_collection()
+
+                        return Collector(
+                            TransformedEnv(central_env), self.agent.collection_policy,
+                            backend="direct", frames_per_batch=self.agent.frames_per_batch,
+                            total_frames=-1, policy_device=self.collection_device,
+                            env_device="cpu", storing_device="cpu",
+                            no_cuda_sync=not self.measure_cuda_sync,
+                            reset_at_each_iter=False, set_truncated=False, use_buffers=False,
+                            auto_register_policy_transforms=False, track_policy_version=True,
+                            pre_collect_hook=begin_batch, post_collect_hook=receive_reports)
                     if process:
-                        from training.process_collection import pre_collect_profile, post_collect_profile
+                        from training.process_collection import (
+                            pre_collect_profile, post_collect_profile, instrument_policy_inference)
+                        if self.measure_stages:
+                            instrument_policy_inference(self.agent.collection_policy, stage_resources,
+                                                        cuda_sync=self.measure_cuda_sync)
                         return Collector(
                             self._process_factories(), self.agent.collection_policy,
                             backend="process", num_collectors=self.parallel_envs, sync=True,
@@ -1003,6 +1077,10 @@ class OnPolicyTrainer:
                 startup_started = time.perf_counter()
                 collector = (self.measure_stage("collector_initialize", create_collector)
                              if self.measure_stages else create_collector())
+                if self.centralized_collection and self.measure_stages:
+                    from training.process_collection import instrument_policy_inference
+                    instrument_policy_inference(collector.policy, stage_resources,
+                                                cuda_sync=self.measure_cuda_sync)
                 if not process and self.measure_stages and self.collection_device != self.agent.device:
                     # Instrument the copy only after TorchRL creates it; wrapping
                     # the source's forward would survive deepcopy with a bound
@@ -1022,13 +1100,16 @@ class OnPolicyTrainer:
                 while True:
                     try:
                         batch_started = time.perf_counter()
-                        with CudaCollectionProfile(not process and self.measure_stages and self.measure_cuda_sync
+                        with CudaCollectionProfile((not process or self.centralized_collection)
+                                                   and self.measure_stages and self.measure_cuda_sync
                                                    and self.collection_device.type == "cuda") as copy_profile:
                             data = (self.measure_stage("collector", next, iterator)
                                     if self.measure_stages else next(iterator))
                         if copy_profile.enabled:
                             self.cuda_copy_seconds += copy_profile.device_to_cpu_seconds
                             self.cuda_copy_calls += copy_profile.device_to_cpu_calls
+                            self.cuda_upload_seconds += copy_profile.cpu_to_device_seconds
+                            self.cuda_upload_calls += copy_profile.cpu_to_device_calls
                         self._record_boundary("collection", batch_started)
                     except StopIteration:
                         break
@@ -1084,14 +1165,21 @@ class OnPolicyTrainer:
         finally:
             stage_resources.close()
             shutdown_started = time.perf_counter()
-            if collector is not None:
-                try:
+            try:
+                if collector is not None:
                     collector.shutdown()
+            finally:
+                try:
+                    if central_env is not None and not central_env.is_closed:
+                        central_env.close()
                 finally:
-                    if process:
-                        self.env.close()
-            else:
-                self.env.close()
+                    try:
+                        if process or collector is None:
+                            self.env.close()
+                    finally:
+                        # ParallelEnv.close adjusts the parent's thread pool.
+                        if central_threads is not None:
+                            torch.set_num_threads(central_threads)
             self._record_boundary("shutdown", shutdown_started)
             self._run_finished = time.perf_counter()
             self._finish_process_phase()

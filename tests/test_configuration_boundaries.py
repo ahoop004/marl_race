@@ -102,6 +102,14 @@ def test_removed_parallel_settings_fail_clearly_after_cli_overrides(setting):
     assert setting.split("=", 1)[0] in str(error.value)
 
 
+@pytest.mark.parametrize("backend", ["async", None, 1, []])
+def test_unknown_collection_backend_fails_clearly(backend):
+    scenario = ppo_scenario()
+    scenario["experiment"]["collection_backend"] = backend
+    with pytest.raises(ScenarioError, match="collection_backend"):
+        validate_experiment_scenario(scenario)
+
+
 def test_environment_and_observations_share_one_resolved_configuration(monkeypatch):
     from core import setup, task_builder
 

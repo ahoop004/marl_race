@@ -140,7 +140,9 @@ class RaceTrainingReports:
             **episode_race_record(finalize_episode_facts(self.facts), timestep=self.task.timestep,
                                  finite_race=self.task.episode_limits.finish_on_laps),
             "run_id": t.run_id, "environment_id": self.environment_id, "episode_id": self.episode_id,
-            "environment_episode": (self.environment_episode if self.episode_stride > 1 else self.episode), "map_id": self.map_id,
+            "environment_episode": (self.environment_episode if self.episode_stride > 1
+                                    or getattr(t.env, "environment_id", None) is not None else self.episode),
+            "map_id": self.map_id,
             "environment_seed": self.environment_seed, "spawn_ids": self.spawn_ids,
             "spawn_configuration": self.spawn_context, "environment_decisions": self.steps,
             "environment_decisions_total": t._environment_steps,
@@ -148,7 +150,8 @@ class RaceTrainingReports:
             "policy_version_start": self.start_policy, "policy_version_end": t._updates,
             "reported_at_environment_steps": t._environment_steps,
             "team_reward_components": dict(self.team_components), "training_return": self.reward}
-        if t.algorithm == "ppo" and self.episode_stride == 1:
+        if (t.algorithm == "ppo" and self.episode_stride == 1
+                and getattr(t.env, "environment_id", None) is None):
             # Preserve PPO's existing episode CSV path and metric contract.
             metrics.pop("race_record")
         self.pending_episodes.append((self.episode, self.reward, info, metrics))
