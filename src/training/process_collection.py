@@ -19,6 +19,7 @@ except ImportError:
 from adapters.native_torchrl import NativeRaceTorchRLEnv
 from training.race_reporting import RaceTrainingReports
 from training.runtime import seed_process, CudaCollectionProfile
+from utils.cpu_affinity import cpu_placement
 
 
 # Collector hooks execute in the same worker that calls the environment factory.
@@ -28,6 +29,7 @@ _worker_started = _collection_started = _collection_cpu_started = None
 _collection_wall = _collection_cpu = 0.
 _factory_seconds = 0.
 _cuda_profile = None
+_worker_placement = {}
 
 
 def pre_collect_profile():
@@ -59,6 +61,7 @@ def post_collect_profile(batch):
                    environment_steps=sum(r.trainer._environment_steps for r in _worker_reports.values()),
                    learner_samples=sum(r.trainer._agent_steps for r in _worker_reports.values()),
                    completed_episodes=sum(r.reports.completed for r in _worker_reports.values()))
+    process.update(_worker_placement)
     if _cuda_profile.enabled:
         process.update(collection_device_to_cpu_seconds=first.cuda_copy_seconds,
                        collection_device_to_cpu_calls=first.cuda_copy_calls)
@@ -166,12 +169,24 @@ class RaceEnvFactory:
     profiling: dict | None = None
     collection_device: str = "cpu"
     envs_per_worker: int = 1
+    parent_cpu_affinity: tuple | None = None
 
     def __call__(self):
         global _worker_reports, _worker_started, _collection_wall, _collection_cpu, _factory_seconds
+        global _worker_placement
         _worker_started = time.perf_counter()
         _collection_wall = _collection_cpu = 0.
         _worker_reports = {}
+        _worker_placement = cpu_placement()
+        # Topology is inspected once at construction, not on every decision.
+        _worker_placement.pop("cpu_topology")
+        if self.parent_cpu_affinity is not None and _worker_placement["cpu_affinity"] is not None:
+            _worker_placement["cpu_affinity_within_parent"] = set(
+                _worker_placement["cpu_affinity"]).issubset(self.parent_cpu_affinity)
+            _worker_placement["cpu_affinity_matches_parent"] = set(
+                _worker_placement["cpu_affinity"]) == set(self.parent_cpu_affinity)
+            if not _worker_placement["cpu_affinity_within_parent"]:
+                raise RuntimeError("Collector CPU affinity exceeds the parent allocation")
         torch.set_num_threads(self.scenario["experiment"].get("torch_threads", 1))
         seed_process(self.seed)
         if self.envs_per_worker == 1:

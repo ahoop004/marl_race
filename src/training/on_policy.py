@@ -2,7 +2,6 @@
 import time
 import math
 import sys
-import os
 from contextlib import ExitStack, contextmanager
 from functools import wraps
 
@@ -20,6 +19,7 @@ from training.contracts import validate_team_reward_composers
 from training.race_reporting import RaceTrainingReports
 from training.runtime import CudaCollectionProfile
 from utils.torch_io import synchronize_device, resolve_collection_device
+from utils.cpu_affinity import cpu_placement
 
 
 class _CollectionBoundary:
@@ -64,6 +64,9 @@ class OnPolicyTrainer:
             if render:
                 raise ValueError("Process collection requires headless environments")
         self.parallel_envs, self.scenario = parallel_envs, scenario
+        self._process_placement = cpu_placement()
+        self._process_placement.pop("cpu_topology")
+        self._collection_batches = self._last_collection_batch_frames = 0
         self.collection_device = resolve_collection_device(collection_device, agent.device, parallel_envs, envs_per_worker)
         self.scenario_dir = str(scenario_dir) if scenario_dir is not None else None
         self._worker_policy_starts = {}
@@ -599,7 +602,9 @@ class OnPolicyTrainer:
             self._sample_peak_rss()
         if self._peak_rss_bytes is not None:
             result["perf/process/peak_rss_bytes"] = self._peak_rss_bytes
-        result["perf/process/cpu_affinity_count"] = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+        result.update({f"perf/process/{name}": value for name, value in self._process_placement.items()})
+        result["perf/collection_batches"] = self._collection_batches
+        result["perf/last_collection_batch_frames"] = self._last_collection_batch_frames
         if self._steady_started is not None:
             duration = max((self._steady_finished or now) - self._steady_started, 1e-9)
             result["perf/steady_elapsed_seconds"] = duration
@@ -721,7 +726,8 @@ class OnPolicyTrainer:
             options, bool(self.reports.transition_hooks), self.focal_id,
             dict(measure_stages=self.measure_stages, measure_mpc=self.measure_mpc,
                  measure_hybrid=self.measure_hybrid, measure_cuda_sync=self.measure_cuda_sync),
-            str(self.collection_device), self.envs_per_worker)
+            str(self.collection_device), self.envs_per_worker,
+            tuple(self._process_placement["cpu_affinity"]) if self._process_placement["cpu_affinity"] is not None else None)
             for worker in range(self.parallel_envs)]
 
     def _process_streams(self, batch):
@@ -833,6 +839,9 @@ class OnPolicyTrainer:
 
     def train(self, n_episodes=0, *, total_steps=None):
         self._run_started, self._run_finished = time.perf_counter(), None
+        self._process_placement = cpu_placement()
+        self._process_placement.pop("cpu_topology")
+        self._collection_batches = self._last_collection_batch_frames = 0
         self._steady_started = self._steady_finished = None
         self.boundary_seconds = {phase: {} for phase in self.stage_seconds}
         self.worker_stage_seconds = {phase: {} for phase in self.stage_seconds}
@@ -904,8 +913,9 @@ class OnPolicyTrainer:
                 if process:
                     updated.update({
                         "train/update_sample_overshoot": max(0, updated["train/rollout_agent_samples"] - self.agent.n_steps),
-                        "train/collection_batch_frames": self.total_envs * math.ceil(self.agent.frames_per_batch / self.total_envs),
-                        "train/collection_batch_rounding": self.total_envs * math.ceil(self.agent.frames_per_batch / self.total_envs) - self.agent.frames_per_batch,
+                        "train/collection_batch_requested_frames": self.agent.frames_per_batch,
+                        "train/collection_batch_frames": self._last_collection_batch_frames,
+                        "train/collection_batch_rounding": max(0, self._last_collection_batch_frames - self.agent.frames_per_batch),
                     })
                 update_environment_steps = self._environment_steps
                 update_physics_steps = self._physics_steps
@@ -1023,6 +1033,8 @@ class OnPolicyTrainer:
                     except StopIteration:
                         break
                     self.checkpoint_ready = False
+                    self._collection_batches += 1
+                    self._last_collection_batch_frames = data.numel()
                     updated = False
                     metrics = {}
                     aggregation_started = time.perf_counter()

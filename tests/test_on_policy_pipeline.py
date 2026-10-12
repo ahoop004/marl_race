@@ -117,10 +117,26 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
         if process:
             assert training.collected_steps == sum(physical_batches) == 24
             assert training._agent_steps == sum(int(f["next", "agent_steps"].sum()) for f in seen_batches)
+            metrics = training.performance_metrics()
+            assert metrics["perf/collection_batches"] == len(physical_batches)
+            assert metrics["perf/last_collection_batch_frames"] == physical_batches[-1]
+            parent_cpus = metrics["perf/process/cpu_affinity"]
+            worker_pids = set()
+            for worker in range(workers):
+                prefix = f"perf/workers/{worker}/"
+                worker_pids.add(metrics[prefix + "pid"])
+                if parent_cpus is not None:
+                    assert metrics[prefix + "cpu_affinity"] == parent_cpus
+                    assert metrics[prefix + "cpu_affinity_within_parent"]
+                    assert metrics[prefix + "cpu_affinity_matches_parent"]
+                    assert metrics[prefix + "cpu_sockets"] == metrics["perf/process/cpu_sockets"]
+                    assert metrics[prefix + "numa_nodes"] == metrics["perf/process/numa_nodes"]
+            assert len(worker_pids) == workers and metrics["perf/process/pid"] not in worker_pids
         if envs_per_worker > 1:
             assert training.counter_metrics()["train/budget_step_overshoot"] == 1
             assert len(capture.steps) == training._agent_steps
             assert capture.updates[-1]["train/collection_batch_frames"] == 8
+            assert capture.updates[-1]["train/collection_batch_requested_frames"] == 7
             assert capture.updates[-1]["train/collection_batch_rounding"] == 1
             races = [metrics["race_record"] for _, _, _, metrics in capture.episodes]
             assert len(races) == training.reports.completed == 8

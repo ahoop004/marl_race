@@ -15,6 +15,7 @@ import yaml
 
 from core.map_selection import resolve_bundle_yaml
 from utils.map_loader import resolve_map_asset_paths
+from utils.cpu_affinity import cpu_placement, slurm_allocation
 
 
 PROVENANCE_VERSION = "1.1"
@@ -148,7 +149,7 @@ def build_run_provenance(
                        for cfg in scenario.get("agents", {}).values())
     inspect_cuda = any(str(device).startswith("cuda") or device == "gpu" for device in devices)
     cuda_available = torch.cuda.is_available() if inspect_cuda else None
-    resources = {"cpu_affinity_count": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()}
+    resources = {**cpu_placement(), "slurm": slurm_allocation()}
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             key, value = line.split(":", 1)
