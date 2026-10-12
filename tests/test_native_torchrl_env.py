@@ -88,7 +88,16 @@ def test_construction_specs_seed_options_and_snapshot_ownership():
         assert next_data["agent_steps"].item() == 1
         assert next_data["elapsed_seconds"].item() == pytest.approx(0.15)
         assert all(np.allclose(row["learner"], [0, 0.3]) for row in task.env.calls)
-        env.reset(seed=23, options={"episode_index": 4})
+        # Changing a pack member must not overwrite another member or the
+        # cached index used by subsequent snapshots.
+        next_data["done"].fill_(True)
+        assert not next_data["race_episode_done"].item()
+        next_data["agents", "index"].fill_(9)
+        retained = next_data.clone()
+        reset = env.reset(seed=23, options={"episode_index": 4})
+        torch.testing.assert_close(reset["agents", "index"], torch.arange(1))
+        for key in retained.keys(True, True):
+            torch.testing.assert_close(next_data[key], retained[key], rtol=0, atol=0)
         torch.testing.assert_close(initial["agents", "observation"], torch.zeros(1, 1))
         torch.testing.assert_close(final["agents", "observation"], torch.full((1, 1), 3.0))
         torch.testing.assert_close(next_data["state"], final["state"])

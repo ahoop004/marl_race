@@ -34,6 +34,8 @@ def pre_collect_profile():
     global _collection_started, _collection_cpu_started, _cuda_profile
     _collection_started, _collection_cpu_started = time.perf_counter(), time.process_time()
     for reports in _worker_reports.values():
+        reports.batch_events = []
+        reports.batch_start = reports.trainer._environment_steps
         if reports.profiler is not None:
             reports.profiler._timing_phase = "steady"
     _cuda_profile = CudaCollectionProfile(any(
@@ -62,7 +64,12 @@ def post_collect_profile(batch):
                        collection_device_to_cpu_calls=first.cuda_copy_calls)
     if resource is not None:
         process["peak_rss_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)
-    packet = dict(collection_seconds=wall, process=process)
+    # Sparse chronological reports share the existing batch transport. Empty
+    # transitions need no NonTensorData allocation, stacking, or serialization.
+    packet = dict(collection_seconds=wall, process=process,
+                  race_events={environment: reports.batch_events
+                               for environment, reports in _worker_reports.items()
+                               if reports.batch_events})
     for reports in _worker_reports.values():
         profiler = reports.profiler
         if profiler is not None:
@@ -78,6 +85,8 @@ class _WorkerReports:
     def __init__(self, env, *, algorithm, run_id, worker, workers, episode_offset,
                  agent_options, transitions, focal_id, profiling=None, collection_device="cpu"):
         self.env = env
+        self.batch_events = []
+        self.batch_start = 0
         self.requires_transition_record = transitions
         self.trainer = SimpleNamespace(
             task=env.task, agent=SimpleNamespace(**agent_options), env=env,
@@ -134,6 +143,10 @@ class _WorkerReports:
     def decision(self, result):
         self.reports.decision(result)
         self.reports.dispatch({})
+        if self.env.batch_reports and self.env.report_events:
+            index = self.trainer._environment_steps - self.batch_start - 1
+            self.batch_events.append((index, self.env.report_events))
+            self.env.report_events = []
 
 
 @dataclass
@@ -188,7 +201,7 @@ class RaceEnvFactory:
         env = NativeRaceTorchRLEnv.from_scenario(
             scenario, scenario_dir=self.scenario_dir, environment_id=environment_id,
             reward_mode=self.agent_options["reward_mode"],
-            team_reward_reduction=self.agent_options["team_reward_reduction"])
+            team_reward_reduction=self.agent_options["team_reward_reduction"], batch_reports=True)
         try:
             reports = _WorkerReports(
                 env, algorithm=self.algorithm, run_id=self.run_id, worker=environment_id,

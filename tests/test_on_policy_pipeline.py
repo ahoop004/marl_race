@@ -146,7 +146,8 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
 
 
 @pytest.mark.parametrize("envs_per_worker", [1, 2])
-def test_process_reporting_keeps_prefix_counters_and_policy_starts(envs_per_worker, monkeypatch):
+@pytest.mark.parametrize("transport", ["transition", "batch"])
+def test_process_reporting_keeps_prefix_counters_and_policy_starts(envs_per_worker, transport, monkeypatch):
     training, _ = trainer(Capture(False))
     training.parallel_envs, training.envs_per_worker = 2, envs_per_worker
     training.process_collection = True
@@ -186,7 +187,13 @@ def test_process_reporting_keeps_prefix_counters_and_policy_starts(envs_per_work
             }, []))
         streams.append(torch.stack(rows))
     batch = torch.stack(streams).reshape((2, envs_per_worker, 5) if envs_per_worker > 1 else (2, 5))
-    batch["worker_profile"] = NonTensorData({"collection_seconds": 1.}, batch_size=batch.batch_size)
+    packet = {"collection_seconds": 1.}
+    if transport == "batch":
+        packet["race_events"] = {environment: [(index, events) for index, events in enumerate(
+            stream.get(("next", "race_events")).tolist()) if events]
+            for environment, stream in enumerate(streams)}
+        batch = batch.exclude(("next", "race_events"))
+    batch["worker_profile"] = NonTensorData(packet, batch_size=batch.batch_size)
     training._receive_process_batch(batch)
     assert seen == [
         ("on_step", ("first",), 11, 22, 32, 7, 11),
@@ -233,6 +240,67 @@ def test_process_rollouts_preserve_races_masks_and_fixed_only_endpoints(single_c
             torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
     assert rollouts[0][-1]["next", "learning", "terminated"].item()
     assert not rollouts[1][-1]["next", "learning", "done"].item()
+
+
+def test_worker_batch_reports_preserve_reset_order_and_packet_lifetime(monkeypatch):
+    from dataclasses import asdict, is_dataclass
+    import numpy as np
+    from torchrl.envs import step_mdp
+    from adapters.native_torchrl import NativeRaceTorchRLEnv
+    from test_native_torchrl_env import team_task, zero_policy
+    from training import process_collection as collection
+
+    retirements = {1: (("car_0",), False, ("car_0",), ()),
+                   3: (("car_1",), False, ("car_1",), ()),
+                   5: ((), True, (), ("car_2", "car_3"))}
+    envs = [NativeRaceTorchRLEnv(team_task(retirements), reward_mode="team_shared",
+                               environment_id=0, batch_reports=buffered) for buffered in (False, True)]
+    reporters = []
+    for env in envs:
+        reports = collection._WorkerReports(
+            env, algorithm="mappo", run_id="reports", worker=0, workers=2, episode_offset=0,
+            agent_options=dict(reward_mode="team_shared", team_reward_reduction="mean",
+                               team_return_mode="joint", critic_mode="shared_team"),
+            transitions=True, focal_id="car_0")
+        reports.worker_id = 0
+        env.on_reset, env.on_physics_step, env.on_decision = reports.reports.reset, reports.reports.physics, reports.decision
+        reporters.append(reports)
+    monkeypatch.setattr(collection, "_worker_reports", {0: reporters[1]})
+    monkeypatch.setattr(collection, "_collection_wall", 0.)
+    monkeypatch.setattr(collection, "_collection_cpu", 0.)
+
+    def comparable(rows):
+        return [(index, [(method, [asdict(arg) if is_dataclass(arg) else arg for arg in args])
+                         for method, args in events]) for index, events in rows]
+
+    packets, expected = [], []
+    try:
+        assert "race_events" in envs[0].observation_spec and "race_events" not in envs[1].observation_spec
+        current = [env.reset(seed=17) for env in envs]
+        for frames in (4, 1, 4, 1, 2):
+            collection.pre_collect_profile()
+            legacy = []
+            for index in range(frames):
+                for slot, env in enumerate(envs):
+                    transition = env.step(zero_policy(current[slot]))
+                    if slot == 0 and transition["next", "race_events"]:
+                        legacy.append((index, transition["next", "race_events"]))
+                    current[slot] = env.reset() if env.snapshot.episode_done else step_mdp(transition)
+            batch = TensorDict({}, [frames])
+            collection.post_collect_profile(batch)
+            packet = batch[0]["worker_profile"]
+            np.testing.assert_equal(comparable(legacy), comparable(packet["race_events"][0]))
+            expected.append(comparable(legacy))
+            packets.append(packet)
+        # Later collection and resets must leave earlier attached events intact.
+        for packet, rows in zip(packets, expected):
+            np.testing.assert_equal(comparable(packet["race_events"][0]), rows)
+        assert packets[-1]["process"]["environment_steps"] == 12
+        assert packets[-1]["process"]["completed_episodes"] == 2
+        assert reporters[0].trainer._agent_steps == reporters[1].trainer._agent_steps
+    finally:
+        for env in envs:
+            env.close()
 
 
 @pytest.mark.parametrize("budget", [1, 3, 4, 6, 7, 9])

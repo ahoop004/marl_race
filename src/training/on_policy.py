@@ -754,8 +754,11 @@ class OnPolicyTrainer:
                 raise RuntimeError(f"Unexpected environment ID in worker {worker}, slot {local}")
             episodes = stream["environment_episode"].squeeze(-1)
             starts = (episodes[1:] != episodes[:-1]).nonzero().flatten().add(1).tolist()
-            events = {index: value for index, value in enumerate(stream.get(("next", "race_events")).tolist())
-                      if value}
+            if "race_events" in packet:
+                events = dict(packet["race_events"].get(environment, ()))
+            else:
+                events = {index: value for index, value in enumerate(stream.get(("next", "race_events")).tolist())
+                          if value}
             # Only reporting and episode boundaries require Python work. Prefix
             # sums preserve the exact counters visible to each hook, including
             # fixed-only decisions and rows without any reporting events.

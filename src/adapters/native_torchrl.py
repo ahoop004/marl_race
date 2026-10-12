@@ -25,6 +25,7 @@ class NativeRaceTorchRLEnv(EnvBase):
     real actor samples, including their final actions; fixed-only steps have
     no samples. Inactive slots retain their last observation and boundary flags.
     """
+    _NUMPY_DTYPES = {torch.float32: np.float32, torch.int64: np.int64, torch.bool: np.bool_}
 
     @classmethod
     def from_scenario(cls, scenario, *, scenario_dir=None, mode="train",
@@ -40,7 +41,8 @@ class NativeRaceTorchRLEnv(EnvBase):
             raise
 
     def __init__(self, task: RaceTaskProtocol, *, reward_mode="individual",
-                 team_reward_reduction="mean", device="cpu", environment_id=None):
+                 team_reward_reduction="mean", device="cpu", environment_id=None,
+                 batch_reports=False):
         super().__init__(device=device, batch_size=(), run_type_checks=True)
         self.task = task
         self.agent_ids = tuple(task.possible_agents)
@@ -65,12 +67,14 @@ class NativeRaceTorchRLEnv(EnvBase):
         self.profile_call = None
         self._pending_seed = None
         self.environment_id = environment_id
+        self.batch_reports = batch_reports
         self.environment_episode = -1
         self.report_events = []
         n, p = len(self.agent_ids), len(self.physical_agent_ids)
         self._observations = np.zeros((n, max(width[0] for width in widths)), dtype=np.float32)
         self._terminated = np.zeros((n, 1), dtype=bool)
         self._truncated = np.zeros((n, 1), dtype=bool)
+        self.register_buffer("_agent_index", torch.arange(n, dtype=torch.int64, device=self.device))
 
         def boolean(shape):
             return Categorical(2, shape=shape, dtype=torch.bool, device=self.device)
@@ -103,8 +107,9 @@ class NativeRaceTorchRLEnv(EnvBase):
         if environment_id is not None:
             self.observation_spec["environment_id"] = count((1,))
             self.observation_spec["environment_episode"] = count((1,))
-            # Variable episode/transition reports travel with the native batch,
-            # without shared counters or a second multiprocessing channel.
+        if environment_id is not None and not batch_reports:
+            # Direct consumers retain the per-transition reporting contract;
+            # process collectors attach buffered reports once per worker batch.
             self.observation_spec["race_events"] = NonTensor(shape=(), example_data=[])
         self.reward_spec = Composite(
             agents=Composite(reward=real((n, 1)), individual_reward=real((n, 1)),
@@ -118,8 +123,10 @@ class NativeRaceTorchRLEnv(EnvBase):
         self.is_closed = False
 
     def _tensor(self, value, dtype):
-        # Copy task arrays: TensorDict transitions must survive later steps/resets.
-        return torch.tensor(value, dtype=dtype, device=self.device)
+        # Own a NumPy copy before wrapping it: task/scratch arrays can change on
+        # the next step, whereas retained TensorDict transitions must not.
+        tensor = torch.from_numpy(np.array(value, dtype=self._NUMPY_DTYPES[dtype], copy=True))
+        return tensor if self.device.type == "cpu" else tensor.to(self.device)
 
     def _set_seed(self, seed: int | None):
         # EnvBase.set_seed must not consume a task reset or process RNG draws.
@@ -163,14 +170,13 @@ class NativeRaceTorchRLEnv(EnvBase):
             raise ValueError("agents.action must have dtype float32")
         active = set(self.snapshot.agents)
         def policy_actions():
-            actions = {}
-            for i, aid in enumerate(self.agent_ids):
-                if aid in active:
-                    detached = action[i].detach()
-                    cpu = (self.profile_call("action_device_to_cpu", detached.cpu, device=action.device)
-                           if self.profile_call and action.device.type != "cpu" else detached.cpu())
-                    actions[aid] = cpu.numpy().copy()
-            return actions
+            if not active:
+                return {}
+            detached = action.detach()
+            cpu = (self.profile_call("action_device_to_cpu", detached.cpu, device=action.device)
+                   if self.profile_call and action.device.type != "cpu" else detached.cpu())
+            actions = cpu.numpy().copy()
+            return {aid: actions[i] for i, aid in enumerate(self.agent_ids) if aid in active}
         actions = (self.profile_call("action_conversion", policy_actions)
                    if self.profile_call else policy_actions())
         # RaceTask validates all active actions before any composer/controller runs.
@@ -185,7 +191,7 @@ class NativeRaceTorchRLEnv(EnvBase):
         output = self._output(result.after, result)
         if self.on_decision is not None:
             self.on_decision(result)
-        if self.environment_id is not None:
+        if self.environment_id is not None and not self.batch_reports:
             output["race_events"] = NonTensorData(self.report_events)
             self.report_events = []
         return output
@@ -209,59 +215,71 @@ class NativeRaceTorchRLEnv(EnvBase):
             raise ValueError("Global-state order must match the configured physical agents")
         active = np.array([aid in snapshot.agents for aid in self.agent_ids])[:, None]
         masks = snapshot.global_state.masks
-        physical = {}
-        for key in ("active", "controlled", "trainable", "finished", "crashed",
-                    "truncated", "task_complete"):
-            fallback = [aid in snapshot.active_physical_agents if key == "active"
-                        else aid in self.agent_ids if key == "trainable"
-                        else key == "controlled" for aid in self.physical_agent_ids]
-            physical[key] = self._tensor(
-                np.asarray(masks.get(f"{key}_mask", fallback)).reshape(p, 1), torch.bool)
+        physical_keys = ("active", "controlled", "trainable", "finished", "crashed",
+                         "truncated", "task_complete")
+        physical_values = []
+        for key in physical_keys:
+            value = masks.get(f"{key}_mask")
+            if value is None:
+                value = [aid in snapshot.active_physical_agents if key == "active"
+                         else aid in self.agent_ids if key == "trainable"
+                         else key == "controlled" for aid in self.physical_agent_ids]
+            physical_values.append(np.asarray(value).reshape(p, 1))
+        # Each pack owns fresh storage; its non-overlapping views are local to
+        # this snapshot, with no backing memory reused by subsequent steps.
+        physical = dict(zip(physical_keys, self._tensor(physical_values, torch.bool).unbind(0)))
+        agent_active, agent_term, agent_trunc, agent_done = self._tensor(
+            [active, self._terminated, self._truncated, self._terminated | self._truncated], torch.bool).unbind(0)
         root_term, root_trunc = self._physical_boundary(result)
         learning_done = not bool(snapshot.agents)
+        done, terminated, truncated, race_done, learning_end, learning_term, learning_trunc, valid = self._tensor(
+            [[snapshot.episode_done], [root_term], [root_trunc], [snapshot.episode_done],
+             [learning_done], [learning_done], [False], [bool(result and result.decisions)]], torch.bool).unbind(0)
+        decision_steps, physics_steps, decision_physics_steps, agent_steps = self._tensor(
+            [[snapshot.decision_steps], [snapshot.physics_steps],
+             [result.physics_steps if result else 0], [result.agent_steps if result else 0]], torch.int64).unbind(0)
         output = TensorDict({
             "state": self._tensor(snapshot.global_state.vector, torch.float32),
             "agents": TensorDict({
                 "observation": self._tensor(self._observations, torch.float32),
-                "index": torch.arange(n, dtype=torch.int64, device=self.device),
-                "active": self._tensor(active, torch.bool),
-                "terminated": self._tensor(self._terminated, torch.bool),
-                "truncated": self._tensor(self._truncated, torch.bool),
-                "done": self._tensor(self._terminated | self._truncated, torch.bool),
+                "index": self._agent_index.clone(),
+                "active": agent_active,
+                "terminated": agent_term,
+                "truncated": agent_trunc,
+                "done": agent_done,
             }, batch_size=(n,), device=self.device),
             "physical": TensorDict(physical, batch_size=(p,), device=self.device),
             "learning": TensorDict({
-                "done": self._tensor([learning_done], torch.bool),
-                "terminated": self._tensor([learning_done], torch.bool),
-                "truncated": self._tensor([False], torch.bool),
-                "valid": self._tensor([bool(result and result.decisions)], torch.bool),
+                "done": learning_end,
+                "terminated": learning_term,
+                "truncated": learning_trunc,
+                "valid": valid,
             }, batch_size=(), device=self.device),
-            "done": self._tensor([snapshot.episode_done], torch.bool),
-            "terminated": self._tensor([root_term], torch.bool),
-            "truncated": self._tensor([root_trunc], torch.bool),
-            "race_episode_done": self._tensor([snapshot.episode_done], torch.bool),
-            "decision_steps": self._tensor([snapshot.decision_steps], torch.int64),
-            "physics_steps": self._tensor([snapshot.physics_steps], torch.int64),
-            "decision_physics_steps": self._tensor([result.physics_steps if result else 0], torch.int64),
-            "agent_steps": self._tensor([result.agent_steps if result else 0], torch.int64),
+            "done": done,
+            "terminated": terminated,
+            "truncated": truncated,
+            "race_episode_done": race_done,
+            "decision_steps": decision_steps,
+            "physics_steps": physics_steps,
+            "decision_physics_steps": decision_physics_steps,
+            "agent_steps": agent_steps,
             "elapsed_seconds": self._tensor([result.elapsed_seconds if result else 0], torch.float32),
         }, batch_size=(), device=self.device)
         if result is not None:
             rewards = (self.profile_call("race_bookkeeping_reward", self.reward_mapping.from_step,
                                          result, self.agent_ids)
                        if self.profile_call else self.reward_mapping.from_step(result, self.agent_ids))
-            output["agents", "reward"] = self._tensor(
-                [[rewards.get(aid, 0.0)] for aid in self.agent_ids], torch.float32)
-            output["agents", "individual_reward"] = self._tensor(
-                [[result.decisions[aid].individual_reward if aid in result.decisions else 0.0]
-                 for aid in self.agent_ids], torch.float32)
-            output["team_reward"] = self._tensor(
-                [next(iter(rewards.values())) if rewards and self.reward_mapping.mode == "team_shared" else 0.0],
-                torch.float32)
-            output["shared_bonus"] = self._tensor([result.team_reward], torch.float32)
+            output["agents", "reward"], output["agents", "individual_reward"] = self._tensor(
+                [[[rewards.get(aid, 0.0)] for aid in self.agent_ids],
+                 [[result.decisions[aid].individual_reward if aid in result.decisions else 0.0]
+                  for aid in self.agent_ids]], torch.float32).unbind(0)
+            output["team_reward"], output["shared_bonus"] = self._tensor(
+                [[next(iter(rewards.values())) if rewards and self.reward_mapping.mode == "team_shared" else 0.0],
+                 [result.team_reward]], torch.float32).unbind(0)
         if self.environment_id is not None:
-            output["environment_id"] = self._tensor([self.environment_id], torch.int64)
-            output["environment_episode"] = self._tensor([self.environment_episode], torch.int64)
+            output["environment_id"], output["environment_episode"] = self._tensor(
+                [[self.environment_id], [self.environment_episode]], torch.int64).unbind(0)
+        if self.environment_id is not None and not self.batch_reports:
             output["race_events"] = NonTensorData([])
         return output
 
