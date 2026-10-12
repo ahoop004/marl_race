@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torchrl.data import LazyTensorStorage, SamplerWithoutReplacement, TensorDictReplayBuffer
-from tensordict import TensorDict
+from tensordict import NonTensorData, TensorDict
 
 from test_torchrl_ppo import Capture, trainer, agent, rollout
 from test_torchrl_mappo import learner, transition, IDS
@@ -18,6 +18,7 @@ from loggers.csv_logger import CSVLogger
 @pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
 @pytest.mark.parametrize("learner_device,collection_device,workers,envs_per_worker", [
     ("cpu", None, 1, 1), ("cpu", None, 2, 1), ("cpu", None, 2, 2),
+    ("cpu", None, 2, 4),
     ("cpu", None, 1, 2), ("cuda", "cpu", 2, 2),
     ("cuda", "cpu", 2, 1), ("cuda", "cuda", 2, 1), ("cuda", "cpu", 1, 1),
 ])
@@ -57,6 +58,8 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
     update = policy.update_rollouts if process else policy.update
     seen_batches = []
     physical_batches = []
+    collector_batches = []
+    collector_storages = set()
     receive = training._receive_process_batch
 
     def check_process_batch(data):
@@ -65,6 +68,9 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
                     else (workers, time_steps))
         assert tuple(data.batch_size) == expected
         physical_batches.append(data.numel())
+        collector_batches.append(data)  # Keep compared storages alive to prevent allocator reuse.
+        collector_storages.update(value.untyped_storage().data_ptr() for value in data.values(True, True)
+                                  if isinstance(value, torch.Tensor))
         receive(data)
 
     monkeypatch.setattr(training, "_receive_process_batch", check_process_batch)
@@ -81,6 +87,9 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
                 assert (decisions[1:] == decisions[:-1] + 1).all()
                 assert not fragment[:-1]["next", "done"].any()
                 assert fragment["agents", "active"].any(dim=(-2, -1)).all()
+                for key, value in fragment.items(True, True):
+                    if isinstance(value, torch.Tensor):
+                        assert value.untyped_storage().data_ptr() not in collector_storages, key
             assert all(value.device.type == "cpu" for value in fragment.values(True, True)
                        if isinstance(value, torch.Tensor))
             current = fragment.to(policy.device).clone()
@@ -134,6 +143,96 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
         handle.remove()
         task.close()
         torch.set_num_threads(previous_threads)
+
+
+@pytest.mark.parametrize("envs_per_worker", [1, 2])
+def test_process_reporting_keeps_prefix_counters_and_policy_starts(envs_per_worker, monkeypatch):
+    training, _ = trainer(Capture(False))
+    training.parallel_envs, training.envs_per_worker = 2, envs_per_worker
+    training.process_collection = True
+    training._updates, training._initial_updates = 2, 0
+    training._environment_steps, training._physics_steps, training._agent_steps = 10, 20, 30
+    training._pending_learning_steps = 5
+    training._worker_policy_starts = {(0, 0): 1}
+    training.measure_mpc = training.measure_hybrid = True
+    phase = training._timing_phase
+    training.mpc_environment_decisions[phase] = 10
+    training.hybrid_environment_decisions[phase] = 10
+    monkeypatch.setattr(training, "_receive_worker_profile", lambda *args: None)
+    seen = []
+    training.hooks = training.reports.transition_hooks = [object()]
+    monkeypatch.setattr(training, "call_hook", lambda hook, method, *args: seen.append(
+        (method, args, training._environment_steps, training._physics_steps, training._agent_steps,
+         training._pending_learning_steps, training.mpc_environment_decisions[phase])))
+    streams = []
+    for environment in range(2 * envs_per_worker):
+        rows = []
+        for index, (physics, samples) in enumerate(zip([2, 1, 3, 2, 4], [2, 1, 2, 0, 0])):
+            events = []
+            if environment == 0:
+                if index == 0:
+                    events = [("on_step", ("first",))]
+                elif index in (1, 4):
+                    events = [("on_episode_end", (index, 7., {}, {"race_record": {}}))]
+                elif index == 2:
+                    events = [("on_episode_start", ({"episode": 8},)), ("on_step", ("next",))]
+            rows.append(TensorDict({
+                "environment_id": torch.tensor([environment]),
+                "environment_episode": torch.tensor([int(environment == 0 and index >= 2)]),
+                "next": TensorDict({"decision_physics_steps": torch.tensor([physics]),
+                                    "agent_steps": torch.tensor([samples]),
+                                    "policy_version": torch.tensor([2]),
+                                    "race_events": NonTensorData(events)}, []),
+            }, []))
+        streams.append(torch.stack(rows))
+    batch = torch.stack(streams).reshape((2, envs_per_worker, 5) if envs_per_worker > 1 else (2, 5))
+    batch["worker_profile"] = NonTensorData({"collection_seconds": 1.}, batch_size=batch.batch_size)
+    training._receive_process_batch(batch)
+    assert seen == [
+        ("on_step", ("first",), 11, 22, 32, 7, 11),
+        ("on_episode_start", ({"episode": 8},), 13, 26, 35, 10, 13),
+        ("on_step", ("next",), 13, 26, 35, 10, 13),
+    ]
+    episodes = training.reports.pending_episodes
+    assert [metrics["train/environment_steps"] for _, _, _, metrics in episodes] == [12, 15]
+    assert [metrics["train/physics_steps"] for _, _, _, metrics in episodes] == [23, 32]
+    assert [metrics["train/agent_steps"] for _, _, _, metrics in episodes] == [33, 35]
+    assert [metrics["race_record"]["policy_version_start"] for _, _, _, metrics in episodes] == [1, 2]
+    assert all(metrics["race_record"]["policy_version_end"] == 2 for _, _, _, metrics in episodes)
+    assert training.reports.completed == 2 and training.reports.next_episode == 9
+    assert training._worker_policy_starts == {(environment, 0): 2 for environment in range(1, 2 * envs_per_worker)}
+    assert training._environment_steps == training.mpc_environment_decisions[phase] == 10 + batch.numel()
+    assert training.hybrid_environment_decisions[phase] == 10 + batch.numel()
+    assert training._physics_steps == 20 + 12 * 2 * envs_per_worker
+    assert training._agent_steps == 30 + 5 * 2 * envs_per_worker
+    assert training._pending_learning_steps == 5 + 5 * 2 * envs_per_worker
+    batch["next", "policy_version"].fill_(1)
+    with pytest.raises(RuntimeError, match="stale policy"):
+        training._receive_process_batch(batch)
+
+
+@pytest.mark.parametrize("single_chunk", [False, True])
+def test_process_rollouts_preserve_races_masks_and_fixed_only_endpoints(single_chunk):
+    from training.on_policy import OnPolicyTrainer
+
+    policy = learner()
+    rows = []
+    for step, (episode, ids, terminal) in enumerate([
+            (0, IDS, False), (0, ["car_1"], True), (0, [], False),
+            (1, [], False), (2, IDS, False), (2, ["car_1"], False)]):
+        row = transition(policy, ids, step, step + 1, terminal=terminal)
+        row["environment_episode"] = torch.tensor([episode])
+        rows.append(row)
+    data = torch.stack(rows)
+    chunks = [data] if single_chunk else [data[:1], data[1:4], data[4:]]
+    rollouts = OnPolicyTrainer._process_rollouts({0: chunks, 1: [data[2:4]]})
+    assert len(rollouts) == 2
+    for actual, expected in zip(rollouts, [data[:2], data[4:]]):
+        assert actual.batch_size == expected.batch_size
+        for key in expected.keys(True, True):
+            torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+    assert rollouts[0][-1]["next", "learning", "terminated"].item()
+    assert not rollouts[1][-1]["next", "learning", "done"].item()
 
 
 @pytest.mark.parametrize("budget", [1, 3, 4, 6, 7, 9])

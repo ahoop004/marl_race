@@ -731,10 +731,10 @@ class OnPolicyTrainer:
             raise RuntimeError(f"Unexpected process batch layout: {batch.batch_size}")
         if self.envs_per_worker > 1 and batch.batch_size[1] != self.envs_per_worker:
             raise RuntimeError(f"Unexpected grouped process batch layout: {batch.batch_size}")
-        for worker, worker_data in enumerate(batch.unbind(0)):
-            streams = worker_data.unbind(0) if self.envs_per_worker > 1 else (worker_data,)
-            for local, stream in enumerate(streams):
-                yield worker, local, stream
+        for worker in range(self.parallel_envs):
+            for local in range(self.envs_per_worker):
+                yield worker, local, (batch[worker, local] if self.envs_per_worker > 1
+                                      else batch[worker])
 
     def _receive_process_batch(self, batch):
         """Aggregate actual worker decisions, including fixed-only continuations."""
@@ -752,20 +752,33 @@ class OnPolicyTrainer:
             environment = worker * self.envs_per_worker + local
             if not (stream["environment_id"] == environment).all():
                 raise RuntimeError(f"Unexpected environment ID in worker {worker}, slot {local}")
-            for row in stream.unbind(0):
-                local_episode = int(row["environment_episode"].item())
+            episodes = stream["environment_episode"].squeeze(-1)
+            starts = (episodes[1:] != episodes[:-1]).nonzero().flatten().add(1).tolist()
+            events = {index: value for index, value in enumerate(stream.get(("next", "race_events")).tolist())
+                      if value}
+            # Only reporting and episode boundaries require Python work. Prefix
+            # sums preserve the exact counters visible to each hook, including
+            # fixed-only decisions and rows without any reporting events.
+            positions = sorted({0, len(stream) - 1, *starts, *events})
+            counters = torch.cat((stream["next", "decision_physics_steps"],
+                                  stream["next", "agent_steps"]), dim=-1).cumsum(dim=0)
+            selected_counters = counters[positions].tolist()
+            selected_episodes = episodes[positions].tolist()
+            previous_index, previous_physics, previous_samples = -1, 0, 0
+            for index, local_episode, (physics, samples) in zip(positions, selected_episodes, selected_counters):
                 key = environment, local_episode
                 self._worker_policy_starts.setdefault(key, self._updates)
-                self._environment_steps += 1
-                self._physics_steps += int(row["next", "decision_physics_steps"].item())
-                samples = int(row["next", "agent_steps"].item())
-                self._agent_steps += samples
-                self._pending_learning_steps += samples
+                decisions = index - previous_index
+                self._environment_steps += decisions
+                self._physics_steps += physics - previous_physics
+                self._agent_steps += samples - previous_samples
+                self._pending_learning_steps += samples - previous_samples
+                previous_index, previous_physics, previous_samples = index, physics, samples
                 for enabled, counts in ((self.measure_mpc, self.mpc_environment_decisions),
                                         (self.measure_hybrid, self.hybrid_environment_decisions)):
                     if enabled:
-                        counts[self._timing_phase] = counts.get(self._timing_phase, 0) + 1
-                for method, args in row["next", "race_events"]:
+                        counts[self._timing_phase] = counts.get(self._timing_phase, 0) + decisions
+                for method, args in events.get(index, ()):
                     if method == "on_episode_start":
                         self.reports.next_episode = max(self.reports.next_episode, args[0]["episode"] + 1)
                     if method == "on_episode_end":
@@ -798,18 +811,20 @@ class OnPolicyTrainer:
 
     @staticmethod
     def _process_rollouts(pending):
-        """Join time within environment slots, then split races before GAE and masking."""
+        """Join time within environment slots and split physical races before GAE."""
         rollouts = []
         for chunks in pending.values():
-            data = torch.cat(chunks, dim=0)
+            data = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+            active = data["agents", "active"].any(dim=(-2, -1))
+            if not active.all():
+                data = data[active]
+            if not data.batch_size.numel():
+                continue
             episodes = data["environment_episode"].squeeze(-1)
             boundaries = (episodes[1:] != episodes[:-1]).nonzero().flatten().add(1).tolist()
             start = 0
             for end in [*boundaries, len(data)]:
-                race = data[start:end]
-                race = race[race["agents", "active"].any(dim=(-2, -1))]
-                if race.batch_size.numel():
-                    rollouts.append(race)
+                rollouts.append(data[start:end])
                 start = end
         return rollouts
 
@@ -1012,10 +1027,12 @@ class OnPolicyTrainer:
                     # but follows the learner endpoint and needs no GAE rows.
                     if process:
                         self._receive_process_batch(data)
-                        for _, _, fragment in self._process_streams(data):
-                            fragment = fragment.exclude("race_events", ("next", "race_events"), "worker_profile")
-                            environment = int(fragment[0]["environment_id"].item())
-                            pending.setdefault(environment, []).append(fragment.clone())
+                        # Own the retained tensors before the next collector
+                        # batch; per-environment slices can then safely be views.
+                        owned = data.exclude("race_events", ("next", "race_events"), "worker_profile").clone()
+                        for worker, local, fragment in self._process_streams(owned):
+                            environment = worker * self.envs_per_worker + local
+                            pending.setdefault(environment, []).append(fragment)
                     else:
                         data = data[data["agents", "active"].any(dim=(-2, -1))]
                         if data.batch_size.numel():
