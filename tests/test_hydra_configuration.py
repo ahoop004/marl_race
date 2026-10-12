@@ -35,6 +35,8 @@ def parity_fingerprints(config, source, params=None):
     for name in ("measure_mpc", "measure_hybrid"):
         if task["experiment"].get(name) is False:
             task["experiment"].pop(name)
+    if task["experiment"].get("envs_per_worker") == 1:
+        task["experiment"].pop("envs_per_worker")
     if "mappo" in config:
         task["mappo"] = deepcopy(config["mappo"])
     env = task["environment"]

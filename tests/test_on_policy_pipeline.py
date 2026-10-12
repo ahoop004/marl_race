@@ -16,11 +16,13 @@ from loggers.csv_logger import CSVLogger
 
 
 @pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
-@pytest.mark.parametrize("learner_device,collection_device,workers", [
-    ("cpu", None, 2), ("cuda", "cpu", 2), ("cuda", "cuda", 2), ("cuda", "cpu", 1),
+@pytest.mark.parametrize("learner_device,collection_device,workers,envs_per_worker", [
+    ("cpu", None, 1, 1), ("cpu", None, 2, 1), ("cpu", None, 2, 2),
+    ("cpu", None, 1, 2), ("cuda", "cpu", 2, 2),
+    ("cuda", "cpu", 2, 1), ("cuda", "cuda", 2, 1), ("cuda", "cpu", 1, 1),
 ])
 def test_collection_devices_sync_batches_and_checkpoint_loading(
-        algorithm, learner_device, collection_device, workers, tmp_path, monkeypatch):
+        algorithm, learner_device, collection_device, workers, envs_per_worker, tmp_path, monkeypatch):
     if learner_device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA hardware unavailable")
     from core.configuration import PROJECT_ROOT
@@ -29,28 +31,56 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
     from training.algorithms import create_learner, learner_params
     from training.on_policy import OnPolicyTrainer
 
+    scenario_name = ("mappo_2v2_completion_scratch.yaml" if algorithm == "mappo" and envs_per_worker > 1
+                     else f"{algorithm}_serial_profile.yaml")
     scenario = load_and_expand_scenario(
-        PROJECT_ROOT / "scenarios" / f"{algorithm}_serial_profile.yaml", overrides=[
+        PROJECT_ROOT / "scenarios" / scenario_name, overrides=[
             f"experiment.parallel_envs={workers}", "environment.max_steps=12",
-            "algorithm.params.n_steps=16", "algorithm.params.frames_per_batch=8",
+            f"experiment.envs_per_worker={envs_per_worker}",
+            "algorithm.params.n_steps=16", f"++algorithm.params.frames_per_batch={7 if envs_per_worker > 1 else 8}",
             "algorithm.params.n_epochs=1", "algorithm.params.batch_size=8",
             f"execution.params.device={learner_device}",
         ])
+    if envs_per_worker > 1:
+        scenario["environment"]["max_steps"] = 3
+    process = workers * envs_per_worker > 1
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     task = create_race_task(scenario, scenario_dir=PROJECT_ROOT / "scenarios")
     params = learner_params(scenario, task.spec, algorithm)
     policy = create_learner(algorithm, task.spec, params)
     initial = {key: value.clone() for key, value in policy.actor.state_dict().items()}
-    capture = Capture(False)
+    capture = Capture(envs_per_worker > 1)
     training = OnPolicyTrainer(task, policy, hooks=[capture], parallel_envs=workers,
+                               envs_per_worker=envs_per_worker,
                                scenario=scenario, collection_device=collection_device)
-    update = policy.update_rollouts if workers > 1 else policy.update
+    update = policy.update_rollouts if process else policy.update
     seen_batches = []
+    physical_batches = []
+    receive = training._receive_process_batch
+
+    def check_process_batch(data):
+        time_steps = math.ceil(policy.frames_per_batch / (workers * envs_per_worker))
+        expected = ((workers, envs_per_worker, time_steps) if envs_per_worker > 1
+                    else (workers, time_steps))
+        assert tuple(data.batch_size) == expected
+        physical_batches.append(data.numel())
+        receive(data)
+
+    monkeypatch.setattr(training, "_receive_process_batch", check_process_batch)
 
     def check_then_update(data):
         fragments = data if isinstance(data, list) else [data]
         for fragment in fragments:
+            if process:
+                assert fragment.ndim == 1
+                assert fragment["environment_id"].unique().numel() == 1
+                assert fragment["environment_episode"].unique().numel() == 1
+                assert fragment["collector", "traj_ids"].unique().numel() == 1
+                decisions = fragment["decision_steps"].squeeze(-1)
+                assert (decisions[1:] == decisions[:-1] + 1).all()
+                assert not fragment[:-1]["next", "done"].any()
+                assert fragment["agents", "active"].any(dim=(-2, -1)).all()
             assert all(value.device.type == "cpu" for value in fragment.values(True, True)
                        if isinstance(value, torch.Tensor))
             current = fragment.to(policy.device).clone()
@@ -65,17 +95,31 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
             seen_batches.append(fragment)
         return update(data)
 
-    monkeypatch.setattr(policy, "update_rollouts" if workers > 1 else "update", check_then_update)
+    monkeypatch.setattr(policy, "update_rollouts" if process else "update", check_then_update)
     gae_devices = []
     handle = policy.gae.register_forward_pre_hook(
         lambda module, args: gae_devices.append(args[0]["next", "observation"].device.type
                                                if algorithm == "ppo" else args[0]["state"].device.type))
     try:
-        training.train(total_steps=24)
+        training.train(total_steps=23 if envs_per_worker > 1 else 24)
         assert seen_batches and len(capture.updates) >= 2
         assert set(gae_devices) == {learner_device}
         assert any(not torch.equal(initial[key], value) for key, value in policy.actor.state_dict().items())
-        if workers > 1 or learner_device != str(training.collection_device):
+        if process:
+            assert training.collected_steps == sum(physical_batches) == 24
+            assert training._agent_steps == sum(int(f["next", "agent_steps"].sum()) for f in seen_batches)
+        if envs_per_worker > 1:
+            assert training.counter_metrics()["train/budget_step_overshoot"] == 1
+            assert len(capture.steps) == training._agent_steps
+            assert capture.updates[-1]["train/collection_batch_frames"] == 8
+            assert capture.updates[-1]["train/collection_batch_rounding"] == 1
+            races = [metrics["race_record"] for _, _, _, metrics in capture.episodes]
+            assert len(races) == training.reports.completed == 8
+            assert len({race["episode_id"] for race in races}) == 8
+            assert {race["environment_id"] for race in races} == set(range(workers * envs_per_worker))
+            assert all(race["environment_seed"] == 42 + race["environment_id"] for race in races)
+            assert all(race["worker_id"] == race["environment_id"] // envs_per_worker for race in races)
+        if process or learner_device != str(training.collection_device):
             assert sum(values.get("weight_sync", 0.) for values in training.boundary_seconds.values()) > 0
         checkpoint = tmp_path / "devices.pt"
         policy.save_checkpoint(checkpoint, training_state=training.checkpoint_state())

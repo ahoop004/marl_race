@@ -49,17 +49,22 @@ class OnPolicyTrainer:
                  focal_agent_id=None, algorithm=None, measure_services=False,
                  measure_stages=False, measure_mpc=False, measure_hybrid=False,
                  profiling_warmup_updates=1, measure_cuda_sync=False,
-                 parallel_envs=1, scenario=None, scenario_dir=None, collection_device=None):
+                 parallel_envs=1, envs_per_worker=1, scenario=None, scenario_dir=None, collection_device=None):
         self.task, self.agent = task, agent
         if type(parallel_envs) is not int or parallel_envs < 1:
             raise ValueError("parallel_envs must be a positive integer")
-        if parallel_envs > 1:
+        if type(envs_per_worker) is not int or envs_per_worker < 1:
+            raise ValueError("envs_per_worker must be a positive integer")
+        self.envs_per_worker = envs_per_worker
+        self.total_envs = parallel_envs * envs_per_worker
+        self.process_collection = self.total_envs > 1
+        if self.process_collection:
             if scenario is None:
                 raise ValueError("Process collection requires the task's scenario configuration")
             if render:
                 raise ValueError("Process collection requires headless environments")
         self.parallel_envs, self.scenario = parallel_envs, scenario
-        self.collection_device = resolve_collection_device(collection_device, agent.device, parallel_envs)
+        self.collection_device = resolve_collection_device(collection_device, agent.device, parallel_envs, envs_per_worker)
         self.scenario_dir = str(scenario_dir) if scenario_dir is not None else None
         self._worker_policy_starts = {}
         self.algorithm = algorithm or ("mappo" if hasattr(agent, "global_state_dim") else "ppo")
@@ -212,7 +217,7 @@ class OnPolicyTrainer:
         instrument(self.agent.gae, "forward", "gae", self.agent.device)
         self.agent.profile_call = self._profile_learning
         resources.callback(setattr, self.agent, "profile_call", None)
-        if self.parallel_envs > 1 or not self.measure_stages:
+        if self.process_collection or not self.measure_stages:
             # Inference and environments live in workers. Never serialize a
             # policy wrapper closing over the parent trainer and its hooks.
             return
@@ -558,6 +563,9 @@ class OnPolicyTrainer:
         result.update({"perf/collection_device": str(self.collection_device),
                        "perf/learner_device": str(self.agent.device),
                        "perf/worker_count": self.parallel_envs,
+                       "perf/envs_per_worker": self.envs_per_worker,
+                       "perf/environment_slots": self.total_envs,
+                       "perf/worker_wait_overlaps_collection": True,
                        "perf/learning_cuda_completion_timing": self.measure_stages and self.measure_cuda_sync,
                        "perf/action_transfer_in_collection": self.collection_device.type == "cuda"})
         if self.measure_stages and self.measure_cuda_sync and self.collection_device.type == "cuda":
@@ -635,7 +643,7 @@ class OnPolicyTrainer:
                 "train/completed_episodes": self.reports.completed,
                 "train/updates": self._updates,
                 "train/optimizer_steps_total": self._optimizer_steps}
-        if self.parallel_envs > 1:
+        if self.process_collection:
             metrics.update({
                 "train/budget_step_overshoot": max(0, self._environment_steps - self.total_steps) if self.total_steps is not None else 0,
                 "train/budget_episode_overshoot": max(0, self.reports.completed - self.n_episodes) if self.total_steps is None and self.n_episodes is not None else 0,
@@ -709,12 +717,24 @@ class OnPolicyTrainer:
             ("team_return_mode", None), ("critic_mode", None))}
         return [RaceEnvFactory(
             self.scenario, self.scenario_dir, self.algorithm, self.run_id, worker,
-            self.parallel_envs, self.reports.next_episode, (seed + worker) % 2**32,
+            self.parallel_envs, self.reports.next_episode, (seed + worker * self.envs_per_worker) % 2**32,
             options, bool(self.reports.transition_hooks), self.focal_id,
             dict(measure_stages=self.measure_stages, measure_mpc=self.measure_mpc,
                  measure_hybrid=self.measure_hybrid, measure_cuda_sync=self.measure_cuda_sync),
-            str(self.collection_device))
+            str(self.collection_device), self.envs_per_worker)
             for worker in range(self.parallel_envs)]
+
+    def _process_streams(self, batch):
+        """Yield one chronological time stream per independent race slot."""
+        expected_dims = 3 if self.envs_per_worker > 1 else 2
+        if batch.ndim != expected_dims or batch.batch_size[0] != self.parallel_envs:
+            raise RuntimeError(f"Unexpected process batch layout: {batch.batch_size}")
+        if self.envs_per_worker > 1 and batch.batch_size[1] != self.envs_per_worker:
+            raise RuntimeError(f"Unexpected grouped process batch layout: {batch.batch_size}")
+        for worker, worker_data in enumerate(batch.unbind(0)):
+            streams = worker_data.unbind(0) if self.envs_per_worker > 1 else (worker_data,)
+            for local, stream in enumerate(streams):
+                yield worker, local, stream
 
     def _receive_process_batch(self, batch):
         """Aggregate actual worker decisions, including fixed-only continuations."""
@@ -724,15 +744,17 @@ class OnPolicyTrainer:
         if not (batch["next", "policy_version"] == expected).all():
             raise RuntimeError(f"Collected a stale policy batch; expected version {expected}")
         durations = []
-        for worker_data in batch.unbind(0):
-            worker = int(worker_data[0]["environment_id"].item())
-            packet = worker_data[0]["worker_profile"]
-            self._receive_worker_profile(worker, packet)
-            durations.append(packet["collection_seconds"])
-            for row in worker_data.unbind(0):
-                worker = int(row["environment_id"].item())
+        for worker, local, stream in self._process_streams(batch):
+            if local == 0:
+                packet = stream[0]["worker_profile"]
+                self._receive_worker_profile(worker, packet)
+                durations.append(packet["collection_seconds"])
+            environment = worker * self.envs_per_worker + local
+            if not (stream["environment_id"] == environment).all():
+                raise RuntimeError(f"Unexpected environment ID in worker {worker}, slot {local}")
+            for row in stream.unbind(0):
                 local_episode = int(row["environment_episode"].item())
-                key = worker, local_episode
+                key = environment, local_episode
                 self._worker_policy_starts.setdefault(key, self._updates)
                 self._environment_steps += 1
                 self._physics_steps += int(row["next", "decision_physics_steps"].item())
@@ -753,7 +775,8 @@ class OnPolicyTrainer:
                         race.update(environment_decisions_total=self._environment_steps,
                                     reported_at_environment_steps=self._environment_steps,
                                     policy_version_start=self._worker_policy_starts.pop(key),
-                                    policy_version_end=self._updates)
+                                    policy_version_end=self._updates,
+                                    worker_id=worker)
                         metrics.update(self.counter_metrics())
                         self.reports.pending_episodes.append((episode, reward, info, metrics))
                     else:
@@ -775,7 +798,7 @@ class OnPolicyTrainer:
 
     @staticmethod
     def _process_rollouts(pending):
-        """Join time within workers, then split races before GAE and masking."""
+        """Join time within environment slots, then split races before GAE and masking."""
         rollouts = []
         for chunks in pending.values():
             data = torch.cat(chunks, dim=0)
@@ -826,7 +849,7 @@ class OnPolicyTrainer:
             self.task, reward_mode=getattr(self.agent, "reward_mode", "individual"),
             team_reward_reduction=getattr(self.agent, "team_reward_reduction", "mean"))
         self.env.render_mode = "human" if self.render else None
-        process = self.parallel_envs > 1
+        process = self.process_collection
         if not process:
             self.env.on_reset = self.reports.reset
             self.env.on_decision = self.reports.decision
@@ -863,8 +886,8 @@ class OnPolicyTrainer:
                 if process:
                     updated.update({
                         "train/update_sample_overshoot": max(0, updated["train/rollout_agent_samples"] - self.agent.n_steps),
-                        "train/collection_batch_frames": self.parallel_envs * math.ceil(self.agent.frames_per_batch / self.parallel_envs),
-                        "train/collection_batch_rounding": self.parallel_envs * math.ceil(self.agent.frames_per_batch / self.parallel_envs) - self.agent.frames_per_batch,
+                        "train/collection_batch_frames": self.total_envs * math.ceil(self.agent.frames_per_batch / self.total_envs),
+                        "train/collection_batch_rounding": self.total_envs * math.ceil(self.agent.frames_per_batch / self.total_envs) - self.agent.frames_per_batch,
                     })
                 update_environment_steps = self._environment_steps
                 update_physics_steps = self._physics_steps
@@ -989,9 +1012,10 @@ class OnPolicyTrainer:
                     # but follows the learner endpoint and needs no GAE rows.
                     if process:
                         self._receive_process_batch(data)
-                        for worker, fragment in enumerate(data.unbind(0)):
+                        for _, _, fragment in self._process_streams(data):
                             fragment = fragment.exclude("race_events", ("next", "race_events"), "worker_profile")
-                            pending.setdefault(worker, []).append(fragment.clone())
+                            environment = int(fragment[0]["environment_id"].item())
+                            pending.setdefault(environment, []).append(fragment.clone())
                     else:
                         data = data[data["agents", "active"].any(dim=(-2, -1))]
                         if data.batch_size.numel():

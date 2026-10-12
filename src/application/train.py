@@ -128,10 +128,14 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     )
 
     learner = create_learner(algorithm, spec, params)
+    workers = exp_cfg.get("parallel_envs", 1)
+    envs_per_worker = exp_cfg.get("envs_per_worker", 1)
+    total_envs = workers * envs_per_worker
+    process_collection = total_envs > 1
     collection_device = resolve_collection_device(
-        params.get("collection_device"), learner.device, exp_cfg.get("parallel_envs", 1))
+        params.get("collection_device"), learner.device, workers, envs_per_worker)
     console.print_info(f"collection_device={collection_device}  learner_device={learner.device}  "
-                       f"workers={exp_cfg.get('parallel_envs', 1)}")
+                       f"workers={workers}  envs_per_worker={envs_per_worker}  environment_slots={total_envs}")
     recovery_state = None
     if resume_payload:
         recovery_state, _ = learner.resume_training(resume_payload)
@@ -176,7 +180,9 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "rollout_storage_device": "cpu",
         "update_device": str(learner.device),
         "torch_threads": exp_cfg.get("torch_threads", 1),
-        "parallel_envs": exp_cfg.get("parallel_envs", 1),
+        "parallel_envs": workers,
+        "envs_per_worker": envs_per_worker,
+        "total_envs": total_envs,
         "measure_services": exp_cfg.get("measure_services", False),
         "measure_stages": exp_cfg.get("measure_stages", False),
         "measure_cuda_sync": exp_cfg.get("measure_cuda_sync", False),
@@ -192,22 +198,26 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     }
     provenance["collector"] = {
         "implementation": "torchrl.collectors.Collector",
-        "backend": "process" if exp_cfg.get("parallel_envs", 1) > 1 else "direct",
+        "backend": "process" if process_collection else "direct",
         "task_adapter": "native_envbase",
-        "mode": "synchronous" if exp_cfg.get("parallel_envs", 1) > 1 else "serial",
-        "num_envs": exp_cfg.get("parallel_envs", 1),
-        "inference": "worker" if exp_cfg.get("parallel_envs", 1) > 1 else "local",
+        "mode": "synchronous" if process_collection else "serial",
+        "num_collectors": workers,
+        "envs_per_worker": envs_per_worker,
+        "num_envs": total_envs,
+        "environment_batch": "SerialEnv" if envs_per_worker > 1 else "unbatched",
+        "inference": "worker" if process_collection else "local",
         "frames_per_batch": learner.frames_per_batch,
         "learning_sample_target": learner.n_steps,
         "learning_sample_unit": "active_learner_samples",
-        "effective_frames_per_batch": ((learner.frames_per_batch + exp_cfg.get("parallel_envs", 1) - 1)
-                                       // exp_cfg.get("parallel_envs", 1) * exp_cfg.get("parallel_envs", 1)),
-        "worker_seed_scheme": "(experiment.seed + worker_id) modulo 2**32",
+        "effective_frames_per_batch": ((learner.frames_per_batch + total_envs - 1)
+                                       // total_envs * total_envs),
+        "worker_seed_scheme": "(experiment.seed + environment_id) modulo 2**32",
+        "environment_id_scheme": "worker_id * envs_per_worker + local_env_id",
         "sync": True,
         "reset_at_each_iter": False,
         "set_truncated": False,
-        "use_buffers": exp_cfg.get("parallel_envs", 1) == 1,
-        "track_policy_version": exp_cfg.get("parallel_envs", 1) > 1,
+        "use_buffers": not process_collection,
+        "track_policy_version": process_collection,
         "no_cuda_sync": not exp_cfg.get("measure_cuda_sync", False),
         "num_sub_threads": exp_cfg.get("torch_threads", 1),
     }
@@ -263,7 +273,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
                            f"completion={evaluator.completion}")
     trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id,
                              collection_device=str(collection_device),
-                             parallel_envs=exp_cfg.get("parallel_envs", 1),
+                             parallel_envs=workers, envs_per_worker=envs_per_worker,
                              scenario=scenario, scenario_dir=scenario_dir,
                              measure_services=exp_cfg.get("measure_services", False),
                              measure_stages=exp_cfg.get("measure_stages", False),

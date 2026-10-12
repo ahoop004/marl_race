@@ -1,6 +1,7 @@
 """Serializable race construction and reports carried by process collector batches."""
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import partial
 from types import SimpleNamespace
 from contextlib import ExitStack
 import time
@@ -8,6 +9,7 @@ import sys
 
 import torch
 from tensordict import NonTensorData
+from torchrl.envs import SerialEnv, TransformedEnv
 
 try:
     import resource
@@ -21,7 +23,7 @@ from training.runtime import seed_process, CudaCollectionProfile
 
 # Collector hooks execute in the same worker that calls the environment factory.
 # This reference is process-local; reports use TorchRL's existing batch transport.
-_worker_reports = None
+_worker_reports = {}
 _worker_started = _collection_started = _collection_cpu_started = None
 _collection_wall = _collection_cpu = 0.
 _factory_seconds = 0.
@@ -31,9 +33,11 @@ _cuda_profile = None
 def pre_collect_profile():
     global _collection_started, _collection_cpu_started, _cuda_profile
     _collection_started, _collection_cpu_started = time.perf_counter(), time.process_time()
-    if _worker_reports.profiler is not None:
-        _worker_reports.profiler._timing_phase = "steady"
-    _cuda_profile = CudaCollectionProfile(_worker_reports.profile_cuda_collection)
+    for reports in _worker_reports.values():
+        if reports.profiler is not None:
+            reports.profiler._timing_phase = "steady"
+    _cuda_profile = CudaCollectionProfile(any(
+        reports.profile_cuda_collection for reports in _worker_reports.values()))
     _cuda_profile.__enter__()
 
 
@@ -42,25 +46,30 @@ def post_collect_profile(batch):
     wall = time.perf_counter() - _collection_started
     cpu = time.process_time() - _collection_cpu_started
     _cuda_profile.__exit__(None, None, None)
-    _worker_reports.cuda_copy_seconds += _cuda_profile.device_to_cpu_seconds
-    _worker_reports.cuda_copy_calls += _cuda_profile.device_to_cpu_calls
+    first = next(iter(_worker_reports.values()))
+    first.cuda_copy_seconds += _cuda_profile.device_to_cpu_seconds
+    first.cuda_copy_calls += _cuda_profile.device_to_cpu_calls
     _collection_wall += wall
     _collection_cpu += cpu
     process = dict(collection_seconds=_collection_wall, collection_cpu_seconds=_collection_cpu,
                    collection_cpu_percent=100 * _collection_cpu / max(_collection_wall, 1e-9),
-                   cpu_seconds=time.process_time(), factory_seconds=_factory_seconds)
+                   cpu_seconds=time.process_time(), factory_seconds=_factory_seconds,
+                   environment_steps=sum(r.trainer._environment_steps for r in _worker_reports.values()),
+                   learner_samples=sum(r.trainer._agent_steps for r in _worker_reports.values()),
+                   completed_episodes=sum(r.reports.completed for r in _worker_reports.values()))
     if _cuda_profile.enabled:
-        process.update(collection_device_to_cpu_seconds=_worker_reports.cuda_copy_seconds,
-                       collection_device_to_cpu_calls=_worker_reports.cuda_copy_calls)
+        process.update(collection_device_to_cpu_seconds=first.cuda_copy_seconds,
+                       collection_device_to_cpu_calls=first.cuda_copy_calls)
     if resource is not None:
         process["peak_rss_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)
     packet = dict(collection_seconds=wall, process=process)
-    profiler = _worker_reports.profiler
-    if profiler is not None:
-        for name in ("stage_seconds", "stage_calls", "scope_seconds", "mpc_totals", "hybrid_totals"):
-            packet[name.removesuffix("_totals")] = getattr(profiler, name)
-            setattr(profiler, name, {phase: {} for phase in profiler.stage_seconds}
-                    if not name.endswith("_totals") else {})
+    for reports in _worker_reports.values():
+        profiler = reports.profiler
+        if profiler is not None:
+            for name in ("stage_seconds", "stage_calls", "scope_seconds", "mpc_totals", "hybrid_totals"):
+                profiler._merge_profile(packet.setdefault(name.removesuffix("_totals"), {}), getattr(profiler, name))
+                setattr(profiler, name, {phase: {} for phase in profiler.stage_seconds}
+                        if not name.endswith("_totals") else {})
     batch["worker_profile"] = NonTensorData(packet, batch_size=batch.batch_size)
 
 
@@ -110,12 +119,13 @@ class _WorkerReports:
     def on_episode_start(self, metadata):
         metadata.update(environment_id=self.env.environment_id,
                         environment_episode=self.env.environment_episode,
-                        episode=self.reports.episode)
+                        episode=self.reports.episode, worker_id=self.worker_id)
         self.env.report_events.append(("on_episode_start", (metadata,)))
 
     def on_step(self, record):
         record.info.update(environment_id=self.env.environment_id,
-                           environment_episode=self.env.environment_episode)
+                           environment_episode=self.env.environment_episode,
+                           worker_id=self.worker_id)
         self.env.report_events.append(("on_step", (record,)))
 
     def on_episode_end(self, *args):
@@ -128,7 +138,7 @@ class _WorkerReports:
 
 @dataclass
 class RaceEnvFactory:
-    """Only configuration crosses the process boundary; each worker owns a race."""
+    """Only configuration crosses the boundary; each process owns its race slots."""
     scenario: dict
     scenario_dir: str | None
     algorithm: str
@@ -142,27 +152,51 @@ class RaceEnvFactory:
     focal_id: str
     profiling: dict | None = None
     collection_device: str = "cpu"
+    envs_per_worker: int = 1
 
     def __call__(self):
         global _worker_reports, _worker_started, _collection_wall, _collection_cpu, _factory_seconds
         _worker_started = time.perf_counter()
         _collection_wall = _collection_cpu = 0.
-        scenario = deepcopy(self.scenario)
-        scenario["experiment"]["seed"] = self.seed
-        torch.set_num_threads(scenario["experiment"].get("torch_threads", 1))
+        _worker_reports = {}
+        torch.set_num_threads(self.scenario["experiment"].get("torch_threads", 1))
         seed_process(self.seed)
+        if self.envs_per_worker == 1:
+            env = self._make_env(self.worker, self.seed)
+        else:
+            env = SerialEnv(self.envs_per_worker, [
+                partial(self._make_env, self.worker * self.envs_per_worker + local,
+                        (self.seed + local) % 2**32)
+                for local in range(self.envs_per_worker)], use_buffers=False)
+            try:
+                # SerialEnv first probes temporary environments for specs.
+                # Starting it replaces those reporters with the live instances.
+                env.start()
+            except BaseException:
+                env.close(raise_if_closed=False)
+                raise
+            # TorchRL 0.14 rejects automatic policy-version tracking on a
+            # bare BatchedEnvBase. An outer TransformedEnv lets the collector
+            # own and advance its usual PolicyVersion transform for all slots.
+            env = TransformedEnv(env)
+        _factory_seconds = time.perf_counter() - _worker_started
+        return env
+
+    def _make_env(self, environment_id, seed):
+        scenario = deepcopy(self.scenario)
+        scenario["experiment"]["seed"] = seed
         env = NativeRaceTorchRLEnv.from_scenario(
-            scenario, scenario_dir=self.scenario_dir, environment_id=self.worker,
+            scenario, scenario_dir=self.scenario_dir, environment_id=environment_id,
             reward_mode=self.agent_options["reward_mode"],
             team_reward_reduction=self.agent_options["team_reward_reduction"])
         try:
             reports = _WorkerReports(
-                env, algorithm=self.algorithm, run_id=self.run_id, worker=self.worker,
-                workers=self.workers, episode_offset=self.episode_offset,
+                env, algorithm=self.algorithm, run_id=self.run_id, worker=environment_id,
+                workers=self.workers * self.envs_per_worker, episode_offset=self.episode_offset,
                 agent_options=self.agent_options, transitions=self.transitions,
                 focal_id=self.focal_id, profiling=self.profiling, collection_device=self.collection_device)
-            _worker_reports = reports
-            _factory_seconds = time.perf_counter() - _worker_started
+            reports.worker_id = self.worker
+            _worker_reports[environment_id] = reports
             env.on_reset = reports.reports.reset
             env.on_physics_step = reports.reports.physics
             env.on_decision = reports.decision

@@ -22,6 +22,7 @@ paths:
 experiment:
   name: race
   parallel_envs: 1
+  envs_per_worker: 1
   measure_mpc: false  # Opt in with experiment.measure_mpc=true.
   measure_hybrid: false  # Opt in with experiment.measure_hybrid=true.
   seed: ${execution.experiment.seed}

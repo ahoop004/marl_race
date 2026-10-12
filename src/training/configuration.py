@@ -38,9 +38,10 @@ def validate_training_scenario(scenario):
     experiment = scenario["experiment"]
     environment = scenario["environment"]
     agents = scenario["agents"]
-    parallel_envs = experiment.get("parallel_envs", 1)
-    if type(parallel_envs) is not int or parallel_envs < 1:
-        raise ScenarioError("experiment.parallel_envs must be a positive integer")
+    for name in ("parallel_envs", "envs_per_worker"):
+        value = experiment.get(name, 1)
+        if type(value) is not int or value < 1:
+            raise ScenarioError(f"experiment.{name} must be a positive integer")
     for params in [scenario.get("training_defaults", {}),
                    *(cfg.get("params", {}) for cfg in agents.values())]:
         value = params.get("collection_device")
