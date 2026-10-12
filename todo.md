@@ -1,305 +1,636 @@
-Implement **Grouped Synchronous TorchRL Environment Collection** in `ahoop004/marl_race`, branch `parallel`.
+# Task: Final TorchRL Collection and Training Pipeline Optimization
 
-### Objective
+**Repository:** `ahoop004/marl_race`  
+**Branch:** `parallel`  
+**Objective:** Optimize PPO/MAPPO execution before the final HPC performance evaluation and full training experiments.
 
-Extend the existing TorchRL synchronous PPO/MAPPO collector so each CPU process can manage multiple independent racing environments.
+## Context
 
-Keep the current TorchRL collector, PPO/MAPPO learners, TensorDict data format, existing checkpoint format, and training algorithms.
+The project has completed its initial refactoring, serial profiling, synchronous TorchRL multiprocessing implementation, and grouped-environment implementation.
 
-Do not recreate the custom multiprocessing scheduler from `f110_marl`.
+The current architecture uses:
 
-The goal is to compare:
+- TorchRL 0.14 synchronous `Collector`
+- CPU collection with a CPU or CUDA learner
+- Configurable `experiment.parallel_envs`
+- Configurable `experiment.envs_per_worker`
+- Grouped `SerialEnv` instances within collector processes
+- TorchRL/TensorDict rollout storage
+- On-policy policy-version synchronization
+- PPO and MAPPO learners, including existing transfer and LoRA support
 
-- Current: 8 processes × 1 environment = 8 races
-- Grouped: 8 processes × 2 environments = 16 races
-- Grouped: 8 processes × 4 environments = 32 races
-- Grouped: 8 processes × 8 environments = 64 races
+The current best HPC PPO configuration is:
 
-These are independent race environments, not vehicles within the same race. Each MAPPO environment must retain its complete 2v2 simulation.
+- 8 collector processes
+- 2 racing environments per process
+- 16 total racing environments
+- `frames_per_batch=1024`
+- `n_steps=4096`
+- `batch_size=512`
+- `n_epochs=4`
+- CPU inference
+- CUDA learner
+- 32 allocated CPUs
+- NVIDIA L40S GPU
 
-### Background
+Measured performance:
 
-The old `F110_MARL` repository on `marl-rewiring` supported separate environment and worker counts, including 400 environments across 100 processes.
+- Overall throughput: **684.45 environment decisions/sec**
+- Steady-state throughput: **765.78 decisions/sec**
+- Collection: 54.70 seconds
+- Aggregation: 16.30 seconds
+- Update: 8.98 seconds
+- Total decisions: 65,536
+- PPO updates: 16
 
-It used grouped environments, custom multiprocessing, centralized batched inference, and a synchronous PPO/MAPPO learner.
+Earlier benchmarks demonstrated that both increasing collection batch size and grouping environments improve throughput.
 
-The new `marl_race` project uses TorchRL 0.14 with one race per process.
+We now want to optimize the remaining overhead without destabilizing the existing training implementation.
 
-Recent HPC PPO measurements on 32 allocated CPUs and one NVIDIA L40S showed:
+## General instructions
 
-| Workers | Overall decisions/s | Steady decisions/s |
-|---|---|---|
-| 8 | 472.12 | 509.21 |
-| 16 | 372.49 | 396.64 |
-| 28 | 272.99 | 295.40 |
+Prioritize code reuse and minimal implementation changes.
 
-Steady collection time increased from 91.60 to 166.44 seconds between 8 and 28 workers. Aggregation increased from 19.39 to 28.21 seconds. Weight synchronization remained below 0.5 seconds.
+Preserve:
 
-The current physical collection batch is 256 frames, which gives individual workers increasingly short collection fragments as worker count increases.
+- Existing TorchRL 0.14 infrastructure
+- PPO/MAPPO mathematical behavior
+- Actor and critic architectures
+- LoRA adapters and transfer learning
+- Reward functions and episode semantics
+- Observation/action contracts
+- Checkpoint formats and resume behavior
+- Existing experiment configuration compatibility
+- Deterministic environment IDs and seed derivation
+- Synchronous on-policy collection and policy-version correctness
 
-We want to evaluate grouped environments rather than continue increasing process count.
+Do not:
 
-### Task 1 — Add environment grouping configuration
+- Replace TorchRL
+- Reimplement PPO/MAPPO
+- Introduce Ray, MPI, DDP, or multi-node execution
+- Change package versions
+- Change learning hyperparameters as an optimization
+- Add broad abstractions or frameworks
+- Generate README files or additional documentation
+- Introduce a large test suite
+- Run expensive HPC experiments locally
+- Rewrite working code without demonstrated performance benefit
 
-Add one optional parameter:
+Keep the existing ungrouped and grouped collectors functional throughout.
 
-```yaml
-experiment:
-  parallel_envs: 8
-  envs_per_worker: 4
-```
+Use focused verification and incremental performance measurements.
 
-Maintain backward compatibility:
+---
 
-- `parallel_envs` remains the number of collector processes.
-- `envs_per_worker` is the number of independent race environments within each process.
-- Default `envs_per_worker=1`.
-- Total environments = `parallel_envs * envs_per_worker`.
-- `1 × 1` must retain the existing direct serial path.
-- Grouped configurations must use the appropriate process collector path, including when there is only one process.
-- Validate both as positive integers.
+# Phase 1 — Optimize TensorDict Aggregation
 
-Do not introduce additional configuration groups, new scenario files, or unrelated parameter changes.
+**Priority: Critical**
 
-### Task 2 — Use TorchRL SerialEnv inside existing process collectors
+### Relevant code
 
-Investigate and use the existing TorchRL 0.14 `SerialEnv` API.
+- `src/training/on_policy.py`
+- `_receive_process_batch()`
+- `_process_streams()`
+- `_process_rollouts()`
+- Collection and aggregation paths within `train()`
 
-Reuse:
+### Problem
 
-- `Collector(backend="process", sync=True)`
-- `NativeRaceTorchRLEnv`
-- `RaceEnvFactory`
-- Existing PPO/MAPPO collection policies
-- Existing learner-side weight synchronization
+The current aggregation implementation iterates over environments and individual transitions in Python.
 
-Each process should construct a `SerialEnv` containing its assigned independent racing environments.
+Each transition may require:
 
-Each nested environment must have:
+- Extracting scalar counters from tensors
+- Checking episode IDs
+- Processing agent masks
+- Inspecting reporting events
+- Updating counters
+- Tracking episode/policy information
 
-- Its own race task and simulator instance
-- Independent controller state
-- Independent seed and map schedule
-- Independent episode/reset lifecycle
-- Unique global environment ID
+With larger grouped environment counts, this introduces significant Python overhead.
 
-Use global environment IDs to derive seeds, for example:
+### Required changes
 
-`environment_id = worker_id * envs_per_worker + local_env_id`
+1. Identify which aggregation operations dominate runtime.
+2. Replace per-transition tensor operations with vectorized operations wherever correctness permits.
+3. Aggregate environment decisions, physics steps, and learner sample counts using tensor reductions.
+4. Preserve independent trajectories for each environment.
+5. Optimize episode-boundary detection using tensor operations.
+6. Minimize repeated `.item()`, `.unbind()`, tensor indexing, and conversion operations.
+7. Reduce avoidable TensorDict cloning, concatenation, and intermediate allocations.
+8. Process variable-length Python reporting events only where necessary.
 
-Preserve the current deterministic seed convention using the global environment ID.
+Do not flatten environment, time, and agent dimensions incorrectly.
 
-Do not introduce nested `ParallelEnv` process pools, Ray, MPI, DDP, or custom multiprocessing communication.
+Do not merge GAE sequences across physical episode boundaries.
 
-Keep inference on CPU inside each collector process for the initial implementation.
+### Important correctness requirements
 
-Allow the central learner to remain on CPU or CUDA.
+Preserve:
 
-### Task 3 — Handle grouped TensorDict batch dimensions
+- Active learner masks
+- Fixed-only continuation decisions
+- Terminal rewards
+- Truncation versus termination
+- Bootstrap values
+- Team GAE behavior
+- Policy-version validation
+- Exact environment and learner sample accounting
 
-The current process collector assumes one environment per worker.
+Avoid introducing tensor views that become invalid when collector buffers are reused.
 
-With grouped environments, TorchRL should preserve dimensions resembling:
+### Acceptance criteria
 
-`[workers, envs_per_worker, time]`
+Aggregation produces equivalent sample counts, episode boundaries, and learning inputs to the original implementation.
 
-Confirm the actual dimensions returned by the installed TorchRL version.
+Report before/after aggregation time and throughput for a short matched comparison.
 
-Update existing batch aggregation and rollout assembly to support both ungrouped and grouped layouts.
+---
 
-Requirements:
+# Phase 2 — Reduce Worker Reporting Overhead
 
-1. Preserve each environment's chronological trajectory order.
-2. Never concatenate unrelated environments into a single GAE trajectory.
-3. Split trajectories correctly at physical episode boundaries.
-4. Preserve bootstrap and termination semantics.
-5. Preserve active learner masks and retired-agent behavior.
-6. Preserve MAPPO team rewards and shared-critic inputs.
-7. Exclude fixed-only continuation decisions from learner samples while still counting physical environment decisions.
-8. Preserve policy-version checks to prevent stale-policy updates.
-9. Preserve the current synchronous update barrier.
+**Priority: High**
 
-Do not modify PPO or MAPPO losses, networks, optimizer equations, or GAE implementations.
+### Relevant code
 
-Do not flatten environment and agent dimensions interchangeably.
+- `src/training/process_collection.py`
+- `src/training/race_reporting.py`
+- `src/adapters/native_torchrl.py`
+- Existing training hooks and metric reporting
 
-### Task 4 — Make reporting compatible with grouped environments
+### Problem
 
-The current process collector contains process-local reporting state designed around one environment per process.
+Every environment transition can carry reporting metadata, event payloads, and Python objects through the TensorDict collection pipeline.
 
-Adapt this with minimal changes so multiple environments can report independently from the same process.
+Grouped collection increases the number of environments contributing reports to each batch.
 
-Ensure:
+### Required changes
 
-- Unique global environment IDs
-- Unique episode identities
-- Correct per-environment episode counters
-- Correct process-level counters
-- Correct total environment decisions
-- Correct active learner sample counts
-- Correct MAPPO team outcomes
-- No duplicate or lost episode records
-- Correct policy versions and worker attribution
+1. Examine the current `NonTensorData` event transport.
+2. Identify allocations and serialization operations performed on every environment step.
+3. Avoid transmitting empty reporting data unnecessarily where TorchRL's tensor/spec contracts permit.
+4. Batch or buffer worker events when safe.
+5. Avoid repeatedly creating identical metadata.
+6. Aggregate routine counters within worker processes where possible.
+7. Preserve detailed reporting only for the events or metrics that require it.
+8. Maintain compatibility with existing CSV and W&B hooks.
 
-Investigate compatibility of the existing `NonTensorData` race-event transport with `SerialEnv`.
+Investigate whether normal training can use a minimal reporting path without losing required metrics.
 
-Use the existing event/reporting infrastructure whenever possible.
+Do not disable episode logging, racing outcomes, rewards, or required performance counters merely to improve throughput.
 
-Do not build a new logging system.
+### Requirements
 
-### Task 5 — Preserve training budget semantics
+The following must remain correct:
 
-Maintain the existing contracts:
+- Episode starts and ends
+- Collision and completion events
+- Individual and team race outcomes
+- Environment IDs
+- Episode IDs
+- Reward totals
+- Training progress
+- Evaluation and checkpoint triggers
+- Per-worker profiling data
 
-- `experiment.total_steps`: Global joint environment decisions across all environments.
-- `algorithm.params.n_steps`: Global active learner sample target per update.
-- `algorithm.params.frames_per_batch`: Global physical collection batch target.
-- `algorithm.params.batch_size`: Optimizer minibatch size.
-- `algorithm.params.n_epochs`: PPO/MAPPO optimizer epochs.
+Preserve the existing reporting schema unless changing an internal field is unavoidable.
 
-Increasing the number of environments must not automatically multiply the global learner sample target or optimizer workload.
+### Acceptance criteria
 
-Handle collector batch rounding and sample overshoot explicitly and report them using existing metrics.
+Reduced reporting overhead with no missing, duplicated, or reordered required lifecycle events.
 
-Do not introduce artificial episode truncations merely to make batch sizes divisible.
+Measure the performance effect independently from Phase 1 wherever practical.
 
-Preserve the current behavior when grouping is disabled.
+---
 
-### Task 6 — Minimal profiling additions
+# Phase 3 — Optimize Environment Tensor Construction
 
-Reuse the existing timers and run summaries.
+**Priority: High**
 
-Add only the missing grouping information:
+### Relevant code
 
-- Number of processes
-- Environments per process
-- Total active environment slots
-- Actual collected decisions
-- Active learner samples
-- Collection wall time
-- Aggregation time
-- Weight synchronization time
-- Learner update time
-- Per-process collection time
-- Collector startup time
+- `src/adapters/native_torchrl.py`
+- `NativeRaceTorchRLEnv._tensor()`
+- `NativeRaceTorchRLEnv._output()`
+- Environment action conversion
+- TensorDict construction
 
-Retain current worker-waiting metrics.
+### Problem
 
-Make clear that aggregate worker-wait time overlaps collection wall time and must not be added to it.
+The environment creates many small tensors using `torch.tensor()` on each observation and transition.
 
-Do not add per-step logging, a new profiling framework, or large diagnostic outputs.
+Repeated memory allocation, copying, spec validation, and TensorDict construction may be costly.
 
-Preserve normal training behavior when detailed profiling is disabled.
+### Required changes
 
-### Task 7 — Minimal correctness validation
+Investigate and selectively optimize:
 
-Perform short, targeted smoke tests only.
+1. Repeated creation of small CPU tensors.
+2. Conversions from NumPy arrays to PyTorch tensors.
+3. Repeated creation of constant index/mask tensors.
+4. TensorDict construction overhead.
+5. Redundant copies or dtype conversions.
+6. Runtime spec/type checking overhead.
+7. Repeated action conversion from tensors to NumPy arrays.
 
-Required configurations:
+Consider:
 
-**PPO**
+- Reusing immutable tensors
+- Using `torch.from_numpy()` or `torch.as_tensor()` when safe
+- Preallocating reusable temporary buffers
+- Constructing outputs from fewer allocations
+- Disabling expensive runtime validation after initialization, if safe
 
-- 1 process × 1 environment: existing behavior
-- 2 processes × 2 environments: grouped collection
+### Critical safety requirement
 
-**MAPPO**
+The collector must retain immutable snapshots of transitions until they are consumed.
 
-- 1 process × 1 environment: existing behavior
-- 2 processes × 2 environments: grouped collection
+Do not return tensor views backed by mutable simulation state if later environment steps can overwrite them.
 
-For grouped MAPPO, use the actual hybrid PP/FTG completion scenario, not the MPC serial profiling scenario.
+Verify tensor storage lifetime, especially with grouped `SerialEnv` and `use_buffers=False`.
 
-Check:
+The optimized implementation must preserve:
 
-- Correct TensorDict batch dimensions
-- Correct environment IDs and seeds
-- Correct collected-step accounting
-- Correct episode and GAE boundaries
-- Valid PPO/MAPPO optimization
-- No stale policy versions
-- Clean worker shutdown
-- CPU collection with optional CUDA learner
+- Tensor shapes and dtypes
+- Device placement
+- Observation ordering
+- Agent masks
+- Reward values
+- Termination/truncation semantics
+- TorchRL environment specifications
 
-Use small decision budgets.
+Runtime type-check disabling must be separately measurable and reversible.
 
-Do not add an extensive test suite or run long training jobs.
+### Acceptance criteria
 
-If TorchRL `SerialEnv` has an incompatibility with the existing dynamic metadata or event transport, identify the precise blocker and attempt only a small, localized fix.
+Equivalent environment outputs and no transition aliasing or storage corruption.
 
-If the fix requires replacing the collector or rewriting the training pipeline, stop and report the blocker instead.
+Record the impact on collection throughput and per-step allocation/conversion time.
 
-### Task 8 — Controlled performance comparison
+---
 
-After correctness validation, perform only a small local comparison.
+# Phase 4 — Collection Batch Configuration
 
-Use the same:
+**Priority: Benchmark tuning, not architectural rewriting**
 
-- PPO scenario
-- Git commit
-- Seed
-- Physics and reward configuration
-- Global environment decision budget
-- Global PPO sample target per update
-- Minibatch size
-- Epoch count
-- Learner device
+The existing implementation already supports configurable `frames_per_batch`.
+
+Do not introduce a new batching framework.
+
+Verify that collection parameters remain independent:
+
+- `parallel_envs`
+- `envs_per_worker`
+- `frames_per_batch`
+- `n_steps`
+- `batch_size`
+- `n_epochs`
+
+Confirm that increasing collection frames does not implicitly change:
+
+- PPO/MAPPO target learner sample budget
+- Optimizer epochs
+- Optimizer minibatch size
+- Environment termination behavior
+
+Continue reporting actual collected frames and overshoot.
+
+Avoid introducing rollout truncations solely to produce divisible batches.
+
+Prepare benchmark overrides for:
+
+- `frames_per_batch=512`
+- `frames_per_batch=1024`
+- `frames_per_batch=2048`
+
+Do not change default training hyperparameters before the final evaluation.
+
+---
+
+# Phase 5 — CPU Affinity and NUMA Awareness
+
+**Priority: Experimental**
+
+The target HPC node contains:
+
+- 192 CPU cores
+- Two CPU sockets
+- One or more NVIDIA L40S GPUs
+- SLURM-managed CPU allocations
+
+The initial benchmarking allocation uses 32 CPU cores and one GPU.
+
+### Required investigation
+
+1. Check how TorchRL collector processes inherit CPU affinity.
+2. Verify that workers remain inside their SLURM allocation.
+3. Determine whether collector workers are concentrated on one socket.
+4. Investigate whether process placement contributes to synchronization or collection overhead.
+5. Compare current OS scheduling against explicitly controlled process placement.
+
+Prefer SLURM CPU binding or existing operating-system affinity mechanisms rather than a custom scheduling implementation.
+
+If code-level affinity control is necessary:
+
+- Make it optional.
+- Respect `os.sched_getaffinity()`.
+- Never assign CPUs outside the allocated CPU set.
+- Avoid oversubscribing learner and collector processes.
+- Preserve default behavior unless affinity is explicitly enabled.
+
+Do not hardcode hardware-specific CPU IDs.
+
+Report whether affinity improves or reduces throughput.
+
+---
+
+# Phase 6 — Prototype Centralized TorchRL Inference
+
+**Priority: Conditional architecture experiment**
+
+Only begin this phase after Phases 1–3 are implemented, measured, and stable.
+
+Do not replace the existing grouped process collector.
+
+### Goal
+
+Compare the current worker-local inference architecture against centralized batched inference, similar to the older `F110_MARL` implementation.
+
+The older implementation used multiple environments per CPU process and performed batched actor/critic inference in the parent process.
+
+### Preferred TorchRL prototype
+
+Investigate using:
+
+- TorchRL `ParallelEnv`
+- Nested grouped `SerialEnv`
+- `Collector(backend="direct")`
+- Central batched TorchRL policy execution
+
+Conceptual layout:
+
+CPU workers → grouped racing environments → central batched actor → actions returned to workers → synchronous PPO/MAPPO learner.
+
+### Implementation requirements
+
+1. Reuse existing `RaceEnvFactory`.
+2. Reuse existing native TorchRL environment adapter.
+3. Reuse current TorchRL actors, critics, and learners.
+4. Preserve the current grouped process collector as the default.
+5. Introduce only one optional backend selection if necessary.
+6. Support centralized CPU inference initially.
+7. Support centralized CUDA inference if the API and policy device contracts permit.
+8. Preserve exact on-policy update barriers and policy versions.
+
+Verify that `ParallelEnv`, grouped environments, and the existing event transport are compatible with the installed TorchRL version.
+
+Check action/observation batch shapes, policy-device transfers, and subprocess lifecycle before attempting larger benchmarks.
+
+### Important restrictions
+
+Do not introduce an asynchronous collector into normal PPO/MAPPO training.
+
+Do not implement a custom inference server unless a supported TorchRL approach demonstrably cannot satisfy the requirements.
+
+Do not replace the learner implementation.
+
+If the prototype encounters a significant TorchRL incompatibility, report the issue and stop that implementation rather than building a large workaround.
+
+### Performance comparison
 
 Compare:
 
-1. 2 processes × 1 environment
-2. 2 processes × 2 environments
-3. 2 processes × 4 environments, if the earlier configurations pass
+- Current grouped collector: CPU inference, CUDA learner
+- Central synchronous collector: CPU inference, CUDA learner
+- Central synchronous collector: CUDA inference, CUDA learner
 
-Use CPU inference and a single learner.
+Keep the same number of processes, environments, rollout frames, learner sample target, and optimizer workload.
 
-Keep detailed stage profiling, controller profiling, evaluation, and W&B disabled.
+Measure:
 
-Run only enough decisions to establish that grouped collection works and to identify obvious regressions.
+- Decisions/sec
+- Inference calls
+- Actual inference batch size
+- Inference latency
+- CPU/GPU transfer overhead
+- Collection time
+- Aggregation time
+- Update time
+- GPU utilization where measurable
 
-Do not run the full HPC scaling matrix. Provide commands for those experiments so they can be executed separately on the HPC node.
+Only retain centralized inference if it provides a meaningful improvement without compromising learning correctness.
 
-For later HPC comparisons, support two controlled benchmark types:
+---
 
-**A. Fixed global collection batch**
+# Phase 7 — Evaluate torch.compile and CUDA Graphs
 
-Keep `frames_per_batch` constant while changing grouping. This isolates the effect of environment grouping and changes fragment length per environment.
+**Priority: Optional, last**
 
-**B. Fixed approximate fragment length**
+Only investigate compilation if profiling identifies policy inference or optimization kernels as a significant bottleneck.
 
-Increase `frames_per_batch` with total environment count to maintain approximately the same decisions per environment per collector batch. Report changes in collector batch granularity and sample overshoot.
+Do not compile the environment, simulation lifecycle, or dynamic reporting path.
 
-Do not mix these comparisons when claiming performance improvements.
+Potential candidates:
 
-### Strict implementation constraints
+- TorchRL actor forward pass
+- Critic forward pass
+- Repeated fixed-shape neural network computations
 
-- Remain on TorchRL 0.14.
-- Reuse existing training and collection infrastructure.
-- Minimal additional code.
-- Prefer modifying existing files rather than adding new modules.
-- No custom collector framework.
-- No changes to PPO/MAPPO algorithms or rewards.
-- No new neural network architectures.
-- No distributed/multi-node features.
-- No centralized inference server yet.
-- No Ray, MPI, or DDP.
-- No README updates.
-- No documentation files.
-- No unnecessary test files.
-- No full regression suite.
-- No extensive profiling or long training runs.
-- Do not automatically change Python or package versions.
+Investigate `torch.compile` first.
 
-### Deliverables
+CUDA Graphs should be considered only where fixed-shape execution, memory ownership, and stochastic policy sampling can be handled safely.
 
-After implementation, provide a concise report containing:
+Verify compatibility with:
 
-1. Files changed and why.
-2. How `envs_per_worker` is configured.
-3. Actual grouped TensorDict batch layout.
-4. How per-environment reporting and GAE boundaries are preserved.
-5. Smoke-test results.
-6. Small local throughput comparison.
-7. Exact HPC benchmark commands for 8×1, 8×2, 8×4, and 8×8.
-8. Any known limitations or performance regressions.
+- Grouped environment batch shapes
+- PPO stochastic sampling
+- MAPPO shared and independent actors
+- LoRA adapters
+- Actor weight synchronization
+- CPU versus CUDA execution
+- Checkpoint loading
 
-Do not proceed to centralized batched inference or a custom collector without approval.
+Measure compilation/warmup cost separately from steady-state throughput.
+
+Do not enable compilation by default.
+
+If the measured benefit is negligible or the implementation introduces complexity, skip it.
+
+---
+
+# Phase 8 — Focused Correctness Validation
+
+Reuse existing tests wherever possible.
+
+Do not add a large new test suite.
+
+Minimum required validation:
+
+**PPO**
+
+- Serial 1×1
+- Grouped 2×2
+- Grouped 2×4
+- CPU collection + CUDA learner
+
+**MAPPO**
+
+- Serial 1×1
+- Grouped 2×2
+- Grouped 2×4
+- Actual 2v2 hybrid PP/FTG scenario
+
+Validate:
+
+- Environment IDs and independent seeds
+- Correct TensorDict shape contracts
+- Correct physical decision accounting
+- Correct active learner samples
+- Episode resets and independent trajectories
+- GAE and bootstrap boundaries
+- Retired-agent and fixed-only continuation behavior
+- PPO/MAPPO optimizer steps
+- Actor weight synchronization
+- No stale policy versions
+- No missing race events
+- Valid checkpoint save/load
+- Clean shutdown
+
+For MAPPO, preserve shared team rewards, centralized critic inputs, and per-agent activity masks.
+
+Do not silently update stale test expectations. If an unrelated baseline test already fails, document it and leave it out of the optimization scope.
+
+---
+
+# Phase 9 — Prepare Final HPC Evaluation
+
+Do not run the complete HPC benchmark matrix as part of this coding task.
+
+Provide commands to execute it later.
+
+The matrix should compare the existing grouped collector and optimized implementation under matched conditions.
+
+### Initial PPO matrix
+
+Use:
+
+- PPO lap-completion pretrain scenario
+- CPU collection
+- CUDA learner
+- Same map, physics, reward and observation configuration
+- Fixed seed
+- `n_steps=4096`
+- `batch_size=512`
+- `n_epochs=4`
+- Evaluation disabled
+- W&B disabled
+- Detailed profiling disabled for throughput measurement
+
+Candidate layouts:
+
+| Workers | Envs/worker | Total envs | Frames/batch |
+|---|---|---|---|
+| 4 | 2 | 8 | 1024 |
+| 8 | 1 | 8 | 1024 |
+| 8 | 2 | 16 | 1024 |
+| 8 | 4 | 32 | 1024 |
+| 16 | 2 | 32 | 1024 |
+| 8 | 2 | 16 | 512 |
+| 8 | 2 | 16 | 2048 |
+| 8 | 4 | 32 | 2048 |
+
+Use a larger profiling budget than the existing 65,536-decision experiments.
+
+Propose at least 262,144 decisions for the final shortlisted configurations, with repetitions to assess performance variability.
+
+### MAPPO matrix
+
+After PPO, prepare a smaller matrix using the actual:
+
+`scenarios/mappo_2v2_completion_scratch.yaml`
+
+Evaluate:
+
+- 4×2
+- 8×2
+- 8×4
+
+Tune MAPPO independently rather than assuming the fastest PPO configuration is also optimal for 2v2 racing.
+
+Record joint environment decisions, active learner samples, and optimizer steps separately.
+
+### Centralized inference
+
+If implemented successfully, include matched centralized-inference comparisons with the best grouped collector.
+
+Do not combine centralized inference, affinity changes, and compilation in the same initial comparison.
+
+### Required final metrics
+
+- Overall environment decisions/sec
+- Steady-state environment decisions/sec
+- Active learner samples/sec
+- Physics steps/sec
+- Collector startup time
+- Collection wall time
+- Aggregation wall time
+- Learner update time
+- Weight synchronization time
+- Worker waiting and imbalance
+- Actual optimizer steps
+- Number of completed episodes
+- Peak process memory, when available
+- CUDA utilization/memory, when available
+- Actual CPU affinity and process count
+
+Distinguish overlapping timings from additive wall-clock stages.
+
+Preserve existing `run_summary.json`, `update_metrics.csv`, and configuration snapshots.
+
+Avoid unnecessary new output formats.
+
+---
+
+# Phase 10 — Completion Report
+
+Provide a concise final response containing:
+
+1. Files changed and reason for each change.
+2. Before/after results for aggregation optimization.
+3. Before/after results for reporting optimization.
+4. Before/after results for tensor construction optimization.
+5. Whether CPU affinity control was useful.
+6. Whether centralized inference was implemented, rejected, or deferred, with supporting evidence.
+7. Whether compilation was worth enabling.
+8. PPO and MAPPO correctness validation results.
+9. Known limitations or regressions.
+10. Exact commands for the final HPC evaluation matrix.
+
+Explicitly identify changes that improved performance versus changes retained only for investigation.
+
+Remove unused experimental code that provides no demonstrated benefit, unless it is needed for a clearly isolated benchmark.
+
+Do not modify README files or write additional documentation.
+
+## Execution instructions
+
+Work incrementally and avoid extensive agent-token usage.
+
+**Implementation order:**
+
+1. Establish narrow timing measurements and preserve the baseline.
+2. Optimize aggregation.
+3. Optimize reporting.
+4. Optimize environment tensor construction.
+5. Validate correctness and measure the combined implementation.
+6. Investigate CPU affinity with minimal changes.
+7. Prototype centralized inference only if justified.
+8. Consider compilation only if profiling supports it.
+9. Prepare final benchmark commands and report.
+
+Do not begin a large centralized-inference rewrite while the aggregation and environment-construction optimizations remain unmeasured.
+
+If a phase introduces a correctness regression or requires substantial architectural change, stop that phase, retain the last working implementation, and explain the trade-off.
+
+**The final deliverable is a stable, optimized, reproducible TorchRL PPO/MAPPO training pipeline ready for HPC performance evaluation—not a new RL framework.**
