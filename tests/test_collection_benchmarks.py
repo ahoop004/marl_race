@@ -1,5 +1,6 @@
 """Matched configuration and allocation safety for the small HPC runner."""
 import argparse
+import json
 import runpy
 
 import pytest
@@ -81,3 +82,75 @@ def test_inference_comparisons_preserve_workload(benchmark, algorithm, tmp_path)
         config.pop("_configuration", None)
         configs.append(config)
     assert configs[0] == configs[1] == configs[2]
+
+
+@pytest.mark.parametrize("algorithm,expected", [
+    ("ppo", [(4, 2, 1024), (8, 1, 1024), (8, 2, 1024), (8, 4, 1024),
+             (16, 2, 1024), (8, 2, 512), (8, 2, 2048), (8, 4, 2048)]),
+    ("mappo", [(4, 2, 1024), (8, 2, 1024), (8, 4, 1024)]),
+])
+def test_final_matrix_uses_requested_layouts_and_baseline_checkout(benchmark, algorithm, expected, tmp_path):
+    args = argparse.Namespace(matrix="final", algorithm=algorithm, layout=None,
+                              workers=1, envs_per_worker=1, total_steps=262144,
+                              torch_threads=1, learner_device="cuda", source_root=tmp_path / "baseline")
+    candidates = benchmark["matrix_candidates"](args, {"inherited": None})
+    assert [row[:3] for row in candidates] == expected
+    for workers, envs, frames, _, mask, backend, device in candidates:
+        assert (mask, backend, device) == (None, "process", "cpu")
+        command = benchmark["training_command"](args, frames, tmp_path / "run",
+            workers=workers, envs_per_worker=envs)
+        assert command[1] == str(args.source_root / "run.py")
+        assert command[command.index("--total-steps") + 1] == "262144"
+        overrides = [command[index + 1] for index, value in enumerate(command) if value == "--set"]
+        config = load_and_expand_scenario(command[command.index("--scenario") + 1], overrides=overrides)
+        assert (config["experiment"]["parallel_envs"], config["experiment"]["envs_per_worker"]) == (workers, envs)
+        assert config["algorithm"]["params"]["frames_per_batch"] == frames
+        assert config["experiment"]["measure_stages"] is False
+        assert config["experiment"]["measure_cuda_sync"] is False
+    args.layout = [benchmark["parse_layout"]("8x2x2048")]
+    assert [row[:3] for row in benchmark["matrix_candidates"](args, {})] == [(8, 2, 2048)]
+    for value in ("8x2", "8x0x1024", "-1x2x512", "8x2xno"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            benchmark["parse_layout"](value)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_hpc_summary_handles_baseline_instrumentation_and_rejects_invalid_runs(benchmark, legacy, tmp_path):
+    summary = {"environment_steps": 262144, "agent_steps": 262144, "optimizer_steps": 2048,
+               "physics_steps": 262144, "completed_episodes": 30, "perf/worker_count": 2,
+               "perf/environment_slots": 4, "perf/collection_device": "cpu", "perf/learner_device": "cuda",
+               "perf/environment_steps_per_second": 500., "perf/learner_samples_per_second": 500.,
+               "perf/physics_steps_per_second": 500.}
+    snapshot = {"config": {"algorithm": {"params": {"frames_per_batch": 7}},
+                            "experiment": {"total_steps": 262144}},
+                "provenance": {"execution": {}, "git": {"commit": "baseline"}}}
+    if not legacy:
+        summary.update({"perf/collection_backend": "process", "perf/collection_batches": 32768,
+                        "perf/last_collection_batch_frames": 8, "perf/process/cpu_affinity": [1, 3],
+                        "perf/workers/0/cpu_affinity": [1, 3], "perf/workers/1/cpu_affinity": [1, 3],
+                        "perf/workers/0/pid": 101, "perf/workers/1/pid": 102})
+    (tmp_path / "config_snapshot.json").write_text(json.dumps(snapshot))
+    def report():
+        (tmp_path / "run_summary.json").write_text(json.dumps(summary))
+        return benchmark["report_run"](tmp_path, 262144, None, [1, 3], learner_device="cuda")
+    result = report()
+    assert result["actual_batch_frames"] == 8
+    assert result["batch_frames_measured"] is not legacy
+    assert result["worker_affinity_verified"] == (None if legacy else True)
+    assert result["actual_worker_processes"] == (None if legacy else 2)
+    summary["environment_steps"] = 262152
+    with pytest.raises(RuntimeError, match="invalid collected budget"):
+        report()
+    summary["environment_steps"] = 262144
+    summary["perf/learner_device"] = "cpu"
+    with pytest.raises(RuntimeError, match="learner_device"):
+        report()
+    if not legacy:
+        summary["perf/learner_device"] = "cuda"
+        summary["perf/workers/1/cpu_affinity"] = [1, 4]
+        with pytest.raises(RuntimeError, match="workers did not inherit"):
+            report()
+        summary["perf/workers/1/cpu_affinity"] = [1, 3]
+        summary["perf/workers/1/pid"] = 101
+        with pytest.raises(RuntimeError, match="worker process count"):
+            report()
