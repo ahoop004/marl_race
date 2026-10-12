@@ -1,8 +1,10 @@
-"""Matched final, batch, affinity, and inference experiments on HPC.
+"""Matched final, batch, affinity, inference, and compilation experiments on HPC.
 
 Examples:
   srun --ntasks=1 --cpus-per-task=32 --cpu-bind=verbose,cores \
     python3 scripts/benchmark_collection.py --matrix final --algorithm ppo
+  srun --ntasks=1 --cpus-per-task=32 --cpu-bind=verbose,cores \
+    python3 scripts/benchmark_collection.py --matrix compilation --algorithm ppo
   srun --ntasks=1 --cpus-per-task=32 --cpu-bind=verbose,cores \
     python3 scripts/benchmark_collection.py --matrix batches
   srun --ntasks=1 --cpus-per-task=32 --cpu-bind=verbose,cores \
@@ -14,6 +16,9 @@ equal physical-core counts; inherited scheduling retains the full allowed set.
 Use --source-root for a baseline checkout, with a separate --output-root. Older
 checkouts may lack affinity/batch instrumentation; absent measurements stay null.
 Inference/worker timings overlap collection; GAE/optimization overlap update.
+Compilation first-call seconds include forward compilation and execution.
+Backward compilation and later shape/guard recompiles remain in the regular
+collection/update timings. CUDA Graphs are disabled; warmup is reported separately.
 """
 import argparse
 import json
@@ -94,7 +99,7 @@ def placement_masks(placement, count, minimum):
 
 
 def training_command(args, frames, destination, mask=None, *, backend="process", collection_device="cpu",
-                     workers=None, envs_per_worker=None):
+                     workers=None, envs_per_worker=None, compilation=None):
     scenario = ("ppo_lap_completion_pretrain.yaml" if args.algorithm == "ppo"
                 else "mappo_2v2_completion_scratch.yaml")
     target = 4096 if args.algorithm == "ppo" else 2048
@@ -116,8 +121,15 @@ def training_command(args, frames, destination, mask=None, *, backend="process",
                  f"++experiment.measure_stages={str(getattr(args, 'profile', False)).lower()}",
                  f"++experiment.measure_cuda_sync={str(getattr(args, 'profile', False)).lower()}",
                  "experiment.measure_mpc=false",
-                 "experiment.measure_hybrid=false", "++experiment.profiling_warmup_updates=1",
+                 "experiment.measure_hybrid=false",
+                 f"++experiment.profiling_warmup_updates={args.compile_warmup_updates if compilation is not None else 1}",
                  "checkpoint.every_steps=null", "checkpoint.every_updates=null"]
+    if compilation is not None:
+        value = "false" if compilation == "eager" else (
+            "{actor:" + str(compilation in {"actor", "both"}).lower() +
+            ",critic:" + str(compilation in {"critic", "both"}).lower() +
+            ",mode:" + args.compile_mode + "}")
+        overrides.append("++execution.params.compile_networks=" + value)
     if backend != "process":
         overrides.append(f"++experiment.collection_backend={backend}")
     for override in overrides:
@@ -128,7 +140,7 @@ def training_command(args, frames, destination, mask=None, *, backend="process",
 
 
 def report_run(destination, target, mask, allowed, *, backend="process", collection_device="cpu",
-               learner_device=None):
+               learner_device=None, compilation=None, compile_mode=None):
     summary = json.loads((destination / "run_summary.json").read_text())
     snapshot = json.loads((destination / "config_snapshot.json").read_text())
     config = snapshot["config"]
@@ -148,6 +160,14 @@ def report_run(destination, target, mask, allowed, *, backend="process", collect
         raise RuntimeError(f"{destination}: saved decision target did not match requested {target}")
     if not target <= actual < target + batch:
         raise RuntimeError(f"{destination}: invalid collected budget {actual} for target {target}")
+    if compilation is not None:
+        for role in ("actor", "critic"):
+            expected = compilation in {role, "both"}
+            if summary.get(f"perf/compilation/{role}") is not expected:
+                raise RuntimeError(f"{destination}: {role} compilation did not match requested {compilation}")
+        if compilation != "eager" and (summary.get("perf/compilation/backend") != "inductor" or
+                (compile_mode is not None and summary.get("perf/compilation/mode") != compile_mode)):
+            raise RuntimeError(f"{destination}: compilation backend/mode did not match the requested experiment")
     parent = summary.get("perf/process/cpu_affinity")
     if parent is not None and ((allowed is not None and not set(parent).issubset(allowed))
                                or (mask is not None and parent != mask)):
@@ -187,12 +207,17 @@ def report_run(destination, target, mask, allowed, *, backend="process", collect
                           source_dirty=snapshot["provenance"].get("git", {}).get("dirty"),
                           worker_startup_seconds=summary.get("perf/boundaries/initialization/worker_startup_seconds"),
                           parent_peak_rss_bytes=summary.get("perf/process/peak_rss_bytes"),
+                          warmup_collection_seconds=summary.get("perf/boundaries/warmup/collection_seconds"),
+                          warmup_update_seconds=summary.get("perf/boundaries/warmup/update_seconds"),
+                          steady_collection_seconds=summary.get("perf/boundaries/steady/collection_seconds"),
+                          steady_update_seconds=summary.get("perf/boundaries/steady/update_seconds"),
                           worker_wait_seconds=sum(value for key, value in summary.items()
                               if key.startswith("perf/boundaries/") and key.endswith("/worker_wait_seconds")),
                           worker_wait_overlaps_collection=True, **boundaries,
                           profiling={key: value for key, value in summary.items()
                                      if key.startswith(("perf/inference/", "perf/cuda_collection/",
-                                                        "perf/cuda_device_sampling/"))})
+                                                        "perf/cuda_device_sampling/", "perf/compilation/"))
+                                     or (key.startswith("perf/workers/") and "/compilation/" in key)})
     print(json.dumps(report), flush=True)
     return report
 
@@ -208,6 +233,9 @@ def parse_layout(value):
 
 
 def matrix_candidates(args, masks):
+    if args.matrix == "compilation":
+        return [(args.workers, args.envs_per_worker, args.frames_per_batch, name, None,
+                 args.collection_backend, args.collection_device) for name in ("eager", "actor", "critic", "both")]
     if args.matrix == "final":
         layouts = args.layout or ([(4, 2, 1024), (8, 1, 1024), (8, 2, 1024), (8, 4, 1024),
                                   (16, 2, 1024), (8, 2, 512), (8, 2, 2048), (8, 4, 2048)]
@@ -226,13 +254,13 @@ def matrix_candidates(args, masks):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--matrix", choices=("final", "batches", "affinity", "inference"), required=True)
+    parser.add_argument("--matrix", choices=("final", "batches", "affinity", "inference", "compilation"), required=True)
     parser.add_argument("--algorithm", choices=("ppo", "mappo"), default="ppo")
     parser.add_argument("--workers", type=int, default=8,
-                        help="Workers for batches/affinity/inference; use --layout for final")
+                        help="Workers for batches/affinity/inference/compilation; use --layout for final")
     parser.add_argument("--envs-per-worker", type=int, default=2,
-                        help="Envs per worker for batches/affinity/inference; use --layout for final")
-    parser.add_argument("--frames-per-batch", type=int, default=1024, help="Fixed for affinity/inference matrices")
+                        help="Envs per worker for batches/affinity/inference/compilation; use --layout for final")
+    parser.add_argument("--frames-per-batch", type=int, default=1024, help="Fixed for affinity/inference/compilation matrices")
     parser.add_argument("--layout", type=parse_layout, action="append",
                         help="Select a final-matrix shortlist; repeat for multiple WORKERSxENVSxFRAMES layouts")
     parser.add_argument("--source-root", type=Path, default=PROJECT_ROOT,
@@ -241,6 +269,13 @@ def main():
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--learner-device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--collection-backend", choices=("process", "centralized"), default="process",
+                        help="Backend for compilation experiments")
+    parser.add_argument("--collection-device", choices=("cpu", "cuda"), default="cpu",
+                        help="Inference device for compilation experiments")
+    parser.add_argument("--compile-mode", choices=("default", "max-autotune-no-cudagraphs"), default="default")
+    parser.add_argument("--compile-warmup-updates", type=int, default=3,
+                        help="Warmup updates for all four compilation candidates; included in the decision budget")
     parser.add_argument("--placement-cpus", type=int, default=None,
                         help="Physical cores for socket/spread; default is one thread budget per process")
     parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "outputs" / "hpc_final")
@@ -254,7 +289,7 @@ def main():
     if args.layout and args.matrix != "final":
         parser.error("--layout is only supported with --matrix final")
     if min(args.workers, args.envs_per_worker, args.frames_per_batch, args.total_steps,
-           args.repetitions, args.torch_threads) < 1:
+           args.repetitions, args.torch_threads, args.compile_warmup_updates) < 1:
         parser.error("Counts and budgets must be positive")
     placement = cpu_placement()
     print("Inherited placement: " + json.dumps(placement), flush=True)
@@ -273,10 +308,11 @@ def main():
         # Rotate order to reduce bias from node load/warm caches between repetitions.
         offset = (repeat - 1) % len(candidates)
         for workers, envs, size, name, mask, backend, device in candidates[offset:] + candidates[:offset]:
+            compilation = name if args.matrix == "compilation" else None
             destination = args.output_root.resolve() / args.algorithm / args.matrix / (
                 f"w{workers}e{envs}_f{size}_{name}_r{repeat}")
             command = training_command(args, size, destination, mask, backend=backend, collection_device=device,
-                                       workers=workers, envs_per_worker=envs)
+                                       workers=workers, envs_per_worker=envs, compilation=compilation)
             print(shlex.join(command), flush=True)
             if args.dry_run:
                 continue
@@ -284,7 +320,8 @@ def main():
                 parser.error(f"Output already exists: {destination}; use another --output-root")
             run_training(command, destination, args.profile, args.source_root)
             report_run(destination, args.total_steps, mask, placement["cpu_affinity"],
-                       backend=backend, collection_device=device, learner_device=args.learner_device)
+                       backend=backend, collection_device=device, learner_device=args.learner_device,
+                       compilation=compilation, compile_mode=args.compile_mode)
 
 
 if __name__ == "__main__":

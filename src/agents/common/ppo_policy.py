@@ -67,6 +67,8 @@ class PPOPolicy(OnPolicyOptimizationSettings):
             log_std_init=float(params.get("log_std_init", 0.0)),
         ).to(self.device)
         self.critic = build_critic(obs_dim, self.network_config).to(self.device)
+        from agents.common.compilation import configure_compilation
+        configure_compilation(self, params.get("compile_networks", False))
         self._optim_parameters = tuple(self.actor.parameters()) + tuple(self.critic.parameters())
         self.optimizer = optim.Adam(self._optim_parameters, lr=self.lr) if training else None
 

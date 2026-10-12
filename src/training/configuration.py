@@ -45,8 +45,13 @@ def validate_training_scenario(scenario):
         value = experiment.get(name, 1)
         if type(value) is not int or value < 1:
             raise ScenarioError(f"experiment.{name} must be a positive integer")
+    from agents.common.compilation import resolve_compile_config
     for params in [scenario.get("training_defaults", {}),
                    *(cfg.get("params", {}) for cfg in agents.values())]:
+        try:
+            resolve_compile_config(params.get("compile_networks", False))
+        except ValueError as exc:
+            raise ScenarioError(str(exc)) from exc
         value = params.get("collection_device")
         if value is not None and (not isinstance(value, str) or (
                 value not in {"cpu", "cuda"} and not (

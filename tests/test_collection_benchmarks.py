@@ -130,9 +130,9 @@ def test_hpc_summary_handles_baseline_instrumentation_and_rejects_invalid_runs(b
                         "perf/workers/0/cpu_affinity": [1, 3], "perf/workers/1/cpu_affinity": [1, 3],
                         "perf/workers/0/pid": 101, "perf/workers/1/pid": 102})
     (tmp_path / "config_snapshot.json").write_text(json.dumps(snapshot))
-    def report():
+    def report(**kwargs):
         (tmp_path / "run_summary.json").write_text(json.dumps(summary))
-        return benchmark["report_run"](tmp_path, 262144, None, [1, 3], learner_device="cuda")
+        return benchmark["report_run"](tmp_path, 262144, None, [1, 3], learner_device="cuda", **kwargs)
     result = report()
     assert result["actual_batch_frames"] == 8
     assert result["batch_frames_measured"] is not legacy
@@ -145,6 +145,15 @@ def test_hpc_summary_handles_baseline_instrumentation_and_rejects_invalid_runs(b
     summary["perf/learner_device"] = "cpu"
     with pytest.raises(RuntimeError, match="learner_device"):
         report()
+    summary["perf/learner_device"] = "cuda"
+    with pytest.raises(RuntimeError, match="actor compilation"):
+        report(compilation="both")
+    summary.update({"perf/compilation/actor": True, "perf/compilation/critic": True,
+                    "perf/compilation/backend": "aot_eager", "perf/compilation/mode": "default"})
+    with pytest.raises(RuntimeError, match="compilation backend/mode"):
+        report(compilation="both", compile_mode="default")
+    summary["perf/compilation/backend"] = "inductor"
+    report(compilation="both", compile_mode="default")
     if not legacy:
         summary["perf/learner_device"] = "cuda"
         summary["perf/workers/1/cpu_affinity"] = [1, 4]
@@ -154,3 +163,32 @@ def test_hpc_summary_handles_baseline_instrumentation_and_rejects_invalid_runs(b
         summary["perf/workers/1/pid"] = 101
         with pytest.raises(RuntimeError, match="worker process count"):
             report()
+
+
+@pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
+def test_compilation_matrix_changes_only_compilation_with_equal_warmup(benchmark, algorithm, tmp_path):
+    args = argparse.Namespace(matrix="compilation", algorithm=algorithm, workers=8, envs_per_worker=2,
+                              frames_per_batch=1024, total_steps=262144, torch_threads=1,
+                              learner_device="cuda", collection_backend="process", collection_device="cpu",
+                              compile_mode="default", compile_warmup_updates=3, profile=False)
+    from application.configuration import validate_experiment_scenario
+    from agents.common.compilation import resolve_compile_config
+    configs = []
+    for workers, envs, frames, name, mask, backend, device in benchmark["matrix_candidates"](args, {}):
+        command = benchmark["training_command"](args, frames, tmp_path / name, workers=workers,
+            envs_per_worker=envs, compilation=name, backend=backend, collection_device=device)
+        overrides = [command[index + 1] for index, value in enumerate(command) if value == "--set"]
+        config = load_and_expand_scenario(command[command.index("--scenario") + 1], overrides=overrides)
+        validate_experiment_scenario(config)
+        assert config["experiment"]["profiling_warmup_updates"] == 3
+        assert config["experiment"]["measure_stages"] is False
+        flag = config["execution"]["params"].pop("compile_networks")
+        settings = resolve_compile_config(flag)
+        assert settings["actor"] == (name in {"actor", "both"})
+        assert settings["critic"] == (name in {"critic", "both"})
+        config["training_defaults"].pop("compile_networks")
+        for agent in config["agents"].values():
+            agent.get("params", {}).pop("compile_networks", None)
+        config.pop("_configuration", None)
+        configs.append(config)
+    assert len(configs) == 4 and all(config == configs[0] for config in configs)

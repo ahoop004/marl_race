@@ -75,6 +75,7 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
         self.gae = MultiAgentGAE(
             gamma=self.gamma, lmbda=self.gae_lambda, value_network=self.value_module,
             average_gae=False, auto_reset_env=False, time_dim=0,
+            deactivate_vmap=self.compilation_config["critic"],
         )
         self.gae.set_keys(value=("agents", "state_value"), advantage=("agents", "advantage"),
                           value_target=("agents", "value_target"), reward="team_reward",

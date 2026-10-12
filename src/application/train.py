@@ -192,6 +192,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "measure_mpc": exp_cfg.get("measure_mpc", False),
         "measure_hybrid": exp_cfg.get("measure_hybrid", False),
         "profiling_warmup_updates": exp_cfg.get("profiling_warmup_updates", 1),
+        "compile_networks": dict(learner.compilation_config),
+        "compilation_cuda_graphs": False,
     }
     provenance["algorithm_implementation"] = {
         "backend": "torchrl",

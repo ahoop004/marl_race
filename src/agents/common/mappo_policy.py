@@ -155,6 +155,8 @@ class MAPPOPolicy(OnPolicyOptimizationSettings):
             }
             if len(set(self.obs_dims.values())) > 1:
                 self.lora_contract["observation_dims"] = dict(self.obs_dims)
+        from agents.common.compilation import configure_compilation
+        configure_compilation(self, params.get("compile_networks", False))
         self._optim_parameters = tuple(p for p in self.actor.parameters() if p.requires_grad) + tuple(
             self.critic.parameters())
         self.optimizer = optim.Adam(self._optim_parameters, lr=self.lr) if training else None

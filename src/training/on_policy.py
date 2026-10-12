@@ -573,6 +573,16 @@ class OnPolicyTrainer:
         result = {f"perf/{name}_per_second": (value - base) / elapsed
                   for name, value, base in zip(names, self._rate_counters(), self._rate_baseline)}
         result["perf/elapsed_seconds"] = elapsed
+        from agents.common.compilation import compilation_metrics
+        compilation = getattr(self.agent, "compilation_config", dict(actor=False, critic=False,
+                                                                     backend="inductor", mode="default"))
+        result.update({f"perf/compilation/{key}": value for key, value in compilation.items()})
+        result["perf/compilation/cuda_graphs"] = False
+        result["perf/compilation/gae_deactivate_vmap"] = compilation["critic"]
+        if compilation["actor"] or compilation["critic"]:
+            result.update({"perf/compilation/" + key: value for key, value in compilation_metrics().items()})
+            result["perf/compilation/first_call_includes_execution"] = True
+            result["perf/compilation/first_call_excludes_backward_and_later_recompiles"] = True
         result["perf/end_to_end_env_steps_per_second"] = result["perf/environment_steps_per_second"]
         result.update({"perf/collection_device": str(self.collection_device),
                        "perf/collection_backend": self.collection_backend,

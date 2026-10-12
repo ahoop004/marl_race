@@ -105,6 +105,8 @@ def worker_collection_report():
                    learner_samples=sum(r.trainer._agent_steps for r in _worker_reports.values()),
                    completed_episodes=sum(r.reports.completed for r in _worker_reports.values()))
     process.update(_worker_placement)
+    from agents.common.compilation import compilation_metrics
+    process.update({"compilation/" + key: value for key, value in compilation_metrics().items()})
     if _cuda_profile.enabled:
         process.update(collection_device_to_cpu_seconds=first.cuda_copy_seconds,
                        collection_device_to_cpu_calls=first.cuda_copy_calls,

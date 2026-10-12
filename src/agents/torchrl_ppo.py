@@ -72,6 +72,9 @@ class TorchRLPPOAgent(PPOPolicy):
         self.gae = GAE(
             gamma=self.gamma, lmbda=self.gae_lambda, value_network=self.value_module,
             average_gae=False, auto_reset_env=False,
+            # Eager vmap over a compiled forward is unsupported by PyTorch.
+            # TorchRL's equivalent sequential value calls preserve GAE maths.
+            deactivate_vmap=self.compilation_config["critic"],
         )
         self._pending_batches = []
         self._pending_steps = 0
