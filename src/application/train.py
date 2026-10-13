@@ -247,7 +247,6 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     hooks = [
         ConsoleHook(
             logger=console,
-            log_every=int(os.environ.get("F110_LOG_EVERY", "1")),
             summary_every=int(os.environ.get("F110_SUMMARY_EVERY", "25")),
             lap_completion=compact_laps,
         ),

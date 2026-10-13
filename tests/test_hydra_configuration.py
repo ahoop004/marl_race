@@ -349,6 +349,7 @@ def test_completion_training_and_evaluation_share_horizons_and_termination(path)
     config = load_and_expand_scenario(path)
     training = resolve_environment_config(config)
     evaluated = resolve_environment_config(config, mode="eval")
+    assert training["max_steps"] == 3000
     for key in ("target_laps", "max_steps", "episode_termination", "terminate_on_collision", "track_limits"):
         assert evaluated[key] == training[key]
     for protocol in ("selection", "final"):

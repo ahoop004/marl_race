@@ -15,6 +15,28 @@ from training.hooks import CSVHook, CheckpointHook, EvaluationCheckpointHook, Wa
 from loggers.csv_logger import CSVLogger
 
 
+@pytest.mark.parametrize("lap_completion", [False, True])
+def test_console_reports_every_completed_episode_with_lap_fields(lap_completion):
+    from training.hooks import ConsoleHook
+
+    messages = []
+    hook = ConsoleHook(SimpleNamespace(print_info=messages.append),
+                       summary_every=25, lap_completion=lap_completion)
+    for episode in (0, 1, 7, 25):
+        hook.on_episode_end(episode, -2.5, {"outcome": "timeout"}, {
+            "agent_rewards": {"car_0": -1, "car_1": -1.5},
+            "agent_outcomes": {"car_0": "timeout", "car_1": "finished"},
+            "race_record": {"mean_learner_laps": 0.5},
+            "lap_time_s": 12.345,
+        })
+    episodes = [message for message in messages if message.startswith("ep ")]
+    assert episodes == [
+        f"ep {episode:>6}  reward=-2.50  mean=-2.50  "
+        "laps=0.5  lap_time=12.35s  outcome=car_0:timeout car_1:finished"
+        for episode in (0, 1, 7, 25)
+    ]
+
+
 @pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
 @pytest.mark.parametrize("learner_device,collection_device,workers,envs_per_worker,collection_backend", [
     (*case, "process") for case in [

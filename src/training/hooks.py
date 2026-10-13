@@ -87,12 +87,10 @@ class ConsoleHook(TrainingHook):
     def __init__(
         self,
         logger: ConsoleLogger,
-        log_every: int = 1,
         summary_every: int = 25,
         lap_completion: bool = False,
     ) -> None:
         self._log = logger
-        self._log_every = max(1, log_every)
         self._summary_every = max(1, summary_every)
         self._rewards: Deque[float] = deque(maxlen=summary_every)
         self._outcomes: Deque[str] = deque(maxlen=self._summary_every)
@@ -114,49 +112,30 @@ class ConsoleHook(TrainingHook):
             metrics.get("agent_terminal_reasons") if isinstance(metrics, dict) else None
         )
 
-        if episode % self._log_every == 0:
-            mean_r = np.mean(self._rewards) if self._rewards else 0.0
-            agent_rewards = metrics.get("agent_rewards") if isinstance(metrics, dict) else None
-            if self._lap_completion:
-                laps, lap_time, outcomes = episode_lap_summary(info, metrics)
-                laps_text = "n/a" if laps is None else f"{laps:g}"
-                time_text = "n/a" if lap_time is None else f"{lap_time:.2f}s"
-                self._log.print_info(
-                    f"ep {episode:>6}  reward={reward:+.2f}  mean={mean_r:+.2f}  "
-                    f"laps={laps_text}  lap_time={time_text}  outcome={outcomes}")
-            elif isinstance(agent_rewards, dict) and len(agent_rewards) > 1:
-                rewards_str = "  ".join(
-                    f"{aid}={r:+.2f}" for aid, r in agent_rewards.items()
+        mean_r = np.mean(self._rewards) if self._rewards else 0.0
+        laps, lap_time, outcomes = episode_lap_summary(info, metrics)
+        laps_text = "n/a" if laps is None else f"{laps:g}"
+        time_text = "n/a" if lap_time is None else f"{lap_time:.2f}s"
+        self._log.print_info(
+            f"ep {episode:>6}  reward={reward:+.2f}  mean={mean_r:+.2f}  "
+            f"laps={laps_text}  lap_time={time_text}  outcome={outcomes}")
+
+        agent_rewards = metrics.get("agent_rewards") if isinstance(metrics, dict) else None
+        if not self._lap_completion and isinstance(agent_rewards, dict) and len(agent_rewards) > 1:
+            rewards_str = "  ".join(f"{aid}={r:+.2f}" for aid, r in agent_rewards.items())
+            self._log.print_info(f"  agent rewards: {rewards_str}")
+            if isinstance(agent_terminal_reasons, dict):
+                terminal_str = "  ".join(
+                    f"{aid}={reason or 'active'}"
+                    for aid, reason in agent_terminal_reasons.items()
                 )
-                self._log.print_info(
-                    f"ep {episode:>6}  mean={mean_r:+.2f}  outcome={outcome}  | {rewards_str}"
+                self._log.print_info(f"  terminal reasons: {terminal_str}")
+            individual_rewards = metrics.get("agent_individual_rewards")
+            if metrics.get("reward_mode") == "team_shared" and isinstance(individual_rewards, dict):
+                individual_str = "  ".join(
+                    f"{aid}={r:+.2f}" for aid, r in individual_rewards.items()
                 )
-                if isinstance(agent_terminal_reasons, dict):
-                    terminal_str = "  ".join(
-                        f"{aid}={reason or 'active'}"
-                        for aid, reason in agent_terminal_reasons.items()
-                    )
-                    self._log.print_info(f"  terminal reasons: {terminal_str}")
-                individual_rewards = metrics.get("agent_individual_rewards")
-                if (
-                    metrics.get("reward_mode") == "team_shared"
-                    and isinstance(individual_rewards, dict)
-                ):
-                    individual_str = "  ".join(
-                        f"{aid}={r:+.2f}" for aid, r in individual_rewards.items()
-                    )
-                    self._log.print_info(
-                        f"  individual reward signals: {individual_str}"
-                    )
-            else:
-                lap_count = info.get("lap_count") if isinstance(info, dict) else None
-                lap_time = metrics.get("lap_time_s")
-                laps_str = str(lap_count) if lap_count is not None else "n/a"
-                lap_time_str = f"{lap_time:.2f}s" if lap_time is not None else "n/a"
-                self._log.print_info(
-                    f"ep {episode:>6}  reward={reward:+.2f}  mean={mean_r:+.2f}  "
-                    f"laps={laps_str}  lap_time={lap_time_str}  outcome={outcome}"
-                )
+                self._log.print_info(f"  individual reward signals: {individual_str}")
 
         if episode % self._summary_every == 0 and self._outcomes:
             from collections import Counter
