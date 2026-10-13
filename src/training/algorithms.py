@@ -7,7 +7,7 @@ from wrappers.actions.composer import ActionComposer
 
 
 def resolve_training_params(agent_cfg: dict, scenario: dict) -> dict:
-    """Merge training_defaults with agent params — agent params win."""
+    """Merge training params; top-level optimizer/objective choices are authoritative."""
     defaults = scenario.get("training_defaults", {})
     params = agent_cfg.get("params", {})
     environment = scenario.get("environment", {})
@@ -18,7 +18,11 @@ def resolve_training_params(agent_cfg: dict, scenario: dict) -> dict:
     if "_configuration" in scenario and "algorithm" in scenario:
         network = {key: value for key, value in network.items() if key in {
             "architecture", "actor_hidden_dims", "critic_hidden_dims", "activation"}}
-    return {"network": network, **defaults, **params,
+    optimization = {key: scenario["algorithm"].get(key, default) for key, default in (
+        ("optimizer", "adam"), ("optimizer_kwargs", {}),
+        ("loss", "clip_ppo" if scenario["algorithm"]["name"] == "ppo" else "mappo"),
+        ("critic_loss", "l2"))} if "algorithm" in scenario else {}
+    return {"network": network, **defaults, **params, **optimization,
             "_physics_contract": physics_contract(environment),
             "_action_contract": ActionComposer.contract_from_config(
         agent_cfg.get("action_constraints", {}), decision_dt,

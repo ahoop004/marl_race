@@ -5,11 +5,11 @@ from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.modules import IndependentNormal, ProbabilisticActor
 from torchrl.envs.utils import ExplorationType, set_exploration_type
-from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 
 from agents.common.outputs import PolicyOutput
 from agents.common.ppo_policy import PPOPolicy
+from agents.common.optimization import make_objective
 from agents.torchrl_updates import optimize_ppo
 
 
@@ -63,9 +63,9 @@ class TorchRLPPOAgent(PPOPolicy):
         )
         # Tanh's Jacobian cancels in PPO ratios. Stored latent samples avoid
         # reconstructing saturated actions; the existing bounded entropy stays.
-        self.loss_module = ClipPPOLoss(
-            self.probabilistic_actor, self.value_module, clip_epsilon=self.clip_range,
-            entropy_bonus=False, critic_coeff=self.vf_coef, loss_critic_type="l2",
+        self.loss_module = make_objective(
+            self.algorithm, self.loss, self.critic_loss, self.probabilistic_actor, self.value_module,
+            clip_epsilon=self.clip_range, entropy_bonus=False, critic_coeff=self.vf_coef,
             normalize_advantage=False, functional=False,
         )
         self.loss_module.set_keys(action="raw_action", sample_log_prob="raw_log_prob")

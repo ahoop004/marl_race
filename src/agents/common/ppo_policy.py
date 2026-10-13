@@ -5,7 +5,6 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.optim as optim
 
 from agents.common.outputs import PolicyOutput
 from agents.common.optimization import OnPolicyOptimizationSettings
@@ -69,8 +68,7 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         self.critic = build_critic(obs_dim, self.network_config).to(self.device)
         from agents.common.compilation import configure_compilation
         configure_compilation(self, params.get("compile_networks", False))
-        self._optim_parameters = tuple(self.actor.parameters()) + tuple(self.critic.parameters())
-        self.optimizer = optim.Adam(self._optim_parameters, lr=self.lr) if training else None
+        self.build_optimizer((*self.actor.parameters(), *self.critic.parameters()), training=training)
 
     @torch.no_grad()
     def value_batch(self, observations: np.ndarray) -> np.ndarray:

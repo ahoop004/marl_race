@@ -55,6 +55,17 @@ def parity_fingerprints(config, source, params=None):
         values = deepcopy(params[aid] if params is not None
                           else resolve_training_params(config["agents"][aid], config))
         values["network"] = resolve_network_config(values, default_hidden_dims=[64, 64])
+        # Additive optimization selection fields express the same historical
+        # Adam/L2 defaults; retain the original numerical parity fingerprints.
+        for key, default in (("optimizer", "adam"), ("optimizer_kwargs", {}),
+                             ("loss", "clip_ppo" if agent["algorithm"] == "ppo" else "mappo"),
+                             ("critic_loss", "l2"), ("lr_scheduler_kwargs", {})):
+            if values.get(key) == default:
+                values.pop(key)
+        if agent["algorithm"] == "mappo":
+            for key, default in (("lr_schedule", "constant"), ("learning_rate_end", None)):
+                if values.get(key) == default:
+                    values.pop(key, None)
         for k in ("pi_hidden_dims", "vf_hidden_dims", "hidden_dims", "activation"):
             values.pop(k, None)
         if values.get("pretrained_actor_checkpoint"):
@@ -115,7 +126,7 @@ def test_adaptation_choices_do_not_change_the_task(adaptation):
     (PRETRAIN, "network.actor.distribution=normal", "tanh_normal"),
     (TEAM, "network.critic.input_type=local_observation", "global_state input"),
     (TEAM, "network.critic.parameter_sharing=independent", "shared_team parameters"),
-    (TEAM, "algorithm.optimizer=sgd", "Unsupported loss, optimizer"),
+    (TEAM, "algorithm.optimizer=adagrad", "Unsupported optimizer"),
     (TEAM, "adaptation.load_scope=actor_and_critic", "actor_only loading"),
     (TEAM, "network.actor_hidden_dims=[0]", "positive integers"),
     (TEAM, "adaptation.checkpoint=null", "Fine-tuning requires"),

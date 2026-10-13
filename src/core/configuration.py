@@ -107,11 +107,15 @@ def validate_configuration(config):
             raise ScenarioError(f"checkpoint.{key} must be a positive integer or null")
     if checkpoint.get("resume") is not None and (not isinstance(checkpoint["resume"], str) or not checkpoint["resume"].strip()):
         raise ScenarioError("checkpoint.resume must be a path or null")
-    expected_loss, expected_gae = (("clip_ppo", "gae") if algorithm["name"] == "ppo"
-                                   else ("mappo", "multi_agent_gae"))
-    if (algorithm["loss"] != expected_loss or algorithm["advantage_estimator"] != expected_gae
-            or algorithm["optimizer"] != "adam" or algorithm["critic_loss"] != "l2"):
-        raise ScenarioError("Unsupported loss, optimizer or advantage estimator for the selected algorithm")
+    expected_gae = "gae" if algorithm["name"] == "ppo" else "multi_agent_gae"
+    if algorithm["advantage_estimator"] != expected_gae:
+        raise ScenarioError("Unsupported advantage estimator for the selected algorithm")
+    from agents.common.optimization import resolve_optimizer, validate_objective
+    try:
+        resolve_optimizer(algorithm["optimizer"], algorithm.get("optimizer_kwargs", {}))
+        validate_objective(algorithm["name"], algorithm["loss"], algorithm["critic_loss"])
+    except ValueError as exc:
+        raise ScenarioError(str(exc)) from exc
     allowed = {"architecture", "actor_hidden_dims", "critic_hidden_dims", "activation",
                "encoder", "actor", "critic"}
     if set(network) - allowed or network.get("architecture") != "mlp":

@@ -247,11 +247,38 @@ def restore_rng(state):
 
 def optimization_contract(policy):
     names = ("lr", "lr_end", "lr_schedule", "target_kl", "gamma", "gae_lambda", "clip_range",
-             "ent_coef", "vf_coef", "max_grad_norm", "n_steps", "n_epochs", "batch_size")
+             "ent_coef", "vf_coef", "max_grad_norm", "n_steps", "n_epochs", "batch_size",
+             "optimizer_name", "optimizer_kwargs", "scheduler_kwargs", "scheduler_clock", "loss", "critic_loss")
     return {**{key: getattr(policy, key) for key in names},
             "min_rollout_steps": getattr(policy, "min_rollout_steps", 1),
             **({key: getattr(policy, key) for key in ("reward_mode", "team_return_mode", "team_reward_reduction")}
                if hasattr(policy, "reward_mode") else {})}
+
+
+def _resume_optimization_contract(state, algorithm):
+    """Interpret original v1 contracts as hardcoded Adam/L2, constant or linear.
+
+    Partially populated new contracts are rejected, rather than defaulted.
+    Transfer/model-only loading does not compare training optimization settings.
+    """
+    from agents.common.optimization import OBJECTIVES, resolve_optimizer
+
+    stored = state.get("optimization_contract")
+    if not isinstance(stored, dict):
+        raise ValueError("Checkpoint missing optimization_contract")
+    added = {"optimizer_name", "optimizer_kwargs", "scheduler_kwargs", "scheduler_clock", "loss", "critic_loss"}
+    present = added & stored.keys()
+    legacy = not present
+    if present and present != added:
+        raise ValueError("Checkpoint has an incomplete optimization_contract")
+    if legacy:
+        if stored.get("lr_schedule") not in {"constant", "linear"}:
+            raise ValueError("Legacy checkpoint schedule cannot be unambiguously interpreted")
+        name, kwargs = resolve_optimizer()
+        stored = {**stored, "optimizer_name": name, "optimizer_kwargs": kwargs,
+                  "scheduler_kwargs": {}, "scheduler_clock": "training_budget_progress",
+                  "loss": OBJECTIVES[algorithm], "critic_loss": "l2"}
+    return stored, legacy
 
 
 def resume_training(policy, path):
@@ -260,16 +287,32 @@ def resume_training(policy, path):
     if not isinstance(state, dict) or state.get("boundary") != RESUME_BOUNDARY:
         raise ValueError("Checkpoint is model-only or has an unsupported resume boundary; use latest.pt")
     _validate_models(policy, checkpoint, critic=True)
-    validate_checkpoint_compatibility(state, {"optimization_contract": optimization_contract(policy)})
+    contract, legacy = _resume_optimization_contract(state, policy.algorithm)
+    validate_checkpoint_compatibility({"optimization_contract": contract}, {
+        "optimization_contract": optimization_contract(policy)})
     validate_checkpoint_compatibility(checkpoint["metadata"]["versions"], policy_metadata(policy)["versions"])
     if policy.optimizer is None:
         raise ValueError("Training resume requires a training learner")
     required = {"optimizer", "schedule_progress", "progress", "budget", "rng", "hooks", "recovery_seed"}
     if not required <= state.keys():
         raise ValueError("Checkpoint missing required recovery state")
+    if not legacy and "scheduler" not in state:
+        raise ValueError("Checkpoint missing required scheduler recovery state")
+    scheduler_state = state.get("scheduler")
+    if policy.scheduler is not None:
+        if not isinstance(scheduler_state, dict) or set(scheduler_state) != set(policy.scheduler.state_dict()):
+            raise ValueError("Checkpoint missing or incompatible native scheduler state")
+        validate_checkpoint_compatibility(scheduler_state, {
+            key: value for key, value in policy.scheduler_kwargs.items()})
+        rates = [group["lr"] for group in state["optimizer"]["param_groups"]]
+        validate_checkpoint_compatibility(scheduler_state, {"_last_lr": rates, "base_lrs": [policy.lr]})
+    elif scheduler_state is not None:
+        raise ValueError("Checkpoint has unexpected scheduler state")
     policy.actor.load_state_dict(checkpoint["models"]["actor"], strict=True)
     policy.critic.load_state_dict(checkpoint["models"]["critic"], strict=True)
     policy.optimizer.load_state_dict(state["optimizer"])
+    if policy.scheduler is not None:
+        policy.scheduler.load_state_dict(scheduler_state)
     policy.set_training_progress(state["schedule_progress"])
     policy.source_checkpoint = checkpoint["metadata"]["adaptation"]["source_checkpoint"]
     if hasattr(policy, "_lora_ready"):

@@ -5,10 +5,10 @@ from tensordict import TensorDict
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import IndependentNormal, ProbabilisticActor
-from torchrl.objectives.multiagent import MAPPOLoss
 from torchrl.objectives.value import MultiAgentGAE
 
 from agents.common.mappo_policy import MAPPOPolicy
+from agents.common.optimization import make_objective
 from agents.torchrl_updates import optimize_ppo
 
 
@@ -62,9 +62,9 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
             _CentralValue(self.critic), in_keys=["state", ("agents", "index")],
             out_keys=[("agents", "state_value")],
         )
-        self.loss_module = MAPPOLoss(
-            self.probabilistic_actor, self.value_module, clip_epsilon=self.clip_range,
-            entropy_bonus=False, critic_coeff=self.vf_coef, loss_critic_type="l2",
+        self.loss_module = make_objective(
+            self.algorithm, self.loss, self.critic_loss, self.probabilistic_actor, self.value_module,
+            clip_epsilon=self.clip_range, entropy_bonus=False, critic_coeff=self.vf_coef,
             normalize_advantage=False, functional=False,
         )
         self.loss_module.set_keys(

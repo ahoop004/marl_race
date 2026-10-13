@@ -2,6 +2,7 @@ name: ppo
 backend: torchrl
 loss: clip_ppo
 optimizer: adam
+optimizer_kwargs: {}
 advantage_estimator: gae
 critic_loss: l2
 observation_extension: null
@@ -22,6 +23,7 @@ params:
   learning_rate: 0.001
   gamma: 0.99
   lr_schedule: linear
+  lr_scheduler_kwargs: {}  # Native StepLR/ExponentialLR advance once per learner update.
   learning_rate_end: 0.0001
   log_std_init: 0.0
   target_kl: null

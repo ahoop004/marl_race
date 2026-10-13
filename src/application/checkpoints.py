@@ -31,9 +31,18 @@ def validate_resume_experiment(metadata, scenario):
     """Recovery must retain task, reward, opponent and evaluation protocols."""
     from core.provenance import collect_map_protocols
     from utils.torch_io import validate_checkpoint_compatibility
-    stored = metadata["configuration"]
+    from copy import deepcopy
+    stored = deepcopy(metadata["configuration"])
     if not stored:
         raise ValueError("Application resume requires a fully resolved experiment configuration")
+    # The original schema implied empty kwargs. Add only these unambiguous
+    # defaults; learner recovery separately validates the optimization contract.
+    if "algorithm" in stored:
+        stored["algorithm"].setdefault("optimizer_kwargs", {})
+        stored["algorithm"]["params"].setdefault("lr_scheduler_kwargs", {})
+        if stored["algorithm"]["name"] == "mappo":
+            stored["algorithm"]["params"].setdefault("lr_schedule", "constant")
+            stored["algorithm"]["params"].setdefault("learning_rate_end", None)
     fields = ("algorithm", "network", "environment", "agents", "controllers", "maps", "evaluation", "mappo")
     validate_checkpoint_compatibility(stored, {key: scenario[key] for key in fields if key in scenario})
     validate_checkpoint_compatibility(stored["experiment"], {"seed": scenario["experiment"].get("seed")})

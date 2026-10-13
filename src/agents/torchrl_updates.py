@@ -4,6 +4,7 @@ import math
 
 import torch
 from torchrl.data import LazyTensorStorage, SamplerWithoutReplacement, TensorDictReplayBuffer
+from torchrl.objectives.utils import distance_loss
 
 
 def mean_update_metrics(rows, *, profile=None):
@@ -67,7 +68,7 @@ def optimize_ppo(agent, data, *, group=None):
             else:
                 with torch.no_grad():
                     values = agent.value_module(batch.clone(False))[key("state_value")]
-                    value_loss = torch.nn.functional.mse_loss(values, batch[key("value_target")])
+                    value_loss = distance_loss(values, batch[key("value_target")], agent.critic_loss).mean()
             rows.append(torch.stack((losses["loss_objective"].detach(), value_loss.detach(),
                                      entropy.detach(), kl)))
         if early_stop:
@@ -84,4 +85,5 @@ def optimize_ppo(agent, data, *, group=None):
         "train/action_saturation": float((data[key("action")].abs() >= 1 - 1e-6).float().mean()),
         "train/action_std": float(torch.cat(log_stds).clamp(agent.actor.LOG_STD_MIN, agent.actor.LOG_STD_MAX).exp().mean()),
     })
+    agent.step_update_scheduler(len(rows))
     return metrics

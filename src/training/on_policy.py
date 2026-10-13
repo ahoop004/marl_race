@@ -708,6 +708,7 @@ class OnPolicyTrainer:
         completed, total = ((self._environment_steps, self.total_steps) if self.total_steps is not None
                             else (self.reports.completed, self.n_episodes))
         return {"boundary": RESUME_BOUNDARY, "optimizer": self.agent.optimizer.state_dict(),
+                "scheduler": self.agent.scheduler.state_dict() if self.agent.scheduler is not None else None,
                 "optimization_contract": optimization_contract(self.agent),
                 "schedule_progress": completed / max(total, 1), "progress": self.checkpoint_progress(),
                 "budget": {"total_steps": self.total_steps, "n_episodes": self.n_episodes},

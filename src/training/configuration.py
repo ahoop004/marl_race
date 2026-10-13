@@ -46,6 +46,17 @@ def validate_training_scenario(scenario):
         if type(value) is not int or value < 1:
             raise ScenarioError(f"experiment.{name} must be a positive integer")
     from agents.common.compilation import resolve_compile_config
+    from agents.common.optimization import OnPolicyOptimizationSettings
+    from training.algorithms import resolve_training_params
+    for agent_cfg in agents.values():
+        algorithm = agent_cfg.get("algorithm")
+        if algorithm in POLICY_ALGORITHMS:
+            settings = OnPolicyOptimizationSettings()
+            settings.algorithm = algorithm
+            try:
+                settings.configure_optimization(resolve_training_params(agent_cfg, scenario))
+            except (ValueError, TypeError) as exc:
+                raise ScenarioError(str(exc)) from exc
     for params in [scenario.get("training_defaults", {}),
                    *(cfg.get("params", {}) for cfg in agents.values())]:
         try:
