@@ -18,6 +18,31 @@ PRETRAIN = "scenarios/ppo_lap_completion_pretrain.yaml"
 TEAM = "scenarios/mappo_2v2_completion_scratch.yaml"
 
 
+def test_historical_reward_preset_is_explicit_and_only_changes_rewards():
+    baseline = load_and_expand_scenario(PRETRAIN)
+    selected = load_and_expand_scenario(PRETRAIN, overrides=["reward=solo_completion_historical"])
+    validate_experiment_scenario(selected)
+    assert selected["_configuration"]["choices"]["reward"] == "solo_completion_historical"
+    for key in ("environment", "algorithm", "network", "training_defaults", "experiment", "evaluation"):
+        assert selected[key] == baseline[key]
+    for aid in baseline["agents"]:
+        expected, actual = deepcopy(baseline["agents"][aid]), deepcopy(selected["agents"][aid])
+        reward = actual.pop("reward")
+        original = expected.pop("reward")
+        assert actual == expected
+        for name, component in original["reward"].items():
+            changed = dict(reward["reward"][name])
+            if name in {"progress_delta_bonus", "lap_completion"}:
+                assert changed.pop("event_semantics") == "f110_71a3e0f"
+            assert changed == component
+    for scenario in (PRETRAIN, TEAM):
+        config = load_and_expand_scenario(scenario)
+        for agent in config["agents"].values():
+            if agent.get("trainable"):
+                assert all("event_semantics" not in component for component in agent["reward"]["reward"].values())
+    assert load_and_expand_scenario(PRETRAIN) == baseline
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 

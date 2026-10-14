@@ -21,10 +21,19 @@ def _float_or_none(value: object) -> Optional[float]:
         return None
 
 
+def _historical_event_predicates(config: dict) -> bool:
+    """Opt into the exact F110_MARL 71a3e0f predicates for reproduction."""
+    semantics = config.get("event_semantics", "current")
+    if not isinstance(semantics, str) or semantics not in {"current", "f110_71a3e0f"}:
+        raise ValueError("event_semantics must be current or f110_71a3e0f")
+    return semantics == "f110_71a3e0f"
+
+
 class ProgressDeltaBonusComponent(RewardComponent):
     """Signed progress with optional exclusive boundary/collision costs."""
 
     def __init__(self, config: dict) -> None:
+        self._historical_events = _historical_event_predicates(config)
         self.weight = float(config.get("weight", 100.0))
         self.positive_only = bool(config.get("positive_only", True))
         self.units = str(config.get("units", "lap_fraction"))
@@ -37,10 +46,14 @@ class ProgressDeltaBonusComponent(RewardComponent):
 
     def compute(self, step_info: dict) -> Dict[str, float]:
         info = step_info.get("info") or {}
-        if (self.collision_penalty is not None and (
-                info.get("collision_event", info.get("collision", False))
-                or info.get("terminal_reason") == "collision")):
-            return {"progress_delta/collision": float(self.collision_penalty)}
+        if self.collision_penalty is not None:
+            if self._historical_events:
+                collided = info.get("terminal_reason") == "collision"
+            else:
+                collided = (info.get("collision_event", info.get("collision", False))
+                            or info.get("terminal_reason") == "collision")
+            if collided:
+                return {"progress_delta/collision": float(self.collision_penalty)}
         if self.boundary_penalty is not None:
             boundary = (step_info.get("info") or {}).get("track_limits")
             if boundary is None:
@@ -102,6 +115,7 @@ class LapCompletionComponent(RewardComponent):
     """Sparse final-race bonus tied only to explicit completion facts."""
 
     def __init__(self, config: dict) -> None:
+        self._historical_events = _historical_event_predicates(config)
         self.bonus = float(config.get("bonus", 150.0))
         self.require_clean = bool(config.get("require_clean", True))
 
@@ -111,14 +125,20 @@ class LapCompletionComponent(RewardComponent):
             return {}
         if not bool(info.get("race_completed", False)):
             return {}
-        if info.get("terminal_reason") not in (None, "race_complete"):
-            return {}
-        if self.require_clean and (
-            info.get("collision_event", info.get("collision", False))
-            or info.get("boundary_event", False)
-            or (info.get("track_limits") or {}).get("exceeded", False)
-        ):
-            return {}
+        if self._historical_events:
+            # Historical cleanliness reads collision only, even when other
+            # event fields or the immutable terminal reason disagree.
+            if self.require_clean and bool(info.get("collision", False)):
+                return {}
+        else:
+            if info.get("terminal_reason") not in (None, "race_complete"):
+                return {}
+            if self.require_clean and (
+                info.get("collision_event", info.get("collision", False))
+                or info.get("boundary_event", False)
+                or (info.get("track_limits") or {}).get("exceeded", False)
+            ):
+                return {}
 
         return {"lap_completion/bonus": self.bonus}
 

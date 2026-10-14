@@ -1,0 +1,11 @@
+defaults:
+- solo_completion
+- _self_
+task:
+  name: lap_completion_normalized_progress_historical
+  description: Exact reward event predicates from F110_MARL commit 71a3e0f.
+reward:
+  progress_delta_bonus:
+    event_semantics: f110_71a3e0f
+  lap_completion:
+    event_semantics: f110_71a3e0f

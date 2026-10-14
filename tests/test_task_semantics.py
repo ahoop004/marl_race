@@ -81,6 +81,50 @@ def test_solo_transfer_and_team_local_completion_rewards_agree(events, progress,
         assert reward == pytest.approx(sum(expected.values()))
 
 
+@pytest.mark.parametrize("events,expected", [
+    ({}, {"progress_delta/bonus": .01}),
+    ({"track_limits": {"exceeded": True}}, {"progress_delta/boundary": -.05}),
+    ({"boundary_event": True}, {"progress_delta/boundary": -.05}),
+    ({"terminal_reason": "collision"}, {"progress_delta/collision": -2.}),
+    ({"collision": True, "collision_event": True}, {"progress_delta/bonus": .01}),
+    ({"lap_crossed": True, "race_completed": True},
+     {"progress_delta/bonus": .01, "lap_completion/bonus": 2.}),
+    ({"lap_crossed": True, "race_completed": True, "track_limits": {"exceeded": True}},
+     {"progress_delta/boundary": -.05, "lap_completion/bonus": 2.}),
+    ({"lap_crossed": True, "race_completed": True, "collision": True, "collision_event": False},
+     {"progress_delta/bonus": .01}),
+    ({"lap_crossed": True, "race_completed": True, "collision": False, "collision_event": True},
+     {"progress_delta/bonus": .01, "lap_completion/bonus": 2.}),
+    ({"lap_crossed": True, "race_completed": True, "terminal_reason": "collision"},
+     {"progress_delta/collision": -2., "lap_completion/bonus": 2.}),
+    ({"lap_crossed": True, "race_completed": True, "terminal_reason": "time_limit"},
+     {"progress_delta/bonus": .01, "timeout/penalty": -1., "lap_completion/bonus": 2.}),
+    ({"terminal_reason": "time_limit"}, {"progress_delta/bonus": .01, "timeout/penalty": -1.}),
+    ({"lap_crossed": False, "race_completed": True}, {"progress_delta/bonus": .01}),
+    ({"lap_crossed": True, "race_completed": False}, {"progress_delta/bonus": .01}),
+])
+def test_historical_reward_event_predicates(events, expected):
+    """Synthetic contexts preserve historical rules even for unusual combinations."""
+    from core.scenario import load_yaml_config
+    config = load_yaml_config("configs/reward/solo_completion_historical.yaml")
+    context = dict(timestep=.05, done=True, terminated=True, info={
+        "centerline": {"progress_delta": .01}, "track_limits": {"exceeded": False}, **events})
+    reward, breakdown = RewardComposer.from_config(config).compute(context)
+    expected = {**expected, "step_time/penalty": -.00025 * .05}
+    assert breakdown == pytest.approx(expected)
+    assert reward == pytest.approx(sum(expected.values()))
+
+
+def test_historical_cleanliness_can_be_disabled_and_semantics_are_validated():
+    from wrappers.rewards.completion import LapCompletionComponent, ProgressDeltaBonusComponent
+    component = LapCompletionComponent(dict(event_semantics="f110_71a3e0f", bonus=2., require_clean=False))
+    assert component.compute({"info": dict(lap_crossed=True, race_completed=True, collision=True,
+                                           terminal_reason="collision")}) == {"lap_completion/bonus": 2.}
+    for cls in (LapCompletionComponent, ProgressDeltaBonusComponent):
+        with pytest.raises(ValueError, match="event_semantics"):
+            cls({"event_semantics": "historical_typo"})
+
+
 def test_shared_finish_rewards_are_incremental_and_reset_for_the_next_race():
     composer = RewardComposer.from_config({"team_race_result": {
         "enabled": True, "objective": "combined",
