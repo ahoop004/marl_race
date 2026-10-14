@@ -2,6 +2,7 @@
 import time
 import math
 import sys
+import logging
 from contextlib import ExitStack, contextmanager
 from functools import partial, wraps
 
@@ -70,6 +71,8 @@ class OnPolicyTrainer:
             if render:
                 raise ValueError("Process collection requires headless environments")
         self.parallel_envs, self.scenario = parallel_envs, scenario
+        self.measure_collector_startup = bool(scenario and scenario["experiment"].get("measure_collector_startup", False))
+        self.collector_startup = {}
         self._process_placement = cpu_placement()
         self._process_placement.pop("cpu_topology")
         self._collection_batches = self._last_collection_batch_frames = 0
@@ -615,6 +618,16 @@ class OnPolicyTrainer:
         for worker, values in self.worker_metrics.items():
             result.update({f"perf/workers/{worker}/{name}": value for name, value in values.items()})
         result.update(self.worker_batch_metrics)
+        result.update({"perf/startup/" + name: value for name, value in self.collector_startup.items()})
+        if self.measure_collector_startup:
+            for stage in ("policy_ready", "environment_construction", "initial_weight_receive"):
+                workers = {worker: values[f"startup/{stage}_seconds"]
+                           for worker, values in self.worker_metrics.items()
+                           if f"startup/{stage}_seconds" in values}
+                if workers:
+                    slowest = max(workers, key=workers.get)
+                    result[f"perf/startup/slowest_{stage}_worker"] = slowest
+                    result[f"perf/startup/slowest_{stage}_seconds"] = workers[slowest]
         if self.measure_stages:
             result["perf/inference/cuda_completion_timing"] = self.measure_cuda_sync
             result["perf/inference/worker_seconds_overlap"] = not self.centralized_collection
@@ -790,6 +803,9 @@ class OnPolicyTrainer:
         expected = self._updates - self._initial_updates
         if not (batch["next", "policy_version"] == expected).all():
             raise RuntimeError(f"Collected a stale policy batch; expected version {expected}")
+        if self.measure_collector_startup:
+            self.collector_startup["last_collected_policy_version"] = expected
+            self.collector_startup["workers_with_verified_policy_version"] = self.parallel_envs
         durations = []
         for worker, local, stream in self._process_streams(batch):
             if local == 0:
@@ -1065,7 +1081,15 @@ class OnPolicyTrainer:
                         if self.measure_stages:
                             instrument_policy_inference(self.agent.collection_policy, stage_resources,
                                                         cuda_sync=self.measure_cuda_sync)
-                        return Collector(
+                        startup_options = {}
+                        if self.measure_collector_startup:
+                            from training.process_collection import (
+                                StartupProfileCollector, StartupProfileWeightSync, begin_worker_startup)
+                            scheme = StartupProfileWeightSync()
+                            startup_options = dict(collector_class=StartupProfileCollector,
+                                                   init_fn=begin_worker_startup,
+                                                   weight_sync_schemes={"policy": scheme})
+                        result = Collector(
                             self._process_factories(), self.agent.collection_policy,
                             backend="process", num_collectors=self.parallel_envs, sync=True,
                             frames_per_batch=self.agent.frames_per_batch, total_frames=-1,
@@ -1074,7 +1098,19 @@ class OnPolicyTrainer:
                             reset_at_each_iter=False, set_truncated=False, use_buffers=False,
                             auto_register_policy_transforms=False, track_policy_version=True,
                             pre_collect_hook=pre_collect_profile, post_collect_hook=post_collect_profile,
-                            backend_options={"cat_results": "stack", "num_sub_threads": self.scenario["experiment"].get("torch_threads", 1)})
+                            backend_options={"cat_results": "stack", "num_sub_threads": self.scenario["experiment"].get("torch_threads", 1),
+                                             **startup_options})
+                        if self.measure_collector_startup:
+                            ready = time.perf_counter()
+                            self.collector_startup.update({
+                                "worker_spawning_seconds": scheme.startup["worker_spawning_seconds"],
+                                "spawned_workers": scheme.startup["spawned_workers"],
+                                "initial_weight_dispatch_seconds": scheme.startup["initial_weight_dispatch_seconds"],
+                                "readiness_wait_seconds": ready - scheme.startup["weight_dispatch_finished"],
+                                "initialized_workers": self.parallel_envs,
+                                "environment_slots": self.total_envs,
+                            })
+                        return result
                     return Collector(
                         self.env, self.agent.collection_policy, backend="direct",
                         frames_per_batch=self.agent.frames_per_batch, total_frames=-1,
@@ -1086,8 +1122,20 @@ class OnPolicyTrainer:
                         postproc=lambda batch: batch[batch["collector", "traj_ids"] >= 0],
                         interruptor=_CollectionBoundary(self))
                 startup_started = time.perf_counter()
-                collector = (self.measure_stage("collector_initialize", create_collector)
-                             if self.measure_stages else create_collector())
+                try:
+                    collector = (self.measure_stage("collector_initialize", create_collector)
+                                 if self.measure_stages else create_collector())
+                except Exception:
+                    if self.measure_collector_startup:
+                        logging.getLogger("torchrl").exception("Collector initialization failed after %.3fs",
+                                                             time.perf_counter() - startup_started)
+                    raise
+                if self.measure_collector_startup:
+                    self.collector_startup["collector_initialize_seconds"] = time.perf_counter() - startup_started
+                    self.collector_startup["collection_ready"] = True
+                    logging.getLogger("torchrl").info("Collector ready: %s workers, %s environment slots, %.3fs",
+                                                    self.parallel_envs, self.total_envs,
+                                                    self.collector_startup["collector_initialize_seconds"])
                 if self.centralized_collection and self.measure_stages:
                     from training.process_collection import instrument_policy_inference
                     instrument_policy_inference(collector.policy, stage_resources,
@@ -1111,6 +1159,9 @@ class OnPolicyTrainer:
                 while True:
                     try:
                         batch_started = time.perf_counter()
+                        if self.measure_collector_startup and not self._collection_batches:
+                            self.collector_startup["first_collection_begin_seconds"] = batch_started - startup_started
+                            logging.getLogger("torchrl").info("First collection begins")
                         with CudaCollectionProfile((not process or self.centralized_collection)
                                                    and self.measure_stages and self.measure_cuda_sync
                                                    and self.collection_device.type == "cuda") as copy_profile:
@@ -1179,6 +1230,9 @@ class OnPolicyTrainer:
             try:
                 if collector is not None:
                     collector.shutdown()
+                    if self.measure_collector_startup:
+                        self.collector_startup["shutdown_returned"] = True
+                        self.collector_startup["shutdown_seconds"] = time.perf_counter() - shutdown_started
             finally:
                 try:
                     if central_env is not None and not central_env.is_closed:

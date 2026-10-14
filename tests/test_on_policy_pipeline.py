@@ -15,6 +15,71 @@ from training.hooks import CSVHook, CheckpointHook, EvaluationCheckpointHook, Wa
 from loggers.csv_logger import CSVLogger
 
 
+def test_startup_diagnostics_with_two_workers_and_eight_slots(monkeypatch):
+    """Two real synchronous rounds verify initial and updated actor weights."""
+    import multiprocessing
+    from core.configuration import PROJECT_ROOT
+    from core.scenario import load_and_expand_scenario
+    from core.task_builder import create_race_task
+    from training.algorithms import create_learner, learner_params
+    from training.on_policy import OnPolicyTrainer
+
+    scenario = load_and_expand_scenario(PROJECT_ROOT / "scenarios/ppo_lap_completion_pretrain.yaml",
+                                       overrides=["experiment.measure_collector_startup=true",
+                                                  "execution.params.device=cpu",
+                                                  "algorithm.params.n_steps=32",
+                                                  "++algorithm.params.frames_per_batch=32",
+                                                  "algorithm.params.n_epochs=1",
+                                                  "algorithm.params.batch_size=32"])
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    task = create_race_task(scenario, scenario_dir=PROJECT_ROOT / "scenarios")
+    policy = create_learner("ppo", task.spec, learner_params(scenario, task.spec, "ppo"))
+    capture = Capture(False)
+    training = OnPolicyTrainer(task, policy, hooks=[capture], parallel_envs=2, envs_per_worker=8,
+                               scenario=scenario, collection_device="cpu")
+    receive = training._receive_process_batch
+    versions = []
+    def check_batch(data):
+        assert tuple(data.batch_size) == (2, 8, 2)
+        assert set(data["environment_id"].unique().tolist()) == set(range(16))
+        current = data.clone()
+        current["observation"] = current["agents", "observation"].squeeze(-2)
+        with torch.no_grad():
+            log_prob = policy.probabilistic_actor.get_dist(current).log_prob(current["raw_action"])
+        torch.testing.assert_close(log_prob, current["raw_log_prob"], atol=2e-5, rtol=2e-5)
+        versions.append(data["next", "policy_version"].unique().tolist())
+        receive(data)
+    monkeypatch.setattr(training, "_receive_process_batch", check_batch)
+    initial = {key: value.clone() for key, value in policy.actor.state_dict().items()}
+    try:
+        training.train(total_steps=64)
+        assert versions == [[0], [1]]
+        assert len(capture.updates) == 2
+        assert all(update["train/optimizer_steps"] == 1 for update in capture.updates)
+        assert any(not torch.equal(initial[key], value) for key, value in policy.actor.state_dict().items())
+        metrics = training.performance_metrics()
+        assert metrics["perf/startup/spawned_workers"] == metrics["perf/startup/initialized_workers"] == 2
+        assert metrics["perf/startup/environment_slots"] == 16
+        assert metrics["perf/startup/collection_ready"]
+        assert metrics["perf/startup/shutdown_returned"]
+        assert metrics["perf/startup/last_collected_policy_version"] == 1
+        assert metrics["perf/startup/workers_with_verified_policy_version"] == 2
+        assert metrics["perf/startup/first_collection_begin_seconds"] >= metrics["perf/startup/collector_initialize_seconds"]
+        for worker in range(2):
+            prefix = f"perf/workers/{worker}/startup/"
+            assert metrics[prefix + "initial_weight_receive_started_seconds"] >= metrics[prefix + "environment_ready_seconds"]
+            assert metrics[prefix + "policy_ready_seconds"] >= metrics[prefix + "initial_weight_receive_started_seconds"]
+        pids = {metrics[f"perf/workers/{worker}/pid"] for worker in range(2)}
+        assert len(pids) == 2
+        assert not pids.intersection(child.pid for child in multiprocessing.active_children())
+        print({key: value for key, value in metrics.items()
+               if key.startswith("perf/startup/") or key.endswith("peak_rss_bytes")})
+    finally:
+        task.close()
+        torch.set_num_threads(threads)
+
+
 @pytest.mark.parametrize("lap_completion", [False, True])
 def test_console_reports_every_completed_episode_with_lap_fields(lap_completion):
     from training.hooks import ConsoleHook

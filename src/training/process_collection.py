@@ -10,6 +10,9 @@ import sys
 import torch
 from tensordict import NonTensorData
 from torchrl.envs import SerialEnv, TransformedEnv
+from torchrl.collectors import Collector
+from torchrl.weight_update import SharedMemWeightSyncScheme
+from torchrl import logger as _logger
 
 try:
     import resource
@@ -33,6 +36,65 @@ _cuda_profile = None
 _worker_placement = {}
 _inference_profile = {}
 _inference_started = None
+_worker_startup = {}
+
+
+def begin_worker_startup():
+    """Supported worker init_fn; excludes interpreter imports before this hook."""
+    global _worker_startup
+    _worker_startup = {"process_started": time.perf_counter()}
+
+
+class StartupProfileCollector(Collector):
+    """Time the runner's policy factory without changing its weight handshake."""
+    def __init__(self, *args, **kwargs):
+        factory = kwargs["policy_factory"]
+        def policy_factory():
+            started = time.perf_counter()
+            _worker_startup["initial_weight_receive_started_seconds"] = (
+                started - _worker_startup["process_started"])
+            policy = factory()
+            _worker_startup["initial_weight_receive_seconds"] = time.perf_counter() - started
+            _worker_startup["initial_weights_received_seconds"] = time.perf_counter() - _worker_startup["process_started"]
+            return policy
+        kwargs["policy_factory"] = policy_factory
+        try:
+            super().__init__(*args, **kwargs)
+        except Exception:
+            _logger.exception("Collector worker %s initialization failed after %.3fs (stages=%s)",
+                              kwargs.get("worker_idx"),
+                              time.perf_counter() - _worker_startup["process_started"],
+                              {k: v for k, v in _worker_startup.items() if k != "process_started"})
+            raise
+        _worker_startup["policy_ready_seconds"] = time.perf_counter() - _worker_startup["process_started"]
+
+
+class StartupProfileWeightSync(SharedMemWeightSyncScheme):
+    """Only time supported sender hooks; keep the default shared transport."""
+    def __init__(self):
+        super().__init__()
+        self.startup = {}
+
+    def init_on_sender(self, **kwargs):
+        super().init_on_sender(**kwargs)
+        self.startup["spawning_started"] = time.perf_counter()
+        _logger.info("Collector worker spawning begins")
+
+    def connect(self, **kwargs):
+        if not self.initialized_on_sender:
+            return super().connect(**kwargs)
+        started = time.perf_counter()
+        self.startup["worker_spawning_seconds"] = started - self.startup["spawning_started"]
+        self.startup["spawned_workers"] = len(self.context.procs)
+        _logger.info("Collector spawned %s workers in %.3fs; distributing initial weights",
+                     self.startup["spawned_workers"], self.startup["worker_spawning_seconds"])
+        super().connect(**kwargs)
+        # Queue puts return before workers receive/apply weights. Readiness is
+        # established later by the unmodified MultiSyncCollector constructor.
+        self.startup["initial_weight_dispatch_seconds"] = time.perf_counter() - started
+        self.startup["weight_dispatch_finished"] = time.perf_counter()
+        _logger.info("Initial weight dispatch finished in %.3fs; waiting for worker readiness",
+                     self.startup["initial_weight_dispatch_seconds"])
 
 
 def reset_inference_profile():
@@ -105,6 +167,8 @@ def worker_collection_report():
                    learner_samples=sum(r.trainer._agent_steps for r in _worker_reports.values()),
                    completed_episodes=sum(r.reports.completed for r in _worker_reports.values()))
     process.update(_worker_placement)
+    process.update({"startup/" + key: value for key, value in _worker_startup.items()
+                    if key != "process_started"})
     from agents.common.compilation import compilation_metrics
     process.update({"compilation/" + key: value for key, value in compilation_metrics().items()})
     if _cuda_profile.enabled:
@@ -262,6 +326,9 @@ class RaceEnvFactory:
             # own and advance its usual PolicyVersion transform for all slots.
             env = TransformedEnv(env)
         _factory_seconds = time.perf_counter() - _worker_started
+        if _worker_startup:
+            _worker_startup["environment_construction_seconds"] = _factory_seconds
+            _worker_startup["environment_ready_seconds"] = time.perf_counter() - _worker_startup["process_started"]
         # ParallelEnv dispatches these public methods to each worker once per
         # collection batch, reusing the process collector's sparse transport.
         env.begin_collection = pre_collect_profile

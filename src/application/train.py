@@ -228,6 +228,11 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "no_cuda_sync": not exp_cfg.get("measure_cuda_sync", False),
         "num_sub_threads": exp_cfg.get("torch_threads", 1),
     }
+    # TorchRL reads this at import time; set WEIGHT_SYNC_TIMEOUT in the launch
+    # environment, never as a Hydra override after imports have already run.
+    from torchrl._utils import WEIGHT_SYNC_TIMEOUT
+    provenance["collector"]["initial_weight_sync_timeout_seconds"] = WEIGHT_SYNC_TIMEOUT
+    provenance["collector"]["measure_startup"] = exp_cfg.get("measure_collector_startup", False)
     csv_logger = CSVLogger(
         output_dir=output_dir,
         scenario_config=scenario,
@@ -297,7 +302,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     console.print_info(f"Starting {algorithm.upper()} training for {budget}")
     options = {"total_steps": total_steps} if total_steps is not None else {}
     trainer.train(episodes, **options)
-    if trainer.measure_services or trainer.measure_stages or trainer.measure_mpc or trainer.measure_hybrid:
+    if (trainer.measure_services or trainer.measure_stages or trainer.measure_mpc or trainer.measure_hybrid
+            or trainer.measure_collector_startup):
         # Include end-of-run service work, especially latest/final checkpoint saves.
         csv_logger.save_summary({**trainer.checkpoint_progress(), **trainer.service_metrics(),
                                  **trainer.performance_metrics(),

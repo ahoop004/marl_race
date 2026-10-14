@@ -60,6 +60,7 @@ def test_cli_parameter_overrides_preserve_action_ownership_and_cpu_threads():
 
 
 @pytest.mark.parametrize("path,value,message", [
+    (("experiment", "measure_collector_startup"), 1, "measure_collector_startup must be boolean"),
     (("mappo", "reward_mode"), "individual", "MAPPO completion requires"),
     (("environment", "action_repeat"), 2, "joint team returns"),
     (("evaluation", "selection_strategy"), "lap_time", "Unsupported evaluation selection"),
