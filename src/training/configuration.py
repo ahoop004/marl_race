@@ -114,6 +114,12 @@ def validate_training_scenario(scenario):
     if total_steps is not None and (isinstance(total_steps, bool)
             or not isinstance(total_steps, int) or total_steps <= 0):
         raise ScenarioError("'experiment.total_steps' must be a positive integer or null.")
+    stop_after_steps = experiment.get("stop_after_steps")
+    if stop_after_steps is not None:
+        if type(stop_after_steps) is not int or stop_after_steps <= 0:
+            raise ScenarioError("'experiment.stop_after_steps' must be a positive integer or null.")
+        if total_steps is None:
+            raise ScenarioError("'experiment.stop_after_steps' requires experiment.total_steps.")
     if experiment.get("ppo_backend", "torchrl") != "torchrl":
         raise ScenarioError("Legacy PPO backends have been removed; experiment.ppo_backend must be torchrl")
     if experiment.get("mappo_backend", "torchrl") != "torchrl":

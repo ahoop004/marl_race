@@ -71,6 +71,10 @@ class OnPolicyTrainer:
             if render:
                 raise ValueError("Process collection requires headless environments")
         self.parallel_envs, self.scenario = parallel_envs, scenario
+        self.stop_after_steps = (scenario or {}).get("experiment", {}).get("stop_after_steps")
+        if self.stop_after_steps is not None and (type(self.stop_after_steps) is not int
+                                                 or self.stop_after_steps <= 0):
+            raise ValueError("experiment.stop_after_steps must be a positive integer or null")
         self.measure_collector_startup = bool(scenario and scenario["experiment"].get("measure_collector_startup", False))
         self.collector_startup = {}
         self._process_placement = cpu_placement()
@@ -758,6 +762,11 @@ class OnPolicyTrainer:
             return self._environment_steps >= self.total_steps
         return self.n_episodes is not None and self.reports.completed >= self.n_episodes
 
+    def _diagnostic_stop_reached(self):
+        # This limit is execution-only: it never shortens collection rollouts,
+        # the LR horizon or the immutable budget stored for recovery.
+        return self.stop_after_steps is not None and self._environment_steps >= self.stop_after_steps
+
     def _set_progress(self):
         setter = getattr(self.agent, "set_training_progress", None)
         if setter:
@@ -923,6 +932,8 @@ class OnPolicyTrainer:
             raise ValueError("total_steps must be a positive integer")
         if total_steps is None and (type(n_episodes) is not int or n_episodes < 0):
             raise ValueError("n_episodes must be a nonnegative integer")
+        if self.stop_after_steps is not None and total_steps is None:
+            raise ValueError("experiment.stop_after_steps requires a total_steps budget")
         if self._resume_state is not None:
             from utils.torch_io import validate_checkpoint_compatibility
             validate_checkpoint_compatibility(self._resume_state["budget"], {
@@ -1033,7 +1044,7 @@ class OnPolicyTrainer:
             require_source = getattr(self.agent, "_require_lora_source", None)
             if require_source:
                 require_source()
-            if not self.budget_reached():
+            if not self.budget_reached() and not self._diagnostic_stop_reached():
                 # Serial interrupts at an exact decision boundary. Processes
                 # consume whole synchronous batches and report their overshoot.
                 # Neither path introduces artificial trajectory truncations.
@@ -1211,7 +1222,8 @@ class OnPolicyTrainer:
                                 and self._updates - self._initial_updates >= self.profiling_warmup_updates):
                             self._set_timing_phase("steady")
                             self._steady_started, self._steady_baseline = time.perf_counter(), self._rate_counters()
-                    if self.budget_reached() or self._should_stop():
+                    if (self.budget_reached() or self._should_stop()
+                            or (updated and self._diagnostic_stop_reached())):
                         break
                 if not self._should_stop() and pending:
                     prepare_started = time.perf_counter()

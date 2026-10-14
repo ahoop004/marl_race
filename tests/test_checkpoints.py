@@ -9,7 +9,8 @@ import torch
 from agents.common.checkpoints import read_checkpoint, restore_rng
 from agents.common.ppo_policy import PPOPolicy
 from application.checkpoints import resolve_checkpoint_path, validate_resume_experiment
-from training.hooks import CheckpointHook
+from training.hooks import CheckpointHook, EvaluationCheckpointHook
+from training.on_policy import OnPolicyTrainer
 from test_torchrl_ppo import Capture, agent, trainer, rollout
 from utils.torch_io import atomic_save, safe_load
 
@@ -184,6 +185,92 @@ def test_latest_restores_optimizer_progress_rng_and_recovers_a_fresh_episode(tmp
         np.testing.assert_array_equal(a.action_norm, b.action_norm)
     for key, value in recoveries[0][1].items():
         torch.testing.assert_close(value, recoveries[1][1][key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("resumed_limit, expected_steps", [(None, 140), (128, 128), (120, 120)])
+def test_diagnostic_stop_completes_updates_evaluates_and_resumes_full_budget(
+        tmp_path, resumed_limit, expected_steps):
+    # Scale samples per update to four; retain 30 updates and evaluation at 10/20/30.
+    capture = Capture(False)
+    original, fixed = trainer(capture, n_epochs=1, batch_size=4,
+                              learning_rate=.001, lr_schedule="linear", learning_rate_end=.0001)
+    original = OnPolicyTrainer(original.task, original.agent, hooks=[capture],
+                               scenario={"experiment": {"stop_after_steps": 120}})
+    evaluations = []
+
+    class Evaluator:
+        def evaluate(self):
+            evaluations.append((original._updates, original.collected_steps))
+            return {"completion_rate": 0., "collision_rate": 1., "mean_net_progress": 0.}
+
+    original.hooks.extend([
+        CheckpointHook(original.agent, tmp_path, save_every_steps=10),
+        EvaluationCheckpointHook(original.agent, tmp_path, Evaluator(), evaluate_every=100,
+                                 evaluate_every_steps=40),
+    ])
+    original.train(total_steps=140)
+    assert original.collected_steps == fixed.calls == 120
+    assert original._updates == original._optimizer_steps == 30
+    assert original._pending_learning_steps == 0 and not original.budget_reached()
+    assert evaluations == [(10, 40), (20, 80), (30, 120)]
+    saved = read_checkpoint(tmp_path / "latest.pt")
+    assert not (tmp_path / "final.pt").exists()
+    state = saved["training"]
+    assert state["budget"] == {"total_steps": 140, "n_episodes": 0}
+    assert state["schedule_progress"] == pytest.approx(120 / 140)
+    assert state["progress"]["environment_steps"] == 120
+    assert state["progress"]["updates"] == state["progress"]["optimizer_steps"] == 30
+    assert state["hooks"]["EvaluationCheckpointHook"]["evaluation_count"] == 3
+    expected_lr = .001 + (120 / 140) * (.0001 - .001)
+    assert original.agent.optimizer.param_groups[0]["lr"] == pytest.approx(expected_lr)
+
+    resumed_capture = Capture(False)
+    recovered, resumed_fixed = trainer(resumed_capture, n_epochs=1, batch_size=4,
+                                      learning_rate=.001, lr_schedule="linear", learning_rate_end=.0001)
+    recovered = OnPolicyTrainer(recovered.task, recovered.agent, hooks=[resumed_capture],
+                                scenario={"experiment": {"stop_after_steps": resumed_limit}})
+    recovered_evaluations = []
+
+    class ResumedEvaluator:
+        def evaluate(self):
+            recovered_evaluations.append(recovered.collected_steps)
+            return {"completion_rate": 0., "collision_rate": 1., "mean_net_progress": 0.}
+
+    recovered.hooks.extend([
+        CheckpointHook(recovered.agent, tmp_path / "resume", save_every_steps=10),
+        EvaluationCheckpointHook(recovered.agent, tmp_path / "resume", ResumedEvaluator(),
+                                 evaluate_every=100, evaluate_every_steps=40),
+    ])
+    recovery_state, _ = recovered.agent.resume_training(tmp_path / "latest.pt")
+    recovered.restore_training_state(recovery_state)
+    for name in ("actor", "critic"):
+        for key, value in getattr(original.agent, name).state_dict().items():
+            torch.testing.assert_close(value, getattr(recovered.agent, name).state_dict()[key], rtol=0, atol=0)
+    before, after = original.agent.optimizer.state_dict(), recovered.agent.optimizer.state_dict()
+    assert before["param_groups"] == after["param_groups"]
+    for key, values in before["state"].items():
+        for name, value in values.items():
+            torch.testing.assert_close(value, after["state"][key][name], rtol=0, atol=0)
+    with pytest.raises(ValueError, match="total_steps"):
+        recovered.train(total_steps=141)
+    recovered.train(total_steps=140)
+    assert recovered.collected_steps == expected_steps
+    assert resumed_fixed.calls == expected_steps - 120
+    assert recovered._updates == recovered._optimizer_steps == expected_steps // 4
+    assert [row["train/environment_steps"] for row in resumed_capture.updates] == list(
+        range(124, expected_steps + 1, 4))
+    assert recovered_evaluations == []  # Evaluation at update 30 is not repeated.
+    assert recovered.agent.optimizer.param_groups[0]["lr"] == pytest.approx(
+        .001 + (expected_steps / 140) * (.0001 - .001))
+
+
+def test_diagnostic_limit_between_updates_waits_for_complete_update():
+    capture = Capture(False)
+    training, fixed = trainer(capture, n_epochs=1, batch_size=4)
+    training.stop_after_steps = 5
+    training.train(total_steps=20)
+    assert training.collected_steps == fixed.calls == 8
+    assert training._updates == 2 and training.checkpoint_ready
 
 
 @pytest.mark.parametrize("mode", ["shared", "independent", "lora"])

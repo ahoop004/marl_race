@@ -1,0 +1,46 @@
+# @package _global_
+defaults:
+- ppo_lap_completion_pretrain
+- override /reward: solo_completion_historical
+- _self_
+
+experiment:
+  name: ppo_historical_reproduction
+  total_steps: 120000000
+  stop_after_steps: 12288000  # Absolute decisions; stop after a complete learner update.
+  seed: 42
+  parallel_envs: 64
+  envs_per_worker: 8
+  measure_collector_startup: true
+environment:
+  max_steps: 80000
+algorithm:
+  params:
+    frames_per_batch: 4096
+    n_steps: 409600
+    n_epochs: 10
+    batch_size: 1024
+execution:
+  params:
+    collection_device: cpu
+checkpoint:
+  every_steps: 1024000
+wandb:
+  logging:
+    metrics:
+      episode/*: true  # Includes episode/environment_steps for decision-axis comparisons.
+      train/*: true
+      train/last_checked_kl: false  # Historical comparisons use train/approx_kl.
+      perf/*: true
+      eval/*: true
+  group: historical-ppo-torchrl-f110_71a3e0f-64x8-s42-lr120M-stop12.288M
+  name: historical-ppo-torchrl-f110_71a3e0f-64x8-s42-lr120M-stop12.288M
+  tags:
+  - historical-ppo-reproduction
+  - torchrl
+  - solo_completion_historical
+  - 64x8
+  - seed42
+  - lr120M
+  - stop12.288M
+  notes: Historical F110_MARL 71a3e0f PPO reproduction; full 120M-decision LR horizon with an initial 30-update diagnostic stop.

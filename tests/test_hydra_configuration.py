@@ -16,6 +16,109 @@ from training.evaluation_config import resolve_evaluation_protocol
 
 PRETRAIN = "scenarios/ppo_lap_completion_pretrain.yaml"
 TEAM = "scenarios/mappo_2v2_completion_scratch.yaml"
+REPRODUCTION = "scenarios/ppo_historical_reproduction.yaml"
+
+
+def test_historical_reproduction_configuration_tasks_and_lr_horizon():
+    from core.task_builder import create_race_task
+    from training.algorithms import learner_params
+    from training.selection import create_selection_evaluator
+    from loggers.metric_policy import MetricPolicy
+    from application.checkpoints import validate_resume_experiment
+    from core.provenance import collect_map_protocols
+    from test_torchrl_ppo import agent
+
+    config = load_and_expand_scenario(REPRODUCTION, overrides=["reward=solo_completion_historical"])
+    validate_experiment_scenario(config)
+    experiment, params = config["experiment"], config["training_defaults"]
+    assert experiment["seed"] == 42
+    assert experiment["total_steps"] == 120000000 and experiment["stop_after_steps"] == 12288000
+    assert experiment["parallel_envs"] == 64 and experiment["envs_per_worker"] == 8
+    assert params["n_steps"] == 409600 and params["frames_per_batch"] == 4096
+    assert params["n_epochs"] == 10 and params["batch_size"] == 1024
+    assert params["device"] == "cuda" and params["collection_device"] == "cpu"
+    assert experiment["stop_after_steps"] // params["n_steps"] == 30
+    assert 30 * params["n_epochs"] * (params["n_steps"] // params["batch_size"]) == 120000
+    baseline = load_and_expand_scenario(PRETRAIN)
+    assert config["network"] == baseline["network"]
+    assert config["algorithm"]["optimizer"] == "adam" and config["algorithm"]["optimizer_kwargs"] == {}
+    for key in ("gamma", "gae_lambda", "clip_range", "ent_coef", "vf_coef", "max_grad_norm",
+                "learning_rate", "learning_rate_end", "lr_schedule", "log_std_init", "target_kl"):
+        assert params[key] == baseline["training_defaults"][key]
+    environment = deepcopy(config["environment"])
+    assert environment.pop("max_steps") == 80000
+    historical_environment = deepcopy(baseline["environment"])
+    historical_environment.pop("max_steps")
+    assert environment == historical_environment
+    assert environment["max_speed"] == 8. and environment["timestep"] == .05
+    assert environment["action_repeat"] == 1
+    assert environment["map_bundles_train"] == environment["map_bundles_eval"] == ["circle_map"]
+    assert config["checkpoint"]["every_steps"] == 1024000
+    assert config["evaluation"]["enabled"] and config["evaluation"]["episodes"] == 10
+    assert config["evaluation"]["seed"] == 10042 and config["evaluation"]["max_steps"] == 80000
+    assert config["evaluation"]["target_laps"] == 1
+    assert [n * config["evaluation"]["every_steps"] // params["n_steps"] for n in (1, 2, 3)] == [10, 20, 30]
+    for reward in (config["reward"], config["agents"]["car_0"]["reward"]):
+        for component in ("progress_delta_bonus", "lap_completion"):
+            assert reward["reward"][component]["event_semantics"] == "f110_71a3e0f"
+
+    task = create_race_task(config)
+    evaluator = None
+    try:
+        effective_params = learner_params(config, task.spec, "ppo")
+        for key, value in params.items():
+            assert effective_params[key] == value
+        assert task.spec.observation_dims["car_0"] == 158
+        evaluator = create_selection_evaluator("ppo", config, PROJECT_ROOT / "scenarios",
+                                               task.spec, effective_params)
+        for constructed in (task, evaluator.task):
+            components = constructed.reward_composers["car_0"]._components
+            assert sum(getattr(component, "_historical_events", False) for component in components) == 2
+            assert constructed.episode_limits.max_steps == 80000
+            assert constructed.episode_limits.target_laps == 1
+        assert task.env._friction.phase == "train"
+        assert evaluator.task.env._friction.phase == "eval"
+        assert evaluator.task.env._friction.sample()["mu"] == 1.0489
+        assert evaluator.episodes == 10 and evaluator.base_seed == 10042
+    finally:
+        if evaluator is not None:
+            evaluator.close()
+        task.close()
+
+    learner = agent(learning_rate=params["learning_rate"], lr_schedule=params["lr_schedule"],
+                    learning_rate_end=params["learning_rate_end"])
+    for steps, expected in ((0, .001), (409600, .000996928), (819200, .000993856),
+                            (4096000, .000969280), (8192000, .000938560),
+                            (12288000, .000907840), (120000000, .0001)):
+        learner.set_training_progress(steps / experiment["total_steps"])
+        assert learner.optimizer.param_groups[0]["lr"] == pytest.approx(expected, abs=1e-12)
+    policy = MetricPolicy(config["wandb"]["logging"], config)
+    assert policy.accepts("episode/environment_steps") and policy.accepts("train/approx_kl")
+    assert not policy.accepts("train/last_checked_kl")
+    metadata = {"configuration": config, "provenance": {
+        "map_protocols": collect_map_protocols(config["environment"])}}
+    for limit in (None, 16384000):
+        override = "null" if limit is None else str(limit)
+        resumed = load_and_expand_scenario(REPRODUCTION, overrides=[f"experiment.stop_after_steps={override}"])
+        validate_experiment_scenario(resumed)
+        validate_resume_experiment(metadata, resumed)
+        assert resumed["experiment"]["stop_after_steps"] == limit
+        assert resumed["experiment"]["total_steps"] == 120000000
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "12"])
+def test_diagnostic_stop_rejects_invalid_configuration(value):
+    config = load_and_expand_scenario(REPRODUCTION)
+    config["experiment"]["stop_after_steps"] = value
+    with pytest.raises(ScenarioError, match="stop_after_steps"):
+        validate_experiment_scenario(config)
+
+
+def test_diagnostic_stop_requires_a_full_decision_budget():
+    config = load_and_expand_scenario(REPRODUCTION)
+    config["experiment"]["total_steps"] = None
+    with pytest.raises(ScenarioError, match="stop_after_steps"):
+        validate_experiment_scenario(config)
 
 
 def test_historical_reward_preset_is_explicit_and_only_changes_rewards():
