@@ -263,7 +263,7 @@ class _WorkerReports:
 
     def decision(self, result):
         self.reports.decision(result)
-        self.reports.dispatch({})
+        self.reports.dispatch({}, parent=False)
         if self.env.batch_reports and self.env.report_events:
             index = self.trainer._environment_steps - self.batch_start - 1
             self.batch_events.append((index, self.env.report_events))

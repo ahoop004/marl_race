@@ -110,6 +110,7 @@ class WandbLogger:
                         pass
                 if self.should_log("define_metrics"):
                     try:
+                        self._wandb.define_metric("episode/completion_index")
                         for namespace, axis in AXES.items():
                             self._wandb.define_metric(axis)
                             self._wandb.define_metric(f"{namespace}/*", step_metric=axis)

@@ -120,7 +120,11 @@ class RaceTrainingReports:
         info = dict(self.last_info[t.focal_id])
         info["outcome"] = determine_outcome(info, truncated=self.truncated[t.focal_id]).value
         info.setdefault("map_bundle", self.map_id)
-        metrics = dict(episode_steps=self.steps)
+        metrics = dict(
+            episode_steps=self.steps, episode_id=self.episode_id,
+            environment_id=self.environment_id,
+            environment_episode=(self.environment_episode if self.episode_stride > 1
+                                 or getattr(t.env, "environment_id", None) is not None else self.episode))
         lap_steps = info.get("lap_time_steps")
         metrics["lap_time_s"] = float(lap_steps) * self.task.timestep if lap_steps is not None else None
         metrics.update(
@@ -140,8 +144,7 @@ class RaceTrainingReports:
             **episode_race_record(finalize_episode_facts(self.facts), timestep=self.task.timestep,
                                  finite_race=self.task.episode_limits.finish_on_laps),
             "run_id": t.run_id, "environment_id": self.environment_id, "episode_id": self.episode_id,
-            "environment_episode": (self.environment_episode if self.episode_stride > 1
-                                    or getattr(t.env, "environment_id", None) is not None else self.episode),
+            "environment_episode": metrics["environment_episode"],
             "map_id": self.map_id,
             "environment_seed": self.environment_seed, "spawn_ids": self.spawn_ids,
             "spawn_configuration": self.spawn_context, "environment_decisions": self.steps,
@@ -158,9 +161,19 @@ class RaceTrainingReports:
         self.completed += 1
         metrics.update(t.counter_metrics())
 
-    def dispatch(self, update_metrics):
-        for episode, reward, info, metrics in self.pending_episodes:
+    def dispatch(self, update_metrics, *, parent=True):
+        # Zero-based parent reporting order, not physical finish-time order.
+        # Completions were counted when queued; reuse that checkpointed count
+        # without incrementing it again or introducing another resume counter.
+        first_completion = self.completed - len(self.pending_episodes)
+        for index, (episode, reward, info, metrics) in enumerate(self.pending_episodes):
             metrics = {**update_metrics, **metrics}
+            if parent:
+                completion_index = first_completion + index
+                metrics["episode/completion_index"] = completion_index
+                race = metrics.get("race_record")
+                if race is not None:
+                    race["completion_index"] = completion_index
             for hook in self.trainer.hooks:
                 self.trainer.call_hook(hook, "on_episode_end", episode, reward, info, metrics)
         self.pending_episodes.clear()

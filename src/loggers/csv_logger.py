@@ -117,7 +117,8 @@ class CSVLogger:
         for key, value in metrics.items():
             if not key.startswith(("train/", "perf/")) and (
                     isinstance(value, (str, int, float, bool)) or value is None):
-                row.setdefault(key.replace("/", "_"), value)
+                column = "completion_index" if key == "episode/completion_index" else key.replace("/", "_")
+                row.setdefault(column, value)
         if race is not None:
             row.update({key: value for key, value in race.items()
                         if not isinstance(value, (dict, list))})
@@ -126,7 +127,7 @@ class CSVLogger:
 
         if race is not None:
             identity = {key: race.get(key) for key in (
-                "run_id", "environment_id", "episode_id", "environment_episode", "map_id",
+                "run_id", "environment_id", "episode_id", "environment_episode", "completion_index", "map_id",
                 "environment_seed", "policy_version_start", "policy_version_end",
                 "reported_at_environment_steps", "race_mode", "phase")}
             for aid, facts in race["agents"].items():
@@ -154,7 +155,15 @@ class CSVLogger:
             for agent_id in values
         }
         for agent_id in sorted(agent_ids):
-            agent_row = {"episode": int(episode), "agent_id": agent_id}
+            agent_row = {
+                "episode": int(episode), "agent_id": agent_id,
+                **{key: metrics[key] for key in ("episode_id", "environment_id", "environment_episode")
+                   if key in metrics},
+            }
+            if "episode/completion_index" in metrics:
+                agent_row["completion_index"] = metrics["episode/completion_index"]
+            if "train/environment_steps" in metrics:
+                agent_row["reported_at_environment_steps"] = metrics["train/environment_steps"]
             for field, values in agent_fields.items():
                 if isinstance(values, dict):
                     agent_row[field] = values.get(agent_id)

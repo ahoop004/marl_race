@@ -336,6 +336,14 @@ def test_process_reporting_keeps_prefix_counters_and_policy_starts(envs_per_work
     assert [metrics["race_record"]["policy_version_start"] for _, _, _, metrics in episodes] == [1, 2]
     assert all(metrics["race_record"]["policy_version_end"] == 2 for _, _, _, metrics in episodes)
     assert training.reports.completed == 2 and training.reports.next_episode == 9
+    capture = Capture(False)
+    training.hooks = [capture]
+    monkeypatch.setattr(training, "call_hook", lambda hook, method, *args: getattr(hook, method)(*args))
+    training.reports.dispatch({})
+    assert [row[0] for row in capture.episodes] == [1, 4]
+    assert [row[3]["episode/completion_index"] for row in capture.episodes] == [0, 1]
+    assert [row[3]["race_record"]["completion_index"] for row in capture.episodes] == [0, 1]
+    assert [row[3]["train/environment_steps"] for row in capture.episodes] == [12, 15]
     assert training._worker_policy_starts == {(environment, 0): 2 for environment in range(1, 2 * envs_per_worker)}
     assert training._environment_steps == training.mpc_environment_decisions[phase] == 10 + batch.numel()
     assert training.hybrid_environment_decisions[phase] == 10 + batch.numel()
@@ -427,6 +435,11 @@ def test_worker_batch_reports_preserve_reset_order_and_packet_lifetime(monkeypat
         assert packets[-1]["process"]["environment_steps"] == 12
         assert packets[-1]["process"]["completed_episodes"] == 2
         assert reporters[0].trainer._agent_steps == reporters[1].trainer._agent_steps
+        for packet in packets:
+            for _, events in packet["race_events"][0]:
+                for method, args in events:
+                    if method == "on_episode_end":
+                        assert "episode/completion_index" not in args[3]
     finally:
         for env in envs:
             env.close()

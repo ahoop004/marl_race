@@ -5,13 +5,15 @@ from training.evaluation_config import EVALUATION_STRATEGIES
 
 
 AXES = {
-    "episode": "episode/number",
+    "episode": "episode/environment_steps",
     "train": "train/environment_steps",
     "perf": "train/environment_steps",
     "eval": "eval/environment_steps",
 }
 
 CORE = (
+    "episode/number", "episode/completion_index", "episode/episode_id",
+    "episode/environment_id", "episode/environment_episode", "episode/environment_steps",
     "episode/reward", "episode/steps", "episode/lap_count", "episode/lap_time_s",
     "episode/completed", "episode/failed", "episode/timeout", "episode/net_progress_laps",
     "episode/reward/*", "episode/individual_reward/*",

@@ -116,8 +116,11 @@ class ConsoleHook(TrainingHook):
         laps, lap_time, outcomes = episode_lap_summary(info, metrics)
         laps_text = "n/a" if laps is None else f"{laps:g}"
         time_text = "n/a" if lap_time is None else f"{lap_time:.2f}s"
+        completion_index = metrics.get("episode/completion_index", episode)
+        environment_id = metrics.get("environment_id", metrics.get("race_record", {}).get("environment_id"))
+        environment_text = f"env={environment_id}  " if environment_id is not None else ""
         self._log.print_info(
-            f"ep {episode:>6}  reward={reward:+.2f}  mean={mean_r:+.2f}  "
+            f"ep {completion_index:>6}  {environment_text}reward={reward:+.2f}  mean={mean_r:+.2f}  "
             f"laps={laps_text}  lap_time={time_text}  outcome={outcomes}")
 
         agent_rewards = metrics.get("agent_rewards") if isinstance(metrics, dict) else None
@@ -137,7 +140,7 @@ class ConsoleHook(TrainingHook):
                 )
                 self._log.print_info(f"  individual reward signals: {individual_str}")
 
-        if episode % self._summary_every == 0 and self._outcomes:
+        if (completion_index + 1) % self._summary_every == 0 and self._outcomes:
             from collections import Counter
             if self._lap_completion and len(self._agent_outcomes) > 1:
                 counts = Counter(value for outcomes in self._agent_outcomes.values() for value in outcomes)
@@ -186,6 +189,12 @@ class WandbHook(TrainingHook):
         learners = {aid: facts for aid, facts in race.get("agents", {}).items()
                     if facts["team"] == "trainable"}
         log = {"episode/reward": reward, "episode/number": episode}
+        if "episode/completion_index" in metrics:
+            log["episode/completion_index"] = metrics["episode/completion_index"]
+        for key in ("episode_id", "environment_id", "environment_episode"):
+            value = metrics.get(key, race.get(key))
+            if value is not None:
+                log[f"episode/{key}"] = value
         log.update({key.replace("train/", "episode/"): value for key, value in metrics.items() if key in {
             "train/environment_steps", "train/physics_steps", "train/agent_steps",
             "train/completed_episodes", "train/updates", "train/optimizer_steps_total"}})
