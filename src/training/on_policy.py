@@ -863,17 +863,25 @@ class OnPolicyTrainer:
             tuple(self._process_placement["cpu_affinity"]) if self._process_placement["cpu_affinity"] is not None else None)
             for worker in range(self.parallel_envs)]
 
-    def _process_streams(self, batch):
-        """Yield one chronological time stream per independent race slot."""
+    def _process_batch_steps(self, batch):
+        """Validate worker/slot/time axes without indexing any TensorDict leaves."""
         expected_dims = 3 if self.envs_per_worker > 1 else 2
         if batch.ndim != expected_dims or batch.batch_size[0] != self.parallel_envs:
             raise RuntimeError(f"Unexpected process batch layout: {batch.batch_size}")
         if self.envs_per_worker > 1 and batch.batch_size[1] != self.envs_per_worker:
             raise RuntimeError(f"Unexpected grouped process batch layout: {batch.batch_size}")
-        for worker in range(self.parallel_envs):
-            for local in range(self.envs_per_worker):
-                yield worker, local, (batch[worker, local] if self.envs_per_worker > 1
-                                      else batch[worker])
+        return batch.batch_size[-1]
+
+    def _process_streams(self, batch):
+        """Yield one chronological time stream per independent race slot."""
+        steps = self._process_batch_steps(batch)
+        # Unbind each leaf once instead of recursively indexing the TensorDict
+        # for every slot. At the parent handoff, batch is already an owned clone;
+        # its views survive collector reuse. Merging axes preserves slot order.
+        streams = batch.reshape(self.total_envs, steps).unbind(0)
+        for environment, stream in enumerate(streams):
+            worker, local = divmod(environment, self.envs_per_worker)
+            yield worker, local, stream
 
     def _receive_process_batch(self, batch):
         """Aggregate actual worker decisions, including fixed-only continuations."""
@@ -886,40 +894,56 @@ class OnPolicyTrainer:
         if self.measure_collector_startup:
             self.collector_startup["last_collected_policy_version"] = expected
             self.collector_startup["workers_with_verified_policy_version"] = self.parallel_envs
+        steps = self._process_batch_steps(batch)
+        # Read numerical leaves once. All reporting arithmetic stays on the CPU;
+        # the time axis remains independent for every worker/environment slot.
+        # Attribute batched work here; sampled scopes below time only the
+        # remaining per-slot validation and selected-counter preparation.
+        with self.measure_boundary("batch_reporting_numerics"):
+            environments = batch["environment_id"].reshape(self.total_envs, steps)
+            valid_environments = (environments == torch.arange(
+                self.total_envs, device=environments.device).unsqueeze(-1)).all(dim=1).tolist()
+            episodes = batch["environment_episode"].reshape(self.total_envs, steps)
+            starts = [[] for _ in range(self.total_envs)]
+            for environment, index in (episodes[:, 1:] != episodes[:, :-1]).nonzero().tolist():
+                starts[environment].append(index + 1)
+            counters = torch.stack((
+                batch["next", "decision_physics_steps"].reshape(self.total_envs, steps),
+                batch["next", "agent_steps"].reshape(self.total_envs, steps)), dim=-1).cumsum(dim=1)
+        profiles = batch.get("worker_profile")
+        legacy_events = batch.get(("next", "race_events"), None)
         durations = []
         samples = (profiling_sample_indices(self.total_envs, self.profiling_detail_samples)
                    if self.measure_stages else ())
         report_events = episode_events = 0
-        for worker, local, stream in self._process_streams(batch):
+        for environment in range(self.total_envs):
+            worker, local = divmod(environment, self.envs_per_worker)
             detail = self.measure_boundary if worker * self.envs_per_worker + local in samples else None
             if detail:
                 self.record_workload("sampled_reporting_streams")
             if local == 0:
                 with detail("sampled_worker_metadata") if detail else nullcontext():
-                    packet = stream[0]["worker_profile"]
+                    location = (worker, 0, 0) if self.envs_per_worker > 1 else (worker, 0)
+                    packet = profiles[location].data
                     self._receive_worker_profile(worker, packet)
                     durations.append(packet["collection_seconds"])
-            environment = worker * self.envs_per_worker + local
             with detail("sampled_stream_validation") if detail else nullcontext():
-                if not (stream["environment_id"] == environment).all():
+                if not valid_environments[environment]:
                     raise RuntimeError(f"Unexpected environment ID in worker {worker}, slot {local}")
-                episodes = stream["environment_episode"].squeeze(-1)
-                starts = (episodes[1:] != episodes[:-1]).nonzero().flatten().add(1).tolist()
             with detail("sampled_event_reconstruction") if detail else nullcontext():
                 if "race_events" in packet:
                     events = dict(packet["race_events"].get(environment, ()))
                 else:
-                    events = {index: value for index, value in enumerate(stream.get(("next", "race_events")).tolist())
+                    location = (worker, local) if self.envs_per_worker > 1 else worker
+                    events = {index: value for index, value in enumerate(legacy_events[location].tolist())
                               if value}
             # Only reporting and episode boundaries require Python work. Prefix
             # sums preserve the exact counters visible to each hook, including
             # fixed-only decisions and rows without any reporting events.
             with detail("sampled_prefix_counters") if detail else nullcontext():
-                positions = sorted({0, len(stream) - 1, *starts, *events})
-                counters = torch.cat((stream["next", "decision_physics_steps"],
-                                      stream["next", "agent_steps"]), dim=-1).cumsum(dim=0)
-                selected_counters = counters[positions].tolist()
-                selected_episodes = episodes[positions].tolist()
+                positions = sorted({0, steps - 1, *starts[environment], *events})
+                selected_counters = counters[environment, positions].tolist()
+                selected_episodes = episodes[environment, positions].tolist()
             previous_index, previous_physics, previous_samples = -1, 0, 0
             with detail("sampled_event_dispatch_nonservice", exclude_services=True) if detail else nullcontext():
                 for index, local_episode, (physics, samples_count) in zip(positions, selected_episodes, selected_counters):
@@ -1301,7 +1325,7 @@ class OnPolicyTrainer:
                         # Own the retained tensors before the next collector
                         # batch; per-environment slices can then safely be views.
                         with self.measure_boundary("retained_batch_clone"):
-                            owned = data.exclude("race_events", ("next", "race_events"), "worker_profile").clone()
+                            owned = self.agent.select_rollout(data, retain_episode=True).clone()
                         if self.measure_stages:
                             self.record_payload("retained", owned)
                         with self.measure_boundary("stream_extraction"):
@@ -1311,6 +1335,7 @@ class OnPolicyTrainer:
                         if self.measure_stages:
                             self.record_workload("fragment_count", self.total_envs)
                     else:
+                        data = self.agent.select_rollout(data)
                         data = data[data["agents", "active"].any(dim=(-2, -1))]
                         if data.batch_size.numel():
                             pending.append(data)

@@ -12,7 +12,8 @@ from torchrl.objectives.value import GAE
 from agents.common.outputs import PolicyOutput
 from agents.common.ppo_policy import PPOPolicy
 from agents.common.optimization import make_objective
-from agents.torchrl_updates import optimize_ppo
+from agents.torchrl_updates import (PPO_OPTIMIZATION_KEYS, PPO_OPTIONAL_OPTIMIZATION_KEYS,
+                                   optimize_ppo)
 
 
 class _PolicyParameters(torch.nn.Module):
@@ -35,6 +36,34 @@ class _Value(torch.nn.Module):
 
 
 class TorchRLPPOAgent(PPOPolicy):
+    # GAE's value-network inputs, reward/boundaries, optional cached values and
+    # step discounts; active is used only after GAE. Reporting owns other keys.
+    _ROLLOUT_KEYS = (
+        "observation", "action", "raw_action", "raw_log_prob", ("agents", "active"),
+        ("next", "observation"), ("next", "reward"), ("next", "done"),
+        ("next", "terminated"), ("next", "truncated"), "state_value",
+        ("next", "state_value"), "steps_to_next_obs", "is_init", ("next", "is_init"),
+    )
+
+    def select_rollout(self, rollout, *, retain_episode=False):
+        """Select tensor references; the caller still owns the cloning boundary."""
+        keys = self._ROLLOUT_KEYS + (("environment_episode",) if retain_episode else ())
+        # Selecting an absent nested mask with strict=False would retain an
+        # empty collector TensorDict when only traj_ids was present.
+        keys += tuple(key for key in PPO_OPTIONAL_OPTIMIZATION_KEYS
+                      if rollout.get(key, None) is not None)
+        data = rollout.select(*keys, strict=False)
+        observation = rollout.get(("agents", "observation"), None)
+        if observation is not None:
+            data["observation"] = observation.squeeze(-2)
+            data["next", "observation"] = rollout["next", "agents", "observation"].squeeze(-2)
+            for name in ("reward", "done", "terminated", "truncated"):
+                value = rollout.get(("next", "agents", name), None)
+                if value is not None:
+                    # Physical race closure can follow the learner's retirement.
+                    data["next", name] = value.squeeze(-2)
+        return data
+
     def __init__(self, obs_dim, action_low, action_high, params):
         super().__init__(obs_dim, action_low, action_high, params, training=True)
         self.frames_per_batch = int(params.get("frames_per_batch", 256))
@@ -111,6 +140,8 @@ class TorchRLPPOAgent(PPOPolicy):
             return
         region = getattr(self, "profile_region", None)
         with region("rollout_preparation") if region else nullcontext():
+            with region("rollout_key_preparation") if region else nullcontext():
+                rollout = self.select_rollout(rollout)
             profile = getattr(self, "profile_call", None)
             payload = getattr(self, "profile_payload", None)
             if payload:
@@ -125,20 +156,15 @@ class TorchRLPPOAgent(PPOPolicy):
             else:
                 data = rollout.to(self.device).clone()
             environment_steps = data.numel()
-            with region("rollout_key_preparation") if region else nullcontext():
-                if ("agents", "observation") in data.keys(True):
-                    data["observation"] = data["agents", "observation"].squeeze(-2)
-                    data["next", "observation"] = data["next", "agents", "observation"].squeeze(-2)
-                    data["next", "reward"] = data["next", "agents", "reward"].squeeze(-2)
-                    # Physical race closure may occur after the PPO learner retires.
-                    data["next", "done"] = data["next", "agents", "done"].squeeze(-2)
-                    data["next", "terminated"] = data["next", "agents", "terminated"].squeeze(-2)
             with torch.no_grad():
                 self.gae(data)
             with region("post_gae_flatten_mask") if region else nullcontext():
-                data = data.reshape(-1)
-                if ("agents", "active") in data.keys(True):
-                    data = data[data["agents", "active"].reshape(-1)]
+                active = data.get(("agents", "active"), None)
+                keys = PPO_OPTIMIZATION_KEYS + tuple(key for key in PPO_OPTIONAL_OPTIMIZATION_KEYS
+                                                     if data.get(key, None) is not None)
+                data = data.select(*keys).reshape(-1)
+                if active is not None:
+                    data = data[active.reshape(-1)]
             self._pending_environment_steps += environment_steps
             if not data.batch_size.numel():
                 return

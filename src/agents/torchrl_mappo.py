@@ -11,7 +11,7 @@ from torchrl.objectives.value import MultiAgentGAE
 
 from agents.common.mappo_policy import MAPPOPolicy
 from agents.common.optimization import make_objective
-from agents.torchrl_updates import optimize_ppo
+from agents.torchrl_updates import MAPPO_OPTIMIZATION_KEYS, optimize_ppo
 
 
 class _PolicyParameters(torch.nn.Module):
@@ -37,6 +37,23 @@ class _CentralValue(torch.nn.Module):
 
 
 class TorchRLMAPPOAgent(MAPPOPolicy):
+    # Shared critic inputs at both endpoints and joint-team signals must survive
+    # for every agent slot, including retired agents, until MultiAgentGAE ends.
+    _ROLLOUT_KEYS = (
+        "state", ("agents", "observation"), ("agents", "index"), ("agents", "active"),
+        ("agents", "action"), ("agents", "raw_action"), ("agents", "raw_log_prob"),
+        ("next", "state"), ("next", "agents", "index"), ("next", "team_reward"),
+        ("next", "learning", "done"), ("next", "learning", "terminated"),
+        ("next", "learning", "truncated"), ("agents", "state_value"),
+        ("next", "agents", "state_value"), "steps_to_next_obs", "is_init", ("next", "is_init"),
+        "shifted_valid",
+    )
+
+    def select_rollout(self, rollout, *, retain_episode=False):
+        """Drop reporting/physical state without copying tensors or agent slots."""
+        keys = self._ROLLOUT_KEYS + (("environment_episode",) if retain_episode else ())
+        return rollout.select(*keys, strict=False)
+
     def __init__(self, obs_dim, global_state_dim, action_low, action_high, agent_ids, params):
         super().__init__(obs_dim, global_state_dim, action_low, action_high, agent_ids, params, training=True)
         self.frames_per_batch = int(params.get("frames_per_batch", 256))
@@ -108,6 +125,8 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
             if not rollout.batch_size.numel():
                 continue
             with region("rollout_preparation") if region else nullcontext():
+                with region("rollout_key_preparation") if region else nullcontext():
+                    rollout = self.select_rollout(rollout)
                 profile = getattr(self, "profile_call", None)
                 payload = getattr(self, "profile_payload", None)
                 if payload:
@@ -123,6 +142,8 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
                     fragment = rollout.to(self.device).clone()
                 with torch.no_grad():
                     self.gae(fragment)
+                with region("post_gae_flatten_mask") if region else nullcontext():
+                    fragment = fragment.select(*MAPPO_OPTIMIZATION_KEYS, ("agents", "active"))
             fragments.append(fragment)
         if not fragments:
             return {}
@@ -133,7 +154,7 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
         with region("mappo_active_state_preparation") if region else nullcontext():
             mask = data["agents", "active"].reshape(-1)
             states = data["state"].unsqueeze(-2).expand(-1, len(self.agent_ids), -1).reshape(-1, self.global_state_dim)
-            selected = data["agents"].reshape(-1)[mask]
+            selected = data["agents"].exclude("active").reshape(-1)[mask]
             # TensorDict.numel() clamps empty batches to one in TensorDict 0.14.
             n_samples = selected.batch_size.numel()
             if not n_samples:

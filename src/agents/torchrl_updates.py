@@ -10,6 +10,19 @@ from torchrl.objectives.utils import distance_loss
 from training.runtime import profiling_sample_indices
 
 
+# ClipPPOLoss/MAPPOLoss consume precomputed advantages and targets here: their
+# fallback value estimator (and its next-state in_keys) is never invoked.
+# Keep state_value for the critic contract, and bounded/latent actions for
+# entropy, likelihood/KL, and saturation diagnostics. loc/scale are recomputed.
+PPO_OPTIMIZATION_KEYS = ("observation", "action", "raw_action", "raw_log_prob",
+                         "advantage", "value_target", "state_value")
+# TorchRL's loss reduction also reads these when supplied by direct PPO callers.
+# The synchronous, unpadded collector does not normally produce either key.
+PPO_OPTIONAL_OPTIMIZATION_KEYS = (("collector", "mask"), "shifted_valid")
+MAPPO_OPTIMIZATION_KEYS = tuple(("agents", key) for key in PPO_OPTIMIZATION_KEYS) + (
+    ("agents", "index"), "state")
+
+
 def mean_update_metrics(rows, *, profile=None):
     """Transfer averaged optimizer metrics to the CPU once."""
     names = ("train/policy_loss", "train/value_loss", "train/entropy", "train/approx_kl")

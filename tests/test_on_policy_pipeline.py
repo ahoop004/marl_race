@@ -161,6 +161,7 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
     physical_batches = []
     collector_batches = []
     collector_storages = set()
+    reference_pending = {}
     receive = training._receive_process_batch
 
     def check_process_batch(data):
@@ -173,21 +174,35 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
         collector_storages.update(value.untyped_storage().data_ptr() for value in data.values(True, True)
                                   if isinstance(value, torch.Tensor))
         receive(data)
+        # Capture full streams before pruning. Their identities and values must
+        # reconstruct exactly the same races as the smaller retained payload.
+        for worker in range(workers):
+            for local in range(envs_per_worker):
+                stream = data[worker, local] if envs_per_worker > 1 else data[worker]
+                reference_pending.setdefault(worker * envs_per_worker + local, []).append(stream.clone())
 
     monkeypatch.setattr(training, "_receive_process_batch", check_process_batch)
 
     def check_then_update(data):
         fragments = data if isinstance(data, list) else [data]
-        for fragment in fragments:
+        references = training._process_rollouts(reference_pending) if process else fragments
+        reference_pending.clear()
+        assert len(references) == len(fragments)
+        for fragment, reference in zip(fragments, references):
             if process:
                 assert fragment.ndim == 1
-                assert fragment["environment_id"].unique().numel() == 1
+                assert reference["environment_id"].unique().numel() == 1
                 assert fragment["environment_episode"].unique().numel() == 1
-                assert fragment["collector", "traj_ids"].unique().numel() == 1
-                decisions = fragment["decision_steps"].squeeze(-1)
+                assert reference["collector", "traj_ids"].unique().numel() == 1
+                decisions = reference["decision_steps"].squeeze(-1)
                 assert (decisions[1:] == decisions[:-1] + 1).all()
-                assert not fragment[:-1]["next", "done"].any()
+                assert not reference[:-1]["next", "done"].any()
                 assert fragment["agents", "active"].any(dim=(-2, -1)).all()
+                expected = policy.select_rollout(reference, retain_episode=True)
+                assert set(fragment.keys(True, True)) == set(expected.keys(True, True))
+                for key in expected.keys(True, True):
+                    torch.testing.assert_close(fragment[key], expected[key], rtol=0, atol=0)
+                assert "physical" not in fragment and "collector" not in fragment
                 for key, value in fragment.items(True, True):
                     if isinstance(value, torch.Tensor):
                         assert value.untyped_storage().data_ptr() not in collector_storages, key
@@ -195,7 +210,6 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
                        if isinstance(value, torch.Tensor))
             current = fragment.to(policy.device).clone()
             if algorithm == "ppo":
-                current["observation"] = current["agents", "observation"].squeeze(-2)
                 raw_key, log_key = "raw_action", "raw_log_prob"
             else:
                 raw_key, log_key = ("agents", "raw_action"), ("agents", "raw_log_prob")
@@ -218,7 +232,7 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
         assert any(not torch.equal(initial[key], value) for key, value in policy.actor.state_dict().items())
         if process:
             assert training.collected_steps == sum(physical_batches) == 24
-            assert training._agent_steps == sum(int(f["next", "agent_steps"].sum()) for f in seen_batches)
+            assert training._agent_steps == sum(int(f["agents", "active"].sum()) for f in seen_batches)
             metrics = training.performance_metrics()
             assert metrics["perf/collection_backend"] == collection_backend
             if training.measure_stages:
@@ -334,6 +348,8 @@ def test_process_reporting_keeps_prefix_counters_and_policy_starts(envs_per_work
             for environment, stream in enumerate(streams)}
         batch = batch.exclude(("next", "race_events"))
     batch["worker_profile"] = NonTensorData(packet, batch_size=batch.batch_size)
+    # The root version belongs to the observation, not the collected action.
+    batch["policy_version"] = torch.full((*batch.batch_size, 1), -1)
     training._receive_process_batch(batch)
     assert seen == [
         ("on_step", ("first",), 11, 22, 32, 7, 11),
@@ -370,6 +386,11 @@ def test_process_reporting_keeps_prefix_counters_and_policy_starts(envs_per_work
         assert not training.workload_counts[phase] and not training.boundary_calls[phase]
     batch["next", "policy_version"].fill_(1)
     with pytest.raises(RuntimeError, match="stale policy"):
+        training._receive_process_batch(batch)
+    batch["next", "policy_version"].fill_(2)
+    batch["environment_id"].reshape(-1)[-1] = -1
+    training.hooks = training.reports.transition_hooks = []
+    with pytest.raises(RuntimeError, match="Unexpected environment ID"):
         training._receive_process_batch(batch)
 
 
@@ -479,17 +500,27 @@ def test_exact_decision_budgets_include_no_collector_padding(budget, frames_per_
     training, controller = trainer(hook, frames_per_batch=frames_per_batch)
     batches = []
     update = training.agent.update
+    select = training.agent.select_rollout
+    collected_rows = []
+
+    def check_collected(data, **kwargs):
+        if "collector" in data:
+            assert (data["collector", "traj_ids"] >= 0).all()
+            collected_rows.append(data.numel())
+        return select(data, **kwargs)
 
     def capture(data):
         batches.append(data.clone())
         return update(data)
 
     monkeypatch.setattr(training.agent, "update", capture)
+    monkeypatch.setattr(training.agent, "select_rollout", check_collected)
     training.train(total_steps=budget)
     assert training.collected_steps == controller.calls == len(hook.steps) == budget
     assert training._physics_steps == training._agent_steps == budget
     assert sum(batch.numel() for batch in batches) == budget
-    assert all((batch["collector", "traj_ids"] >= 0).all() for batch in batches)
+    assert sum(collected_rows) == budget
+    assert all("collector" not in batch for batch in batches)
     assert [row["train/rollout_steps"] for row in hook.updates] == (
         [4] * (budget // 4) + ([budget % 4] if budget % 4 else []))
     assert len(hook.episodes) == budget // 3
@@ -501,7 +532,7 @@ def test_exact_decision_budgets_include_no_collector_padding(budget, frames_per_
     assert hook.updates[-1]["train/optimizer_steps_total"] == sum(
         row["train/optimizer_steps"] for row in hook.updates)
     data = torch.cat(batches)
-    assert data["next", "agents", "observation"].flatten().tolist() == [i % 3 + 1 for i in range(budget)]
+    assert data["next", "observation"].flatten().tolist() == [i % 3 + 1 for i in range(budget)]
 
 
 @pytest.mark.parametrize("measure_services", [False, True])
@@ -624,6 +655,60 @@ def test_payload_footprint_deduplicates_aliases_without_tensor_movement(monkeypa
     assert tensor_payload(data, source_device="cuda") == (0, 0)
 
 
+@pytest.mark.parametrize("algorithm,validity_mask", [("ppo", False), ("ppo", True), ("mappo", False)])
+def test_rollout_selection_shares_tensors_and_limits_replay_payload(algorithm, validity_mask, monkeypatch):
+    from agents.torchrl_updates import PPO_OPTIMIZATION_KEYS, MAPPO_OPTIMIZATION_KEYS
+    from training.runtime import tensor_payload
+
+    policy = agent() if algorithm == "ppo" else learner()
+    if algorithm == "ppo":
+        data = rollout(policy.policy, [1, 2])
+        data["agents"] = TensorDict({"observation": data["observation"].unsqueeze(-2),
+                                     "active": torch.ones(2, 1, 1, dtype=torch.bool)}, [2, 1])
+        data["next", "agents"] = TensorDict({name: data["next", name].unsqueeze(-2)
+            for name in ("observation", "reward", "done", "terminated")}, [2, 1])
+    else:
+        data = torch.stack([transition(policy, IDS, 0, 1, False),
+                            transition(policy, ["car_1"], 1, 2, True)])
+    data["environment_episode"] = torch.zeros(2, 1, dtype=torch.int64)
+    data["physical"] = TensorDict({"unused": torch.zeros(2, 100)}, [2])
+    data["collector", "traj_ids"] = torch.zeros(2, dtype=torch.int64)
+    if validity_mask:
+        data["collector", "mask"] = torch.tensor([[True], [False]])
+    original_keys = set(data.keys(True, True))
+    retained = policy.select_rollout(data, retain_episode=True)
+    assert set(data.keys(True, True)) == original_keys
+    assert "environment_episode" in retained and "physical" not in retained
+    assert ("collector" in retained) == validity_mask
+    assert tensor_payload(retained)[1] < tensor_payload(data)[1]
+    for key in retained.keys(True, True):
+        assert retained[key].untyped_storage().data_ptr() == data[key].untyped_storage().data_ptr()
+    owned = retained.clone()
+    observation_key = "observation" if algorithm == "ppo" else ("agents", "observation")
+    expected = owned[observation_key].clone()
+    data[observation_key].fill_(-100)
+    torch.testing.assert_close(owned[observation_key], expected, rtol=0, atol=0)
+
+    extend = TensorDictReplayBuffer.extend
+    replay_keys = []
+    def check_payload(replay, samples, *args, **kwargs):
+        replay_keys.append(set(samples.keys(True, True)))
+        return extend(replay, samples, *args, **kwargs)
+    monkeypatch.setattr(TensorDictReplayBuffer, "extend", check_payload)
+    seen_gae = []
+    handle = policy.gae.register_forward_pre_hook(lambda module, args: seen_gae.append(
+        set(args[0].keys(True, True))))
+    try:
+        policy.update_rollouts([owned])
+    finally:
+        handle.remove()
+    assert seen_gae and all("environment_episode" not in keys for keys in seen_gae)
+    expected_keys = set(PPO_OPTIMIZATION_KEYS if algorithm == "ppo" else MAPPO_OPTIMIZATION_KEYS)
+    if validity_mask:
+        expected_keys.add(("collector", "mask"))
+    assert replay_keys == [expected_keys]
+
+
 def test_parent_attribution_with_reused_collector_batch(monkeypatch):
     """Exercise the parent handoff without processes or a physics benchmark."""
     training, _ = trainer(Capture(False), n_steps=16, n_epochs=1, batch_size=4, frames_per_batch=8)
@@ -715,9 +800,10 @@ def test_learner_attribution_preserves_gae_gradients_optimizer_and_rng(algorithm
         with ExitStack() as resources:
             for parameter in policy._optim_parameters:
                 resources.callback(parameter.register_hook(lambda g: gradients.append(g.detach().clone())).remove)
-            value_key = ("agents", "value_target") if algorithm == "mappo" else "value_target"
+            value_keys = ([("agents", name) for name in ("advantage", "value_target")]
+                          if algorithm == "mappo" else ["advantage", "value_target"])
             resources.callback(policy.gae.register_forward_hook(
-                lambda m, a, out: gae.append(out[value_key].detach().clone())).remove)
+                lambda m, a, out: gae.append(tuple(out[key].detach().clone() for key in value_keys))).remove)
             resources.callback(policy.loss_module.register_forward_hook(
                 lambda m, a, out: losses.append(out["loss_objective"].detach().clone())).remove)
             if policy is measured:

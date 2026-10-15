@@ -151,8 +151,8 @@ def test_native_trainer_exact_budget_resets_and_hook_boundaries(transitions, mon
     assert [update["train/environment_steps"] for update in hook.updates] == [4, 7]
     assert hook.ended
     data = torch.cat(fragments)
-    assert data["agents", "observation"].flatten().tolist() == [0, 1, 2, 0, 1, 2, 0]
-    assert data["next", "agents", "observation"].flatten().tolist() == [1, 2, 3, 1, 2, 3, 1]
+    assert data["observation"].flatten().tolist() == [0, 1, 2, 0, 1, 2, 0]
+    assert data["next", "observation"].flatten().tolist() == [1, 2, 3, 1, 2, 3, 1]
     assert data["next", "done"].flatten().tolist() == [False, False, True, False, False, True, False]
     assert not data["next", "terminated"].any()
     if transitions:
