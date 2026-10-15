@@ -224,13 +224,16 @@ def initialize_from_checkpoint(policy, path, *, scope, observation_extension=Non
     policy.source_checkpoint = {**checkpoint["_identity"], "algorithm": "ppo", "scope": scope}
 
 
-def capture_rng():
+def capture_rng(cuda_device=None):
     numpy = np.random.get_state()
     return {"python": random.getstate(), "numpy": {"generator": numpy[0],
             "keys": torch.tensor(numpy[1].astype(np.int64)), "position": numpy[2],
             "has_gauss": numpy[3], "cached_gaussian": numpy[4]},
             "torch": torch.random.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else []}
+            "cuda": torch.cuda.get_rng_state_all() if cuda_device is None and torch.cuda.is_initialized() else [],
+            **({"cuda_local": {"device": torch.device(cuda_device).index,
+                               "state": torch.cuda.get_rng_state(cuda_device)}}
+               if cuda_device is not None and torch.device(cuda_device).type == "cuda" else {})}
 
 
 def restore_rng(state):
@@ -239,6 +242,11 @@ def restore_rng(state):
     np.random.set_state((numpy["generator"], numpy["keys"].numpy().astype(np.uint32),
                          numpy["position"], numpy["has_gauss"], numpy["cached_gaussian"]))
     torch.random.set_rng_state(state["torch"].cpu())
+    if "cuda_local" in state:
+        local = state["cuda_local"]
+        if not torch.cuda.is_available() or torch.cuda.current_device() != local["device"]:
+            raise ValueError("Resume requires the checkpoint rank's local CUDA device")
+        torch.cuda.set_rng_state(local["state"], local["device"])
     if state["cuda"]:
         if not torch.cuda.is_available() or len(state["cuda"]) != torch.cuda.device_count():
             raise ValueError("Resume requires the checkpoint's CUDA RNG device topology")

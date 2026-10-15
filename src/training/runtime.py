@@ -57,15 +57,17 @@ def seed_process(seed):
 def preserve_random_state():
     numpy_state, python_state = np.random.get_state(), random.getstate()
     torch_state = torch.random.get_rng_state()
-    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None
+    cuda_devices = ([torch.cuda.current_device()] if torch.distributed.is_initialized()
+                    else range(torch.cuda.device_count())) if torch.cuda.is_initialized() else ()
+    cuda_states = [(device, torch.cuda.get_rng_state(device)) for device in cuda_devices]
     try:
         yield
     finally:
         np.random.set_state(numpy_state)
         random.setstate(python_state)
         torch.random.set_rng_state(torch_state)
-        if cuda_states is not None:
-            torch.cuda.set_rng_state_all(cuda_states)
+        for device, state in cuda_states:
+            torch.cuda.set_rng_state(state, device)
 
 
 @contextmanager

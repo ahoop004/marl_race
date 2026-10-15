@@ -131,6 +131,11 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
                 with region("post_gae_flatten_mask") if region else nullcontext():
                     fragments.append(data.select(*MAPPO_OPTIMIZATION_KEYS, ("agents", "active")).reshape(-1))
         if not fragments:
+            if getattr(self, "distributed", None):
+                metrics = optimize_ppo(self, None, group="agents")
+                if metrics:
+                    metrics.update({"train/rollout_steps": 0, "train/rollout_agent_samples": 0})
+                return metrics
             return {}
         with region("pending_rollout_concatenation") if region else nullcontext():
             data = torch.cat(fragments, dim=0)
@@ -149,12 +154,14 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
                 rows = positions.div(len(self.agent_ids), rounding_mode="floor")
                 states = data["state"].index_select(0, rows)
             n_samples = selected.batch_size.numel()
-            if not n_samples:
+            if not n_samples and not getattr(self, "distributed", None):
                 return {}
             samples = TensorDict({"agents": selected.unsqueeze(-1), "state": states}, [n_samples])
         profile = getattr(self, "profile_call", None)
         metrics = (profile("optimization", optimize_ppo, self, samples, group="agents", device=self.device)
                    if profile else optimize_ppo(self, samples, group="agents"))
+        if not metrics and getattr(self, "distributed", None):
+            return {}
         metrics["train/rollout_steps"] = data.numel()
         metrics["train/rollout_agent_samples"] = n_samples
         return metrics

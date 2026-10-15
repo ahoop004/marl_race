@@ -129,7 +129,7 @@ class TorchRLPPOAgent(PPOPolicy):
     def update_rollouts(self, rollouts):
         # GAE must see each race's time axis independently, before flattening.
         self._append_rollouts(rollouts)
-        if self._pending_steps < self.min_rollout_steps:
+        if self._pending_steps < self.min_rollout_steps and not getattr(self, "distributed", None):
             return {}
         return self.flush_pending_update()
 
@@ -160,18 +160,21 @@ class TorchRLPPOAgent(PPOPolicy):
                 self._pending_steps += data.batch_size.numel()
 
     def flush_pending_update(self):
-        if not self._pending_batches:
+        if not self._pending_batches and not getattr(self, "distributed", None):
             self._pending_environment_steps = 0
             return {}
         region = getattr(self, "profile_region", None)
         with region("pending_rollout_concatenation") if region else nullcontext():
-            data = torch.cat(self._pending_batches, dim=0)
+            data = torch.cat(self._pending_batches, dim=0) if self._pending_batches else None
         self._pending_batches.clear()
         self._pending_steps = 0
         profile = getattr(self, "profile_call", None)
         metrics = (profile("optimization", optimize_ppo, self, data, device=self.device)
                    if profile else optimize_ppo(self, data))
-        metrics["train/rollout_agent_samples"] = data.numel()
+        if not metrics and getattr(self, "distributed", None):
+            self._pending_environment_steps = 0
+            return {}
+        metrics["train/rollout_agent_samples"] = data.numel() if data is not None else 0
         metrics["train/rollout_steps"] = self._pending_environment_steps
         self._pending_environment_steps = 0
         return metrics

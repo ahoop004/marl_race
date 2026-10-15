@@ -39,6 +39,8 @@ def validate_training_scenario(scenario):
     environment = scenario["environment"]
     agents = scenario["agents"]
     backend = experiment.get("collection_backend", "process")
+    if type(experiment.get("distributed", False)) is not bool:
+        raise ScenarioError("experiment.distributed must be boolean")
     if not isinstance(backend, str) or backend not in {"process", "centralized"}:
         raise ScenarioError("experiment.collection_backend must be process or centralized")
     for name in ("parallel_envs", "envs_per_worker"):

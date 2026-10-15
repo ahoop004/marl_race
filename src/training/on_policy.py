@@ -53,8 +53,14 @@ class OnPolicyTrainer:
                  measure_stages=False, measure_mpc=False, measure_hybrid=False,
                  profiling_warmup_updates=1, measure_cuda_sync=False, profiling_detail_samples=0,
                  parallel_envs=1, envs_per_worker=1, scenario=None, scenario_dir=None, collection_device=None,
-                 collection_backend="process"):
+                 collection_backend="process", distributed=None):
         self.task, self.agent = task, agent
+        self.distributed = distributed
+        self._global_progress = None
+        self._global_pending_steps = 0
+        self._distributed_stop = False
+        self._distributed_checkpoint = None
+        self.rank_metrics = {}
         if type(parallel_envs) is not int or parallel_envs < 1:
             raise ValueError("parallel_envs must be a positive integer")
         if type(envs_per_worker) is not int or envs_per_worker < 1:
@@ -65,7 +71,12 @@ class OnPolicyTrainer:
             raise ValueError("collection_backend must be process or centralized")
         self.collection_backend = collection_backend
         self.centralized_collection = collection_backend == "centralized"
-        self.process_collection = self.total_envs > 1 or self.centralized_collection
+        self.process_collection = self.total_envs > 1 or self.centralized_collection or distributed is not None
+        self.worker_offset = distributed.rank * parallel_envs if distributed else 0
+        self.environment_offset = self.worker_offset * envs_per_worker
+        self.global_frames_per_batch = getattr(agent, "frames_per_batch", 1)
+        if distributed:
+            agent.frames_per_batch = math.ceil(agent.frames_per_batch / distributed.world_size)
         if self.process_collection:
             if scenario is None:
                 raise ValueError("Process collection requires the task's scenario configuration")
@@ -82,7 +93,8 @@ class OnPolicyTrainer:
         self._process_placement.pop("cpu_topology")
         self._collection_batches = self._last_collection_batch_frames = 0
         self.collection_device = resolve_collection_device(
-            collection_device, agent.device, parallel_envs, envs_per_worker, collection_backend)
+            collection_device, agent.device, parallel_envs, envs_per_worker, collection_backend,
+            distributed=distributed is not None)
         self.scenario_dir = str(scenario_dir) if scenario_dir is not None else None
         self._worker_policy_starts = {}
         self.algorithm = algorithm or ("mappo" if hasattr(agent, "global_state_dim") else "ppo")
@@ -540,7 +552,49 @@ class OnPolicyTrainer:
         return result
 
     def _rate_counters(self):
+        if self.distributed:
+            progress = self.checkpoint_progress()
+            return tuple(progress[name] for name in ("environment_steps", "physics_steps", "agent_steps", "optimizer_steps"))
         return (self._environment_steps, self._physics_steps, self._agent_steps, self._optimizer_steps)
+
+    def _synchronize_progress(self):
+        if self.distributed is None:
+            return
+        names = ("environment_steps", "physics_steps", "agent_steps", "completed_episodes")
+        values = self.distributed.sum([self._environment_steps, self._physics_steps, self._agent_steps,
+                                       self.reports.completed, self._pending_learning_steps]).tolist()
+        self._global_pending_steps = values.pop()
+        self._global_progress = dict(zip(names, values))
+        self._global_progress["next_episode"] = int(self.distributed.maximum(self.reports.next_episode))
+        self._distributed_stop = bool(self.distributed.maximum(int(self._should_stop())))
+
+    def _dispatch_episodes(self, metrics):
+        if self.distributed is None:
+            return self.reports.dispatch(metrics)
+        packets = self.distributed.gather(self.reports.pending_episodes)
+        self.reports.pending_episodes.clear()
+        if not self.distributed.primary:
+            return
+        episodes = [episode for packet in packets for episode in packet]
+        first = self.checkpoint_progress()["completed_episodes"] - len(episodes)
+        for index, (episode, reward, info, facts) in enumerate(episodes):
+            values = {**metrics, **facts, **self.counter_metrics(), "episode/completion_index": first + index}
+            race = values.get("race_record")
+            if race is not None:
+                race.update(completion_index=first + index, reported_at_environment_steps=self.collected_steps,
+                            environment_decisions_total=self.collected_steps)
+            for hook in self.hooks:
+                self.call_hook(hook, "on_episode_end", episode, reward, info, values)
+
+    def _cache_distributed_checkpoint(self):
+        if self.distributed is None:
+            return
+        from agents.common.checkpoints import capture_rng
+        local = {"progress": self._local_progress(), "rng": capture_rng(self.distributed.device),
+                 "recovery_seed": getattr(self.task.env, "seed", None) or 0}
+        self._distributed_checkpoint = {
+            "world_size": self.distributed.world_size, "workers_per_rank": self.parallel_envs,
+            "envs_per_worker": self.envs_per_worker, "ranks": self.distributed.gather(local)}
 
     def _finish_process_phase(self):
         if self._process_phase_started is not None:
@@ -738,6 +792,11 @@ class OnPolicyTrainer:
             result["perf/process/peak_rss_bytes"] = self._peak_rss_bytes
         result.update({f"perf/process/{name}": value for name, value in self._process_placement.items()})
         result["perf/collection_batches"] = self._collection_batches
+        if self.distributed:
+            result.update({"perf/distributed/world_size": self.distributed.world_size,
+                           "perf/distributed/rank": self.distributed.rank,
+                           "perf/distributed/global_workers": self.parallel_envs * self.distributed.world_size,
+                           "perf/distributed/global_environment_slots": self.total_envs * self.distributed.world_size})
         result["perf/last_collection_batch_frames"] = self._last_collection_batch_frames
         if self._steady_started is not None:
             duration = max((self._steady_finished or now) - self._steady_started, 1e-9)
@@ -769,6 +828,7 @@ class OnPolicyTrainer:
             result["perf/warmup_seconds"] = sum(self.stage_seconds["warmup"].values())
         result.update(self.mpc_metrics())
         result.update(self.hybrid_metrics())
+        result.update(self.rank_metrics)
         return result
 
     def call_hook(self, hook, method, *args):
@@ -780,23 +840,25 @@ class OnPolicyTrainer:
         return ({f"perf/{name}_seconds": seconds for name, seconds in self.service_seconds.items()}
                 if self.measure_services else {})
 
-    def checkpoint_progress(self):
+    def _local_progress(self):
         return {"environment_steps": self._environment_steps, "agent_steps": self._agent_steps,
                 "physics_steps": self._physics_steps, "completed_episodes": self.reports.completed,
                 "updates": self._updates, "optimizer_steps": self._optimizer_steps,
                 "next_episode": self.reports.next_episode}
 
+    def checkpoint_progress(self):
+        return {**self._local_progress(), **(self._global_progress or {}),
+                "updates": self._updates, "optimizer_steps": self._optimizer_steps}
+
     def counter_metrics(self):
-        metrics = {"train/environment_steps": self._environment_steps,
-                "train/physics_steps": self._physics_steps,
-                "train/agent_steps": self._agent_steps,
-                "train/completed_episodes": self.reports.completed,
-                "train/updates": self._updates,
-                "train/optimizer_steps_total": self._optimizer_steps}
+        progress = self.checkpoint_progress()
+        metrics = {"train/" + key: progress[key] for key in (
+            "environment_steps", "physics_steps", "agent_steps", "completed_episodes", "updates")}
+        metrics["train/optimizer_steps_total"] = self._optimizer_steps
         if self.process_collection:
             metrics.update({
-                "train/budget_step_overshoot": max(0, self._environment_steps - self.total_steps) if self.total_steps is not None else 0,
-                "train/budget_episode_overshoot": max(0, self.reports.completed - self.n_episodes) if self.total_steps is None and self.n_episodes is not None else 0,
+                "train/budget_step_overshoot": max(0, progress["environment_steps"] - self.total_steps) if self.total_steps is not None else 0,
+                "train/budget_episode_overshoot": max(0, progress["completed_episodes"] - self.n_episodes) if self.total_steps is None and self.n_episodes is not None else 0,
             })
         return metrics
 
@@ -810,19 +872,36 @@ class OnPolicyTrainer:
         from agents.common.checkpoints import RESUME_BOUNDARY, capture_rng, optimization_contract
         if not self.checkpoint_ready or getattr(self.agent, "_pending_batches", []):
             raise ValueError("Resumable checkpoints require a completed update with no pending trajectories")
-        completed, total = ((self._environment_steps, self.total_steps) if self.total_steps is not None
-                            else (self.reports.completed, self.n_episodes))
+        if self.distributed and self._distributed_checkpoint is None:
+            raise ValueError("Distributed checkpoints require a synchronized checkpoint boundary")
+        progress = self.checkpoint_progress()
+        completed, total = ((progress["environment_steps"], self.total_steps) if self.total_steps is not None
+                            else (progress["completed_episodes"], self.n_episodes))
         return {"boundary": RESUME_BOUNDARY, "optimizer": self.agent.optimizer.state_dict(),
                 "scheduler": self.agent.scheduler.state_dict() if self.agent.scheduler is not None else None,
                 "optimization_contract": optimization_contract(self.agent),
                 "schedule_progress": completed / max(total, 1), "progress": self.checkpoint_progress(),
                 "budget": {"total_steps": self.total_steps, "n_episodes": self.n_episodes},
-                "rng": capture_rng(), "recovery_seed": getattr(self.task.env, "seed", None) or 0,
+                "rng": capture_rng(self.distributed.device if self.distributed else None),
+                "recovery_seed": getattr(self.task.env, "seed", None) or 0,
                 "hooks": {type(hook).__name__: hook.state_dict() for hook in self.hooks
                           if hasattr(hook, "state_dict")},
-                "recovery": {"discard_partial_episode": True, "environment_schedules": "restart_at_seed"}}
+                "recovery": {"discard_partial_episode": True, "environment_schedules": "restart_at_seed"},
+                **({"distributed": self._distributed_checkpoint} if self.distributed else {})}
 
     def restore_training_state(self, state):
+        distributed_state = state.get("distributed")
+        if bool(distributed_state) != bool(self.distributed):
+            raise ValueError("Training recovery must retain distributed execution mode; use transfer to change mode")
+        if self.distributed:
+            expected = (self.distributed.world_size, self.parallel_envs, self.envs_per_worker)
+            actual = tuple(distributed_state[key] for key in ("world_size", "workers_per_rank", "envs_per_worker"))
+            if expected != actual:
+                raise ValueError("Distributed recovery requires the same world size and collector layout")
+            self._global_progress = dict(state["progress"])
+            local = distributed_state["ranks"][self.distributed.rank]
+            state = {**state, **local}
+            state["progress"] = {**local["progress"], "next_episode": self._global_progress["next_episode"]}
         self._resume_state = state
         progress = state["progress"]
         self._environment_steps, self._agent_steps, self._physics_steps = (
@@ -834,32 +913,33 @@ class OnPolicyTrainer:
             if hasattr(hook, "load_state_dict"):
                 if type(hook).__name__ not in state["hooks"]:
                     raise ValueError(f"Resume checkpoint missing state for {type(hook).__name__}")
-                hook._environment_steps, hook._policy_version = self._environment_steps, self._updates
+                hook._environment_steps, hook._policy_version = self.checkpoint_progress()["environment_steps"], self._updates
                 hook.load_state_dict(state["hooks"][type(hook).__name__])
 
     @property
     def collected_steps(self):
-        return self._environment_steps
+        return self.checkpoint_progress()["environment_steps"]
 
     def _should_stop(self):
-        return bool(getattr(self.agent, "should_stop", False)) or any(
+        return self._distributed_stop or bool(getattr(self.agent, "should_stop", False)) or any(
             getattr(hook, "should_stop", False) for hook in self.hooks)
 
     def budget_reached(self):
         if self.total_steps is not None:
-            return self._environment_steps >= self.total_steps
-        return self.n_episodes is not None and self.reports.completed >= self.n_episodes
+            return self.checkpoint_progress()["environment_steps"] >= self.total_steps
+        return self.n_episodes is not None and self.checkpoint_progress()["completed_episodes"] >= self.n_episodes
 
     def _diagnostic_stop_reached(self):
         # This limit is execution-only: it never shortens collection rollouts,
         # the LR horizon or the immutable budget stored for recovery.
-        return self.stop_after_steps is not None and self._environment_steps >= self.stop_after_steps
+        return self.stop_after_steps is not None and self.collected_steps >= self.stop_after_steps
 
     def _set_progress(self):
         setter = getattr(self.agent, "set_training_progress", None)
         if setter:
-            completed, total = ((self._environment_steps, self.total_steps) if self.total_steps is not None
-                                else (self.reports.completed, self.n_episodes))
+            progress = self.checkpoint_progress()
+            completed, total = ((progress["environment_steps"], self.total_steps) if self.total_steps is not None
+                                else (progress["completed_episodes"], self.n_episodes))
             setter(completed / max(total, 1))
 
     def _process_factories(self):
@@ -872,8 +952,9 @@ class OnPolicyTrainer:
             ("reward_mode", "individual"), ("team_reward_reduction", "mean"),
             ("team_return_mode", None), ("critic_mode", None))}
         return [RaceEnvFactory(
-            self.scenario, self.scenario_dir, self.algorithm, self.run_id, worker,
-            self.parallel_envs, self.reports.next_episode, (seed + worker * self.envs_per_worker) % 2**32,
+            self.scenario, self.scenario_dir, self.algorithm, self.run_id, worker + self.worker_offset,
+            self.parallel_envs * (self.distributed.world_size if self.distributed else 1),
+            self.reports.next_episode, (seed + (worker + self.worker_offset) * self.envs_per_worker) % 2**32,
             options, bool(self.reports.transition_hooks), self.focal_id,
             dict(measure_stages=self.measure_stages, measure_mpc=self.measure_mpc,
                  measure_hybrid=self.measure_hybrid, measure_cuda_sync=self.measure_cuda_sync),
@@ -919,8 +1000,8 @@ class OnPolicyTrainer:
         # remaining per-slot validation and selected-counter preparation.
         with self.measure_boundary("batch_reporting_numerics"):
             environments = batch["environment_id"].reshape(self.total_envs, steps)
-            valid_environments = (environments == torch.arange(
-                self.total_envs, device=environments.device).unsqueeze(-1)).all(dim=1).tolist()
+            valid_environments = (environments == (torch.arange(
+                self.total_envs, device=environments.device) + self.environment_offset).unsqueeze(-1)).all(dim=1).tolist()
             episodes = batch["environment_episode"].reshape(self.total_envs, steps)
             starts = [[] for _ in range(self.total_envs)]
             for environment, index in (episodes[:, 1:] != episodes[:, :-1]).nonzero().tolist():
@@ -950,7 +1031,7 @@ class OnPolicyTrainer:
                     raise RuntimeError(f"Unexpected environment ID in worker {worker}, slot {local}")
             with detail("sampled_event_reconstruction") if detail else nullcontext():
                 if "race_events" in packet:
-                    events = dict(packet["race_events"].get(environment, ()))
+                    events = dict(packet["race_events"].get(environment + self.environment_offset, ()))
                 else:
                     location = (worker, local) if self.envs_per_worker > 1 else worker
                     events = {index: value for index, value in enumerate(legacy_events[location].tolist())
@@ -991,7 +1072,7 @@ class OnPolicyTrainer:
                                         reported_at_environment_steps=self._environment_steps,
                                         policy_version_start=self._worker_policy_starts.pop(key),
                                         policy_version_end=self._updates,
-                                        worker_id=worker)
+                                        worker_id=worker + self.worker_offset)
                             metrics.update(self.counter_metrics())
                             self.reports.pending_episodes.append((episode, reward, info, metrics))
                         else:
@@ -1065,6 +1146,7 @@ class OnPolicyTrainer:
         self.cuda_upload_calls = 0
         self._rate_baseline = self._rate_counters()
         self._initial_updates = self._updates
+        self._synchronize_progress()
         self.process_cpu_seconds = dict.fromkeys(self.stage_seconds, 0.0)
         self._set_timing_phase("initialization")
         self.mpc_totals = {}
@@ -1104,38 +1186,51 @@ class OnPolicyTrainer:
         collector = None
         central_env = None
         central_threads = None
-        update_environment_steps = self._environment_steps
-        update_physics_steps = self._physics_steps
-        update_agent_steps = self._agent_steps
+        update_environment_steps, update_physics_steps, update_agent_steps = self._rate_counters()[:3]
         self._set_progress()
 
         def report_update(updated, update_started):
             nonlocal collection_started, update_environment_steps, update_physics_steps, update_agent_steps
             nonlocal collection_service_seconds
             if updated:
+                if self.distributed:
+                    names = ("train/rollout_steps", "train/rollout_agent_samples")
+                    totals = self.distributed.sum([updated[name] for name in names]).tolist()
+                    updated.update(zip(names, totals))
                 self._updates += 1
                 self._optimizer_steps += int(updated["train/optimizer_steps"])
+                decisions, physics, samples = self._rate_counters()[:3]
                 updated.update({
                     **self.counter_metrics(),
                     **self.service_metrics(),
                     **self.performance_metrics(),
-                    "train/update_environment_steps": self._environment_steps - update_environment_steps,
-                    "train/update_physics_steps": self._physics_steps - update_physics_steps,
-                    "train/update_agent_samples": self._agent_steps - update_agent_steps,
+                    "train/update_environment_steps": decisions - update_environment_steps,
+                    "train/update_physics_steps": physics - update_physics_steps,
+                    "train/update_agent_samples": samples - update_agent_steps,
                     "perf/update_seconds": time.perf_counter() - update_started,
                     "perf/collection_seconds": max(0.0, update_started - collection_started - (
                         sum(self.service_seconds.values()) - collection_service_seconds)),
                 })
                 if process:
+                    frames = (int(self.distributed.sum(self._last_collection_batch_frames))
+                              if self.distributed else self._last_collection_batch_frames)
+                    requested = self.global_frames_per_batch
                     updated.update({
                         "train/update_sample_overshoot": max(0, updated["train/rollout_agent_samples"] - self.agent.n_steps),
-                        "train/collection_batch_requested_frames": self.agent.frames_per_batch,
-                        "train/collection_batch_frames": self._last_collection_batch_frames,
-                        "train/collection_batch_rounding": max(0, self._last_collection_batch_frames - self.agent.frames_per_batch),
+                        "train/collection_batch_requested_frames": requested,
+                        "train/collection_batch_frames": frames,
+                        "train/collection_batch_rounding": max(0, frames - requested),
                     })
-                update_environment_steps = self._environment_steps
-                update_physics_steps = self._physics_steps
-                update_agent_steps = self._agent_steps
+                update_environment_steps, update_physics_steps, update_agent_steps = decisions, physics, samples
+                if self.distributed:
+                    diagnostics = self.distributed.gather({
+                        **{key: value for key, value in self.performance_metrics().items()
+                           if not key.startswith("perf/ranks/")},
+                        "perf/local_environment_steps": self._environment_steps,
+                        "perf/local_agent_steps": self._agent_steps})
+                    self.rank_metrics = {f"perf/ranks/{rank}/{name.removeprefix('perf/')}": value
+                                         for rank, record in enumerate(diagnostics) for name, value in record.items()}
+                    updated.update(self.rank_metrics)
                 for hook in self.hooks:
                     self.call_hook(hook, "on_update", updated)
                 collection_started = time.perf_counter()
@@ -1144,8 +1239,11 @@ class OnPolicyTrainer:
 
         def checkpoint_boundary():
             self.checkpoint_ready = True
+            self._cache_distributed_checkpoint()
             for hook in self.hooks:
                 self.call_hook(hook, "on_checkpoint_boundary")
+            if self.distributed:
+                self.distributed.broadcast(True)  # Rank-zero checkpoint writes have finished.
 
         def optimize(data):
             self._set_progress()
@@ -1361,8 +1459,10 @@ class OnPolicyTrainer:
                                 self.record_payload("retained", data)
                                 self.record_workload("fragment_count")
                     self._record_boundary("aggregation", aggregation_started)
-                    ready = self._pending_learning_steps >= self.agent.n_steps or self.budget_reached()
-                    if ready and pending:
+                    self._synchronize_progress()
+                    ready = ((self._global_pending_steps if self.distributed else self._pending_learning_steps)
+                             >= self.agent.n_steps or self.budget_reached())
+                    if ready and (pending or self.distributed):
                         prepare_started = time.perf_counter()
                         with self.measure_boundary("trajectory_reconstruction"):
                             rollouts = (self._process_rollouts(pending, profile=self if self.measure_stages else None)
@@ -1375,13 +1475,14 @@ class OnPolicyTrainer:
                         pending, self._pending_learning_steps = ({} if process else []), 0
                         updated = bool(metrics)
                     with self.measure_boundary("episode_dispatch_nonservice", exclude_services=True):
-                        self.reports.dispatch(metrics)
+                        self._dispatch_episodes(metrics)
                     if updated:
                         checkpoint_boundary()
                         if (self._timing_phase == "warmup"
                                 and self._updates - self._initial_updates >= self.profiling_warmup_updates):
                             self._set_timing_phase("steady")
                             self._steady_started, self._steady_baseline = time.perf_counter(), self._rate_counters()
+                    self._synchronize_progress()
                     if (self.budget_reached() or self._should_stop()
                             or (updated and self._diagnostic_stop_reached())):
                         break
@@ -1401,6 +1502,8 @@ class OnPolicyTrainer:
             self._steady_finished = time.perf_counter()
             for hook in self.hooks:
                 self.call_hook(hook, "on_training_end")
+            if self.distributed:
+                self.distributed.broadcast(True)
         finally:
             stage_resources.close()
             shutdown_started = time.perf_counter()

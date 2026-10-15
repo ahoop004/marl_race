@@ -21,12 +21,17 @@ from training.hooks import (CSVHook, CheckpointHook, ConsoleHook,
 
 
 def run_training(scenario, args, console, scenario_dir, roles):
-    with ExitStack() as resources:
-        _run_training(scenario, args, console, scenario_dir, roles, resources)
+    from training.distributed import distributed_execution
+    with distributed_execution(
+            scenario["experiment"].get("distributed", False),
+            timeout_seconds=scenario["experiment"].get("distributed_timeout_seconds", 1800)) as distributed:
+        with ExitStack() as resources:
+            _run_training(scenario, args, console, scenario_dir, roles, resources, distributed)
 
 
-def _run_training(scenario, args, console, scenario_dir, roles, resources):
+def _run_training(scenario, args, console, scenario_dir, roles, resources, distributed=None):
     initialization_started = time.perf_counter()
+    primary = distributed is None or distributed.primary
     agent_configs = scenario["agents"]
     exp_cfg = scenario["experiment"]
     env_cfg = scenario["environment"]
@@ -36,6 +41,15 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     resume_payload = read_checkpoint(resume_path) if resume_path else None
     if resume_payload:
         validate_resume_experiment(resume_payload["metadata"], scenario)
+        saved = (resume_payload.get("training") or {}).get("distributed")
+        if bool(saved) != bool(distributed):
+            raise ValueError("Recovery must retain distributed execution mode; use transfer to change mode")
+        if distributed:
+            workers = distributed.layout(exp_cfg.get("parallel_envs", 1), exp_cfg.get("envs_per_worker", 1),
+                                         exp_cfg.get("torch_threads", 1))
+            if (saved["world_size"], saved["workers_per_rank"], saved["envs_per_worker"]) != (
+                    distributed.world_size, workers, exp_cfg.get("envs_per_worker", 1)):
+                raise ValueError("Distributed recovery requires the same world size and collector layout")
     initial_checkpoint = None
     if args.checkpoint and not resume_path:
         if len(trainable_ids) != 1 or str(
@@ -52,6 +66,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         algorithm=algorithm,
         seed=exp_cfg.get("seed"),
     )
+    if distributed:
+        run_id = distributed.broadcast(run_id)
     output_dir = args.output_dir or (str(resume_path.parent) if resume_path else None) or os.path.join(
         scenario.get("paths", {}).get("output_root", "outputs"), exp_cfg.get("name", "unnamed"), run_id
     )
@@ -59,7 +75,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
 
     # Loggers
     wandb_cfg = scenario.get("wandb", {})
-    wandb_enabled = wandb_cfg.get("enabled", False)
+    wandb_enabled = wandb_cfg.get("enabled", False) and primary
     wandb_logger: Optional[WandbLogger] = None
     if wandb_enabled:
         wandb_logger = WandbLogger(
@@ -86,6 +102,10 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     resources.callback(task.close)
     spec = task.spec
     params = learner_params(scenario, spec, algorithm)
+    if distributed:
+        if render:
+            raise ValueError("Distributed training requires headless CPU environments")
+        params["device"] = str(distributed.device)
 
     pretrained_actor_path: Optional[Path] = None
     if getattr(args, "pretrained_actor", None):
@@ -130,12 +150,15 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     learner = create_learner(algorithm, spec, params)
     workers = exp_cfg.get("parallel_envs", 1)
     envs_per_worker = exp_cfg.get("envs_per_worker", 1)
+    if distributed:
+        workers = distributed.layout(workers, envs_per_worker, exp_cfg.get("torch_threads", 1))
     total_envs = workers * envs_per_worker
     collection_backend = exp_cfg.get("collection_backend", "process")
     centralized = collection_backend == "centralized"
-    process_collection = total_envs > 1 or centralized
+    process_collection = total_envs > 1 or centralized or distributed is not None
     collection_device = resolve_collection_device(
-        params.get("collection_device"), learner.device, workers, envs_per_worker, collection_backend)
+        str(distributed.device) if distributed else params.get("collection_device"),
+        learner.device, workers, envs_per_worker, collection_backend, distributed=distributed is not None)
     console.print_info(f"collection_device={collection_device}  learner_device={learner.device}  "
                        f"workers={workers}  envs_per_worker={envs_per_worker}  environment_slots={total_envs}")
     recovery_state = None
@@ -156,6 +179,11 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         console.print_info(f"LoRA mode={learner.lora_config['mode']} rank={learner.lora_config['rank']} "
                            f"actor_trainable={trainable}/{total}; centralized critic fully trainable")
 
+    if distributed:
+        distributed.attach(learner)
+        resources.callback(distributed.detach, learner)
+        seed_process((int(exp_cfg.get("seed") or 0) + distributed.rank) % 2**32)
+
     provenance = build_run_provenance(
         scenario,
         scenario_path=args.scenario,
@@ -172,8 +200,12 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     if wandb_logger:
         provenance["wandb_run_id"] = wandb_logger.wandb_run_id
     provenance["network"] = learner.network_config
+    if distributed:
+        provenance["distributed"] = distributed.metadata()
+        provenance["distributed"].update(global_workers=exp_cfg.get("parallel_envs", 1),
+                                          workers_per_rank=workers, envs_per_worker=envs_per_worker)
     provenance["execution"] = {
-        "requested_device": params.get("device", "cpu"),
+        "requested_device": scenario.get("execution", {}).get("params", {}).get("device", params.get("device", "cpu")),
         "requested_collection_device": params.get("collection_device"),
         "collection_device": str(collection_device),
         "learner_device": str(learner.device),
@@ -214,6 +246,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
                              if centralized else ("SerialEnv" if envs_per_worker > 1 else "unbatched"),
         "inference": "centralized" if centralized else ("worker" if process_collection else "local"),
         "frames_per_batch": learner.frames_per_batch,
+        **({"rank_frames_per_batch": (learner.frames_per_batch + distributed.world_size - 1) // distributed.world_size,
+            "sample_targets_are_global": True} if distributed else {}),
         "learning_sample_target": learner.n_steps,
         "learning_sample_unit": "active_learner_samples",
         "effective_frames_per_batch": ((learner.frames_per_batch + total_envs - 1)
@@ -234,59 +268,61 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     from torchrl._utils import WEIGHT_SYNC_TIMEOUT
     provenance["collector"]["initial_weight_sync_timeout_seconds"] = WEIGHT_SYNC_TIMEOUT
     provenance["collector"]["measure_startup"] = exp_cfg.get("measure_collector_startup", False)
-    csv_logger = CSVLogger(
-        output_dir=output_dir,
-        scenario_config=scenario,
-        provenance=provenance,
-        append=bool(resume_path),
-    )
+    hooks = []
+    if primary:
+        csv_logger = CSVLogger(
+            output_dir=output_dir,
+            scenario_config=scenario,
+            provenance=provenance,
+            append=bool(resume_path),
+        )
 
-    resources.callback(csv_logger.close)
+        resources.callback(csv_logger.close)
 
-    # Hooks
-    eval_cfg = scenario.get("evaluation", {}) or {}
-    if not isinstance(eval_cfg, dict):
-        raise ValueError("Scenario 'evaluation' must be a mapping when provided.")
-    evaluation_selection_enabled = bool(eval_cfg.get("enabled", False)) and algorithm in {"ppo", "mappo"}
-    compact_laps = MetricPolicy(scenario.get("wandb", {}).get("logging"), scenario).lap_completion
+        # Hooks
+        eval_cfg = scenario.get("evaluation", {}) or {}
+        if not isinstance(eval_cfg, dict):
+            raise ValueError("Scenario 'evaluation' must be a mapping when provided.")
+        evaluation_selection_enabled = bool(eval_cfg.get("enabled", False)) and algorithm in {"ppo", "mappo"}
+        compact_laps = MetricPolicy(scenario.get("wandb", {}).get("logging"), scenario).lap_completion
 
-    hooks = [
-        ConsoleHook(
-            logger=console,
-            summary_every=int(os.environ.get("F110_SUMMARY_EVERY", "25")),
-            lap_completion=compact_laps,
-        ),
-        CSVHook(csv_logger),
-        CheckpointHook(learner, output_dir, provenance=provenance, configuration=scenario,
-                       save_every_steps=scenario["checkpoint"]["every_steps"],
-                       save_every_updates=scenario["checkpoint"]["every_updates"]),
-    ]
-    if wandb_logger:
-        hooks.append(WandbHook(wandb_logger))
+        hooks = [
+            ConsoleHook(
+                logger=console,
+                summary_every=int(os.environ.get("F110_SUMMARY_EVERY", "25")),
+                lap_completion=compact_laps,
+            ),
+            CSVHook(csv_logger),
+            CheckpointHook(learner, output_dir, provenance=provenance, configuration=scenario,
+                           save_every_steps=scenario["checkpoint"]["every_steps"],
+                           save_every_updates=scenario["checkpoint"]["every_updates"]),
+        ]
+        if wandb_logger:
+            hooks.append(WandbHook(wandb_logger))
 
-    if (params.get("_physics_contract") is not None
-            and (scenario.get("logging") or {}).get("physics_episodes", True)):
-        from training.hooks import PhysicsEpisodeHook
-        hooks.append(PhysicsEpisodeHook(output_dir))
+        if (params.get("_physics_contract") is not None
+                and (scenario.get("logging") or {}).get("physics_episodes", True)):
+            from training.hooks import PhysicsEpisodeHook
+            hooks.append(PhysicsEpisodeHook(output_dir))
 
-    if evaluation_selection_enabled:
-        evaluator = create_selection_evaluator(algorithm, scenario, scenario_dir, spec, params)
-        resources.callback(evaluator.close)
-        evaluator.bind_agent(learner)
-        hooks.append(EvaluationCheckpointHook(
-            learner, output_dir, evaluator,
-            evaluate_every=int(eval_cfg.get("every_episodes", 100)),
-            selection_strategy=eval_cfg.get("selection_strategy",
-                "team_completion" if algorithm == "mappo" else "completion_progress"),
-            evaluate_every_steps=eval_cfg.get("every_steps"), provenance=provenance,
-            console=console, wandb_logger=wandb_logger, configuration=scenario,
-        ))
-        console.print_info(f"Selection evaluation: {evaluator.episodes} fixed-seed races; "
-                           f"completion={evaluator.completion}")
+        if evaluation_selection_enabled:
+            evaluator = create_selection_evaluator(algorithm, scenario, scenario_dir, spec, params)
+            resources.callback(evaluator.close)
+            evaluator.bind_agent(learner)
+            hooks.append(EvaluationCheckpointHook(
+                learner, output_dir, evaluator,
+                evaluate_every=int(eval_cfg.get("every_episodes", 100)),
+                selection_strategy=eval_cfg.get("selection_strategy",
+                    "team_completion" if algorithm == "mappo" else "completion_progress"),
+                evaluate_every_steps=eval_cfg.get("every_steps"), provenance=provenance,
+                console=console, wandb_logger=wandb_logger, configuration=scenario,
+            ))
+            console.print_info(f"Selection evaluation: {evaluator.episodes} fixed-seed races; "
+                               f"completion={evaluator.completion}")
     trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id,
                              collection_device=str(collection_device),
                              parallel_envs=workers, envs_per_worker=envs_per_worker,
-                             collection_backend=collection_backend,
+                             collection_backend=collection_backend, distributed=distributed,
                              scenario=scenario, scenario_dir=scenario_dir,
                              measure_services=exp_cfg.get("measure_services", False),
                              measure_stages=exp_cfg.get("measure_stages", False),
@@ -304,8 +340,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
     console.print_info(f"Starting {algorithm.upper()} training for {budget}")
     options = {"total_steps": total_steps} if total_steps is not None else {}
     trainer.train(episodes, **options)
-    if (trainer.measure_services or trainer.measure_stages or trainer.measure_mpc or trainer.measure_hybrid
-            or trainer.measure_collector_startup):
+    if primary and (trainer.measure_services or trainer.measure_stages or trainer.measure_mpc or trainer.measure_hybrid
+                    or trainer.measure_collector_startup):
         # Include end-of-run service work, especially latest/final checkpoint saves.
         csv_logger.save_summary({**trainer.checkpoint_progress(), **trainer.service_metrics(),
                                  **trainer.performance_metrics(),

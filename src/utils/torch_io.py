@@ -80,9 +80,9 @@ def synchronize_device(device) -> None:
 
 
 def resolve_collection_device(value, learner_device, parallel_envs=1, envs_per_worker=1,
-                              collection_backend="process") -> torch.device:
+                              collection_backend="process", *, distributed=False) -> torch.device:
     """Serial inference follows the learner; process inference defaults to CPU."""
-    if envs_per_worker > 1 and collection_backend != "centralized":
+    if envs_per_worker > 1 and collection_backend != "centralized" and not distributed:
         if value is not None and value != "cpu":
             raise ValueError("Grouped environment collection requires collection_device=cpu")
         return torch.device("cpu")
