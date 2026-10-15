@@ -582,11 +582,13 @@ class OnPolicyTrainer:
             counts = self.workload_counts[self._timing_phase]
             counts[name] = counts.get(name, 0) + value
 
-    def record_payload(self, name, data, *, destination=None):
+    def record_payload(self, name, data, *, destination=None, trajectories=1):
         if not self.measure_stages:
             return
         # Count calls/leaves, not CUDA memcpy operations. Storage-span unions
         # avoid counting observation aliases twice without reading tensor data.
+        # A grouped transfer is one call but still represents its original
+        # physical trajectories; neither counter counts optimization samples.
         with self.measure_boundary("profiling_payload"):
             source = "cpu" if destination is not None else None
             if destination is not None and torch.device(destination).type != "cuda":
@@ -596,7 +598,7 @@ class OnPolicyTrainer:
             self.record_workload(name + "_storage_span_bytes", size)
             if destination is not None and leaves:
                 self.record_workload("cpu_to_cuda_tensordict_calls")
-                self.record_workload("transferred_trajectories")
+                self.record_workload("transferred_trajectories", trajectories)
 
     @staticmethod
     def _merge_profile(target, source):

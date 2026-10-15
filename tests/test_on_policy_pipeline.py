@@ -709,6 +709,71 @@ def test_rollout_selection_shares_tensors_and_limits_replay_payload(algorithm, v
     assert replay_keys == [expected_keys]
 
 
+@pytest.mark.parametrize("source,destination,size", [
+    ("cpu", "cpu", 1), ("cpu", "cpu", 3), ("cpu", "cuda", 1),
+    ("cpu", "cuda", 3), ("cuda", "cuda", 1), ("cuda", "cuda", 3),
+    ("mixed", "cuda", 1),
+])
+def test_rollout_group_transfer_owns_all_leaves(source, destination, size):
+    from agents.torchrl_rollouts import rollout_groups, transfer_rollout_group, batch_gae
+
+    if destination == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA hardware unavailable")
+    policy, cpu = agent(device=destination), agent()
+    counts = {}
+    policy.profile_count = lambda name, value=1: counts.update({name: counts.get(name, 0) + value})
+    policy.critic.load_state_dict(cpu.critic.state_dict())
+    sources = [rollout(cpu.policy, [index, index + 1]) for index in range(size)]
+    for data in sources:
+        if source == "cuda":
+            data.update(data.to("cuda"))
+        elif source == "mixed":
+            data["action"] = data["action"].to("cuda")
+    reference = [policy.select_rollout(data).to(destination).clone() for data in sources]
+    groups = list(rollout_groups(policy, sources))
+    assert len(groups) == 1
+    data, _ = transfer_rollout_group(policy, groups[0])
+    assert counts["transfer_batch_count"] == 1
+    assert counts.get("learner_clone_batches", 0) == int(size == 1 and (source != "cpu" or destination == "cpu"))
+    before = data.clone()
+    # Simulate source buffer reuse, including leaves already on the learner.
+    for original in sources:
+        for value in original.values(True, True):
+            value.fill_(1)
+    for key in before.keys(True, True):
+        torch.testing.assert_close(data[key], before[key], rtol=0, atol=0)
+    mutated_sources = [original.clone() for original in sources]
+    batch_gae(policy, data, size)
+    with torch.no_grad():
+        for fragment in reference:
+            policy.gae(fragment)
+    for name in ("advantage", "value_target"):
+        torch.testing.assert_close(data[name].reshape(-1), torch.cat([item[name] for item in reference]).reshape(-1))
+    for actual, expected in zip(sources, mutated_sources):
+        for key in actual.keys(True, True):
+            torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+
+
+def test_rollout_group_limits_and_layout_fallback_preserve_order():
+    from agents.torchrl_rollouts import rollout_groups
+
+    policy = SimpleNamespace(select_rollout=lambda data: data)
+    for slots in (32, 128, 256, 512):
+        streams = (TensorDict({"observation": torch.full((2, 1), index)}, [2]) for index in range(slots))
+        groups = list(rollout_groups(policy, streams))
+        assert all(len(group) <= 64 for group in groups)
+        assert [int(item["observation"][0]) for group in groups for item in group] == list(range(slots))
+    streams = [TensorDict({"observation": torch.zeros(length, 1)}, [length]) for length in (2, 2, 3, 2)]
+    assert [len(group) for group in rollout_groups(policy, streams)] == [2, 1, 1]
+    assert [len(group) for group in rollout_groups(policy, streams, max_bytes=8)] == [1] * 4
+    assert [len(group) for group in rollout_groups(policy, streams[:2], max_rows=3)] == [1, 1]
+    streams[1]["observation"] = streams[1]["observation"].double()
+    assert [len(group) for group in rollout_groups(policy, streams)] == [1] * 4
+    nested = [TensorDict({"agents": TensorDict({"observation": torch.zeros(2, 2, 1)}, shape)}, [2])
+              for shape in ([2, 2], [2])]
+    assert [len(group) for group in rollout_groups(policy, nested)] == [1, 1]
+
+
 def test_parent_attribution_with_reused_collector_batch(monkeypatch):
     """Exercise the parent handoff without processes or a physics benchmark."""
     training, _ = trainer(Capture(False), n_steps=16, n_epochs=1, batch_size=4, frames_per_batch=8)
@@ -751,10 +816,12 @@ def test_parent_attribution_with_reused_collector_batch(monkeypatch):
         training.train(total_steps=16)
     finally:
         handle.remove()
-    assert seen == [[0, 1, 10, 11]] * 4
+    assert seen == [[0, 1, 10, 11] * 4]
     counts = training.workload_counts["warmup"]
     assert counts["fragment_count"] == counts["reporting_streams"] == 8
     assert counts["trajectory_count"] == 4 and counts["trajectory_rows"] == 16
+    assert counts["gae_batch_count"] == 1 and counts["gae_trajectories_processed"] == 4
+    assert counts["transfer_batch_count"] == 1 and counts.get("learner_clone_batches", 0) == 0
     assert counts["retained_storage_span_bytes"] > 0
     assert counts["ppo_minibatches"] == 4 and counts["replay_samples"] == 16
     calls = training.boundary_calls["warmup"]

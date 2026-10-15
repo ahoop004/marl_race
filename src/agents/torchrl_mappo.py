@@ -11,6 +11,7 @@ from torchrl.objectives.value import MultiAgentGAE
 
 from agents.common.mappo_policy import MAPPOPolicy
 from agents.common.optimization import make_objective
+from agents.torchrl_rollouts import rollout_groups, transfer_rollout_group, batch_gae
 from agents.torchrl_updates import MAPPO_OPTIMIZATION_KEYS, optimize_ppo
 
 
@@ -120,46 +121,37 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
     def update_rollouts(self, rollouts):
         self._require_lora_source()
         fragments = []
+        all_active = True
         region = getattr(self, "profile_region", None)
-        for rollout in rollouts:
-            if not rollout.batch_size.numel():
-                continue
-            with region("rollout_preparation") if region else nullcontext():
-                with region("rollout_key_preparation") if region else nullcontext():
-                    rollout = self.select_rollout(rollout)
-                profile = getattr(self, "profile_call", None)
-                payload = getattr(self, "profile_payload", None)
-                if payload:
-                    payload("cpu_to_cuda", rollout, destination=self.device)
-                if profile:
-                    moving = any(value.device != self.device for value in rollout.values(True, True)
-                                 if isinstance(value, torch.Tensor))
-                    category = "rollout_device_transfer" if moving else "tensor_device_conversion"
-                    fragment = profile(category, rollout.to, self.device, device=self.device)
-                    with region("learner_rollout_clone") if region else nullcontext():
-                        fragment = profile("tensor_copy", fragment.clone, device=self.device)
-                else:
-                    fragment = rollout.to(self.device).clone()
-                with torch.no_grad():
-                    self.gae(fragment)
+        with region("rollout_preparation") if region else nullcontext():
+            for group in rollout_groups(self, rollouts):
+                data, group_active = transfer_rollout_group(self, group)
+                all_active = all_active and group_active
+                batch_gae(self, data, len(group))
                 with region("post_gae_flatten_mask") if region else nullcontext():
-                    fragment = fragment.select(*MAPPO_OPTIMIZATION_KEYS, ("agents", "active"))
-            fragments.append(fragment)
+                    fragments.append(data.select(*MAPPO_OPTIMIZATION_KEYS, ("agents", "active")).reshape(-1))
         if not fragments:
             return {}
         with region("pending_rollout_concatenation") if region else nullcontext():
             data = torch.cat(fragments, dim=0)
-        # Keep retired slots in GAE for continuing team credit, then select only
-        # actual decisions before advantage normalization and minibatch sampling.
+        # Keep retired slots through GAE, then compute active positions once
+        # globally. Per-group CUDA nonzero calls would add host synchronization.
         with region("mappo_active_state_preparation") if region else nullcontext():
-            mask = data["agents", "active"].reshape(-1)
-            states = data["state"].unsqueeze(-2).expand(-1, len(self.agent_ids), -1).reshape(-1, self.global_state_dim)
-            selected = data["agents"].exclude("active").reshape(-1)[mask]
-            # TensorDict.numel() clamps empty batches to one in TensorDict 0.14.
+            active = data["agents", "active"].reshape(-1)
+            selected = data["agents"].exclude("active").reshape(-1)
+            if all_active:
+                states = data["state"].repeat_interleave(len(self.agent_ids), dim=0)
+            else:
+                positions = active.nonzero().flatten()
+                selected = selected[positions]
+                # Gather just the needed states; do not materialize a full
+                # time x agent x state expansion before selecting active rows.
+                rows = positions.div(len(self.agent_ids), rounding_mode="floor")
+                states = data["state"].index_select(0, rows)
             n_samples = selected.batch_size.numel()
             if not n_samples:
                 return {}
-            samples = TensorDict({"agents": selected.unsqueeze(-1), "state": states[mask]}, [n_samples])
+            samples = TensorDict({"agents": selected.unsqueeze(-1), "state": states}, [n_samples])
         profile = getattr(self, "profile_call", None)
         metrics = (profile("optimization", optimize_ppo, self, samples, group="agents", device=self.device)
                    if profile else optimize_ppo(self, samples, group="agents"))

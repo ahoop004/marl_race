@@ -12,6 +12,7 @@ from torchrl.objectives.value import GAE
 from agents.common.outputs import PolicyOutput
 from agents.common.ppo_policy import PPOPolicy
 from agents.common.optimization import make_objective
+from agents.torchrl_rollouts import rollout_groups, transfer_rollout_group, batch_gae
 from agents.torchrl_updates import (PPO_OPTIMIZATION_KEYS, PPO_OPTIONAL_OPTIMIZATION_KEYS,
                                    optimize_ppo)
 
@@ -127,49 +128,36 @@ class TorchRLPPOAgent(PPOPolicy):
 
     def update_rollouts(self, rollouts):
         # GAE must see each race's time axis independently, before flattening.
-        for rollout in rollouts:
-            self._append_rollout(rollout)
+        self._append_rollouts(rollouts)
         if self._pending_steps < self.min_rollout_steps:
             return {}
         return self.flush_pending_update()
 
     def _append_rollout(self, rollout):
-        if not isinstance(rollout, TensorDictBase):
-            raise TypeError("TorchRL PPO requires a TensorDict rollout")
-        if not rollout.batch_size.numel():
-            return
+        self._append_rollouts([rollout])
+
+    def _append_rollouts(self, rollouts):
         region = getattr(self, "profile_region", None)
         with region("rollout_preparation") if region else nullcontext():
-            with region("rollout_key_preparation") if region else nullcontext():
-                rollout = self.select_rollout(rollout)
-            profile = getattr(self, "profile_call", None)
-            payload = getattr(self, "profile_payload", None)
-            if payload:
-                payload("cpu_to_cuda", rollout, destination=self.device)
-            if profile:
-                moving = any(value.device != self.device for value in rollout.values(True, True)
-                             if isinstance(value, torch.Tensor))
-                category = "rollout_device_transfer" if moving else "tensor_device_conversion"
-                data = profile(category, rollout.to, self.device, device=self.device)
-                with region("learner_rollout_clone") if region else nullcontext():
-                    data = profile("tensor_copy", data.clone, device=self.device)
-            else:
-                data = rollout.to(self.device).clone()
-            environment_steps = data.numel()
-            with torch.no_grad():
-                self.gae(data)
-            with region("post_gae_flatten_mask") if region else nullcontext():
-                active = data.get(("agents", "active"), None)
-                keys = PPO_OPTIMIZATION_KEYS + tuple(key for key in PPO_OPTIONAL_OPTIMIZATION_KEYS
-                                                     if data.get(key, None) is not None)
-                data = data.select(*keys).reshape(-1)
-                if active is not None:
-                    data = data[active.reshape(-1)]
-            self._pending_environment_steps += environment_steps
-            if not data.batch_size.numel():
-                return
-            self._pending_batches.append(data)
-            self._pending_steps += data.batch_size.numel()
+            for group in rollout_groups(self, rollouts):
+                data, all_active = transfer_rollout_group(self, group)
+                environment_steps = data.numel()
+                batch_gae(self, data, len(group))
+                with region("post_gae_flatten_mask") if region else nullcontext():
+                    active = data.get(("agents", "active"), None)
+                    keys = PPO_OPTIMIZATION_KEYS + tuple(key for key in PPO_OPTIONAL_OPTIMIZATION_KEYS
+                                                         if data.get(key, None) is not None)
+                    # Trajectory-major flattening is exactly the original
+                    # concatenation order. Compute dynamic indices only once.
+                    data = data.select(*keys).reshape(-1)
+                    if not all_active:
+                        positions = active.reshape(-1).nonzero().flatten()
+                        data = data[positions]
+                self._pending_environment_steps += environment_steps
+                if not data.batch_size.numel():
+                    continue
+                self._pending_batches.append(data)
+                self._pending_steps += data.batch_size.numel()
 
     def flush_pending_update(self):
         if not self._pending_batches:
