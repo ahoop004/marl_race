@@ -189,6 +189,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
         "measure_services": exp_cfg.get("measure_services", False),
         "measure_stages": exp_cfg.get("measure_stages", False),
         "measure_cuda_sync": exp_cfg.get("measure_cuda_sync", False),
+        "profiling_detail_samples": exp_cfg.get("profiling_detail_samples", 0),
         "measure_mpc": exp_cfg.get("measure_mpc", False),
         "measure_hybrid": exp_cfg.get("measure_hybrid", False),
         "profiling_warmup_updates": exp_cfg.get("profiling_warmup_updates", 1),
@@ -290,6 +291,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources):
                              measure_services=exp_cfg.get("measure_services", False),
                              measure_stages=exp_cfg.get("measure_stages", False),
                              measure_cuda_sync=exp_cfg.get("measure_cuda_sync", False),
+                             profiling_detail_samples=exp_cfg.get("profiling_detail_samples", 0),
                              measure_mpc=exp_cfg.get("measure_mpc", False),
                              measure_hybrid=exp_cfg.get("measure_hybrid", False),
                              profiling_warmup_updates=exp_cfg.get("profiling_warmup_updates", 1))

@@ -57,7 +57,11 @@ class MetricPolicy:
         self.lap_completion = profile == "lap_completion" or (
             profile == "auto" and
             self.selection_strategy in EVALUATION_STRATEGIES)
-        patterns = (*CORE, *(LAP_COMPLETION if self.lap_completion else RACING))
+        # Attribution is scalar-only and opt-in; disabled runs keep their usual
+        # dashboard selection. Explicit user allowlists still take precedence.
+        profiling = (("perf/boundaries/*", "perf/workload/*", "perf/profiling/*")
+                     if scenario.get("experiment", {}).get("measure_stages", False) else ())
+        patterns = (*CORE, *profiling, *(LAP_COMPLETION if self.lap_completion else RACING))
         self._names = set(patterns)
         self._patterns = tuple(pattern for pattern in patterns if "*" in pattern)
 

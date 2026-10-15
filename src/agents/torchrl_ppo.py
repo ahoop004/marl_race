@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModule, TensorDictSequential
@@ -107,39 +109,49 @@ class TorchRLPPOAgent(PPOPolicy):
             raise TypeError("TorchRL PPO requires a TensorDict rollout")
         if not rollout.batch_size.numel():
             return
-        profile = getattr(self, "profile_call", None)
-        if profile:
-            moving = any(value.device != self.device for value in rollout.values(True, True)
-                         if isinstance(value, torch.Tensor))
-            category = "rollout_device_transfer" if moving else "tensor_device_conversion"
-            data = profile(category, rollout.to, self.device, device=self.device)
-            data = profile("tensor_copy", data.clone, device=self.device)
-        else:
-            data = rollout.to(self.device).clone()
-        environment_steps = data.numel()
-        if ("agents", "observation") in data.keys(True):
-            data["observation"] = data["agents", "observation"].squeeze(-2)
-            data["next", "observation"] = data["next", "agents", "observation"].squeeze(-2)
-            data["next", "reward"] = data["next", "agents", "reward"].squeeze(-2)
-            # Physical race closure may occur after the PPO learner retires.
-            data["next", "done"] = data["next", "agents", "done"].squeeze(-2)
-            data["next", "terminated"] = data["next", "agents", "terminated"].squeeze(-2)
-        with torch.no_grad():
-            self.gae(data)
-        data = data.reshape(-1)
-        if ("agents", "active") in data.keys(True):
-            data = data[data["agents", "active"].reshape(-1)]
-        self._pending_environment_steps += environment_steps
-        if not data.batch_size.numel():
-            return
-        self._pending_batches.append(data)
-        self._pending_steps += data.batch_size.numel()
+        region = getattr(self, "profile_region", None)
+        with region("rollout_preparation") if region else nullcontext():
+            profile = getattr(self, "profile_call", None)
+            payload = getattr(self, "profile_payload", None)
+            if payload:
+                payload("cpu_to_cuda", rollout, destination=self.device)
+            if profile:
+                moving = any(value.device != self.device for value in rollout.values(True, True)
+                             if isinstance(value, torch.Tensor))
+                category = "rollout_device_transfer" if moving else "tensor_device_conversion"
+                data = profile(category, rollout.to, self.device, device=self.device)
+                with region("learner_rollout_clone") if region else nullcontext():
+                    data = profile("tensor_copy", data.clone, device=self.device)
+            else:
+                data = rollout.to(self.device).clone()
+            environment_steps = data.numel()
+            with region("rollout_key_preparation") if region else nullcontext():
+                if ("agents", "observation") in data.keys(True):
+                    data["observation"] = data["agents", "observation"].squeeze(-2)
+                    data["next", "observation"] = data["next", "agents", "observation"].squeeze(-2)
+                    data["next", "reward"] = data["next", "agents", "reward"].squeeze(-2)
+                    # Physical race closure may occur after the PPO learner retires.
+                    data["next", "done"] = data["next", "agents", "done"].squeeze(-2)
+                    data["next", "terminated"] = data["next", "agents", "terminated"].squeeze(-2)
+            with torch.no_grad():
+                self.gae(data)
+            with region("post_gae_flatten_mask") if region else nullcontext():
+                data = data.reshape(-1)
+                if ("agents", "active") in data.keys(True):
+                    data = data[data["agents", "active"].reshape(-1)]
+            self._pending_environment_steps += environment_steps
+            if not data.batch_size.numel():
+                return
+            self._pending_batches.append(data)
+            self._pending_steps += data.batch_size.numel()
 
     def flush_pending_update(self):
         if not self._pending_batches:
             self._pending_environment_steps = 0
             return {}
-        data = torch.cat(self._pending_batches, dim=0)
+        region = getattr(self, "profile_region", None)
+        with region("pending_rollout_concatenation") if region else nullcontext():
+            data = torch.cat(self._pending_batches, dim=0)
         self._pending_batches.clear()
         self._pending_steps = 0
         profile = getattr(self, "profile_call", None)

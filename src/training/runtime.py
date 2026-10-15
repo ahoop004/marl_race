@@ -6,6 +6,45 @@ import numpy as np
 import torch
 
 
+def tensor_payload(data, *, source_device=None):
+    """Metadata-only union of tensor storage byte spans, deduplicating aliases.
+
+    Exact for contiguous leaves; strided leaves can include holes in their span.
+    This is a logical footprint, not allocated storage size or PCIe traffic.
+    No tensor contents are read, copied, or moved to calculate it.
+    """
+    spans, leaves = {}, 0
+    for value in data.values(True, True):
+        if not isinstance(value, torch.Tensor):
+            continue
+        if source_device is not None and value.device.type != source_device:
+            continue
+        leaves += 1
+        if not value.numel():
+            continue
+        size = value.element_size()
+        start = value.storage_offset() * size
+        end = start + (1 + sum((n - 1) * stride for n, stride in
+                              zip(value.shape, value.stride()))) * size
+        key = (value.device, value.untyped_storage().data_ptr())
+        spans.setdefault(key, []).append((start, end))
+    total = 0
+    for intervals in spans.values():
+        previous_end = 0
+        for start, end in sorted(intervals):
+            total += max(0, end - max(start, previous_end))
+            previous_end = max(previous_end, end)
+    return leaves, total
+
+
+def profiling_sample_indices(total, limit):
+    """Bounded deterministic samples including endpoints, without touching RNG."""
+    count = min(total, limit)
+    if count < 2:
+        return {0} if count else set()
+    return {index * (total - 1) // (count - 1) for index in range(count)}
+
+
 def seed_process(seed):
     if seed is not None:
         random.seed(seed)

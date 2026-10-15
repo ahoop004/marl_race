@@ -3,7 +3,7 @@ import time
 import math
 import sys
 import logging
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial, wraps
 
 try:
@@ -19,7 +19,8 @@ from torchrl.envs import ParallelEnv, TransformedEnv
 from adapters.native_torchrl import NativeRaceTorchRLEnv
 from training.contracts import validate_team_reward_composers
 from training.race_reporting import RaceTrainingReports
-from training.runtime import CudaCollectionProfile, preserve_random_state
+from training.runtime import (CudaCollectionProfile, preserve_random_state, tensor_payload,
+                              profiling_sample_indices)
 from utils.torch_io import synchronize_device, resolve_collection_device
 from utils.cpu_affinity import cpu_placement
 
@@ -50,7 +51,7 @@ class OnPolicyTrainer:
     def __init__(self, task, agent, *, hooks=None, render=False, run_id="run",
                  focal_agent_id=None, algorithm=None, measure_services=False,
                  measure_stages=False, measure_mpc=False, measure_hybrid=False,
-                 profiling_warmup_updates=1, measure_cuda_sync=False,
+                 profiling_warmup_updates=1, measure_cuda_sync=False, profiling_detail_samples=0,
                  parallel_envs=1, envs_per_worker=1, scenario=None, scenario_dir=None, collection_device=None,
                  collection_backend="process"):
         self.task, self.agent = task, agent
@@ -110,6 +111,11 @@ class OnPolicyTrainer:
         if type(measure_cuda_sync) is not bool:
             raise ValueError("measure_cuda_sync must be a boolean")
         self.measure_cuda_sync = measure_cuda_sync
+        if type(profiling_detail_samples) is not int or not 0 <= profiling_detail_samples <= 32:
+            raise ValueError("profiling_detail_samples must be an integer in [0, 32]")
+        # Opt-in host samples: streams per collector batch / reconstruction, and
+        # minibatches per learner update. Zero keeps standard attribution coarse.
+        self.profiling_detail_samples = profiling_detail_samples
         self.profiling_warmup_updates = profiling_warmup_updates
         self.stage_seconds = {phase: {} for phase in ("initialization", "warmup", "steady")}
         self.stage_calls = {phase: {} for phase in self.stage_seconds}
@@ -123,6 +129,8 @@ class OnPolicyTrainer:
         self._steady_finished = None
         self._rate_baseline = self._steady_baseline = None
         self.boundary_seconds = {phase: {} for phase in self.stage_seconds}
+        self.workload_counts = {phase: {} for phase in self.stage_seconds}
+        self.boundary_calls = {phase: {} for phase in self.stage_seconds}
         self.worker_stage_seconds = {phase: {} for phase in self.stage_seconds}
         self.worker_stage_calls = {phase: {} for phase in self.stage_seconds}
         self.worker_scope_seconds = {phase: {} for phase in self.stage_seconds}
@@ -237,6 +245,15 @@ class OnPolicyTrainer:
         instrument(self.agent.gae, "forward", "gae", self.agent.device)
         self.agent.profile_call = self._profile_learning
         resources.callback(setattr, self.agent, "profile_call", None)
+        # New attribution uses inclusive host boundaries only. In particular it
+        # never adds CUDA waits, even when legacy stage completion timing is on.
+        for name, value in (("profile_region", self.measure_boundary),
+                            ("profile_count", self.record_workload),
+                            ("profile_payload", self.record_payload),
+                            ("profiling_detail_samples", self.profiling_detail_samples)):
+            original = getattr(self.agent, name, None)
+            setattr(self.agent, name, value if self.measure_stages else None)
+            resources.callback(setattr, self.agent, name, original)
         if self.process_collection or not self.measure_stages:
             # Inference and environments live in workers. Never serialize a
             # policy wrapper closing over the parent trainer and its hooks.
@@ -539,6 +556,48 @@ class OnPolicyTrainer:
         values = self.boundary_seconds[self._timing_phase]
         values[name] = values.get(name, 0.) + time.perf_counter() - started
 
+    @contextmanager
+    def measure_boundary(self, name, *, exclude_services=False):
+        """Inclusive parent host wall time, nested in existing envelopes.
+
+        No CUDA synchronization and no subtraction from historical stage timers.
+        The optional nonservice variant excludes only existing service timers.
+        """
+        if not self.measure_stages:
+            yield
+            return
+        services = sum(self.service_seconds.values()) if exclude_services else 0.
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            if exclude_services:
+                started += sum(self.service_seconds.values()) - services
+            self._record_boundary(name, started)
+            calls = self.boundary_calls[self._timing_phase]
+            calls[name] = calls.get(name, 0) + 1
+
+    def record_workload(self, name, value=1):
+        if self.measure_stages:
+            counts = self.workload_counts[self._timing_phase]
+            counts[name] = counts.get(name, 0) + value
+
+    def record_payload(self, name, data, *, destination=None):
+        if not self.measure_stages:
+            return
+        # Count calls/leaves, not CUDA memcpy operations. Storage-span unions
+        # avoid counting observation aliases twice without reading tensor data.
+        with self.measure_boundary("profiling_payload"):
+            source = "cpu" if destination is not None else None
+            if destination is not None and torch.device(destination).type != "cuda":
+                return
+            leaves, size = tensor_payload(data, source_device=source)
+            self.record_workload(name + "_tensor_leaves", leaves)
+            self.record_workload(name + "_storage_span_bytes", size)
+            if destination is not None and leaves:
+                self.record_workload("cpu_to_cuda_tensordict_calls")
+                self.record_workload("transferred_trajectories")
+
     @staticmethod
     def _merge_profile(target, source):
         for key, value in source.items():
@@ -670,6 +729,17 @@ class OnPolicyTrainer:
             result.update({f"perf/steady_{name}_per_second": (value - base) / duration
                 for name, value, base in zip(names, self._rate_counters(), self._steady_baseline)})
         if self.measure_stages:
+            result.update({"perf/profiling/detail_samples": self.profiling_detail_samples,
+                           "perf/profiling/attribution_adds_cuda_sync": False,
+                           "perf/profiling/event_dispatch_excludes_measured_services": self.measure_services})
+            result.update({f"perf/boundaries/{phase}/{name}_calls": calls
+                           for phase, values in self.boundary_calls.items() for name, calls in values.items()})
+            result.update({f"perf/workload/{phase}/{name}": value
+                           for phase, values in self.workload_counts.items() for name, value in values.items()})
+            for phase, values in self.workload_counts.items():
+                if values.get("trajectory_count"):
+                    result[f"perf/workload/{phase}/mean_trajectory_length"] = (
+                        values["trajectory_rows"] / values["trajectory_count"])
             result.update({f"perf/stages/{phase}/{name}_seconds": seconds
                 for phase, values in self.stage_seconds.items() for name, seconds in values.items()})
             result.update({f"perf/stages/{phase}/{name}_calls": calls
@@ -810,67 +880,86 @@ class OnPolicyTrainer:
         # The next-state tag is stamped at the action's environment step. The
         # root tag can still describe the previous batch's last observation.
         expected = self._updates - self._initial_updates
-        if not (batch["next", "policy_version"] == expected).all():
-            raise RuntimeError(f"Collected a stale policy batch; expected version {expected}")
+        with self.measure_boundary("batch_policy_validation"):
+            if not (batch["next", "policy_version"] == expected).all():
+                raise RuntimeError(f"Collected a stale policy batch; expected version {expected}")
         if self.measure_collector_startup:
             self.collector_startup["last_collected_policy_version"] = expected
             self.collector_startup["workers_with_verified_policy_version"] = self.parallel_envs
         durations = []
+        samples = (profiling_sample_indices(self.total_envs, self.profiling_detail_samples)
+                   if self.measure_stages else ())
+        report_events = episode_events = 0
         for worker, local, stream in self._process_streams(batch):
+            detail = self.measure_boundary if worker * self.envs_per_worker + local in samples else None
+            if detail:
+                self.record_workload("sampled_reporting_streams")
             if local == 0:
-                packet = stream[0]["worker_profile"]
-                self._receive_worker_profile(worker, packet)
-                durations.append(packet["collection_seconds"])
+                with detail("sampled_worker_metadata") if detail else nullcontext():
+                    packet = stream[0]["worker_profile"]
+                    self._receive_worker_profile(worker, packet)
+                    durations.append(packet["collection_seconds"])
             environment = worker * self.envs_per_worker + local
-            if not (stream["environment_id"] == environment).all():
-                raise RuntimeError(f"Unexpected environment ID in worker {worker}, slot {local}")
-            episodes = stream["environment_episode"].squeeze(-1)
-            starts = (episodes[1:] != episodes[:-1]).nonzero().flatten().add(1).tolist()
-            if "race_events" in packet:
-                events = dict(packet["race_events"].get(environment, ()))
-            else:
-                events = {index: value for index, value in enumerate(stream.get(("next", "race_events")).tolist())
-                          if value}
+            with detail("sampled_stream_validation") if detail else nullcontext():
+                if not (stream["environment_id"] == environment).all():
+                    raise RuntimeError(f"Unexpected environment ID in worker {worker}, slot {local}")
+                episodes = stream["environment_episode"].squeeze(-1)
+                starts = (episodes[1:] != episodes[:-1]).nonzero().flatten().add(1).tolist()
+            with detail("sampled_event_reconstruction") if detail else nullcontext():
+                if "race_events" in packet:
+                    events = dict(packet["race_events"].get(environment, ()))
+                else:
+                    events = {index: value for index, value in enumerate(stream.get(("next", "race_events")).tolist())
+                              if value}
             # Only reporting and episode boundaries require Python work. Prefix
             # sums preserve the exact counters visible to each hook, including
             # fixed-only decisions and rows without any reporting events.
-            positions = sorted({0, len(stream) - 1, *starts, *events})
-            counters = torch.cat((stream["next", "decision_physics_steps"],
-                                  stream["next", "agent_steps"]), dim=-1).cumsum(dim=0)
-            selected_counters = counters[positions].tolist()
-            selected_episodes = episodes[positions].tolist()
+            with detail("sampled_prefix_counters") if detail else nullcontext():
+                positions = sorted({0, len(stream) - 1, *starts, *events})
+                counters = torch.cat((stream["next", "decision_physics_steps"],
+                                      stream["next", "agent_steps"]), dim=-1).cumsum(dim=0)
+                selected_counters = counters[positions].tolist()
+                selected_episodes = episodes[positions].tolist()
             previous_index, previous_physics, previous_samples = -1, 0, 0
-            for index, local_episode, (physics, samples) in zip(positions, selected_episodes, selected_counters):
-                key = environment, local_episode
-                self._worker_policy_starts.setdefault(key, self._updates)
-                decisions = index - previous_index
-                self._environment_steps += decisions
-                self._physics_steps += physics - previous_physics
-                self._agent_steps += samples - previous_samples
-                self._pending_learning_steps += samples - previous_samples
-                previous_index, previous_physics, previous_samples = index, physics, samples
-                for enabled, counts in ((self.measure_mpc, self.mpc_environment_decisions),
-                                        (self.measure_hybrid, self.hybrid_environment_decisions)):
-                    if enabled:
-                        counts[self._timing_phase] = counts.get(self._timing_phase, 0) + decisions
-                for method, args in events.get(index, ()):
-                    if method == "on_episode_start":
-                        self.reports.next_episode = max(self.reports.next_episode, args[0]["episode"] + 1)
-                    if method == "on_episode_end":
-                        episode, reward, info, metrics = args
-                        self.reports.completed += 1
-                        race = metrics["race_record"]
-                        race.update(environment_decisions_total=self._environment_steps,
-                                    reported_at_environment_steps=self._environment_steps,
-                                    policy_version_start=self._worker_policy_starts.pop(key),
-                                    policy_version_end=self._updates,
-                                    worker_id=worker)
-                        metrics.update(self.counter_metrics())
-                        self.reports.pending_episodes.append((episode, reward, info, metrics))
-                    else:
-                        hooks = self.reports.transition_hooks if method == "on_step" else self.hooks
-                        for hook in hooks:
-                            self.call_hook(hook, method, *args)
+            with detail("sampled_event_dispatch_nonservice", exclude_services=True) if detail else nullcontext():
+                for index, local_episode, (physics, samples_count) in zip(positions, selected_episodes, selected_counters):
+                    key = environment, local_episode
+                    self._worker_policy_starts.setdefault(key, self._updates)
+                    decisions = index - previous_index
+                    self._environment_steps += decisions
+                    self._physics_steps += physics - previous_physics
+                    self._agent_steps += samples_count - previous_samples
+                    self._pending_learning_steps += samples_count - previous_samples
+                    previous_index, previous_physics, previous_samples = index, physics, samples_count
+                    for enabled, counts in ((self.measure_mpc, self.mpc_environment_decisions),
+                                            (self.measure_hybrid, self.hybrid_environment_decisions)):
+                        if enabled:
+                            counts[self._timing_phase] = counts.get(self._timing_phase, 0) + decisions
+                    for method, args in events.get(index, ()):
+                        if self.measure_stages:
+                            report_events += 1
+                            episode_events += method in {"on_episode_start", "on_episode_end"}
+                        if method == "on_episode_start":
+                            self.reports.next_episode = max(self.reports.next_episode, args[0]["episode"] + 1)
+                        if method == "on_episode_end":
+                            episode, reward, info, metrics = args
+                            self.reports.completed += 1
+                            race = metrics["race_record"]
+                            race.update(environment_decisions_total=self._environment_steps,
+                                        reported_at_environment_steps=self._environment_steps,
+                                        policy_version_start=self._worker_policy_starts.pop(key),
+                                        policy_version_end=self._updates,
+                                        worker_id=worker)
+                            metrics.update(self.counter_metrics())
+                            self.reports.pending_episodes.append((episode, reward, info, metrics))
+                        else:
+                            hooks = self.reports.transition_hooks if method == "on_step" else self.hooks
+                            for hook in hooks:
+                                self.call_hook(hook, method, *args)
+        if self.measure_stages:
+            self.record_workload("reporting_streams", self.parallel_envs * self.envs_per_worker)
+            self.record_workload("report_events", report_events)
+            self.record_workload("episode_events", episode_events)
         self.worker_batch_metrics = {
             "perf/workers/batch_collection_min_seconds": min(durations),
             "perf/workers/batch_collection_max_seconds": max(durations),
@@ -885,22 +974,32 @@ class OnPolicyTrainer:
             values[name] = values.get(name, 0.) + value
 
     @staticmethod
-    def _process_rollouts(pending):
+    def _process_rollouts(pending, *, profile=None):
         """Join time within environment slots and split physical races before GAE."""
         rollouts = []
-        for chunks in pending.values():
-            data = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
-            active = data["agents", "active"].any(dim=(-2, -1))
-            if not active.all():
-                data = data[active]
+        samples = profiling_sample_indices(len(pending), profile.profiling_detail_samples) if profile else ()
+        for index, chunks in enumerate(pending.values()):
+            detail = profile.measure_boundary if index in samples else None
+            if detail:
+                profile.record_workload("sampled_reconstruction_streams")
+            with detail("sampled_trajectory_concatenation") if detail else nullcontext():
+                data = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+            with detail("sampled_inactive_filtering") if detail else nullcontext():
+                active = data["agents", "active"].any(dim=(-2, -1))
+                if not active.all():
+                    data = data[active]
             if not data.batch_size.numel():
                 continue
-            episodes = data["environment_episode"].squeeze(-1)
-            boundaries = (episodes[1:] != episodes[:-1]).nonzero().flatten().add(1).tolist()
-            start = 0
-            for end in [*boundaries, len(data)]:
-                rollouts.append(data[start:end])
-                start = end
+            with detail("sampled_trajectory_splitting") if detail else nullcontext():
+                episodes = data["environment_episode"].squeeze(-1)
+                boundaries = (episodes[1:] != episodes[:-1]).nonzero().flatten().add(1).tolist()
+                start = 0
+                for end in [*boundaries, len(data)]:
+                    rollouts.append(data[start:end])
+                    start = end
+        if profile:
+            profile.record_workload("trajectory_count", len(rollouts))
+            profile.record_workload("trajectory_rows", sum(len(rollout) for rollout in rollouts))
         return rollouts
 
     def train(self, n_episodes=0, *, total_steps=None):
@@ -910,6 +1009,8 @@ class OnPolicyTrainer:
         self._collection_batches = self._last_collection_batch_frames = 0
         self._steady_started = self._steady_finished = None
         self.boundary_seconds = {phase: {} for phase in self.stage_seconds}
+        self.workload_counts = {phase: {} for phase in self.stage_seconds}
+        self.boundary_calls = {phase: {} for phase in self.stage_seconds}
         self.worker_stage_seconds = {phase: {} for phase in self.stage_seconds}
         self.worker_stage_calls = {phase: {} for phase in self.stage_seconds}
         self.worker_scope_seconds = {phase: {} for phase in self.stage_seconds}
@@ -1195,27 +1296,43 @@ class OnPolicyTrainer:
                     # Fixed-only continuation counts toward the physical budget,
                     # but follows the learner endpoint and needs no GAE rows.
                     if process:
-                        self._receive_process_batch(data)
+                        with self.measure_boundary("batch_reporting"):
+                            self._receive_process_batch(data)
                         # Own the retained tensors before the next collector
                         # batch; per-environment slices can then safely be views.
-                        owned = data.exclude("race_events", ("next", "race_events"), "worker_profile").clone()
-                        for worker, local, fragment in self._process_streams(owned):
-                            environment = worker * self.envs_per_worker + local
-                            pending.setdefault(environment, []).append(fragment)
+                        with self.measure_boundary("retained_batch_clone"):
+                            owned = data.exclude("race_events", ("next", "race_events"), "worker_profile").clone()
+                        if self.measure_stages:
+                            self.record_payload("retained", owned)
+                        with self.measure_boundary("stream_extraction"):
+                            for worker, local, fragment in self._process_streams(owned):
+                                environment = worker * self.envs_per_worker + local
+                                pending.setdefault(environment, []).append(fragment)
+                        if self.measure_stages:
+                            self.record_workload("fragment_count", self.total_envs)
                     else:
                         data = data[data["agents", "active"].any(dim=(-2, -1))]
                         if data.batch_size.numel():
                             pending.append(data)
+                            if self.measure_stages:
+                                self.record_payload("retained", data)
+                                self.record_workload("fragment_count")
                     self._record_boundary("aggregation", aggregation_started)
                     ready = self._pending_learning_steps >= self.agent.n_steps or self.budget_reached()
                     if ready and pending:
                         prepare_started = time.perf_counter()
-                        rollouts = self._process_rollouts(pending) if process else torch.cat(pending, dim=0)
+                        with self.measure_boundary("trajectory_reconstruction"):
+                            rollouts = (self._process_rollouts(pending, profile=self if self.measure_stages else None)
+                                        if process else torch.cat(pending, dim=0))
+                        if self.measure_stages and not process:
+                            self.record_workload("trajectory_count")
+                            self.record_workload("trajectory_rows", len(rollouts))
                         self._record_boundary("aggregation", prepare_started)
                         metrics = optimize(rollouts)
                         pending, self._pending_learning_steps = ({} if process else []), 0
                         updated = bool(metrics)
-                    self.reports.dispatch(metrics)
+                    with self.measure_boundary("episode_dispatch_nonservice", exclude_services=True):
+                        self.reports.dispatch(metrics)
                     if updated:
                         checkpoint_boundary()
                         if (self._timing_phase == "warmup"
@@ -1227,7 +1344,12 @@ class OnPolicyTrainer:
                         break
                 if not self._should_stop() and pending:
                     prepare_started = time.perf_counter()
-                    rollouts = self._process_rollouts(pending) if process else torch.cat(pending, dim=0)
+                    with self.measure_boundary("trajectory_reconstruction"):
+                        rollouts = (self._process_rollouts(pending, profile=self if self.measure_stages else None)
+                                    if process else torch.cat(pending, dim=0))
+                    if self.measure_stages and not process:
+                        self.record_workload("trajectory_count")
+                        self.record_workload("trajectory_rows", len(rollouts))
                     self._record_boundary("aggregation", prepare_started)
                     metrics = optimize(rollouts)
                     pending, self._pending_learning_steps = ({} if process else []), 0

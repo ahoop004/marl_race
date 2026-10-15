@@ -229,6 +229,13 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
                         assert metrics[f"perf/inference/{phase}/mean_agent_batch"] == batch_size * len(task.possible_agents)
                 assert sum(p.get("environment_rows", 0) for p in training.inference_profile.values()) == 24
                 assert sum(p.get("calls", 0) for p in training.inference_profile.values()) == 24 // batch_size
+                workload = training.workload_counts.values()
+                assert sum(c.get("fragment_count", 0) for c in workload) == len(physical_batches) * training.total_envs
+                assert sum(c.get("reporting_streams", 0) for c in workload) == len(physical_batches) * training.total_envs
+                assert sum(c.get("trajectory_count", 0) for c in workload) == len(seen_batches)
+                assert sum(c.get("retained_storage_span_bytes", 0) for c in workload) > 0
+                for name in ("batch_reporting", "retained_batch_clone", "stream_extraction", "trajectory_reconstruction"):
+                    assert sum(c.get(name, 0) for c in training.boundary_calls.values()) > 0
             assert metrics["perf/collection_batches"] == len(physical_batches)
             assert metrics["perf/last_collection_batch_frames"] == physical_batches[-1]
             parent_cpus = metrics["perf/process/cpu_affinity"]
@@ -276,9 +283,13 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
 
 @pytest.mark.parametrize("envs_per_worker", [1, 2])
 @pytest.mark.parametrize("transport", ["transition", "batch"])
-def test_process_reporting_keeps_prefix_counters_and_policy_starts(envs_per_worker, transport, monkeypatch):
+@pytest.mark.parametrize("detail_samples", [None, 0, 2])
+def test_process_reporting_keeps_prefix_counters_and_policy_starts(envs_per_worker, transport, detail_samples, monkeypatch):
     training, _ = trainer(Capture(False))
     training.parallel_envs, training.envs_per_worker = 2, envs_per_worker
+    training.total_envs = 2 * envs_per_worker
+    training.measure_stages = detail_samples is not None
+    training.profiling_detail_samples = detail_samples or 0
     training.process_collection = True
     training._updates, training._initial_updates = 2, 0
     training._environment_steps, training._physics_steps, training._agent_steps = 10, 20, 30
@@ -350,13 +361,21 @@ def test_process_reporting_keeps_prefix_counters_and_policy_starts(envs_per_work
     assert training._physics_steps == 20 + 12 * 2 * envs_per_worker
     assert training._agent_steps == 30 + 5 * 2 * envs_per_worker
     assert training._pending_learning_steps == 5 + 5 * 2 * envs_per_worker
+    if detail_samples is not None:
+        counts = training.workload_counts[phase]
+        assert counts["reporting_streams"] == 2 * envs_per_worker
+        assert counts["report_events"] == 5 and counts["episode_events"] == 3
+        assert training.boundary_calls[phase].get("sampled_prefix_counters", 0) == detail_samples
+    else:
+        assert not training.workload_counts[phase] and not training.boundary_calls[phase]
     batch["next", "policy_version"].fill_(1)
     with pytest.raises(RuntimeError, match="stale policy"):
         training._receive_process_batch(batch)
 
 
 @pytest.mark.parametrize("single_chunk", [False, True])
-def test_process_rollouts_preserve_races_masks_and_fixed_only_endpoints(single_chunk):
+@pytest.mark.parametrize("detail_samples", [None, 0, 2])
+def test_process_rollouts_preserve_races_masks_and_fixed_only_endpoints(single_chunk, detail_samples):
     from training.on_policy import OnPolicyTrainer
 
     policy = learner()
@@ -369,7 +388,11 @@ def test_process_rollouts_preserve_races_masks_and_fixed_only_endpoints(single_c
         rows.append(row)
     data = torch.stack(rows)
     chunks = [data] if single_chunk else [data[:1], data[1:4], data[4:]]
-    rollouts = OnPolicyTrainer._process_rollouts({0: chunks, 1: [data[2:4]]})
+    profile = None
+    if detail_samples is not None:
+        profile, _ = trainer(Capture(False))
+        profile.measure_stages, profile.profiling_detail_samples = True, detail_samples
+    rollouts = OnPolicyTrainer._process_rollouts({0: chunks, 1: [data[2:4]]}, profile=profile)
     assert len(rollouts) == 2
     for actual, expected in zip(rollouts, [data[:2], data[4:]]):
         assert actual.batch_size == expected.batch_size
@@ -377,6 +400,10 @@ def test_process_rollouts_preserve_races_masks_and_fixed_only_endpoints(single_c
             torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
     assert rollouts[0][-1]["next", "learning", "terminated"].item()
     assert not rollouts[1][-1]["next", "learning", "done"].item()
+    if profile:
+        assert profile.workload_counts["initialization"]["trajectory_count"] == 2
+        assert profile.workload_counts["initialization"]["trajectory_rows"] == 4
+        assert profile.boundary_calls["initialization"].get("sampled_inactive_filtering", 0) == detail_samples
 
 
 def test_worker_batch_reports_preserve_reset_order_and_packet_lifetime(monkeypatch):
@@ -556,6 +583,164 @@ def test_stage_timers_are_exclusive_and_optional(monkeypatch):
     assert training.stage_calls["warmup"] == dict(physics=1, lidar=1)
 
 
+def test_attribution_boundaries_are_optional_inclusive_and_phase_scoped(monkeypatch):
+    training, _ = trainer(Capture(False))
+    monkeypatch.setattr("training.on_policy.time.perf_counter", lambda: pytest.fail("disabled clock"))
+    monkeypatch.setattr("training.on_policy.tensor_payload", lambda *a, **k: pytest.fail("disabled payload scan"))
+    with training.measure_boundary("outer"):
+        training.record_payload("retained", None)
+        training.record_workload("fragment_count")
+    assert not any(training.workload_counts.values())
+    training.measure_stages = training.measure_services = True
+    training._timing_phase = "warmup"
+    ticks = iter([0., 1., 3., 5., 6., 9.])
+    monkeypatch.setattr("training.on_policy.time.perf_counter", lambda: next(ticks))
+    with training.measure_boundary("outer"):
+        with training.measure_boundary("inner"):
+            pass
+    # Boundaries overlap; neither is subtracted from the historical stage timer.
+    assert training.boundary_seconds["warmup"] == dict(outer=5., inner=2.)
+    assert not any(training.stage_seconds.values())
+    training._timing_phase = "steady"
+    with training.measure_boundary("dispatch_nonservice", exclude_services=True):
+        training.service_seconds["logging"] += 2.
+    assert training.boundary_seconds["steady"]["dispatch_nonservice"] == 1.
+    assert training.boundary_calls["steady"]["dispatch_nonservice"] == 1
+
+
+def test_payload_footprint_deduplicates_aliases_without_tensor_movement(monkeypatch):
+    from training.runtime import tensor_payload, profiling_sample_indices
+
+    base = torch.arange(12, dtype=torch.float32)
+    data = TensorDict({"a": base[1:9], "alias": base[1:9], "b": base[5:11],
+                       "expanded": base[1].expand(8), "event": NonTensorData("ignored")}, [])
+    rng = torch.random.get_rng_state()
+    assert profiling_sample_indices(4000, 8) == {0, 571, 1142, 1713, 2285, 2856, 3427, 3999}
+    assert not profiling_sample_indices(4000, 0)
+    assert torch.equal(rng, torch.random.get_rng_state())
+    for method in ("cpu", "to", "clone"):
+        monkeypatch.setattr(torch.Tensor, method, lambda *a, **k: pytest.fail("payload moved a tensor"))
+    assert tensor_payload(data) == (4, 40)
+    assert tensor_payload(data, source_device="cuda") == (0, 0)
+
+
+def test_parent_attribution_with_reused_collector_batch(monkeypatch):
+    """Exercise the parent handoff without processes or a physics benchmark."""
+    training, _ = trainer(Capture(False), n_steps=16, n_epochs=1, batch_size=4, frames_per_batch=8)
+    training.parallel_envs = training.envs_per_worker = 2
+    training.total_envs, training.process_collection = 4, True
+    training.scenario = {"experiment": {"seed": 42}}
+    training.measure_stages, training.profiling_detail_samples = True, 2
+    streams = []
+    for environment in range(4):
+        stream = rollout(training.agent.policy, [0, 1])
+        stream["agents"] = TensorDict({"active": torch.ones(2, 1, 1, dtype=torch.bool)}, [2, 1])
+        stream["environment_id"] = torch.full((2, 1), environment)
+        stream["environment_episode"] = torch.zeros(2, 1, dtype=torch.int64)
+        for name in ("decision_physics_steps", "agent_steps"):
+            stream["next", name] = torch.ones(2, 1, dtype=torch.int64)
+        stream["next", "policy_version"] = torch.zeros(2, 1, dtype=torch.int64)
+        streams.append(stream)
+    batch = torch.stack(streams).reshape(2, 2, 2)
+    batch["worker_profile"] = NonTensorData({"collection_seconds": 0.001, "process": {},
+                                            "race_events": {}}, batch_size=batch.batch_size)
+    class ReusedCollector:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __iter__(self):
+            for offset in (0, 10):
+                batch["observation"].copy_(torch.tensor([offset, offset + 1]).reshape(1, 1, 2, 1))
+                batch["next", "observation"] = batch["observation"] + 1
+                with torch.no_grad():
+                    training.agent.policy(batch)
+                yield batch
+        def update_policy_weights_(self, weights):
+            pass
+        def shutdown(self):
+            pass
+    seen = []
+    handle = training.agent.gae.register_forward_pre_hook(
+        lambda m, a: seen.append(a[0]["observation"].flatten().tolist()))
+    monkeypatch.setattr("training.on_policy.Collector", ReusedCollector)
+    try:
+        training.train(total_steps=16)
+    finally:
+        handle.remove()
+    assert seen == [[0, 1, 10, 11]] * 4
+    counts = training.workload_counts["warmup"]
+    assert counts["fragment_count"] == counts["reporting_streams"] == 8
+    assert counts["trajectory_count"] == 4 and counts["trajectory_rows"] == 16
+    assert counts["retained_storage_span_bytes"] > 0
+    assert counts["ppo_minibatches"] == 4 and counts["replay_samples"] == 16
+    calls = training.boundary_calls["warmup"]
+    assert calls["retained_batch_clone"] == calls["stream_extraction"] == 2
+    assert calls["trajectory_reconstruction"] == 1
+    assert calls["sampled_stream_validation"] == 4
+    assert training.performance_metrics()["perf/workload/warmup/mean_trajectory_length"] == 4
+
+
+@pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
+@pytest.mark.parametrize("detail_samples", [0, 2])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_learner_attribution_preserves_gae_gradients_optimizer_and_rng(algorithm, detail_samples, device, monkeypatch):
+    from contextlib import ExitStack
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA hardware unavailable")
+    factory = agent if algorithm == "ppo" else learner
+    source = factory(n_epochs=2)
+    plain, measured = factory(n_epochs=2, device=device), factory(n_epochs=2, device=device)
+    for module in ("actor", "critic"):
+        for policy in (plain, measured):
+            getattr(policy, module).load_state_dict(getattr(source, module).state_dict())
+    if algorithm == "ppo":
+        fragments = [rollout(source.policy, [1, 2], done=[False, True]), rollout(source.policy, [10, 11, 12])]
+    else:
+        fragments = [torch.stack([transition(source, IDS, 0, 1, False),
+                                  transition(source, ["car_1"], 1, 2, True)]),
+                     torch.stack([transition(source, IDS, 0, 3, False)])]
+    training, _ = trainer(Capture(False))
+    training.agent, training.process_collection = measured, True
+    training.measure_stages, training.profiling_detail_samples = True, detail_samples
+    training._timing_phase = "steady"
+    rng = torch.random.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state() if device == "cuda" else None
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: pytest.fail("attribution added a CUDA wait"))
+    results = []
+    for policy in (plain, measured):
+        torch.random.set_rng_state(rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state(cuda_rng)
+        gradients, gae, losses = [], [], []
+        with ExitStack() as resources:
+            for parameter in policy._optim_parameters:
+                resources.callback(parameter.register_hook(lambda g: gradients.append(g.detach().clone())).remove)
+            value_key = ("agents", "value_target") if algorithm == "mappo" else "value_target"
+            resources.callback(policy.gae.register_forward_hook(
+                lambda m, a, out: gae.append(out[value_key].detach().clone())).remove)
+            resources.callback(policy.loss_module.register_forward_hook(
+                lambda m, a, out: losses.append(out["loss_objective"].detach().clone())).remove)
+            if policy is measured:
+                training._instrument_stages(resources)
+            metrics = policy.update_rollouts([fragment.clone() for fragment in fragments])
+        results.append((metrics, gradients, gae, losses, policy.optimizer.state_dict(),
+                        [p.detach().clone() for p in policy._optim_parameters], torch.random.get_rng_state(),
+                        torch.cuda.get_rng_state() if device == "cuda" else None))
+    torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
+    counts = training.workload_counts["steady"]
+    assert counts["ppo_minibatches"] == results[0][0]["train/optimizer_steps"] == 6
+    assert counts["replay_samples"] == 10
+    assert counts.get("cpu_to_cuda_tensordict_calls", 0) == (2 if device == "cuda" else 0)
+    for name in ("replay_construction", "replay_population", "optimizer_loop", "final_metric_aggregation",
+                 "rollout_preparation", "learner_rollout_clone", "pending_rollout_concatenation"):
+        assert math.isfinite(training.boundary_seconds["steady"][name])
+        assert training.boundary_seconds["steady"][name] >= 0
+    calls = training.boundary_calls["steady"]
+    for name in ("minibatch_sampling", "kl", "loss_forward", "entropy", "backward", "gradient_clipping", "optimizer_step"):
+        assert calls.get("sampled_" + name, 0) == detail_samples
+    assert measured.profile_region is None and measured.profile_count is None
+
+
 @pytest.mark.parametrize("measure_mpc", [False, True])
 def test_stage_profiling_preserves_updates_and_restores_instance_methods(measure_mpc):
     plain_capture, measured_capture = Capture(False), Capture(False)
@@ -587,20 +772,41 @@ def test_stage_profiling_preserves_updates_and_restores_instance_methods(measure
     assert metrics["perf/initialization_seconds"] >= 0 and metrics["perf/warmup_seconds"] > 0
     assert all(metrics[f"perf/{name}_per_second"] > 0 for name in (
         "environment_steps", "physics_steps", "learner_samples", "optimizer_steps"))
+    assert measured.workload_counts["warmup"]["trajectory_count"] == 1
+    assert measured.workload_counts["steady"]["trajectory_count"] == 2
+    assert metrics["perf/workload/steady/mean_trajectory_length"] == 2.5
+    for phase in ("warmup", "steady"):
+        assert measured.boundary_calls[phase]["replay_population"] == measured.stage_calls[phase]["optimization"]
+        assert all(math.isfinite(v) and v >= 0 for v in measured.boundary_seconds[phase].values())
+    assert not any(plain.workload_counts.values()) and not any(plain.boundary_calls.values())
 
 
 @pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
-def test_kl_gate_preserves_parameters_before_first_optimizer_step(algorithm):
+@pytest.mark.parametrize("detail_samples", [None, 2])
+def test_kl_gate_preserves_parameters_before_first_optimizer_step(algorithm, detail_samples):
+    from contextlib import ExitStack
+
     policy = agent(target_kl=1e-6) if algorithm == "ppo" else learner(target_kl=1e-6)
     data = rollout(policy.policy, [0, 1, 2]) if algorithm == "ppo" else torch.stack(
         [transition(policy, IDS, step, 1, terminal=step == 2) for step in range(3)])
     with torch.no_grad():
         policy.actor.net[0].bias.add_(10)
     before = {key: value.clone() for key, value in policy.actor.state_dict().items()}
-    metrics = policy.update(data)
+    with ExitStack() as resources:
+        if detail_samples is not None:
+            training, _ = trainer(Capture(False))
+            training.agent, training.process_collection = policy, True
+            training.measure_stages, training.profiling_detail_samples = True, detail_samples
+            training._instrument_stages(resources)
+        metrics = policy.update(data)
     assert metrics["train/kl_early_stop"] == 1 and metrics["train/optimizer_steps"] == 0
     for key, value in policy.actor.state_dict().items():
         torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+    if detail_samples is not None:
+        assert training.workload_counts["initialization"]["ppo_minibatches"] == 1
+        assert training.workload_counts["initialization"]["replay_samples"] == 2
+        assert training.boundary_calls["initialization"]["sampled_kl"] == 1
+        assert "sampled_backward" not in training.boundary_calls["initialization"]
 
 
 def test_minibatch_sampler_visits_every_sample_once_including_short_tail():

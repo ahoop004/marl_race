@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule, TensorDictSequential
@@ -101,34 +103,42 @@ class TorchRLMAPPOAgent(MAPPOPolicy):
     def update_rollouts(self, rollouts):
         self._require_lora_source()
         fragments = []
+        region = getattr(self, "profile_region", None)
         for rollout in rollouts:
             if not rollout.batch_size.numel():
                 continue
-            profile = getattr(self, "profile_call", None)
-            if profile:
-                moving = any(value.device != self.device for value in rollout.values(True, True)
-                             if isinstance(value, torch.Tensor))
-                category = "rollout_device_transfer" if moving else "tensor_device_conversion"
-                fragment = profile(category, rollout.to, self.device, device=self.device)
-                fragment = profile("tensor_copy", fragment.clone, device=self.device)
-            else:
-                fragment = rollout.to(self.device).clone()
-            with torch.no_grad():
-                self.gae(fragment)
+            with region("rollout_preparation") if region else nullcontext():
+                profile = getattr(self, "profile_call", None)
+                payload = getattr(self, "profile_payload", None)
+                if payload:
+                    payload("cpu_to_cuda", rollout, destination=self.device)
+                if profile:
+                    moving = any(value.device != self.device for value in rollout.values(True, True)
+                                 if isinstance(value, torch.Tensor))
+                    category = "rollout_device_transfer" if moving else "tensor_device_conversion"
+                    fragment = profile(category, rollout.to, self.device, device=self.device)
+                    with region("learner_rollout_clone") if region else nullcontext():
+                        fragment = profile("tensor_copy", fragment.clone, device=self.device)
+                else:
+                    fragment = rollout.to(self.device).clone()
+                with torch.no_grad():
+                    self.gae(fragment)
             fragments.append(fragment)
         if not fragments:
             return {}
-        data = torch.cat(fragments, dim=0)
+        with region("pending_rollout_concatenation") if region else nullcontext():
+            data = torch.cat(fragments, dim=0)
         # Keep retired slots in GAE for continuing team credit, then select only
         # actual decisions before advantage normalization and minibatch sampling.
-        mask = data["agents", "active"].reshape(-1)
-        states = data["state"].unsqueeze(-2).expand(-1, len(self.agent_ids), -1).reshape(-1, self.global_state_dim)
-        selected = data["agents"].reshape(-1)[mask]
-        # TensorDict.numel() clamps empty batches to one in TensorDict 0.14.
-        n_samples = selected.batch_size.numel()
-        if not n_samples:
-            return {}
-        samples = TensorDict({"agents": selected.unsqueeze(-1), "state": states[mask]}, [n_samples])
+        with region("mappo_active_state_preparation") if region else nullcontext():
+            mask = data["agents", "active"].reshape(-1)
+            states = data["state"].unsqueeze(-2).expand(-1, len(self.agent_ids), -1).reshape(-1, self.global_state_dim)
+            selected = data["agents"].reshape(-1)[mask]
+            # TensorDict.numel() clamps empty batches to one in TensorDict 0.14.
+            n_samples = selected.batch_size.numel()
+            if not n_samples:
+                return {}
+            samples = TensorDict({"agents": selected.unsqueeze(-1), "state": states[mask]}, [n_samples])
         profile = getattr(self, "profile_call", None)
         metrics = (profile("optimization", optimize_ppo, self, samples, group="agents", device=self.device)
                    if profile else optimize_ppo(self, samples, group="agents"))

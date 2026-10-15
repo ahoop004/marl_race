@@ -76,6 +76,9 @@ def validate_training_scenario(scenario):
         raise ScenarioError("experiment.measure_collector_startup must be boolean")
     if type(experiment.get("measure_cuda_sync", False)) is not bool:
         raise ScenarioError("experiment.measure_cuda_sync must be boolean")
+    samples = experiment.get("profiling_detail_samples", 0)
+    if type(samples) is not int or not 0 <= samples <= 32:
+        raise ScenarioError("experiment.profiling_detail_samples must be an integer in [0, 32]")
     if type(experiment.get("measure_mpc", False)) is not bool:
         raise ScenarioError("experiment.measure_mpc must be boolean")
     if type(experiment.get("measure_hybrid", False)) is not bool:

@@ -14,6 +14,27 @@ from training.race_reporting import RaceTrainingReports
 from test_torchrl_ppo import Capture, trainer
 
 
+def test_attribution_logging_is_opt_in_and_keeps_decision_axis(tmp_path):
+    metrics = {"perf/boundaries/steady/replay_population_seconds": 0.1,
+               "perf/workload/steady/replay_samples": 10,
+               "train/environment_steps": 5, "train/policy_loss": 0.2}
+    assert "perf/workload/steady/replay_samples" not in MetricPolicy().filter(metrics)
+    policy = MetricPolicy(scenario={"experiment": {"measure_stages": True}})
+    assert policy.filter(metrics) == metrics
+    assert not MetricPolicy({"groups": {"performance": False}},
+                            {"experiment": {"measure_stages": True}}).accepts("perf/workload/steady/replay_samples")
+    assert not MetricPolicy({"metrics": {"train/*": True}},
+                            {"experiment": {"measure_stages": True}}).accepts("perf/workload/steady/replay_samples")
+    logger = CSVLogger(str(tmp_path))
+    logger.log_update(metrics)
+    logger.flush()
+    with (tmp_path / "update_metrics.csv").open() as stream:
+        row = next(csv.DictReader(stream))
+    assert float(row["perf/boundaries/steady/replay_population_seconds"]) == 0.1
+    assert row["perf/workload/steady/replay_samples"] == "10"
+    logger.close()
+
+
 def queued_episode(episode, steps, *, race=True):
     identity = dict(episode_id=f"run_ep{episode:06d}", environment_id=episode % 512,
                     environment_episode=episode // 512)

@@ -507,3 +507,18 @@ def test_mpc_profiling_requires_boolean(value):
         f"experiment.measure_mpc={value}"])
     with pytest.raises(ScenarioError, match="measure_mpc must be boolean"):
         validate_experiment_scenario(config)
+
+
+@pytest.mark.parametrize("value", ["-1", "33", "true", "1.5"])
+def test_detail_profiling_requires_bounded_sample_budget(value):
+    config = load_and_expand_scenario("scenarios/ppo_serial_profile.yaml", overrides=[
+        f"++experiment.profiling_detail_samples={value}"])
+    with pytest.raises(ScenarioError, match="profiling_detail_samples"):
+        validate_experiment_scenario(config)
+
+
+def test_detail_profiling_hydra_override():
+    config = load_and_expand_scenario("scenarios/ppo_serial_profile.yaml", overrides=[
+        "++experiment.measure_stages=true", "++experiment.profiling_detail_samples=8"])
+    validate_experiment_scenario(config)
+    assert config["experiment"]["profiling_detail_samples"] == 8
