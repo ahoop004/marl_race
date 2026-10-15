@@ -33,6 +33,8 @@ class RewardComposer:
 
     def __init__(self, components: List[RewardComponent]) -> None:
         self._components = components
+        self._local_components = tuple(c for c in components if getattr(c, "scope", None) != "team")
+        self._team_components = tuple(c for c in components if getattr(c, "scope", None) == "team")
 
     def reset(self) -> None:
         for c in self._components:
@@ -45,9 +47,7 @@ class RewardComposer:
     def compute(self, step_info: dict, *, team: bool = False) -> Tuple[float, Dict[str, float]]:
         """Compute local rewards by default, or shared components once per step."""
         breakdown: Dict[str, float] = {}
-        for component in self._components:
-            if (getattr(component, "scope", None) == "team") != team:
-                continue
+        for component in self._team_components if team else self._local_components:
             breakdown.update(component.compute(step_info))
         total = sum(breakdown.values())
         return total, breakdown

@@ -15,6 +15,7 @@ def build_reward_context(
     obs_dict: Dict[str, Any],
     actions: Dict[str, np.ndarray],
     global_state: Optional[GlobalState] = None,
+    agent_roles: Optional[tuple[Sequence[str], Sequence[str], set[str]]] = None,
 ) -> Dict[str, Any]:
     if global_state is None:
         try:
@@ -27,9 +28,15 @@ def build_reward_context(
         else np.zeros(0, dtype=np.float32)
     )
 
-    trainable_agent_ids = _string_list(getattr(env, "trainable_agents", []) or [])
-    fixed_policy_agent_ids = _string_list(getattr(env, "fixed_policy_agents", []) or [])
-    team_set = set(trainable_agent_ids)
+    if agent_roles is None:
+        trainable_agent_ids = _string_list(getattr(env, "trainable_agents", []) or [])
+        fixed_policy_agent_ids = _string_list(getattr(env, "fixed_policy_agents", []) or [])
+        team_set = set(trainable_agent_ids)
+    else:
+        # Roles are shared only within this synchronous physics substep. Keep
+        # the published lists independent for composers that retain contexts.
+        trainable_agent_ids = list(agent_roles[0])
+        fixed_policy_agent_ids, team_set = agent_roles[1:]
 
     get_target_id = getattr(env, "get_target_id", None)
     target_id = get_target_id(agent_id) if callable(get_target_id) else None

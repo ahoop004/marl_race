@@ -76,6 +76,13 @@ def split_joint_obs(
     ang_vels_z = joint.get("ang_vels_z")
     collisions = joint.get("collisions")
 
+    # Validate each shared field once, retaining lazy indexing/fallbacks below.
+    has_scans = isinstance(scans, np.ndarray)
+    has_poses = isinstance(poses_x, np.ndarray)
+    has_vx = isinstance(linear_vels_x, np.ndarray)
+    has_vy = isinstance(linear_vels_y, np.ndarray)
+    has_angular = isinstance(ang_vels_z, np.ndarray)
+    has_collisions = isinstance(collisions, np.ndarray)
     dt = max(float(timestep), 1e-6)
 
     for i, aid in enumerate(possible_agents):
@@ -83,7 +90,7 @@ def split_joint_obs(
         agent_obs: Dict[str, np.ndarray] = {}
         target_idx = agent_target_index.get(aid)
 
-        has_scan = isinstance(scans, np.ndarray) and i < scans.shape[0]
+        has_scan = has_scans and i < scans.shape[0]
 
         if "lidar" in sensors:
             if has_scan:
@@ -91,7 +98,7 @@ def split_joint_obs(
             else:
                 n_beams = (
                     scans.shape[1]
-                    if isinstance(scans, np.ndarray) and scans.ndim == 2
+                    if has_scans and scans.ndim == 2
                     else lidar_beam_count
                 )
                 lidar_reading = np.zeros((n_beams,), dtype=np.float32)
@@ -99,9 +106,9 @@ def split_joint_obs(
             agent_obs["scans"] = lidar_reading
 
         if "pose" in sensors:
-            if isinstance(poses_x, np.ndarray) and i < poses_x.shape[0]:
+            if has_poses and i < poses_x.shape[0]:
                 agent_obs["pose"] = np.array(
-                    [np.float32(poses_x[i]), np.float32(poses_y[i]), np.float32(poses_theta[i])],
+                    [poses_x[i], poses_y[i], poses_theta[i]],
                     dtype=np.float32,
                 )
             else:
@@ -109,12 +116,12 @@ def split_joint_obs(
 
         curr_vx = (
             float(linear_vels_x[i])
-            if isinstance(linear_vels_x, np.ndarray) and i < linear_vels_x.shape[0]
+            if has_vx and i < linear_vels_x.shape[0]
             else 0.0
         )
         curr_vy = (
             float(linear_vels_y[i])
-            if isinstance(linear_vels_y, np.ndarray) and i < linear_vels_y.shape[0]
+            if has_vy and i < linear_vels_y.shape[0]
             else 0.0
         )
 
@@ -138,17 +145,17 @@ def split_joint_obs(
         if "angular_velocity" in sensors:
             agent_obs["angular_velocity"] = (
                 np.float32(ang_vels_z[i])
-                if isinstance(ang_vels_z, np.ndarray) and i < ang_vels_z.shape[0]
+                if has_angular and i < ang_vels_z.shape[0]
                 else np.float32(0.0)
             )
 
         if "target_pose" in sensors:
-            if target_idx is not None and isinstance(poses_x, np.ndarray) and target_idx < poses_x.shape[0]:
+            if target_idx is not None and has_poses and target_idx < poses_x.shape[0]:
                 agent_obs["target_pose"] = np.array(
                     [
-                        np.float32(poses_x[target_idx]),
-                        np.float32(poses_y[target_idx]),
-                        np.float32(poses_theta[target_idx]),
+                        poses_x[target_idx],
+                        poses_y[target_idx],
+                        poses_theta[target_idx],
                     ],
                     dtype=np.float32,
                 )
@@ -156,7 +163,7 @@ def split_joint_obs(
                 agent_obs["target_pose"] = np.zeros(3, dtype=np.float32)
 
         if "target_collision" in sensors:
-            if target_idx is not None and isinstance(collisions, np.ndarray) and target_idx < collisions.shape[0]:
+            if target_idx is not None and has_collisions and target_idx < collisions.shape[0]:
                 agent_obs["target_collision"] = np.float32(float(collisions[target_idx]))
             else:
                 agent_obs["target_collision"] = np.float32(0.0)
@@ -167,7 +174,7 @@ def split_joint_obs(
             agent_obs["lap"] = np.array([lap_count_val, lap_time_val], dtype=np.float32)
 
         if "collision" in sensors:
-            if isinstance(collisions, np.ndarray) and i < collisions.shape[0]:
+            if has_collisions and i < collisions.shape[0]:
                 col_val = float(collisions[i])
             elif fallback_collisions is not None and i < fallback_collisions.shape[0]:
                 col_val = float(fallback_collisions[i])

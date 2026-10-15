@@ -74,11 +74,9 @@ class FrenetNeighborsComponent(ObservationComponent):
             if not isinstance(neighbor, Mapping):
                 continue
             start = self.slot_dim * slot
-            values = np.asarray(
-                [_finite_number(neighbor.get(field)) for field in _FIELDS],
-                dtype=np.float32,
-            )
-            out[start : start + 4] = values / self._maxima
+            values = out[start : start + 4]
+            values[:] = [_finite_number(neighbor.get(field)) for field in _FIELDS]
+            np.divide(values, self._maxima, out=values)
             out[start + 4] = 1.0
             if self.include_team:
                 if "is_teammate" not in neighbor:

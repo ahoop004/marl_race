@@ -41,6 +41,8 @@ class ObservationComposer:
             offsets.append(offset)
             offset += c.dim
         self._offsets: List[int] = offsets
+        self._slices = [slice(start, start + c.dim)
+                        for c, start in zip(components, offsets)]
 
     @property
     def obs_dim(self) -> int:
@@ -60,8 +62,8 @@ class ObservationComposer:
         """
         info = info or {}
         buf = self._buf
-        for c, start in zip(self._components, self._offsets):
-            c.compute_into(raw_obs, info, buf[start : start + c.dim])
+        for c, selection in zip(self._components, self._slices):
+            c.compute_into(raw_obs, info, buf[selection])
         return buf.copy()
 
     def reset(self) -> None:

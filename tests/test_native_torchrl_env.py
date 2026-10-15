@@ -110,6 +110,36 @@ def test_construction_specs_seed_options_and_snapshot_ownership():
         env.close()
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_all_output_fields_own_storage_across_steps_resets_and_sibling_writes(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    env = NativeRaceTorchRLEnv(team_task({}), reward_mode="team_shared",
+                              device=device, environment_id=17, batch_reports=True)
+    try:
+        initial = env.reset(seed=3)
+        first = env.step(zero_policy(initial))["next"]
+        retained = first.clone()
+        env.step(zero_policy(first.clone()))
+        env.reset(seed=4)
+        env._observations.fill(123)
+        env._terminated.fill(True)
+        env._truncated.fill(True)
+        env.task.env.vector.fill(456)
+        keys = list(first.keys(True, True))
+        for key in keys:
+            torch.testing.assert_close(first[key], retained[key], rtol=0, atol=0)
+        # Exercise every pair of slices, including fields sharing a dtype pack.
+        for key in keys:
+            first[key].fill_(False if first[key].dtype == torch.bool else -7)
+            for other in keys:
+                if other != key:
+                    torch.testing.assert_close(first[other], retained[other], rtol=0, atol=0)
+            first[key].copy_(retained[key])
+    finally:
+        env.close()
+
+
 @pytest.mark.parametrize("mode,reduction", [("individual", "mean"), ("team_shared", "mean"), ("team_shared", "sum")])
 @pytest.mark.parametrize("repeat", [1, 3])
 def test_scripted_task_parity_retirement_and_fixed_only_continuation(mode, reduction, repeat):

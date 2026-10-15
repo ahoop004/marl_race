@@ -14,6 +14,10 @@ from tasks.specification import TaskSpec, EpisodeMetadata, EpisodeLimits
 
 
 def _detach(value, memo=None):
+    # Most nested info entries are immutable leaves. Avoid allocating a memo
+    # and testing Mapping/dataclass protocols for every scalar.
+    if type(value) in (str, int, float, bool, type(None)) or isinstance(value, np.generic):
+        return value
     if memo is None:
         memo = {}
     if id(value) in memo:
@@ -227,7 +231,8 @@ class RaceTask:
         truncated = dict.fromkeys(before.agents, False)
         team_reward, team_components, substeps = 0.0, {}, []
         for _ in range(self.action_repeat):
-            supplied_actions = _detach(physical)
+            # Conversion above guarantees independently owned NumPy arrays.
+            supplied_actions = {aid: action.copy() for aid, action in physical.items()}
             raw_obs, _, terms, truncs, infos = self.env.step(physical)
             self._physics_steps += 1
             facts = _detach(self.env.last_step_facts)
@@ -236,13 +241,18 @@ class RaceTask:
             substeps.append(substep)
             if on_physics_step is not None:
                 on_physics_step(substep)
+            agent_roles = None
+            if len(before.agents) + (self.team_reward_agent_id is not None) > 1:
+                trainable = [str(aid) for aid in (getattr(self.env, "trainable_agents", []) or [])]
+                fixed = [str(aid) for aid in (getattr(self.env, "fixed_policy_agents", []) or [])]
+                agent_roles = (trainable, fixed, set(trainable))
             for aid in before.agents:
                 agent_term, agent_trunc = bool(terms.get(aid, False)), bool(truncs.get(aid, False))
                 terminated[aid] |= agent_term
                 truncated[aid] |= agent_trunc
                 context = build_reward_context(
                     env=self.env, agent_id=aid, info_dict=infos, obs_dict=raw_obs,
-                    actions=physical, global_state=global_state,
+                    actions=physical, global_state=global_state, agent_roles=agent_roles,
                 )
                 context.update(obs=before.observations[aid], next_obs=raw_obs.get(aid, {}),
                                info=infos.get(aid, {}), done=agent_term or agent_trunc,
@@ -250,19 +260,20 @@ class RaceTask:
                                action=normalized[aid], timestep=self.timestep)
                 reward, breakdown = self.reward_composers[aid].compute(context)
                 rewards[aid] += float(reward)
+                agent_components = components[aid]
                 for name, value in breakdown.items():
-                    components[aid][name] = components[aid].get(name, 0.0) + float(value)
+                    agent_components[name] = agent_components.get(name, 0.0) + float(value)
             if self.team_reward_agent_id is not None:
                 aid = self.team_reward_agent_id
                 context = build_reward_context(
                     env=self.env, agent_id=aid, info_dict=infos, obs_dict=raw_obs,
-                    actions=physical, global_state=global_state,
+                    actions=physical, global_state=global_state, agent_roles=agent_roles,
                 )
                 bonus, breakdown = self.reward_composers[aid].compute(context, team=True)
                 team_reward += float(bonus)
                 for name, value in breakdown.items():
                     team_components[name] = team_components.get(name, 0.0) + float(value)
-            if self.env.episode_done or not set(physical).issubset(self.env.agents):
+            if self.env.episode_done or any(aid not in self.env.agents for aid in physical):
                 break
 
         next_observations, decisions = {}, {}

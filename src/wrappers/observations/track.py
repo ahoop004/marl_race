@@ -92,20 +92,17 @@ class FrenetVehicleTrackComponent(ObservationComponent):
             wheel = [_number(raw_obs.get("speed_reference_rate")) / wheel_radius,
                      _number(raw_obs.get("speed_reference")) / wheel_radius,
                      velocity[0] / wheel_radius]
-        state = np.asarray(
-            [
-                velocity[0],
-                velocity[1],
-                _number(centerline.get("heading_error")),
-                _number(centerline.get("d")),
-                _number(raw_obs.get("angular_velocity")),
-                _number(raw_obs.get("steering_angle")),
-                _number(raw_obs.get("steering_reference")),
-                *wheel,
-            ],
-            dtype=np.float32,
+        out[:10] = (
+            velocity[0],
+            velocity[1],
+            _number(centerline.get("heading_error")),
+            _number(centerline.get("d")),
+            _number(raw_obs.get("angular_velocity")),
+            _number(raw_obs.get("steering_angle")),
+            _number(raw_obs.get("steering_reference")),
+            *wheel,
         )
-        out[:10] = state / self._maxima
+        np.divide(out[:10], self._maxima, out=out[:10])
 
         curvature = _vector(preview.get("curvature"), self.points)
         width = _vector(preview.get("width"), self.points)
@@ -114,8 +111,8 @@ class FrenetVehicleTrackComponent(ObservationComponent):
         if self.track_maxima is not None:
             curvature_max = self.track_maxima["curvature"]
             width_max = self.track_maxima["width"]
-        out[10 : 10 + self.points] = curvature / curvature_max
-        out[10 + self.points :] = width / width_max
+        np.divide(curvature, curvature_max, out=out[10 : 10 + self.points])
+        np.divide(width, width_max, out=out[10 + self.points :])
         np.nan_to_num(out, copy=False)
         if self.clip:
             np.clip(out, -1.0, 1.0, out=out)
@@ -130,10 +127,13 @@ def _number(value: object, default: float = 0.0) -> float:
 
 
 def _vector(value: object, size: int) -> np.ndarray:
-    result = np.zeros(size, dtype=np.float32)
     if value is None:
-        return result
+        return np.zeros(size, dtype=np.float32)
     array = np.asarray(value, dtype=np.float32).reshape(-1)
+    # Read-only use within compute_into; never expose the source as output.
+    if array.size >= size:
+        return array[:size]
+    result = np.zeros(size, dtype=np.float32)
     count = min(size, array.size)
     result[:count] = array[:count]
     return result

@@ -16,6 +16,25 @@ ALL_SENSORS = (
 )
 
 
+def test_composer_retains_ownership_and_survives_worker_serialization():
+    import pickle
+    from wrappers.observations.composer import ObservationComposer
+    from wrappers.observations.track import FrenetVehicleTrackComponent
+
+    composer = ObservationComposer([FrenetVehicleTrackComponent(points=2, wheel_radius=.05)])
+    raw = {"velocity": np.array([2., -1.], dtype=np.float32)}
+    info = {"track_preview": {"curvature": np.array([.1, .2], dtype=np.float32),
+                              "width": np.array([2., 3.], dtype=np.float32)}}
+    observation = composer.wrap(raw, info)
+    expected = observation.copy()
+    restored = pickle.loads(pickle.dumps(composer))
+    np.testing.assert_array_equal(restored.wrap(raw, info), expected, strict=True)
+    raw["velocity"].fill(9)
+    info["track_preview"]["width"].fill(8)
+    composer.wrap(raw, info)
+    np.testing.assert_array_equal(observation, expected, strict=True)
+
+
 @pytest.fixture(params=["legacy_st", "combined_slip_st"])
 def race_env(request, monkeypatch):
     monkeypatch.chdir(ROOT)

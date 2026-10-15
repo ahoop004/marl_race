@@ -91,6 +91,29 @@ def make_task(events, repeat=3, team=False):
 ACTION = {"learner": np.array([0, 1], dtype=np.float32)}
 
 
+def test_shared_reward_roles_preserve_context_values_and_list_ownership():
+    from tasks.reward_context import build_reward_context
+
+    task, _, _ = make_task({})
+    task.reset()
+    args = dict(env=task.env, agent_id="learner", info_dict=task.env.infos,
+                obs_dict=task.env.raw, actions=ACTION, global_state=task.env.get_global_state())
+    expected = build_reward_context(**args)
+    roles = (["learner"], ["opponent"], {"learner"})
+    first = build_reward_context(**args, agent_roles=roles)
+    second = build_reward_context(**args, agent_roles=roles)
+    assert first.keys() == expected.keys()
+    for key in first:
+        if isinstance(first[key], np.ndarray):
+            np.testing.assert_array_equal(first[key], expected[key], strict=True)
+        else:
+            assert first[key] == expected[key]
+    for key in ("trainable_agent_ids", "teammate_ids", "opponent_agent_ids"):
+        first[key].append("changed")
+        assert second[key] == expected[key]
+    assert roles == (["learner"], ["opponent"], {"learner"})
+
+
 def test_repeat_accumulates_rewards_holds_commands_and_detaches_snapshots():
     task, controller, reward = make_task({}, team=True)
     initial = task.reset(seed=7, options={"episode_index": 3})
