@@ -671,11 +671,27 @@ class OnPolicyTrainer:
                 values.get("collection_cpu_to_device_seconds", 0.) for values in self.worker_metrics.values())
             result["perf/cuda_collection/cpu_to_device_calls"] = self.cuda_upload_calls + sum(
                 values.get("collection_cpu_to_device_calls", 0) for values in self.worker_metrics.values())
-        cuda_device = next((device for device in (self.agent.device, self.collection_device)
-                            if torch.device(device).type == "cuda"), None)
-        if cuda_device is not None:
+        cuda_devices = {}
+        for role, device in (("learner", self.agent.device), ("inference", self.collection_device)):
+            device = torch.device(device)
+            if device.type == "cuda":
+                index = device.index if device.index is not None else torch.cuda.current_device()
+                cuda_devices.setdefault(index, []).append(role)
+        for index, roles in cuda_devices.items():
+            device = torch.device("cuda", index)
+            properties = torch.cuda.get_device_properties(device)
+            prefix = f"perf/cuda_devices/{index}/"
+            result.update({prefix + "roles": roles,
+                           prefix + "name": properties.name,
+                           prefix + "uuid": str(properties.uuid),
+                           prefix + "parent_peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+                           prefix + "parent_peak_reserved_bytes": torch.cuda.max_memory_reserved(device)})
+        if cuda_devices:
+            # Retain the original single-device fields for older report readers.
+            index = next(iter(cuda_devices))
+            cuda_device = torch.device("cuda", index)
             result["perf/cuda_device_name"] = torch.cuda.get_device_name(cuda_device)
-            result["perf/cuda_device_index"] = torch.device(cuda_device).index or 0
+            result["perf/cuda_device_index"] = index
             result["perf/cuda_parent_peak_allocated_bytes"] = torch.cuda.max_memory_allocated(cuda_device)
             result["perf/cuda_parent_peak_reserved_bytes"] = torch.cuda.max_memory_reserved(cuda_device)
         result.update({f"perf/boundaries/{phase}/{name}_seconds": seconds

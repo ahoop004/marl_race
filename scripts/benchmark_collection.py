@@ -43,7 +43,7 @@ def run_training(command, destination, profile, source_root=PROJECT_ROOT):
     # diagnostic in separate profiled runs, outside the throughput comparison.
     with tempfile.TemporaryFile(mode="w+") as samples:
         sampler = subprocess.Popen([
-            "nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used",
+            "nvidia-smi", "--query-gpu=index,uuid,utilization.gpu,memory.used",
             "--format=csv,noheader,nounits", "--loop-ms=500"],
             stdout=samples, stderr=subprocess.DEVNULL)
         try:
@@ -57,23 +57,35 @@ def run_training(command, destination, profile, source_root=PROJECT_ROOT):
                 sampler.wait()
         summary_path = destination / "run_summary.json"
         summary = json.loads(summary_path.read_text())
-        rows = []
+        devices = {key.split("/")[2]: value.removeprefix("GPU-").lower()
+                   for key, value in summary.items()
+                   if key.startswith("perf/cuda_devices/") and key.endswith("/uuid")}
+        rows = {index: [] for index in devices}
+        legacy_rows = []
         samples.seek(0)
         for line in samples:
             try:
-                index, utilization, memory = map(float, line.strip().split(","))
+                physical_index, uuid, utilization, memory = (part.strip() for part in line.split(","))
+                physical_index, utilization, memory = map(float, (physical_index, utilization, memory))
             except ValueError:
                 continue
-            if index == summary.get("perf/cuda_device_index"):
-                rows.append((utilization, memory))
-        if rows:
-            prefix = "perf/cuda_device_sampling/"
-            summary.update({prefix + "scope": "device-wide, whole run including startup and saving",
-                            prefix + "interval_seconds": .5, prefix + "samples": len(rows),
-                            prefix + "mean_utilization_percent": sum(row[0] for row in rows) / len(rows),
-                            prefix + "max_utilization_percent": max(row[0] for row in rows),
-                            prefix + "peak_memory_used_bytes": int(max(row[1] for row in rows) * 1024**2)})
-            summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+            for index, expected_uuid in devices.items():
+                # Slurm can remap CUDA ordinal 0 to any physical GPU index.
+                if uuid.removeprefix("GPU-").lower() == expected_uuid:
+                    rows[index].append((utilization, memory))
+            if not devices and physical_index == summary.get("perf/cuda_device_index"):
+                legacy_rows.append((utilization, memory))
+        groups = {f"perf/cuda_devices/{index}/sampling/": values for index, values in rows.items()}
+        primary = str(summary.get("perf/cuda_device_index"))
+        groups["perf/cuda_device_sampling/"] = rows.get(primary, legacy_rows)
+        for prefix, values in groups.items():
+            if values:
+                summary.update({prefix + "scope": "device-wide, whole run including startup and saving",
+                                prefix + "interval_seconds": .5, prefix + "samples": len(values),
+                                prefix + "mean_utilization_percent": sum(row[0] for row in values) / len(values),
+                                prefix + "max_utilization_percent": max(row[0] for row in values),
+                                prefix + "peak_memory_used_bytes": int(max(row[1] for row in values) * 1024**2)})
+        summary_path.write_text(json.dumps(summary, indent=2) + "\n")
 
 
 def placement_masks(placement, count, minimum):
@@ -189,7 +201,8 @@ def report_run(destination, target, mask, allowed, *, backend="process", collect
         raise RuntimeError(f"{destination}: worker process count did not match the configured layout")
     boundaries = {stage: sum(value for key, value in summary.items()
                             if key.startswith("perf/boundaries/") and key.endswith(f"/{stage}_seconds"))
-                  for stage in ("collection", "aggregation", "update", "weight_sync")}
+                  for stage in ("collection", "aggregation", "update", "weight_sync",
+                                "rollout_device_transfer", "gae", "optimization")}
     report = dict(run=str(destination), decisions=actual, budget_overshoot=actual - target,
                           collection_batches=summary.get("perf/collection_batches"), actual_batch_frames=batch,
                           batch_frames_measured="perf/last_collection_batch_frames" in summary,
@@ -199,7 +212,7 @@ def report_run(destination, target, mask, allowed, *, backend="process", collect
                           physics_steps_per_second=summary["perf/physics_steps_per_second"],
                           physics_steps=summary["physics_steps"], completed_episodes=summary["completed_episodes"],
                           learner_samples=summary["agent_steps"], optimizer_steps=summary["optimizer_steps"],
-                          backend=backend, collection_device=collection_device,
+                          backend=backend, collection_device=collection_device, learner_device=learner_device,
                           cpu_affinity=parent, worker_affinity_verified=affinity_verified,
                           expected_worker_processes=expected_processes,
                           actual_worker_processes=len(worker_pids) if worker_pids else (0 if not expected_processes else None),
@@ -213,10 +226,11 @@ def report_run(destination, target, mask, allowed, *, backend="process", collect
                           steady_update_seconds=summary.get("perf/boundaries/steady/update_seconds"),
                           worker_wait_seconds=sum(value for key, value in summary.items()
                               if key.startswith("perf/boundaries/") and key.endswith("/worker_wait_seconds")),
+                          last_batch_worker_imbalance_ratio=summary.get("perf/workers/batch_imbalance_ratio"),
                           worker_wait_overlaps_collection=True, **boundaries,
                           profiling={key: value for key, value in summary.items()
-                                     if key.startswith(("perf/inference/", "perf/cuda_collection/",
-                                                        "perf/cuda_device_sampling/", "perf/compilation/"))
+                                     if key.startswith(("perf/inference/", "perf/cuda_collection/", "perf/workload/",
+                                                        "perf/cuda_devices/", "perf/cuda_device_sampling/", "perf/compilation/"))
                                      or (key.startswith("perf/workers/") and "/compilation/" in key)})
     print(json.dumps(report), flush=True)
     return report
@@ -233,6 +247,9 @@ def parse_layout(value):
 
 
 def matrix_candidates(args, masks):
+    if args.matrix == "devices":
+        return [(args.workers, args.envs_per_worker, args.frames_per_batch, name, None, "centralized", device)
+                for name, device in (("one_gpu", "cuda:0"), ("two_gpu", "cuda:1"))]
     if args.matrix == "compilation":
         return [(args.workers, args.envs_per_worker, args.frames_per_batch, name, None,
                  args.collection_backend, args.collection_device) for name in ("eager", "actor", "critic", "both")]
@@ -252,15 +269,21 @@ def matrix_candidates(args, masks):
             for size in frames for name, mask in masks.items()]
 
 
+def parse_device(value):
+    if value in {"cpu", "cuda"} or (value.startswith("cuda:") and value[5:].isdigit()):
+        return value
+    raise argparse.ArgumentTypeError("Device must be cpu, cuda, or cuda:<index>")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--matrix", choices=("final", "batches", "affinity", "inference", "compilation"), required=True)
+    parser.add_argument("--matrix", choices=("final", "batches", "affinity", "inference", "compilation", "devices"), required=True)
     parser.add_argument("--algorithm", choices=("ppo", "mappo"), default="ppo")
     parser.add_argument("--workers", type=int, default=8,
-                        help="Workers for batches/affinity/inference/compilation; use --layout for final")
+                        help="Workers for fixed-layout matrices; use --layout for final")
     parser.add_argument("--envs-per-worker", type=int, default=2,
-                        help="Envs per worker for batches/affinity/inference/compilation; use --layout for final")
-    parser.add_argument("--frames-per-batch", type=int, default=1024, help="Fixed for affinity/inference/compilation matrices")
+                        help="Envs per worker for fixed-layout matrices; use --layout for final")
+    parser.add_argument("--frames-per-batch", type=int, default=1024, help="Fixed for affinity/inference/compilation/devices matrices")
     parser.add_argument("--layout", type=parse_layout, action="append",
                         help="Select a final-matrix shortlist; repeat for multiple WORKERSxENVSxFRAMES layouts")
     parser.add_argument("--source-root", type=Path, default=PROJECT_ROOT,
@@ -268,10 +291,10 @@ def main():
     parser.add_argument("--total-steps", type=int, default=262144)
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--torch-threads", type=int, default=1)
-    parser.add_argument("--learner-device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--learner-device", type=parse_device, default="cuda")
     parser.add_argument("--collection-backend", choices=("process", "centralized"), default="process",
                         help="Backend for compilation experiments")
-    parser.add_argument("--collection-device", choices=("cpu", "cuda"), default="cpu",
+    parser.add_argument("--collection-device", type=parse_device, default="cpu",
                         help="Inference device for compilation experiments")
     parser.add_argument("--compile-mode", choices=("default", "max-autotune-no-cudagraphs"), default="default")
     parser.add_argument("--compile-warmup-updates", type=int, default=3,
@@ -283,6 +306,10 @@ def main():
     parser.add_argument("--profile", action="store_true",
                         help="Enable detailed inference/transfer timing; use separate runs for throughput")
     args = parser.parse_args()
+    if args.matrix == "devices":
+        if args.learner_device not in {"cuda", "cuda:0"}:
+            parser.error("--matrix devices requires --learner-device cuda:0")
+        args.learner_device = "cuda:0"
     args.source_root = args.source_root.expanduser().resolve()
     if not (args.source_root / "run.py").is_file():
         parser.error("--source-root must contain run.py")

@@ -87,6 +87,54 @@ def test_inference_comparisons_preserve_workload(benchmark, algorithm, tmp_path)
     assert configs[0] == configs[1] == configs[2]
 
 
+@pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
+def test_one_and_two_gpu_matrix_changes_only_inference_device(benchmark, algorithm, tmp_path):
+    args = argparse.Namespace(matrix="devices", algorithm=algorithm, workers=8, envs_per_worker=2,
+                              frames_per_batch=1024, total_steps=262144, torch_threads=1,
+                              learner_device="cuda:0", profile=False)
+    configs = []
+    for workers, envs, frames, name, mask, backend, device in benchmark["matrix_candidates"](args, {}):
+        assert backend == "centralized" and mask is None
+        command = benchmark["training_command"](args, frames, tmp_path / name, workers=workers,
+            envs_per_worker=envs, backend=backend, collection_device=device)
+        overrides = [command[index + 1] for index, value in enumerate(command) if value == "--set"]
+        config = load_and_expand_scenario(command[command.index("--scenario") + 1], overrides=overrides)
+        from application.configuration import validate_experiment_scenario
+        validate_experiment_scenario(config)
+        assert config["execution"]["params"]["device"] == "cuda:0"
+        assert config["experiment"]["measure_stages"] is config["experiment"]["measure_cuda_sync"] is False
+        assert config["execution"]["params"].pop("collection_device") == device
+        config["training_defaults"].pop("collection_device")
+        for agent in config["agents"].values():
+            agent.get("params", {}).pop("collection_device", None)
+        config.pop("_configuration", None)
+        configs.append(config)
+    assert len(configs) == 2 and configs[0] == configs[1]
+
+
+def test_gpu_sampling_matches_uuid_after_slurm_ordinal_remapping(benchmark, tmp_path, monkeypatch):
+    from io import StringIO
+    from contextlib import nullcontext
+    import subprocess
+    import tempfile
+    import shutil
+
+    summary_path = tmp_path / "run_summary.json"
+    summary_path.write_text(json.dumps({"perf/cuda_device_index": 0,
+        "perf/cuda_devices/0/uuid": "learner", "perf/cuda_devices/1/uuid": "inference"}))
+    samples = StringIO("3, GPU-learner, 70, 128\n5, GPU-inference, 40, 64\n0, GPU-unrelated, 99, 999\n")
+    sampler = type("Sampler", (), {"terminate": lambda self: None, "wait": lambda self, **kw: None})()
+    monkeypatch.setattr(shutil, "which", lambda name: name)
+    monkeypatch.setattr(tempfile, "TemporaryFile", lambda **kw: nullcontext(samples))
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: sampler)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: None)
+    benchmark["run_training"](["unused"], tmp_path, profile=True)
+    result = json.loads(summary_path.read_text())
+    assert result["perf/cuda_devices/0/sampling/mean_utilization_percent"] == 70
+    assert result["perf/cuda_devices/1/sampling/mean_utilization_percent"] == 40
+    assert result["perf/cuda_devices/1/sampling/peak_memory_used_bytes"] == 64 * 1024**2
+
+
 @pytest.mark.parametrize("algorithm,expected", [
     ("ppo", [(4, 2, 1024), (8, 1, 1024), (8, 2, 1024), (8, 4, 1024),
              (16, 2, 1024), (8, 2, 512), (8, 2, 2048), (8, 4, 2048)]),

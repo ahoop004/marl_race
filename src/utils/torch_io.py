@@ -96,7 +96,7 @@ def resolve_collection_device(value, learner_device, parallel_envs=1, envs_per_w
 
 
 def resolve_device(preferred: Optional[Iterable[Any]] = None) -> torch.device:
-    """Resolve torch device from preferred values, environment, then availability."""
+    """Resolve a device; explicit CUDA requests must be available and in range."""
 
     candidates = []
     if preferred:
@@ -116,12 +116,16 @@ def resolve_device(preferred: Optional[Iterable[Any]] = None) -> torch.device:
         if choice == "cpu":
             return torch.device("cpu")
         if choice.startswith("cuda") or choice == "gpu":
-            if torch.cuda.is_available():
-                return torch.device(choice if choice.startswith("cuda") else "cuda")
-            print(
-                f"[WARN] Requested device '{value}' but CUDA is unavailable; falling back to CPU."
-            )
-            return torch.device("cpu")
+            device = torch.device(choice if choice.startswith("cuda") else "cuda")
+            count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            index = device.index if device.index is not None else (
+                torch.cuda.current_device() if count else 0)
+            if index >= count:
+                raise ValueError(
+                    f"Requested device '{value}' is unavailable: {count} visible CUDA device(s). "
+                    "CUDA indices are relative to CUDA_VISIBLE_DEVICES; use device=cpu for CPU execution."
+                )
+            return device
         print(f"[WARN] Unknown device '{value}'; expected 'cpu' or 'cuda'.")
 
     if torch.cuda.is_available():

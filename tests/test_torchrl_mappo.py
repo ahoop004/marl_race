@@ -128,6 +128,49 @@ def test_collection_accumulates_team_samples_across_races(frames_per_batch):
 
 
 @pytest.mark.parametrize("actor_mode", ["shared", "independent", "lora"])
+@pytest.mark.parametrize("learner_device,collection_device", [
+    ("cpu", "cpu"), ("cuda:0", "cpu"), ("cuda:0", "cuda:1"),
+])
+def test_actor_routing_survives_collector_copy_and_weight_sync(
+        actor_mode, learner_device, collection_device, tmp_path, monkeypatch):
+    for value in (learner_device, collection_device):
+        device = torch.device(value)
+        if device.type == "cuda" and (not torch.cuda.is_available()
+                                     or device.index >= torch.cuda.device_count()):
+            pytest.skip(f"Requested CUDA hardware unavailable: {value}")
+    from test_native_torchrl_env import team_task
+    from agents.common.ppo_policy import PPOPolicy
+
+    task = team_task({3: ((), True, (), (*IDS, "car_2", "car_3"))})
+    options = params(device=learner_device, hidden_dims=[4], frames_per_batch=2,
+                     actor_mode="shared" if actor_mode == "lora" else actor_mode)
+    if actor_mode == "lora":
+        options["lora"] = {"mode": "per_agent", "rank": 1, "alpha": 2, "per_agent_log_std": True}
+    policy = TorchRLMAPPOAgent(1, task.state_space().shape[0], *BOUNDS, IDS, options)
+    if actor_mode == "lora":
+        source = tmp_path / "source.pt"
+        PPOPolicy(1, *BOUNDS, {"hidden_dims": [4], "device": "cpu"}).save_checkpoint(source)
+        policy.initialize_from_checkpoint(source, scope="actor_only")
+    update = policy.update
+    def checked_update(data):
+        assert all(value.device.type == "cpu" for value in data.values(True, True))
+        current = data.to(policy.device).clone()
+        with torch.no_grad():
+            actual = policy.probabilistic_actor.get_dist(current).log_prob(current["agents", "raw_action"])
+        torch.testing.assert_close(actual, current["agents", "raw_log_prob"], rtol=2e-5, atol=2e-5)
+        return update(data)
+    monkeypatch.setattr(policy, "update", checked_update)
+    hook = Capture(False)
+    training = TorchRLMAPPOTrainer(task, policy, hooks=[hook], collection_device=collection_device)
+    try:
+        training.train(total_steps=4)
+        assert len(hook.updates) == 2
+        assert all(row["train/optimizer_steps"] > 0 for row in hook.updates)
+    finally:
+        task.close()
+
+
+@pytest.mark.parametrize("actor_mode", ["shared", "independent", "lora"])
 def test_native_update_routes_actors_and_reloads_versioned_checkpoints(actor_mode, tmp_path):
     extra = {"actor_mode": actor_mode, "hidden_dims": [4]}
     if actor_mode == "lora":

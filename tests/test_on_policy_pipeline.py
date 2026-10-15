@@ -15,6 +15,57 @@ from training.hooks import CSVHook, CheckpointHook, EvaluationCheckpointHook, Wa
 from loggers.csv_logger import CSVLogger
 
 
+@pytest.mark.parametrize("available,count,requested", [
+    (False, 0, "cuda"), (False, 0, "cuda:0"), (False, 0, "cuda:1"),
+    (True, 1, "cuda:1"), (True, 2, "cuda:2"),
+])
+def test_explicit_cuda_requests_never_fall_back(monkeypatch, available, count, requested):
+    from utils.torch_io import resolve_device, resolve_collection_device
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: available)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: count)
+    for resolve in (lambda: resolve_device([requested]),
+                    lambda: resolve_collection_device(requested, "cpu", 2, 2, "centralized")):
+        with pytest.raises(ValueError, match="visible CUDA device"):
+            resolve()
+    assert resolve_device(["cpu"]) == torch.device("cpu")
+    if not available:
+        monkeypatch.delenv("F110_DEVICE", raising=False)
+        assert resolve_device() == torch.device("cpu")
+
+
+def test_explicit_cuda_indices_and_default_current_device(monkeypatch):
+    from utils.torch_io import resolve_device
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    assert resolve_device(["cuda:0"]) == torch.device("cuda:0")
+    assert resolve_device(["cuda:1"]) == torch.device("cuda:1")
+    assert resolve_device(["cuda"]) == torch.device("cuda")
+
+
+def test_cuda_metrics_report_both_roles_and_the_actual_current_device(monkeypatch):
+    training, _ = trainer(Capture(False))
+    training.agent.device = torch.device("cuda")
+    training.collection_device = torch.device("cuda:0")
+    training._run_started = 1.
+    training._rate_baseline = training._rate_counters()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda device: SimpleNamespace(name=f"gpu{device.index}", uuid=f"uuid{device.index}"))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: f"gpu{device.index}")
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 100 + device.index)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device: 200 + device.index)
+    try:
+        metrics = training.performance_metrics()
+        assert metrics["perf/cuda_device_index"] == 1
+        assert metrics["perf/cuda_devices/1/roles"] == ["learner"]
+        assert metrics["perf/cuda_devices/0/roles"] == ["inference"]
+        assert metrics["perf/cuda_devices/1/parent_peak_allocated_bytes"] == 101
+        assert metrics["perf/cuda_devices/0/parent_peak_reserved_bytes"] == 200
+    finally:
+        training.task.close()
+
+
 def test_startup_diagnostics_with_two_workers_and_eight_slots(monkeypatch):
     """Two real synchronous rounds verify initial and updated actor weights."""
     import multiprocessing
@@ -118,12 +169,18 @@ def test_console_reports_every_completed_episode_with_lap_fields(lap_completion)
     ("cuda", "cpu", 2, 2, "centralized"),
     ("cuda", "cuda", 2, 2, "centralized"),
     ("cuda", "cuda", 2, 4, "centralized"),
+    ("cuda:0", "cuda:0", 2, 2, "centralized"),
+    ("cuda:0", "cuda:1", 2, 2, "centralized"),
+    ("cpu", "cuda:0", 2, 2, "centralized"),
 ])
 def test_collection_devices_sync_batches_and_checkpoint_loading(
         algorithm, learner_device, collection_device, workers, envs_per_worker, collection_backend,
         tmp_path, monkeypatch):
-    if learner_device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA hardware unavailable")
+    for value in (learner_device, collection_device):
+        if value is not None and value.startswith("cuda"):
+            device = torch.device(value)
+            if not torch.cuda.is_available() or (device.index or 0) >= torch.cuda.device_count():
+                pytest.skip(f"Requested CUDA hardware unavailable: {value}")
     from core.configuration import PROJECT_ROOT
     from core.scenario import load_and_expand_scenario
     from core.task_builder import create_race_task
@@ -156,6 +213,30 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
                                collection_backend=collection_backend,
                                measure_stages=(collection_backend == "centralized" or
                                                (workers, envs_per_worker) == (2, 2)))
+    learner_placement = next(policy.actor.parameters()).device
+    inference_devices = []
+    inference_policy_refs = []
+    inference_handles = []
+    if collection_backend == "centralized":
+        import weakref
+        import training.on_policy as pipeline
+        from utils.torch_io import resolve_device
+        expected_inference = resolve_device([collection_device])
+        if expected_inference.type == "cuda" and expected_inference.index is None:
+            expected_inference = torch.device("cuda", torch.cuda.current_device())
+        factory = pipeline.Collector
+        def checked_collector(*args, **kwargs):
+            collector = factory(*args, **kwargs)
+            assert collector.env_device == collector.storing_device == torch.device("cpu")
+            assert {p.device for p in collector.policy.parameters()} == {expected_inference}
+            inference_policy_refs.append(weakref.ref(collector.policy))
+            def check_inference(module, args):
+                device = args[0]["agents", "observation"].device
+                assert device == expected_inference
+                inference_devices.append(device)
+            inference_handles.append(collector.policy.register_forward_pre_hook(check_inference))
+            return collector
+        monkeypatch.setattr(pipeline, "Collector", checked_collector)
     update = policy.update_rollouts if process else policy.update
     seen_batches = []
     physical_batches = []
@@ -222,19 +303,39 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
     monkeypatch.setattr(policy, "update_rollouts" if process else "update", check_then_update)
     gae_devices = []
     handle = policy.gae.register_forward_pre_hook(
-        lambda module, args: gae_devices.append(args[0]["next", "observation"].device.type
-                                               if algorithm == "ppo" else args[0]["state"].device.type))
+        lambda module, args: gae_devices.append(args[0]["next", "observation"].device
+                                               if algorithm == "ppo" else args[0]["state"].device))
     try:
         training.train(total_steps=23 if envs_per_worker > 1 else 24)
         assert torch.get_num_threads() == 1
         assert seen_batches and len(capture.updates) >= 2
-        assert set(gae_devices) == {learner_device}
+        assert set(gae_devices) == {learner_placement}
+        assert {p.device for p in policy.actor.parameters()} == {learner_placement}
+        assert {p.device for p in policy.critic.parameters()} == {learner_placement}
+        if collection_backend == "centralized":
+            assert inference_devices and set(inference_devices) == {expected_inference}
+            if expected_inference != learner_placement:
+                import gc
+                gc.collect()
+                assert all(ref() is None for ref in inference_policy_refs)
         assert any(not torch.equal(initial[key], value) for key, value in policy.actor.state_dict().items())
         if process:
             assert training.collected_steps == sum(physical_batches) == 24
             assert training._agent_steps == sum(int(f["agents", "active"].sum()) for f in seen_batches)
             metrics = training.performance_metrics()
             assert metrics["perf/collection_backend"] == collection_backend
+            roles = {}
+            for role, device in (("learner", learner_placement), ("inference", training.collection_device)):
+                if device.type == "cuda":
+                    index = device.index if device.index is not None else torch.cuda.current_device()
+                    roles.setdefault(index, []).append(role)
+            for index, expected_roles in roles.items():
+                prefix = f"perf/cuda_devices/{index}/"
+                assert metrics[prefix + "roles"] == expected_roles
+                assert metrics[prefix + "uuid"]
+                # Worker-policy allocations live in other processes.
+                if collection_backend == "centralized" or learner_placement.type == "cuda":
+                    assert metrics[prefix + "parent_peak_allocated_bytes"] > 0
             if training.measure_stages:
                 batch_size = workers * envs_per_worker if collection_backend == "centralized" else envs_per_worker
                 for phase, profile in training.inference_profile.items():
@@ -287,10 +388,12 @@ def test_collection_devices_sync_batches_and_checkpoint_loading(
             restored.resume_training(checkpoint)
             for key, value in policy.actor.state_dict().items():
                 torch.testing.assert_close(restored.actor.state_dict()[key].cpu(), value.cpu(), rtol=0, atol=0)
-            assert all(value.device.type == device for state in restored.optimizer.state.values()
+            assert all(value.device == next(restored.actor.parameters()).device for state in restored.optimizer.state.values()
                        for key, value in state.items() if isinstance(value, torch.Tensor) and key != "step")
     finally:
         handle.remove()
+        for inference_handle in inference_handles:
+            inference_handle.remove()
         task.close()
         torch.set_num_threads(previous_threads)
 
