@@ -17,7 +17,7 @@ def benchmark():
 
 @pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
 @pytest.mark.parametrize("frames", [512, 1024, 2048])
-def test_benchmark_frames_preserve_learning_and_episode_settings(benchmark, algorithm, frames, tmp_path):
+def test_benchmark_frames_preserve_fixed_learning_and_episode_settings(benchmark, algorithm, frames, tmp_path):
     args = argparse.Namespace(algorithm=algorithm, total_steps=262144, torch_threads=1,
                               workers=8, envs_per_worker=2, learner_device="cuda")
     command = benchmark["training_command"](args, frames, tmp_path / "run")
@@ -26,6 +26,9 @@ def test_benchmark_frames_preserve_learning_and_episode_settings(benchmark, algo
     baseline = load_and_expand_scenario(scenario)
     configured = load_and_expand_scenario(scenario, overrides=overrides)
     original = resolve_training_params(baseline["agents"]["car_0"], baseline)
+    # Benchmarks explicitly retain smaller update sizes than production runs.
+    original.update(n_steps=4096 if algorithm == "ppo" else 2048,
+                    n_epochs=4 if algorithm == "ppo" else 5, batch_size=512)
     actual = resolve_training_params(configured["agents"]["car_0"], configured)
     assert actual.pop("frames_per_batch") == frames
     assert actual.pop("device") == "cuda"

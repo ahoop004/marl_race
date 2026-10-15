@@ -229,7 +229,7 @@ def test_group_choices_select_algorithms_tasks_and_networks_independently():
     params = resolve_training_params(config["agents"]["car_0"], config)
     assert params["network"] == dict(architecture="mlp", actor_hidden_dims=[32,16],
                                       critic_hidden_dims=[64], activation="relu")
-    assert params["n_steps"] == 2048 and params["batch_size"] == 512
+    assert params["n_steps"] == 409600 and params["batch_size"] == 1024
 
 
 @pytest.mark.parametrize("adaptation", ["scratch", "full_finetune", "lora"])
@@ -387,7 +387,9 @@ def test_resolved_config_and_choices_are_saved_with_experiments(tmp_path):
     from wrappers.observations.composer import ObservationComposer
     import torch
 
-    config = load_and_expand_scenario(TEAM, overrides=["adaptation=lora", "adaptation.lora.rank=2"])
+    config = load_and_expand_scenario(TEAM, overrides=[
+        "adaptation=lora", "adaptation.lora.rank=2", "execution.params.device=cpu",
+    ])
     original = deepcopy(config)
     contracts = {aid: ObservationComposer.from_config(agent["observation"], config["environment"]).contract
                  for aid, agent in config["agents"].items() if agent["trainable"]}
@@ -432,6 +434,7 @@ def test_serial_profiling_presets_keep_production_settings_separate(algorithm, t
     assert {key: values[key] for key in ("gamma", "gae_lambda", "clip_range", "ent_coef", "vf_coef", "max_grad_norm")} == {
         "gamma": .99, "gae_lambda": .95, "clip_range": .2, "ent_coef": .01, "vf_coef": .5, "max_grad_norm": .5}
     assert config["experiment"]["torch_threads"] == 1
+    assert config["experiment"]["parallel_envs"] == config["experiment"]["envs_per_worker"] == 1
     assert config["experiment"]["total_steps"] == 16384 and "episodes" not in config["experiment"]
     assert not config["evaluation"]["enabled"] and not config["wandb"]["enabled"]
     assert not config["environment"]["render"] and config["environment"]["max_steps"] > 0
@@ -477,7 +480,7 @@ def test_completion_training_and_evaluation_share_horizons_and_termination(path)
     config = load_and_expand_scenario(path)
     training = resolve_environment_config(config)
     evaluated = resolve_environment_config(config, mode="eval")
-    assert training["max_steps"] == 8000
+    assert training["max_steps"] == (8000 if "transfer" in path else 80000)
     assert training["max_speed"] == evaluated["max_speed"] == 8.0
     assert training["vehicle_params"]["wheel_actuators"]["wheel_speed_max"] == 160.0
     assert evaluated["vehicle_params"]["wheel_actuators"]["wheel_speed_max"] == 160.0

@@ -1,6 +1,7 @@
 # @package _global_
 defaults:
 - ppo_lap_completion_pretrain
+- override /training: null
 - override /algorithm: ppo_profile
 - override /execution: serial_profile
 - override /simulation: serial_profile

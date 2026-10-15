@@ -35,6 +35,16 @@ python run.py --scenario scenarios/mappo_2v2_completion_lora.yaml \
   --pretrained-actor outputs/pretrain/best.pt \
   --output-dir outputs/mappo_lora
 
+PPO pretraining and all four MAPPO completion scenarios share the historical PPO
+training setup in `configs/training/historical_ppo.yaml`: 64 workers with 8
+environments each, 4,096 collector frames per batch, 409,600 learner samples per
+update, 10 epochs, minibatches of 1,024, and a linear learning-rate schedule from
+0.001 to 0.0001 over 120M environment decisions. Episodes allow 80,000 steps;
+checkpoints are saved every 1,024,000 decisions. Learning runs on CUDA and
+collection runs on CPU. These scenarios keep their existing rewards and run the
+full budget; the historical reproduction alone keeps its 12.288M diagnostic stop.
+Serial profiling scenarios use their separate, smaller workloads.
+
 The MAPPO scratch, pretrained, shared pretrained, and LoRA scenarios use identical
 `hybrid_pp_ftg` opponents. They run Pure Pursuit by default, with speed-dependent
 lookahead, steering-lag compensation, curvature/grip speed limits, and LiDAR gap
