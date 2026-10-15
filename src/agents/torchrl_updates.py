@@ -41,6 +41,23 @@ def _sample_minibatch(region, replay):
         return replay.sample()
 
 
+@torch.no_grad()
+def _approx_kl(agent, batch, key, parameters=None):
+    current = batch.clone(False)
+    if parameters is None:
+        dist = agent.probabilistic_actor.get_dist(current)
+    else:
+        # Match the PPO/MAPPO parameter modules' expansion and agent shape,
+        # using the actor outputs already evaluated by the TorchRL objective.
+        mean, std = parameters
+        shape = batch[key("raw_action")].shape
+        current[key("loc")] = mean.reshape(shape)
+        current[key("scale")] = std.expand_as(mean).reshape(shape)
+        dist = agent.probabilistic_actor.build_dist_from_params(current)
+    log_ratio = dist.log_prob(batch[key("raw_action")]) - batch[key("raw_log_prob")]
+    return (torch.expm1(log_ratio) - log_ratio).mean()
+
+
 def optimize_ppo(agent, data, *, group=None):
     def key(name):
         return (group, name) if group else name
@@ -63,8 +80,19 @@ def optimize_ppo(agent, data, *, group=None):
     samples = (profiling_sample_indices(agent.n_epochs * math.ceil(data.numel() / agent.batch_size),
                                         getattr(agent, "profiling_detail_samples", 0) or 0)
                if region else ())
-    minibatches = replay_samples = 0
-    with region("optimizer_loop") if region else nullcontext():
+    minibatches = replay_samples = actor_forwards = 0
+    actor_parameters = None
+
+    def capture_actor(module, inputs, output):
+        nonlocal actor_parameters, actor_forwards
+        actor_parameters = output
+        actor_forwards += 1  # Top-level actor calls, including routed actors.
+
+    # A public PyTorch hook observes the unchanged TorchRL objective's actor
+    # call. It exists only during this update, is removed even on exceptions,
+    # and keeps no parameter cache or graph across minibatches.
+    with (agent.actor.register_forward_hook(capture_actor),
+          region("optimizer_loop") if region else nullcontext()):
         for _ in range(agent.n_epochs):
             for _ in range(math.ceil(data.numel() / agent.batch_size)):
                 detail = region if minibatches in samples else None
@@ -72,32 +100,37 @@ def optimize_ppo(agent, data, *, group=None):
                 minibatches += 1
                 if count:
                     replay_samples += batch.numel()
-                with detail("sampled_kl") if detail else nullcontext():
-                    with torch.no_grad():
-                        dist = agent.probabilistic_actor.get_dist(batch.clone(False))
-                        log_ratio = dist.log_prob(batch[key("raw_action")]) - batch[key("raw_log_prob")]
-                        kl = (torch.expm1(log_ratio) - log_ratio).mean()
+                if target_kl is not None:
+                    with detail("sampled_kl") if detail else nullcontext():
+                        kl = _approx_kl(agent, batch, key)
                         last_kl = kl
-                    if target_kl is not None:
                         measured_kl = float(kl)
                         if not math.isfinite(measured_kl) or measured_kl > target_kl:
                             early_stop = True
                             break
+                actor_parameters = None
                 if detail:
                     with detail("sampled_loss_forward"):
                         losses = agent.loss_module(batch)
                 else:
                     losses = agent.loss_module(batch)
+                if actor_parameters is None:
+                    raise RuntimeError("The PPO objective did not evaluate the current actor")
+                parameters, actor_parameters = actor_parameters, None
+                if target_kl is None:
+                    # No gate needs a separate actor precheck. This is still
+                    # the pre-step KL, under no_grad, with the original formula.
+                    # sampled_kl now times only distribution/ratio arithmetic;
+                    # the shared actor forward belongs to sampled_loss_forward.
+                    with detail("sampled_kl") if detail else nullcontext():
+                        kl = _approx_kl(agent, batch, key, parameters)
+                        last_kl = kl
                 with detail("sampled_entropy") if detail else nullcontext():
-                    actor_kwargs = {}
-                    if getattr(agent, "routed_actor", False):
-                        actor_kwargs["adapter_indices"] = batch[key("index")].reshape(-1)
-                    _, entropies = agent.actor.evaluate_actions(
-                        batch[key("observation")].reshape(-1, agent.obs_dim),
-                        batch[key("action")].reshape(-1, agent.action_dim),
-                        batch[key("raw_action")].reshape(-1, agent.action_dim), **actor_kwargs,
-                    )
+                    # Preserve the actor's original, unexpanded scale so the
+                    # quadrature uses the same broadcast and reduction order.
+                    entropies = agent.actor.entropy_from_parameters(*parameters)
                     entropy = entropies.mean()
+                del parameters
                 critic_loss = losses.get("loss_critic", torch.zeros((), device=agent.device))
                 loss = losses["loss_objective"] + critic_loss - agent.ent_coef * entropy
                 agent.optimizer.zero_grad()
@@ -125,6 +158,7 @@ def optimize_ppo(agent, data, *, group=None):
     if count:
         count("ppo_minibatches", minibatches)
         count("replay_samples", replay_samples)
+        count("optimization_actor_forwards", actor_forwards)
     with region("final_metric_aggregation") if region else nullcontext():
         profile = getattr(agent, "profile_call", None)
         metrics = (profile("metric_reduction", mean_update_metrics, rows, profile=profile, device=agent.device)

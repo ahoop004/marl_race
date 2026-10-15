@@ -51,6 +51,18 @@ class SquashedGaussianActor(nn.Module):
     def _log_prob(self, dist, raw):
         return (dist.log_prob(raw) - self._log_jacobian(raw)).sum(-1)
 
+    def entropy_from_parameters(self, mean, std, *, normal=None):
+        """The existing 32-point entropy, optionally using an evaluated policy."""
+        dist = torch.distributions.Normal(mean, std) if normal is None else normal
+        samples = mean.unsqueeze(-1) + std.unsqueeze(-1) * self._entropy_nodes
+        correction = (self._log_jacobian(samples) * self._entropy_weights).sum(-1)
+        return (dist.entropy() + correction).sum(-1)
+
+    def entropy(self, obs, *, adapter_indices=None):
+        """Evaluate squashed entropy without reconstructing or scoring actions."""
+        mean, std = self(obs) if adapter_indices is None else self(obs, adapter_indices=adapter_indices)
+        return self.entropy_from_parameters(mean, std)
+
     def evaluate_actions(
         self,
         obs: torch.Tensor,
@@ -74,8 +86,5 @@ class SquashedGaussianActor(nn.Module):
             torch.isfinite(raw_actions), raw_actions, recovered
         )
         log_prob = self._log_prob(dist, raw_actions)
-        samples = mean.unsqueeze(-1) + std.unsqueeze(-1) * self._entropy_nodes
-        correction = (self._log_jacobian(samples) * self._entropy_weights).sum(-1)
-        entropy = (dist.entropy() + correction).sum(-1)
-        return log_prob, entropy
+        return log_prob, self.entropy_from_parameters(mean, std, normal=dist)
 

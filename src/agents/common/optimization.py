@@ -101,6 +101,9 @@ def make_objective(algorithm, loss, critic_loss, actor, critic, **kwargs):
 
     validate_objective(algorithm, loss, critic_loss)
     registry = {"clip_ppo": ClipPPOLoss, "mappo": MAPPOLoss}
+    # TorchRL 0.14 computes this diagnostic by default; training only consumes
+    # the objective and critic losses, so omit its two variance reductions.
+    kwargs.setdefault("log_explained_variance", False)
     return registry[loss](actor, critic, loss_critic_type=critic_loss, **kwargs)
 
 

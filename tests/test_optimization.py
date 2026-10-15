@@ -39,6 +39,58 @@ def batch(policy):
     return torch.stack([transition(policy, IDS, i, i + 1, terminal=i == 1) for i in range(2)])
 
 
+@pytest.mark.parametrize("mode", ["shared", "independent", "lora"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_entropy_only_preserves_quadrature_gradients_and_checkpoint_keys(mode, device, monkeypatch):
+    from agents.common.networks import Actor, route_actor
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    actor = route_actor(Actor(1, 2, [4]), IDS,
+                        actor_mode="independent" if mode == "independent" else "shared",
+                        lora_config={"mode": "per_agent", "rank": 1} if mode == "lora" else None).to(device)
+    indices = {"adapter_indices": torch.tensor([0, 1, 0, 1], device=device)} if mode != "shared" else {}
+    observations = torch.tensor([[-100.], [-1.], [1.], [100.]], device=device)
+    parameters = [p for p in actor.parameters() if p.requires_grad]
+    keys = set(actor.state_dict())
+    for log_std in (-10., -5., 0., 2., 5.):
+        with torch.no_grad():
+            for name, parameter in actor.named_parameters():
+                if name.endswith("log_std"):
+                    parameter.fill_(log_std)
+                if name.endswith("net.2.bias"):
+                    parameter.copy_(torch.tensor([-20., 20.], device=device))
+        raw = torch.tensor([[-100., 100.]], device=device).expand(4, -1)
+        _, expected = actor.evaluate_actions(observations, raw.tanh(), raw, **indices)
+        expected_gradients = torch.autograd.grad(expected.mean(), parameters)
+        actual = actor.entropy(observations, **indices)
+        actual_gradients = torch.autograd.grad(actual.mean(), parameters)
+        torch.testing.assert_close((actual, actual_gradients), (expected, expected_gradients), rtol=0, atol=0)
+    monkeypatch.setattr(actor, "_log_prob", lambda *args: pytest.fail("entropy scored actions"))
+    actor.entropy(observations, **indices)
+    assert set(actor.state_dict()) == keys
+
+
+@pytest.mark.parametrize("factory", [agent, learner], ids=["ppo", "mappo"])
+def test_unused_explained_variance_changes_only_diagnostic_output(factory):
+    policy = factory()
+    data = batch(policy)
+    with torch.no_grad():
+        policy.gae(data)
+    assert not policy.loss_module.log_explained_variance
+    outputs, gradients = [], []
+    for enabled in (False, True):
+        policy.loss_module.log_explained_variance = enabled
+        out = policy.loss_module(data)
+        gradients.append(torch.autograd.grad(out["loss_objective"] + out["loss_critic"], policy._optim_parameters))
+        outputs.append(out)
+    assert "explained_variance" not in outputs[0]
+    assert set(outputs[1].keys()) - set(outputs[0].keys()) == {"explained_variance"}
+    for key in outputs[0].keys():
+        torch.testing.assert_close(outputs[0][key], outputs[1][key], rtol=0, atol=0)
+    torch.testing.assert_close(gradients[0], gradients[1], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("factory", [agent, learner], ids=["ppo", "mappo"])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("optimizer,kwargs", [

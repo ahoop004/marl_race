@@ -816,6 +816,7 @@ def test_learner_attribution_preserves_gae_gradients_optimizer_and_rng(algorithm
     counts = training.workload_counts["steady"]
     assert counts["ppo_minibatches"] == results[0][0]["train/optimizer_steps"] == 6
     assert counts["replay_samples"] == 10
+    assert counts["optimization_actor_forwards"] == counts["ppo_minibatches"]
     assert counts.get("cpu_to_cuda_tensordict_calls", 0) == (2 if device == "cuda" else 0)
     for name in ("replay_construction", "replay_population", "optimizer_loop", "final_metric_aggregation",
                  "rollout_preparation", "learner_rollout_clone", "pending_rollout_concatenation"):
@@ -891,6 +892,7 @@ def test_kl_gate_preserves_parameters_before_first_optimizer_step(algorithm, det
     if detail_samples is not None:
         assert training.workload_counts["initialization"]["ppo_minibatches"] == 1
         assert training.workload_counts["initialization"]["replay_samples"] == 2
+        assert training.workload_counts["initialization"]["optimization_actor_forwards"] == 1
         assert training.boundary_calls["initialization"]["sampled_kl"] == 1
         assert "sampled_backward" not in training.boundary_calls["initialization"]
 
@@ -915,9 +917,15 @@ def test_disabling_kl_gate_preserves_losses_and_optimizer_behavior(algorithm):
     data = rollout(policy.policy, list(range(5))) if algorithm == "ppo" else torch.stack(
         [transition(policy, IDS, step, 1, terminal=step == 4) for step in range(5)])
     rng = torch.random.get_rng_state()
-    metrics = policy.update(data.clone())
+    calls = []
+    with policy.actor.register_forward_hook(lambda *args: calls.append(None)):
+        metrics = policy.update(data.clone())
+    assert len(calls) == metrics["train/optimizer_steps"]
     torch.random.set_rng_state(rng)
-    checked_metrics = checked.update(data.clone())
+    calls.clear()
+    with checked.actor.register_forward_hook(lambda *args: calls.append(None)):
+        checked_metrics = checked.update(data.clone())
+    assert len(calls) == 2 * checked_metrics["train/optimizer_steps"]
     assert metrics == checked_metrics
     for module in ("actor", "critic"):
         for name, value in getattr(policy, module).state_dict().items():
