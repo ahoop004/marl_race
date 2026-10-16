@@ -24,6 +24,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "scripts"))
+from ray_tune_sweeps import (read_spec, generate_plan, trial_settings, preflight, ranking,
+                             digest, identifier, select_path)
 SCENARIOS = {
     "ppo": "scenarios/ppo_lap_completion_pretrain.yaml",
     "mappo": "scenarios/mappo_2v2_completion_scratch.yaml",
@@ -230,6 +233,14 @@ def checkpoint_payload(path, identity):
         raise ValueError(f"Checkpoint belongs to a different trial: {path}")
     if state["budget"]["total_steps"] != identity["settings"]["total_steps"]:
         raise ValueError("Checkpoint training budget differs from the original trial")
+    entry = identity["settings"].get("sweep_trial")
+    if entry:
+        configuration = metadata["configuration"]
+        if configuration["experiment"]["seed"] != entry["seed"]:
+            raise ValueError("Checkpoint training seed differs from the sweep trial")
+        for path, value in entry["parameters"].items():
+            if select_path(configuration, path) != value:
+                raise ValueError(f"Checkpoint hyperparameter differs: {path}")
     return payload
 
 
@@ -266,27 +277,46 @@ def restore_native(checkpoint, out, attempt, identity):
 
 
 def trainer_command(settings, identity, out):
-    cmd = [sys.executable, str(REPO / "run.py"), "--scenario", settings["scenarios"][identity["algorithm"]],
+    entry = settings.get("sweep_trial", {})
+    scenario = entry.get("input_path", settings["scenarios"][identity["algorithm"]])
+    if entry.get("input_path") and hashlib.sha256(Path(scenario).read_bytes()).hexdigest() != entry["input_sha256"]:
+        raise ValueError("Frozen sweep input was modified")
+    cmd = [sys.executable, str(REPO / "run.py"), "--scenario", scenario,
            "--output-dir", str(out), "--run-id", identity["run_id"],
            "--total-steps", str(settings["total_steps"]), "--seed", str(settings["seed"]),
            "--torch-threads", "1", "--no-render"]
-    overrides = ["experiment.parallel_envs=2", "experiment.envs_per_worker=1", "experiment.distributed=false",
-                 "algorithm.params.n_steps=1024", "algorithm.params.frames_per_batch=256",
-                 "algorithm.params.batch_size=128", "algorithm.params.n_epochs=2",
+    smoke = [] if settings.get("sweep") else ["algorithm.params.n_steps=1024", "algorithm.params.frames_per_batch=256",
+                                            "algorithm.params.batch_size=128", "algorithm.params.n_epochs=2"]
+    device = "cuda" if settings.get("resources_per_trial", {}).get("gpu", 1) else "cpu"
+    overrides = ["experiment.parallel_envs=2", "experiment.envs_per_worker=1", "experiment.distributed=false", *smoke,
                  f"checkpoint.every_steps={settings['checkpoint_every_steps']}",
                  f"checkpoint.every_updates={settings['checkpoint_every_updates'] or 'null'}",
                  f"evaluation.enabled={str(settings['evaluation']).lower()}",
-                 "execution.params.device=cuda", "execution.params.collection_device=cpu", *settings["overrides"]]
+                 f"execution.params.device={device}", "execution.params.collection_device=cpu", *settings["overrides"]]
+    if settings.get("sweep"):
+        spec = settings["sweep"]
+        strategy = "completion_progress" if identity["algorithm"] == "ppo" else "team_completion"
+        evaluation = {"enabled": True, "selection_strategy": strategy, **spec["evaluation"]}
+        overrides.extend(f"++evaluation.{key}={json.dumps(value)}" for key, value in evaluation.items())
+        overrides.append(f"++experiment.name={json.dumps(spec['name'])}")
     wandb = settings["wandb"]
     metadata = {"experiment_id": settings["experiment_id"], "trial_id": identity["trial_id"],
                 "algorithm": identity["algorithm"], "scenario": settings["scenarios"][identity["algorithm"]],
                 "git_sha": settings["git_sha"]}
+    if settings.get("sweep"):
+        metadata.update(search_method=settings["sweep"]["search"]["method"], sweep_seed=settings["sweep"]["sweep_seed"],
+                        training_seed=settings["seed"], total_steps=settings["total_steps"],
+                        configuration_id=entry["configuration_id"], sampled_parameters=entry["parameters"],
+                        sample_index=entry["sample_index"], replicate=entry["replicate"])
     wb = {"enabled": wandb["mode"] != "disabled", "mode": wandb["mode"],
           "name": identity["run_id"], "id": identity["wandb_id"],
           "group": wandb["group"] or settings["experiment_id"], "job_type": identity["algorithm"], "tune": metadata}
     wb.update({key: wandb[key] for key in ("project", "entity") if wandb[key] is not None})
     overrides.extend(f"++wandb.{key}={json.dumps(value)}" for key, value in wb.items() if key != "tune")
-    overrides.extend(f"++wandb.tune.{key}={json.dumps(value)}" for key, value in metadata.items())
+    # Dot-containing parameter paths are values inside a JSON string, so Hydra
+    # does not mistake them for nested override keys.
+    overrides.extend(f"++wandb.tune.{key}={json.dumps(json.dumps(value) if isinstance(value, dict) else value)}"
+                     for key, value in metadata.items())
     for override in overrides:
         cmd.extend(["--set", override])
     return cmd
@@ -344,7 +374,7 @@ def trial(config):
     import ray
     from ray import tune
 
-    settings = config["settings"]
+    settings = trial_settings(config["settings"], config.get("sweep_trial"))
     label, trial_id = config["algorithm"], tune.get_context().get_trial_id()
     out = Path(settings["root"]) / "trial_runs" / f"{label}_{trial_id}"
     identity = {"algorithm": label, "trial_id": trial_id, "settings": settings,
@@ -361,8 +391,9 @@ def trial(config):
         else:
             atomic_json(identity_path, identity)
         allocated = ray.get_gpu_ids()
-        if len(allocated) != 1 or not os.environ.get("CUDA_VISIBLE_DEVICES"):
-            raise RuntimeError(f"Expected one Ray GPU: {allocated}, CVD={os.getenv('CUDA_VISIBLE_DEVICES')!r}")
+        expected_gpus = settings.get("resources_per_trial", {}).get("gpu", 1)
+        if len(allocated) != expected_gpus or expected_gpus and not os.environ.get("CUDA_VISIBLE_DEVICES"):
+            raise RuntimeError(f"Expected {expected_gpus} Ray GPU: {allocated}, CVD={os.getenv('CUDA_VISIBLE_DEVICES')!r}")
         attempt = Path(tempfile.mkdtemp(prefix=f"{os.getenv('SLURM_JOB_ID', 'local')}_", dir=_attempts(out)))
         checkpoint = tune.get_checkpoint()
         resume = restore_native(checkpoint, out, attempt, identity)
@@ -388,7 +419,7 @@ def trial(config):
             command.extend(["--resume", str(resume)])
         metadata = {"hostname": socket.gethostname(), "slurm_job_id": os.getenv("SLURM_JOB_ID"),
                     "ray_gpu_ids": [str(x) for x in allocated], "command": command,
-                    "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]}
+                    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
         atomic_json(attempt / "attempt.json", metadata)
         env = os.environ.copy()
         env.update({"PYTHONUNBUFFERED": "1", "WEIGHT_SYNC_TIMEOUT": "900", "OMP_NUM_THREADS": "1",
@@ -404,6 +435,11 @@ def trial(config):
                 stat = (out / "latest.pt").stat()
                 checkpoint_stamp = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
         base = {"algorithm": label, "hostname": metadata["hostname"], "training_output_dir": str(out)}
+        if settings.get("sweep_trial"):
+            entry = settings["sweep_trial"]
+            base.update(seed=entry["seed"], hyperparameters=entry["parameters"], configuration_id=entry["configuration_id"],
+                        sample_index=entry["sample_index"], replicate=entry["replicate"],
+                        total_steps=settings["total_steps"], schedule=entry["schedule"], ray_trial_id=trial_id)
 
         def report(completed=False):
             nonlocal checkpoint_stamp
@@ -481,7 +517,8 @@ def _attempts(out):
 
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment-id", default=os.getenv("EXPERIMENT_ID", f"slurm_{os.getenv('SLURM_JOB_ID', 'local')}"))
+    parser.add_argument("--experiment-id", default=os.getenv("EXPERIMENT_ID"))
+    parser.add_argument("--sweep-spec", default=os.getenv("SWEEP_SPEC"), help="YAML sweep specification; paths relative to the repository")
     parser.add_argument("--root", default=os.getenv("RAY_TUNE_JOB_ROOT"), help="Persistent shared experiment root")
     parser.add_argument("--restore", action="store_true", default=os.getenv("RESTORE", "0") == "1")
     parser.add_argument("--mode", choices=("ppo", "mappo", "both"), default=os.getenv("TRIAL_MODE", "ppo"))
@@ -502,18 +539,49 @@ def arguments():
     return parser.parse_args()
 
 
+def current_revision():
+    paths = ["src", "scripts", "configs", "scenarios", "run.py"]
+    dirty = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", *paths], cwd=REPO)
+    untracked = subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "--", *paths], cwd=REPO, text=True)
+    if dirty.returncode or untracked.strip():
+        raise ValueError("Uncommitted experiment source/configuration; use a reviewed, clean source revision")
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
+
+
+def validate_restoration(settings, spec, experiment_id, root):
+    if settings["git_sha"] != current_revision():
+        raise ValueError("Git revision differs from the saved experiment; restore with the original source revision")
+    if settings["experiment_id"] != experiment_id or settings["root"] != str(root):
+        raise ValueError("Restore identity/path differs from the saved experiment")
+    if spec is not None and settings.get("sweep") != spec:
+        raise ValueError("Sweep specification differs from the saved experiment; sampled configurations cannot change")
+    if "manifest_digest" in settings and settings["manifest_digest"] != digest({k: v for k, v in settings.items() if k != "manifest_digest"}):
+        raise ValueError("Saved experiment configuration/plan was modified")
+    for entry in settings.get("trial_plan", []):
+        if hashlib.sha256(Path(entry["input_path"]).read_bytes()).hexdigest() != entry["input_sha256"]:
+            raise ValueError("Frozen sweep configuration was modified")
+
+
 def main():
     args = arguments()
-    import ray
-    from ray import tune
-
-    if not args.experiment_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in args.experiment_id):
-        raise ValueError("experiment-id must contain only letters, digits, underscores or hyphens")
+    spec = read_spec(args.sweep_spec, REPO) if args.sweep_spec else None
+    args.experiment_id = args.experiment_id or (spec["experiment_id"] if spec else f"slurm_{os.getenv('SLURM_JOB_ID', 'local')}")
+    identifier(args.experiment_id)
+    if spec and args.overrides:
+        raise ValueError("Use fixed_overrides inside the sweep specification, rather than --set")
+    controlled = {"--mode", "--total-steps", "--seed", "--evaluation", "--ppo-scenario", "--mappo-scenario",
+                  "--wandb-mode", "--wandb-project", "--wandb-entity", "--wandb-group", "--set"}
+    conflicting_flags = controlled & {value.split("=", 1)[0] for value in sys.argv[1:]}
+    if spec and conflicting_flags:
+        raise ValueError(f"Configure these options in the sweep specification: {sorted(conflicting_flags)}")
     if (args.total_steps <= 0 or args.checkpoint_every_steps <= 0 or args.max_failures < 0
             or args.checkpoint_every_updates is not None and args.checkpoint_every_updates <= 0
             or not math.isfinite(args.poll_interval) or args.poll_interval <= 0
             or not math.isfinite(args.trial_timeout) or args.trial_timeout < 0):
         raise ValueError("Budgets/intervals must be positive; timeout and max-failures must be >=0")
+    import ray
+    from ray import tune
+
     root = Path(args.root or REPO / "outputs" / f"ray_tune_{args.experiment_id}").expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     with exclusive(root / ".experiment.lock"):
@@ -521,8 +589,9 @@ def main():
         experiment_path = root / "tune_results" / "independent_trials"
         if args.restore:
             settings = json.loads(manifest.read_text())
-            if settings["experiment_id"] != args.experiment_id or settings["root"] != str(root):
-                raise ValueError("Restore identity/path differs from the saved experiment")
+            if settings.get("sweep") and conflicting_flags:
+                raise ValueError("Restored sweep configuration cannot be overridden")
+            validate_restoration(settings, spec, args.experiment_id, root)
             if not tune.Tuner.can_restore(str(experiment_path)):
                 raise RuntimeError(f"No restorable Tune experiment at {experiment_path}")
         else:
@@ -536,25 +605,46 @@ def main():
                         "evaluation": args.evaluation, "overrides": args.overrides,
                         "scenarios": {label: str((REPO / getattr(args, f"{label}_scenario")).resolve()) for label in SCENARIOS},
                         "wandb": {key: getattr(args, f"wandb_{key}") for key in ("mode", "project", "entity", "group")},
-                        "git_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()}
+                        "git_sha": current_revision()}
+            if spec:
+                settings.update(sweep=spec, mode=spec["algorithm"], total_steps=spec["total_steps"],
+                                evaluation=True, overrides=spec["fixed_overrides"],
+                                resources_per_trial=spec["resources_per_trial"], max_concurrent_trials=spec["max_concurrent_trials"])
+                settings["scenarios"][spec["algorithm"]] = spec["scenario"]
+                settings["wandb"].update({"mode": "online", **spec["wandb"]})
+                settings["trial_plan"] = generate_plan(spec, tune)
+                sys.path.insert(0, str(REPO / "src"))
+                preflight(settings, trainer_command, REPO)
+            settings["manifest_digest"] = digest(settings)
             atomic_json(manifest, settings)
         algorithms = ["ppo", "mappo"] if settings["mode"] == "both" else [settings["mode"]]
+        expected_trials = len(settings["trial_plan"]) if "trial_plan" in settings else len(algorithms)
+        resources = settings.get("resources_per_trial", {"cpu": 6, "gpu": 1})
+        concurrency = settings.get("max_concurrent_trials", len(algorithms))
         ray.init(address=os.environ["RAY_ADDRESS"], logging_level="ERROR")
         try:
             deadline = time.monotonic() + 180
             while time.monotonic() < deadline:
-                if ray.cluster_resources().get("GPU", 0) >= 2 and len([n for n in ray.nodes() if n["Alive"]]) == 2:
+                nodes = [n for n in ray.nodes() if n["Alive"]]
+                if ray.cluster_resources().get("GPU", 0) >= 2 and len(nodes) == 2:
                     break
                 time.sleep(2)
             else:
                 raise RuntimeError(f"Two-node Ray cluster not ready: {ray.cluster_resources()}")
-            trainable = tune.with_resources(trial, resources={"cpu": 6, "gpu": 1})
+            if settings.get("sweep") and not any(all(n.get("Resources", {}).get(k.upper() if k == "gpu" else "CPU", 0) >= v
+                                         for k, v in resources.items()) for n in nodes):
+                raise ValueError(f"Trial resources cannot fit on any Ray node: {resources}")
+            trainable = tune.with_resources(trial, resources=resources)
             if args.restore:
                 tuner = tune.Tuner.restore(str(experiment_path), trainable=trainable,
                                            resume_unfinished=True, resume_errored=True, restart_errored=False)
             else:
-                tuner = tune.Tuner(trainable, param_space={"algorithm": tune.grid_search(algorithms), "settings": settings},
-                                   tune_config=tune.TuneConfig(max_concurrent_trials=len(algorithms)),
+                space = {"algorithm": tune.grid_search(algorithms), "settings": settings}
+                if "trial_plan" in settings:
+                    space = {"algorithm": settings["mode"], "settings": settings,
+                             "sweep_trial": tune.grid_search(settings["trial_plan"])}
+                tuner = tune.Tuner(trainable, param_space=space,
+                                   tune_config=tune.TuneConfig(max_concurrent_trials=concurrency),
                                    run_config=tune.RunConfig(name="independent_trials", storage_path=str(root / "tune_results"),
                                                             progress_reporter=tune.CLIReporter(
                                                                 metric_columns=list(COUNTERS), parameter_columns=["algorithm"]),
@@ -563,11 +653,22 @@ def main():
             results = []
             for result in tuner.fit():
                 metrics = result.metrics or {}
-                results.append({key: metrics.get(key) for key in ("algorithm", "hostname", "status", "environment_steps", "training_output_dir")})
-                results[-1].update(tune_result_path=str(result.path), error=str(result.error) if result.error else None)
+                row = {key: metrics.get(key) for key in ("algorithm", "hostname", "status", "environment_steps", "training_output_dir")}
+                row.update(tune_result_path=str(result.path), error=str(result.error) if result.error else None)
+                if "trial_plan" in settings:
+                    entry = (getattr(result, "config", {}) or {}).get("sweep_trial", {})
+                    row.update({key: metrics.get(key, entry.get(key)) for key in
+                                ("seed", "configuration_id", "sample_index", "replicate", "schedule")})
+                    row.update(algorithm=settings["mode"], hyperparameters=entry.get("parameters", metrics.get("hyperparameters")),
+                               total_steps=settings["total_steps"], last_attempt_training_seconds=metrics.get("perf/elapsed_seconds"))
+                results.append(row)
             atomic_json(root / "results.json", results)
+            if "trial_plan" in settings:
+                sys.path.insert(0, str(REPO / "src"))
+                atomic_json(root / "ranked_summary.json", {"experiment_id": settings["experiment_id"],
+                                                          "evaluation_protocol": settings["evaluation_protocol"], **ranking(results)})
             print(json.dumps(results, indent=2), flush=True)
-            if len(results) != len(algorithms) or any(r["error"] or r["status"] != "completed" for r in results):
+            if len(results) != expected_trials or any(r["error"] or r["status"] != "completed" for r in results):
                 raise RuntimeError("One or more Ray Tune trials failed")
         finally:
             ray.shutdown()

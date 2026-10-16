@@ -16,6 +16,7 @@
 #   sbatch scripts/hpc/ray_tune_2node.sbatch
 #   sbatch --export=ALL,TRIAL_MODE=both scripts/hpc/ray_tune_2node.sbatch
 # Reuse EXPERIMENT_ID with RESTORE=1 in a new allocation for recovery.
+# Sweeps: SWEEP_SPEC=scripts/sweeps/ppo_lr_smoke.yaml (or --sweep-spec PATH).
 # Optional: RAY_TUNE_{TOTAL_STEPS,CHECKPOINT_STEPS,TRIAL_TIMEOUT,WANDB_MODE},
 # RAY_TUNE_WANDB_{PROJECT,ENTITY,GROUP}, RAY_TUNE_EVALUATION=1.
 # ENABLE_DASHBOARD=1, HOLD_SECONDS=300 (up to 1800).
@@ -25,13 +26,23 @@ umask 077
 REPO="$HOME/marl_race"
 VENV="$HOME/envs/marl-race"
 TRIAL_MODE="${TRIAL_MODE:-ppo}"
-export EXPERIMENT_ID="${EXPERIMENT_ID:-slurm_${SLURM_JOB_ID}}"
 export RESTORE="${RESTORE:-0}"
+export SWEEP_SPEC="${SWEEP_SPEC:-}"
+# Read only launcher identity arguments; pass the original arguments to Python.
+launcher_args=("$@")
+for ((i=0; i<${#launcher_args[@]}; i++)); do
+  case "${launcher_args[i]}" in
+    --sweep-spec) SWEEP_SPEC="${launcher_args[i+1]:?Missing sweep path}"; i=$((i+1));;
+    --sweep-spec=*) SWEEP_SPEC="${launcher_args[i]#*=}";;
+    --experiment-id) EXPERIMENT_ID="${launcher_args[i+1]:?Missing experiment ID}"; i=$((i+1));;
+    --experiment-id=*) EXPERIMENT_ID="${launcher_args[i]#*=}";;
+  esac
+done
 ENABLE_DASHBOARD="${ENABLE_DASHBOARD:-0}"
 HOLD_SECONDS="${HOLD_SECONDS:-0}"
 
 [[ "$TRIAL_MODE" == ppo || "$TRIAL_MODE" == mappo || "$TRIAL_MODE" == both ]] || { echo "Invalid TRIAL_MODE" >&2; exit 2; }
-[[ "$EXPERIMENT_ID" =~ ^[a-zA-Z0-9_-]+$ && "$RESTORE" =~ ^[01]$ ]] || exit 2
+[[ "$RESTORE" =~ ^[01]$ ]] || exit 2
 [[ "$ENABLE_DASHBOARD" == 0 || "$ENABLE_DASHBOARD" == 1 ]] || exit 2
 [[ "$HOLD_SECONDS" =~ ^[0-9]+$ ]] && (( HOLD_SECONDS <= 1800 )) || exit 2
 [[ -d "$VENV" ]] || { echo "Missing environment $VENV" >&2; exit 2; }
@@ -47,6 +58,12 @@ if [[ -z "$CRUN" ]]; then
   CRUN=/cm/shared/containers/python3/2025.1-py312/crun.python3
 fi
 [[ -x "$CRUN" ]] || { echo "Cannot execute $CRUN" >&2; exit 2; }
+if [[ -z "${EXPERIMENT_ID:-}" && -n "$SWEEP_SPEC" ]]; then
+  EXPERIMENT_ID="$("$CRUN" -p "$VENV" python3 -c \
+    'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["experiment_id"])' "$SWEEP_SPEC")"
+fi
+export EXPERIMENT_ID="${EXPERIMENT_ID:-slurm_${SLURM_JOB_ID}}"
+[[ "$EXPERIMENT_ID" =~ ^[a-zA-Z0-9_-]+$ ]] || exit 2
 
 export RAY_DISABLE_USAGE_STATS=1
 export PYTHONUNBUFFERED=1

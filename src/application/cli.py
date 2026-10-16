@@ -10,7 +10,7 @@ from application.checkpoints import resolve_scenario_relative_path
 from loggers.console import ConsoleLogger
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="F110 RL training")
     p.add_argument("--scenario", required=True, help="Path to scenario YAML file")
     p.add_argument("--set", dest="parameter_overrides", action="append", default=[], metavar="OVERRIDE",
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--run-id", type=str, default=None)
     p.add_argument("--output-dir", type=str, default=None)
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def apply_cli_overrides(scenario: dict, args: argparse.Namespace) -> dict:

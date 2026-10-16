@@ -1,0 +1,30 @@
+name: PPO learning-rate functional pilot
+experiment_id: t5-ppo-lr-smoke
+algorithm: ppo
+scenario: scenarios/ppo_lap_completion_pretrain.yaml
+total_steps: 16384
+seeds: [42]
+sweep_seed: 2026
+search:
+  method: grid
+  parameters:
+    algorithm.params.learning_rate:
+      type: choice
+      values: [0.0001, 0.0003, 0.001]
+max_concurrent_trials: 2
+resources_per_trial: {cpu: 6, gpu: 1}
+# Small explicit collector/update settings for this functional test only.
+fixed_overrides:
+  - algorithm.params.n_steps=1024
+  - algorithm.params.frames_per_batch=256
+  - algorithm.params.batch_size=128
+  - algorithm.params.n_epochs=2
+evaluation:
+  seed: 10042
+  episodes: 1
+  every_steps: 4096
+  max_steps: 256
+wandb:
+  mode: online
+  project: marl-f110-complete
+  entity: ahoop004-old-dominion-university

@@ -134,8 +134,14 @@ def test_native_configuration_roundtrip_and_wandb_metadata(tmp_path, algorithm, 
     assert reloaded["experiment"]["total_steps"] == 9
 
 
-def test_trial_registers_immutable_native_checkpoint_and_recovers_new_allocation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sweep", [False, True])
+def test_trial_registers_immutable_native_checkpoint_and_recovers_new_allocation(tmp_path, monkeypatch, sweep):
     cfg = settings(tmp_path)
+    entry = {"configuration_id": "point", "sample_index": 0, "replicate": 0, "seed": 42,
+             "parameters": {"algorithm.params.learning_rate": .0003}, "schedule": {"lr_schedule": "constant"}}
+    if sweep:
+        cfg["sweep"] = {"name": "sweep", "search": {"method": "grid"}, "sweep_seed": 5, "evaluation": {}}
+    trial_config = {"algorithm": "ppo", "settings": cfg, **({"sweep_trial": entry} if sweep else {})}
     reports, resume_checkpoint, calls = [], None, []
 
     class Checkpoint:
@@ -173,10 +179,12 @@ def test_trial_registers_immutable_native_checkpoint_and_recovers_new_allocation
             identity = json.loads((out / "ray_trial.json").read_text())
             provenance = {"run_id": identity["run_id"], "wandb_run_id": identity["wandb_id"]}
             capture = Capture(False)
-            native, _ = trainer(capture)
+            native, _ = trainer(capture, **({"learning_rate": .0003} if sweep else {}))
             logger = CSVLogger(str(out), append="--resume" in command)
+            configuration = {"experiment": {"seed": 42, "total_steps": 9},
+                             "algorithm": {"params": {"learning_rate": .0003}}} if sweep else None
             native.hooks.extend([CSVHook(logger), CheckpointHook(native.agent, out, provenance=provenance,
-                                                               save_every_steps=4)])
+                                                               configuration=configuration, save_every_steps=4)])
             if "--resume" in command:
                 state, _ = native.agent.resume_training(command[command.index("--resume") + 1])
                 native.restore_training_state(state)
@@ -197,12 +205,12 @@ def test_trial_registers_immutable_native_checkpoint_and_recovers_new_allocation
 
     monkeypatch.setattr(adapter.subprocess, "Popen", Process)
     with pytest.raises(RuntimeError, match="trainer exited"):
-        adapter.trial({"algorithm": "ppo", "settings": cfg})
+        adapter.trial(trial_config)
     registered = resume_checkpoint.directory
     before = (registered / "latest.pt").read_bytes()
     assert read_checkpoint(registered / "latest.pt")["training"]["progress"]["environment_steps"] == 4
     monkeypatch.setenv("SLURM_JOB_ID", "second")
-    adapter.trial({"algorithm": "ppo", "settings": cfg})
+    adapter.trial(trial_config)
     out = tmp_path / "trial_runs/ppo_unique"
     assert calls == [4, 9]
     assert (registered / "latest.pt").read_bytes() == before
@@ -219,6 +227,11 @@ def test_trial_registers_immutable_native_checkpoint_and_recovers_new_allocation
     broken["settings"]["total_steps"] = 10
     with pytest.raises(ValueError, match="budget"):
         adapter.checkpoint_payload(out / "latest.pt", broken)
+    if sweep:
+        broken = deepcopy(identity)
+        broken["settings"]["sweep_trial"]["parameters"]["algorithm.params.learning_rate"] = .001
+        with pytest.raises(ValueError, match="hyperparameter differs"):
+            adapter.checkpoint_payload(out / "latest.pt", broken)
     (out / "latest.pt").write_bytes(b"corrupt")
     with pytest.raises(Exception):
         adapter.restore_native(resume_checkpoint, out, tmp_path, identity)
@@ -226,6 +239,7 @@ def test_trial_registers_immutable_native_checkpoint_and_recovers_new_allocation
 
 def test_restore_uses_saved_settings_and_resume_flags(tmp_path, monkeypatch):
     cfg = settings(tmp_path, "disabled")
+    monkeypatch.setattr(adapter, "current_revision", lambda: cfg["git_sha"])
     adapter.atomic_json(tmp_path / "experiment.json", cfg)
     restored = []
 
