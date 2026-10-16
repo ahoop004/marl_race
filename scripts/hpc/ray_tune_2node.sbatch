@@ -9,22 +9,29 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --time=01:00:00
+#SBATCH --signal=B:TERM@60
 #SBATCH --output=ray-tune-%j.log
 
 # Submit from ~/marl_race:
 #   sbatch scripts/hpc/ray_tune_2node.sbatch
 #   sbatch --export=ALL,TRIAL_MODE=both scripts/hpc/ray_tune_2node.sbatch
-# Optional: ENABLE_DASHBOARD=1, HOLD_SECONDS=300 (up to 1800).
+# Reuse EXPERIMENT_ID with RESTORE=1 in a new allocation for recovery.
+# Optional: RAY_TUNE_{TOTAL_STEPS,CHECKPOINT_STEPS,TRIAL_TIMEOUT,WANDB_MODE},
+# RAY_TUNE_WANDB_{PROJECT,ENTITY,GROUP}, RAY_TUNE_EVALUATION=1.
+# ENABLE_DASHBOARD=1, HOLD_SECONDS=300 (up to 1800).
 set -Eeuo pipefail
 umask 077
 
 REPO="$HOME/marl_race"
 VENV="$HOME/envs/marl-race"
 TRIAL_MODE="${TRIAL_MODE:-ppo}"
+export EXPERIMENT_ID="${EXPERIMENT_ID:-slurm_${SLURM_JOB_ID}}"
+export RESTORE="${RESTORE:-0}"
 ENABLE_DASHBOARD="${ENABLE_DASHBOARD:-0}"
 HOLD_SECONDS="${HOLD_SECONDS:-0}"
 
-[[ "$TRIAL_MODE" == ppo || "$TRIAL_MODE" == both ]] || { echo "Invalid TRIAL_MODE" >&2; exit 2; }
+[[ "$TRIAL_MODE" == ppo || "$TRIAL_MODE" == mappo || "$TRIAL_MODE" == both ]] || { echo "Invalid TRIAL_MODE" >&2; exit 2; }
+[[ "$EXPERIMENT_ID" =~ ^[a-zA-Z0-9_-]+$ && "$RESTORE" =~ ^[01]$ ]] || exit 2
 [[ "$ENABLE_DASHBOARD" == 0 || "$ENABLE_DASHBOARD" == 1 ]] || exit 2
 [[ "$HOLD_SECONDS" =~ ^[0-9]+$ ]] && (( HOLD_SECONDS <= 1800 )) || exit 2
 [[ -d "$VENV" ]] || { echo "Missing environment $VENV" >&2; exit 2; }
@@ -45,14 +52,19 @@ export RAY_DISABLE_USAGE_STATS=1
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 export RAY_TUNE_GIT_SHA="$(git rev-parse HEAD)"
-export RAY_TUNE_JOB_ROOT="$REPO/outputs/ray_tune_${SLURM_JOB_ID}"
+export RAY_TUNE_JOB_ROOT="${RAY_TUNE_JOB_ROOT:-$REPO/outputs/ray_tune_${EXPERIMENT_ID}}"
 mkdir -p "$RAY_TUNE_JOB_ROOT"
 chmod 700 "$RAY_TUNE_JOB_ROOT"
+# flock prevents two allocations using the same experiment concurrently.
+exec 9>"$RAY_TUNE_JOB_ROOT/.allocation.lock"
+flock -n 9 || { echo "Experiment already has an active allocation" >&2; exit 2; }
+ATTEMPT_ROOT="$RAY_TUNE_JOB_ROOT/attempts/${SLURM_JOB_ID}"
+mkdir -p "$ATTEMPT_ROOT"
 
 # Ray 2.59 token authentication; all nodes see the shared home filesystem.
 export RAY_AUTH_MODE=token
 unset RAY_AUTH_TOKEN || true
-export RAY_AUTH_TOKEN_PATH="$RAY_TUNE_JOB_ROOT/.ray_auth_token"
+export RAY_AUTH_TOKEN_PATH="$ATTEMPT_ROOT/.ray_auth_token"
 [[ ! -e "$RAY_AUTH_TOKEN_PATH" ]] || { echo "Token file already exists" >&2; exit 2; }
 trap 'rm -f -- "$RAY_AUTH_TOKEN_PATH"' EXIT
 "$CRUN" -p "$VENV" python3 -c 'import secrets; print(secrets.token_urlsafe(48))' > "$RAY_AUTH_TOKEN_PATH"
@@ -88,9 +100,14 @@ DASHBOARD_FLAG=false
 
 head_step=""
 worker_step=""
+driver_step=""
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
+  # Stop the driver first, then the cluster. Worker watchdogs terminate native
+  # trainer process groups when Ray exits. Persistent experiment data stays put.
+  [[ -z "$driver_step" ]] || kill "$driver_step" 2>/dev/null || true
+  [[ -z "$driver_step" ]] || wait "$driver_step" 2>/dev/null || true
   [[ -z "$worker_step" ]] || kill "$worker_step" 2>/dev/null || true
   [[ -z "$head_step" ]] || kill "$head_step" 2>/dev/null || true
   [[ -z "$worker_step" ]] || wait "$worker_step" 2>/dev/null || true
@@ -98,7 +115,7 @@ cleanup() {
   rm -f -- "$RAY_AUTH_TOKEN_PATH"
   if (( rc != 0 )); then
     echo "ERROR: Ray Tune job failed (exit $rc)" >&2
-    for f in "$RAY_TUNE_JOB_ROOT/head.log" "$RAY_TUNE_JOB_ROOT/worker.log" "$RAY_TUNE_JOB_ROOT/driver.log"; do
+    for f in "$ATTEMPT_ROOT/head.log" "$ATTEMPT_ROOT/worker.log" "$ATTEMPT_ROOT/driver.log"; do
       [[ -f "$f" ]] && { echo "=== $f ==="; tail -n 45 "$f"; } >&2 || true
     done
   fi
@@ -137,7 +154,7 @@ run_on "$HEAD" ray --version
   --ray-client-server-port="$CLIENT_PORT" \
   --include-dashboard="$DASHBOARD_FLAG" --dashboard-host=127.0.0.1 \
   --dashboard-port="$DASHBOARD_PORT" --temp-dir="$TEMP_DIR" \
-  "${common_args[@]}" > "$RAY_TUNE_JOB_ROOT/head.log" 2>&1 &
+  "${common_args[@]}" > "$ATTEMPT_ROOT/head.log" 2>&1 &
 head_step=$!
 
 ready=0
@@ -157,11 +174,16 @@ done
 "${srun_base[@]}" --nodelist="$WORKER" "$CRUN" -p "$VENV" \
   ray start --address="$RAY_ADDRESS" --node-ip-address="$WORKER_IP" \
   --temp-dir="$TEMP_DIR" "${common_args[@]}" \
-  > "$RAY_TUNE_JOB_ROOT/worker.log" 2>&1 &
+  > "$ATTEMPT_ROOT/worker.log" 2>&1 &
 worker_step=$!
 
 # Tune waits for both GPUs before launching trials. The driver is lightweight.
-run_on "$HEAD" python3 -u scripts/ray_tune_trials.py 2>&1 | tee "$RAY_TUNE_JOB_ROOT/driver.log"
+"${srun_base[@]}" --nodelist="$HEAD" "$CRUN" -p "$VENV" \
+  python3 -u scripts/ray_tune_trials.py "$@" > "$ATTEMPT_ROOT/driver.log" 2>&1 &
+driver_step=$!
+echo "Driver log: $ATTEMPT_ROOT/driver.log"
+wait "$driver_step"
+driver_step=""
 
 if (( HOLD_SECONDS > 0 )); then
   echo "Keeping authenticated Ray Dashboard available for ${HOLD_SECONDS}s"

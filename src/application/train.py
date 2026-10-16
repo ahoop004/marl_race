@@ -78,6 +78,13 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
     wandb_enabled = wandb_cfg.get("enabled", False) and primary
     wandb_logger: Optional[WandbLogger] = None
     if wandb_enabled:
+        saved_wandb_id = (resume_payload["metadata"]["provenance"].get("wandb_run_id")
+                          if resume_payload else None)
+        wandb_identity = {}
+        if saved_wandb_id:
+            wandb_identity = {"id": saved_wandb_id, "resume": "must"}
+        elif wandb_cfg.get("id"):
+            wandb_identity = {"id": wandb_cfg["id"], "resume": "allow"}
         wandb_logger = WandbLogger(
             project=wandb_cfg.get("project", "f110"),
             name=wandb_cfg.get("name", exp_cfg.get("name")),
@@ -89,8 +96,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
             notes=wandb_cfg.get("notes"),
             mode=wandb_cfg.get("mode", "online"),
             logging_config=wandb_cfg.get("logging"),
-            **({"id": resume_payload["metadata"]["provenance"]["wandb_run_id"], "resume": "must"}
-               if resume_payload and resume_payload["metadata"]["provenance"].get("wandb_run_id") else {}),
+            **wandb_identity,
             run_id=run_id,
         )
         resources.callback(wandb_logger.finish)
