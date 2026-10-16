@@ -1,0 +1,19 @@
+diff --git a/scripts/ray_tune_trials.py b/scripts/ray_tune_trials.py
+--- a/scripts/ray_tune_trials.py
++++ b/scripts/ray_tune_trials.py
+@@ -624,11 +624,13 @@ def main():
+         ray.init(address=os.environ["RAY_ADDRESS"], logging_level="ERROR")
+         try:
+             deadline = time.monotonic() + 180
++            expected_nodes = int(os.environ.get("RAY_EXPECTED_NODES", "2"))
++            expected_gpus = int(os.environ.get("RAY_EXPECTED_GPUS", "2"))
+             while time.monotonic() < deadline:
+                 nodes = [n for n in ray.nodes() if n["Alive"]]
+-                if ray.cluster_resources().get("GPU", 0) >= 2 and len(nodes) == 2:
++                if ray.cluster_resources().get("GPU", 0) >= expected_gpus and len(nodes) == expected_nodes:
+                     break
+                 time.sleep(2)
+             else:
+-                raise RuntimeError(f"Two-node Ray cluster not ready: {ray.cluster_resources()}")
++                raise RuntimeError(f"Ray cluster not ready for {expected_nodes} nodes, {expected_gpus} GPUs: {ray.cluster_resources()}")
+             if settings.get("sweep") and not any(all(n.get("Resources", {}).get(k.upper() if k == "gpu" else "CPU", 0) >= v
