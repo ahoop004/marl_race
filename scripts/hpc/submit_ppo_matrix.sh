@@ -7,6 +7,7 @@ set -Eeuo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 MODE=dry-run
+PROFILE=""
 SUITE=full
 TAG="$(date -u +%Y%m%dT%H%M%SZ)"
 STEPS=262144
@@ -15,6 +16,7 @@ while (($#)); do
   case "$1" in
     --submit) MODE=submit; shift;;
     --dry-run) MODE=dry-run; shift;;
+    --profile) PROFILE="${2:?}"; shift 2;;
     --suite) SUITE="${2:?}"; shift 2;;
     --tag) TAG="${2:?}"; shift 2;;
     --steps) STEPS="${2:?}"; shift 2;;
@@ -35,11 +37,18 @@ if [[ "$MODE" == submit ]]; then
   }
 fi
 
-OUT="$REPO/outputs/hpc_profile_matrix/$TAG"
+CRUN="${CRUN:-$(command -v crun || true)}"
+[[ -n "$CRUN" ]] || CRUN=/cm/shared/containers/python3/2025.1-py312/crun.python3
+VENV="${VENV:-$HOME/envs/marl-race}"
+[[ -x "$CRUN" && -d "$VENV" ]] || { echo "Missing project container/environment: $CRUN -p $VENV" >&2; exit 2; }
+
+OUT="${PROFILE_MATRIX_ROOT:-$REPO/outputs/hpc_profile_matrix}/$TAG"
+mkdir -p "$(dirname "$OUT")"
+mkdir "$OUT" || { echo "Matrix tag already exists; choose a new --tag to preserve previous outputs" >&2; exit 2; }
 SPEC_DIR="$OUT/specs"
 mkdir -p "$SPEC_DIR"
 JOBS="$OUT/jobs.tsv"
-printf 'profile\texperiment_id\tjob_id\tnodes\tgpus_per_node\tcpus_per_node\tworkers\tenvs_per_worker\ttrials\tsteps_per_trial\n' > "$JOBS"
+printf 'profile\texperiment_id\tjob_id\tnodes\tgpus_per_node\tcpus_per_node\tworkers\tenvs_per_worker\ttrials\tsteps_per_trial\tdependency\n' > "$JOBS"
 
 # profile, nodes, GPUs/node, CPUs/node, collector processes/trial, envs/worker, Ray CPUs/trial
 profiles=(
@@ -51,15 +60,18 @@ profiles=(
   'n02_g2   2 2 24 8 8 10'
   'n03_g2   3 2 24 8 8 10'
 )
-previous=""
+selected=()
 for record in "${profiles[@]}"; do
   read -r key nodes gpus cpus workers envs ray_cpus <<< "$record"
   if [[ "$SUITE" == workers && "$nodes" != 1 ]] || \
      [[ "$SUITE" == nodes && "$key" == w04_n1g1 || "$SUITE" == nodes && "$key" == w08_n1g1 ]]; then
     continue
   fi
+  [[ -z "$PROFILE" || "$PROFILE" == "$key" ]] || continue
+  selected+=("$record")
   concurrency=$(( nodes * gpus ))
   experiment_id="profile_${TAG}_${key}"
+  [[ ! -e "$REPO/outputs/ray_tune_${experiment_id}" ]] || { echo "Existing experiment $experiment_id; choose a new --tag" >&2; exit 2; }
   spec="$SPEC_DIR/${key}.yaml"
   cat > "$spec" <<YAML
 # Throughput comparison only. Fixed evaluation is deliberately short and not a model-quality test.
@@ -95,27 +107,64 @@ evaluation:
 wandb:
   mode: disabled
 YAML
+done
+(( ${#selected[@]} > 0 )) || { echo "No profiles selected (check --profile and --suite)" >&2; exit 2; }
+
+# Validate the entire selection before the first sbatch call, including dry runs.
+mkdir -p "$OUT/validation"
+for record in "${selected[@]}"; do
+  read -r key nodes gpus cpus workers envs ray_cpus <<< "$record"
+  echo "Validating $key: nodes=$nodes GPUs/node=$gpus CPUs/node=$cpus workers/trial=$workers envs/worker=$envs"
+  if ! RESTORE=0 "$CRUN" -p "$VENV" python3 scripts/ray_tune_trials.py \
+      --preflight-only --sweep-spec "$SPEC_DIR/$key.yaml" --experiment-id "profile_${TAG}_${key}" \
+      --cluster-nodes "$nodes" --cpus-per-node "$cpus" --gpus-per-node "$gpus" \
+      > "$OUT/validation/$key.log" 2>&1; then
+    echo "PREFLIGHT FAILED: $key; zero jobs submitted" >&2
+    cat "$OUT/validation/$key.log" >&2
+    exit 1
+  fi
+  cat "$OUT/validation/$key.log"
+done
+
+previous=""
+for record in "${selected[@]}"; do
+  read -r key nodes gpus cpus workers envs ray_cpus <<< "$record"
+  experiment_id="profile_${TAG}_${key}"
+  spec="$SPEC_DIR/${key}.yaml"
+  dependency="none"
   command=(sbatch --parsable --partition=gpu --account=q1wang --qos=normal
     --nodes="$nodes" --ntasks="$nodes" --ntasks-per-node=1
     --cpus-per-task="$cpus" --gres="gpu:${gpus}" --time="$WALLTIME")
-  if [[ "$MODE" == submit && -n "$previous" ]]; then
-    command+=("--dependency=afterany:$previous")
+  if [[ -n "$previous" ]]; then
+    dependency="afterok:$previous"
+    command+=("--dependency=$dependency" --kill-on-invalid-dep=no)
   fi
-  command+=("--export=ALL,RESTORE=0,EXPERIMENT_ID=${experiment_id},SWEEP_SPEC=${spec},PROFILE_GPUS_PER_NODE=${gpus}"
+  command+=("--export=ALL,RESTORE=0,EXPERIMENT_ID=${experiment_id},SWEEP_SPEC=${spec},PROFILE_GPUS_PER_NODE=${gpus},RAY_TUNE_JOB_ROOT=${REPO}/outputs/ray_tune_${experiment_id}"
             scripts/hpc/ray_tune_matrix.sbatch)
-  echo "$key: nodes=$nodes GPUs/node=$gpus CPUs/node=$cpus collectors=$workers envs/worker=$envs ($concurrency concurrent trials)"
   if [[ "$MODE" == submit ]]; then
-    job="$("${command[@]}")"
+    if ! job="$("${command[@]}")"; then
+      echo "Submission failed for $key; submitted IDs are preserved in $JOBS" >&2
+      printf 'Cancel recorded pending jobs: tail -n +2 %q | cut -f3 | xargs -r scancel --state=PENDING\n' "$JOBS" >&2
+      exit 1
+    fi
     job="${job%%;*}"
-    [[ "$job" =~ ^[0-9]+$ ]] || { echo "Unexpected sbatch response $job" >&2; exit 1; }
+    [[ "$job" =~ ^[0-9]+$ ]] || { echo "Unexpected sbatch response $job; earlier IDs are in $JOBS" >&2; exit 1; }
     previous="$job"
-    echo "  submitted $job (previous completed/cancelled before start)"
+    echo "$key: submitted $job; dependency=$dependency"
   else
     job=DRY_RUN
+    previous="<${key}_job_id>"
+    echo "$key: validated dry run; dependency=$dependency"
     printf '  %q' "${command[@]}"; printf '\n'
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t6\t%s\n' \
-    "$key" "$experiment_id" "$job" "$nodes" "$gpus" "$cpus" "$workers" "$envs" "$STEPS" >> "$JOBS"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t6\t%s\t%s\n' \
+    "$key" "$experiment_id" "$job" "$nodes" "$gpus" "$cpus" "$workers" "$envs" "$STEPS" "$dependency" >> "$JOBS"
 done
 printf 'Matrix directory: %s\nManifest: %s\n' "$OUT" "$JOBS"
-if [[ "$MODE" == dry-run ]]; then echo 'Preview only: no Slurm jobs were submitted.'; fi
+if [[ "$MODE" == dry-run ]]; then
+  echo 'All selected profiles passed preflight. No Slurm jobs were submitted; dependency IDs above are placeholders.'
+else
+  echo 'Chain: each profile requires afterok of the previous job. Failed dependencies remain pending (DependencyNeverSatisfied).'
+  printf 'Inspect: tail -n +2 %q | cut -f3 | paste -sd, - | xargs -r squeue -o "%%.18i %%.12T %%.35E %%R" --jobs\n' "$JOBS"
+  printf 'Cancel remaining: tail -n +2 %q | cut -f3 | xargs -r scancel --state=PENDING\n' "$JOBS"
+fi

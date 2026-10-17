@@ -519,6 +519,10 @@ def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment-id", default=os.getenv("EXPERIMENT_ID"))
     parser.add_argument("--sweep-spec", default=os.getenv("SWEEP_SPEC"), help="YAML sweep specification; paths relative to the repository")
+    parser.add_argument("--preflight-only", action="store_true", help="Validate a sweep in temporary storage without Ray cluster startup or training")
+    parser.add_argument("--cluster-nodes", type=int, help="Allocation nodes for preflight resource checks")
+    parser.add_argument("--cpus-per-node", type=int, help="Allocation CPUs per node for preflight resource checks")
+    parser.add_argument("--gpus-per-node", type=int, help="Allocation GPUs per node for preflight resource checks")
     parser.add_argument("--root", default=os.getenv("RAY_TUNE_JOB_ROOT"), help="Persistent shared experiment root")
     parser.add_argument("--restore", action="store_true", default=os.getenv("RESTORE", "0") == "1")
     parser.add_argument("--mode", choices=("ppo", "mappo", "both"), default=os.getenv("TRIAL_MODE", "ppo"))
@@ -562,6 +566,28 @@ def validate_restoration(settings, spec, experiment_id, root):
             raise ValueError("Frozen sweep configuration was modified")
 
 
+def prepare_settings(args, spec, root, tune, git_sha):
+    settings = {"experiment_id": args.experiment_id, "root": str(root), "mode": args.mode,
+                "total_steps": args.total_steps, "seed": args.seed,
+                "checkpoint_every_steps": args.checkpoint_every_steps,
+                "checkpoint_every_updates": args.checkpoint_every_updates,
+                "trial_timeout": args.trial_timeout, "poll_interval": args.poll_interval,
+                "evaluation": args.evaluation, "overrides": args.overrides,
+                "scenarios": {label: str((REPO / getattr(args, f"{label}_scenario")).resolve()) for label in SCENARIOS},
+                "wandb": {key: getattr(args, f"wandb_{key}") for key in ("mode", "project", "entity", "group")},
+                "git_sha": git_sha}
+    if spec:
+        settings.update(sweep=spec, mode=spec["algorithm"], total_steps=spec["total_steps"],
+                        evaluation=True, overrides=spec["fixed_overrides"],
+                        resources_per_trial=spec["resources_per_trial"], max_concurrent_trials=spec["max_concurrent_trials"])
+        settings["scenarios"][spec["algorithm"]] = spec["scenario"]
+        settings["wandb"].update({"mode": "online", **spec["wandb"]})
+        settings["trial_plan"] = generate_plan(spec, tune)
+        sys.path.insert(0, str(REPO / "src"))
+        preflight(settings, trainer_command, REPO)
+    return settings
+
+
 def main():
     args = arguments()
     spec = read_spec(args.sweep_spec, REPO) if args.sweep_spec else None
@@ -582,6 +608,24 @@ def main():
     import ray
     from ray import tune
 
+    if args.preflight_only:
+        if spec is None or args.restore:
+            raise ValueError("--preflight-only requires --sweep-spec and cannot restore an experiment")
+        allocation = (args.cluster_nodes, args.cpus_per_node, args.gpus_per_node)
+        if any(value is not None for value in allocation):
+            if any(type(value) is not int or value < 1 for value in allocation):
+                raise ValueError("Supply positive --cluster-nodes, --cpus-per-node and --gpus-per-node together")
+            if args.cluster_nodes > 8 or args.gpus_per_node > 4:
+                raise ValueError("Matrix launcher supports 1..8 nodes and 1..4 GPUs per node")
+            resources = spec["resources_per_trial"]
+            if resources["cpu"] > args.cpus_per_node or resources["gpu"] > args.gpus_per_node:
+                raise ValueError(f"Trial resources {resources} do not fit a node with {args.cpus_per_node} CPUs/{args.gpus_per_node} GPUs")
+        with tempfile.TemporaryDirectory(prefix="ray-tune-preflight-") as directory:
+            checked = prepare_settings(args, spec, Path(directory), tune, "preflight-only")
+            print(f"PREFLIGHT PASSED: {args.experiment_id}; {len(checked['trial_plan'])} trials; "
+                  f"resources/trial={spec['resources_per_trial']}; frozen configurations reconstructed", flush=True)
+        return
+
     root = Path(args.root or REPO / "outputs" / f"ray_tune_{args.experiment_id}").expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     with exclusive(root / ".experiment.lock"):
@@ -597,24 +641,7 @@ def main():
         else:
             if manifest.exists() or experiment_path.exists() or (root / "trial_runs").exists():
                 raise FileExistsError(f"Experiment already exists; use --restore: {root}")
-            settings = {"experiment_id": args.experiment_id, "root": str(root), "mode": args.mode,
-                        "total_steps": args.total_steps, "seed": args.seed,
-                        "checkpoint_every_steps": args.checkpoint_every_steps,
-                        "checkpoint_every_updates": args.checkpoint_every_updates,
-                        "trial_timeout": args.trial_timeout, "poll_interval": args.poll_interval,
-                        "evaluation": args.evaluation, "overrides": args.overrides,
-                        "scenarios": {label: str((REPO / getattr(args, f"{label}_scenario")).resolve()) for label in SCENARIOS},
-                        "wandb": {key: getattr(args, f"wandb_{key}") for key in ("mode", "project", "entity", "group")},
-                        "git_sha": current_revision()}
-            if spec:
-                settings.update(sweep=spec, mode=spec["algorithm"], total_steps=spec["total_steps"],
-                                evaluation=True, overrides=spec["fixed_overrides"],
-                                resources_per_trial=spec["resources_per_trial"], max_concurrent_trials=spec["max_concurrent_trials"])
-                settings["scenarios"][spec["algorithm"]] = spec["scenario"]
-                settings["wandb"].update({"mode": "online", **spec["wandb"]})
-                settings["trial_plan"] = generate_plan(spec, tune)
-                sys.path.insert(0, str(REPO / "src"))
-                preflight(settings, trainer_command, REPO)
+            settings = prepare_settings(args, spec, root, tune, current_revision())
             settings["manifest_digest"] = digest(settings)
             atomic_json(manifest, settings)
         algorithms = ["ppo", "mappo"] if settings["mode"] == "both" else [settings["mode"]]

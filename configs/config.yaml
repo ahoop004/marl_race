@@ -24,6 +24,9 @@ experiment:
   parallel_envs: 1
   distributed: false  # torchrun: one learner/collector per local GPU; counts stay global.
   envs_per_worker: 1
+  # Ordinary runs default off; preserve explicit execution-profile settings.
+  measure_stages: ${oc.select:execution.experiment.measure_stages,false}
+  measure_services: ${oc.select:execution.experiment.measure_services,false}
   measure_collector_startup: false
   measure_mpc: false  # Opt in with experiment.measure_mpc=true.
   measure_hybrid: false  # Opt in with experiment.measure_hybrid=true.

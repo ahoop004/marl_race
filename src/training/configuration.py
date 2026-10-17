@@ -9,6 +9,14 @@ from training.evaluation_config import resolve_evaluation_protocol
 
 POLICY_ALGORITHMS = frozenset({"ppo", "mappo"})
 
+# Supported optional profiling inputs, including older/frozen configurations
+# that predate their Hydra defaults. Keep validation and sweep preflight aligned.
+PROFILING_DEFAULTS = dict(
+    measure_services=False, measure_stages=False, measure_collector_startup=False,
+    measure_cuda_sync=False, measure_mpc=False, measure_hybrid=False,
+    profiling_detail_samples=0, profiling_warmup_updates=1,
+)
+
 
 MAPPO_DEFAULTS: Dict[str, str] = {
     "actor_mode": "shared",
@@ -70,22 +78,13 @@ def validate_training_scenario(scenario):
                 value not in {"cpu", "cuda"} and not (
                     value.startswith("cuda:") and value[5:].isdigit()))):
             raise ScenarioError("collection_device must be cpu, cuda, cuda:<index>, or null")
-    if type(experiment.get("measure_services", False)) is not bool:
-        raise ScenarioError("experiment.measure_services must be boolean")
-    if type(experiment.get("measure_stages", False)) is not bool:
-        raise ScenarioError("experiment.measure_stages must be boolean")
-    if type(experiment.get("measure_collector_startup", False)) is not bool:
-        raise ScenarioError("experiment.measure_collector_startup must be boolean")
-    if type(experiment.get("measure_cuda_sync", False)) is not bool:
-        raise ScenarioError("experiment.measure_cuda_sync must be boolean")
-    samples = experiment.get("profiling_detail_samples", 0)
+    for name, default in PROFILING_DEFAULTS.items():
+        if type(default) is bool and type(experiment.get(name, default)) is not bool:
+            raise ScenarioError(f"experiment.{name} must be boolean")
+    samples = experiment.get("profiling_detail_samples", PROFILING_DEFAULTS["profiling_detail_samples"])
     if type(samples) is not int or not 0 <= samples <= 32:
         raise ScenarioError("experiment.profiling_detail_samples must be an integer in [0, 32]")
-    if type(experiment.get("measure_mpc", False)) is not bool:
-        raise ScenarioError("experiment.measure_mpc must be boolean")
-    if type(experiment.get("measure_hybrid", False)) is not bool:
-        raise ScenarioError("experiment.measure_hybrid must be boolean")
-    warmup = experiment.get("profiling_warmup_updates", 1)
+    warmup = experiment.get("profiling_warmup_updates", PROFILING_DEFAULTS["profiling_warmup_updates"])
     if type(warmup) is not int or warmup < 0:
         raise ScenarioError("experiment.profiling_warmup_updates must be a nonnegative integer")
     logging_config = scenario.get("logging", {}) or {}

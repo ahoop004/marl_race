@@ -248,20 +248,36 @@ def preflight(settings, command_builder, repo):
     from core.scenario import load_and_expand_scenario
     from training.evaluation_config import resolve_evaluation_protocol
     from training.algorithms import resolve_training_params
+    from training.configuration import PROFILING_DEFAULTS
     from omegaconf import OmegaConf
     from hydra.core.override_parser.overrides_parser import OverridesParser
 
     inputs = Path(settings["root"]) / "sweep_inputs"
     original = load_and_expand_scenario(settings["scenarios"][settings["mode"]], validate=False)
+    optional = set()
     for override in OverridesParser.create().parse_overrides(settings["overrides"]):
-        reference = select_path(original, override.key_or_group)
-        if override.key_or_group.startswith("algorithm.params.") and not isinstance(reference, (dict, list)):
+        path = override.key_or_group
+        profile_key = path.removeprefix("experiment.") if path.startswith("experiment.") else None
+        try:
+            reference = select_path(original, path)
+        except ValueError:
+            if profile_key not in PROFILING_DEFAULTS:
+                raise
+            reference = PROFILING_DEFAULTS[profile_key]
+            optional.add(path)
+        if profile_key in PROFILING_DEFAULTS:
+            reference = PROFILING_DEFAULTS[profile_key]
+        if profile_key in PROFILING_DEFAULTS or path.startswith("algorithm.params.") and not isinstance(reference, (dict, list)):
             validate_value(override.key_or_group, override.value(), reference)
     identity = {"algorithm": settings["mode"], "trial_id": "preflight", "run_id": "preflight", "wandb_id": "preflight"}
 
     def resolve(effective):
         args = parse_args(command_builder(effective, identity, inputs)[2:])
-        return apply_cli_overrides(load_and_expand_scenario(args.scenario, validate=False, overrides=args.parameter_overrides), args)
+        # Only allowlisted optional fields may be added to older scenarios.
+        # The frozen input contains these fields before the real trainer starts.
+        overrides = ["++" + value.lstrip("+") if value.lstrip("+").split("=", 1)[0] in optional else value
+                     for value in args.parameter_overrides]
+        return apply_cli_overrides(load_and_expand_scenario(args.scenario, validate=False, overrides=overrides), args)
 
     # Validate every categorical value and both range ends, even if a random
     # draw would miss an invalid option. Cross-parameter interactions are then
@@ -316,6 +332,10 @@ def preflight(settings, command_builder, repo):
             entry["schedule"] = {k: config["training_defaults"].get(k) for k in ("lr_schedule", "learning_rate_end", "lr_scheduler_kwargs")}
             path = inputs / f"{index:06d}.yaml"
             OmegaConf.save(OmegaConf.create(config), path)
+            frozen = load_and_expand_scenario(str(path), validate=False)
+            validate_experiment_scenario(frozen)
+            if {k: v for k, v in frozen.items() if k != "_configuration"} != {k: v for k, v in config.items() if k != "_configuration"}:
+                raise ValueError("Frozen configuration changes when reconstructed")
             entry["input_path"] = str(path)
             entry["input_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
         except Exception as exc:
