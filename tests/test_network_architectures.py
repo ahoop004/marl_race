@@ -211,15 +211,19 @@ def test_incompatible_architectures_reject_before_loading_weights(change, tmp_pa
 
 
 @pytest.mark.parametrize("actor,critic", [("resmlp", "mlp"), ("mlp", "resmlp")])
-def test_residual_lora_and_ppo_to_mappo_transfer_rejected(actor, critic, tmp_path):
+def test_residual_lora_rejected_and_ppo_to_mappo_transfer_supported(actor, critic, tmp_path):
     raw = network(actor, critic)
     with pytest.raises(ValueError, match="residual MLP.*LoRA"):
         MAPPOPolicy(7, 17, *BOUNDS, IDS, mappo_params(network=raw, lora={"rank": 1}))
     source = PPOPolicy(7, *BOUNDS, {"network": raw})
     source.save_checkpoint(tmp_path / "ppo.pt")
     target = MAPPOPolicy(7, 17, *BOUNDS, IDS, mappo_params(network=raw))
-    with pytest.raises(ValueError, match="Phase 4"):
-        target.initialize_from_checkpoint(tmp_path / "ppo.pt", scope="actor_only")
+    critic_before = deepcopy(target.critic.state_dict())
+    target.initialize_from_checkpoint(tmp_path / "ppo.pt", scope="actor_only")
+    x = torch.randn(5, 7)
+    torch.testing.assert_close(target.actor(x)[0], source.actor(x)[0], rtol=0, atol=0)
+    for key, value in critic_before.items():
+        torch.testing.assert_close(value, target.critic.state_dict()[key], rtol=0, atol=0)
     config = load_and_expand_scenario(TEAM, overrides=["network=resmlp_base", "adaptation=lora"])
     with pytest.raises(ScenarioError, match="residual MLP.*LoRA"):
         validate_experiment_scenario(config)
@@ -253,3 +257,30 @@ def test_encoder_residual_shape_validation_and_optional_projection():
         build_actor(7, 2, resolved)
     assert build_actor(8, 2, resolved)(torch.zeros(5, 8))[0].shape == (5, 2)
     assert build_critic(7, resolved)(torch.zeros(5, 7)).shape == (5,)
+
+
+
+@pytest.mark.parametrize("preset", ["mlp_base", "resmlp_base", "cnn1d_base", "rescnn1d_base"])
+@pytest.mark.parametrize("adaptation", ["scratch", "full_finetune"])
+def test_modular_presets_reuse_adaptation_configuration(preset, adaptation, tmp_path):
+    from training.algorithms import resolve_training_params
+
+    overrides = [f"network={preset}", f"adaptation={adaptation}", "execution.params.device=cpu"]
+    if adaptation == "full_finetune":
+        overrides.append(f"adaptation.checkpoint={tmp_path / 'source.pt'}")
+    config = load_and_expand_scenario(TEAM, overrides=overrides)
+    validate_experiment_scenario(config)
+    params = resolve_training_params(config["agents"]["car_0"], config)
+    assert params["require_pretrained_actor"] == (adaptation == "full_finetune")
+    assert config["adaptation"]["load_scope"] == "actor_only"
+    assert params["pretrained_actor_observation_extension"] == "frenet_neighbors"
+    assert params["pretrained_actor_checkpoint"] == (str(tmp_path / "source.pt") if adaptation == "full_finetune" else None)
+
+
+def test_residual_transfer_requires_an_input_projection():
+    from agents.common.networks import expand_observation_inputs
+
+    resolved = resolve_network_config({"network": network("resmlp")}, default_hidden_dims=[])
+    resolved["actor"]["input_projection"] = False
+    with pytest.raises(ValueError, match="input projection"):
+        expand_observation_inputs({}, {}, resolved, source_width=7, expand_inputs=True)

@@ -63,6 +63,15 @@ class ResidualConv1DBlock(nn.Module):
         return self.shortcut(x) + self.branch(x)
 
 
+def fusion_feature_segments(config, segments):
+    """Feature order shared by fusion forward calls and actor-head transfer."""
+    lidar_end = config["lidar_features"]
+    driving_end = lidar_end + config["vehicle_features"]
+    neighbor_width = config["neighbor_features"] if segments["neighbors"][1] > segments["neighbors"][0] else 0
+    return {"lidar": [0, lidar_end], "vehicle_track": [lidar_end, driving_end],
+            "neighbors": [driving_end, driving_end + neighbor_width]}
+
+
 class CNN1DFusionEncoder(FeatureEncoder):
     """Ordered LiDAR convolutions fused with separate vehicle and neighbor MLPs.
 
@@ -97,9 +106,8 @@ class CNN1DFusionEncoder(FeatureEncoder):
         start, stop = self.segments["neighbors"]
         self.neighbors = (make_mlp(stop - start, self.config["neighbor_hidden_dims"],
                           self.config["neighbor_features"], activation, activation) if stop > start else None)
-        self.output_dim = self.config["lidar_features"] + self.config["vehicle_features"]
-        if self.neighbors is not None:
-            self.output_dim += self.config["neighbor_features"]
+        self.feature_segments = fusion_feature_segments(self.config, self.segments)
+        self.output_dim = self.feature_segments["neighbors"][1]
 
     def forward(self, observations):
         if observations.ndim == 0 or observations.shape[-1] != self.input_dim:

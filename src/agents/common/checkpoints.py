@@ -161,15 +161,21 @@ def evaluation_routing(checkpoint):
 
 
 def _observation_transfer(source, destination, extension):
-    if source == destination:
-        return False
-    # Contracts may contain tensors in future; use the common comparator.
+    if extension not in (None, "frenet_neighbors"):
+        raise ValueError("Unsupported observation extension; only frenet_neighbors is supported")
+    from agents.common.observations import observation_layout, observation_segments
+    for observation in (source, destination):
+        if (not isinstance(observation, dict) or set(observation) != {"dim", "contract"}
+                or type(observation["dim"]) is not int or observation["dim"] <= 0):
+            raise ValueError("Transfer requires explicit observation dimensions and contracts")
+        # Historical, unextended MLP checkpoints can have a null contract.
+        if observation["contract"] is not None:
+            observation_segments(observation["contract"], observation["dim"])
     if source["dim"] == destination["dim"]:
         validate_checkpoint_compatibility(source, destination)
         return False
     if extension != "frenet_neighbors" or source["dim"] >= destination["dim"]:
         raise ValueError("Incompatible observation dimensions; only explicit frenet_neighbors expansion is supported")
-    from agents.common.observations import observation_layout
     prefix, driving, total = observation_layout(source["contract"])
     dest_prefix, dest_driving, dest_total = observation_layout(destination["contract"])
     if (source["dim"] != driving or total != driving or dest_driving != driving
@@ -180,8 +186,68 @@ def _observation_transfer(source, destination, extension):
     return True
 
 
+def _validate_ppo_transfer_source(checkpoint, network):
+    """Validate a complete source against its own factories, independent of the recipient critic.
+
+    Meta-device templates validate every source tensor without allocating model
+    storage or consuming the destination process's initialization RNG stream.
+    """
+    from agents.common.networks import build_actor, build_critic, model_spec
+    from agents.common.observations import observation_segments
+
+    stored = checkpoint["metadata"]
+    observations = stored["contracts"].get("observations")
+    if not isinstance(observations, dict) or len(observations) != 1:
+        raise ValueError("PPO transfer requires one source observation contract")
+    aid, observation = next(iter(observations.items()))
+    if (not isinstance(observation, dict) or set(observation) != {"dim", "contract"}
+            or type(observation["dim"]) is not int or observation["dim"] <= 0):
+        raise ValueError("Transfer requires explicit source observation dimensions and contracts")
+    encoders = {role: model_spec(network, role)["encoder"]["type"] for role in ("actor", "critic")}
+    structure = {"encoder": encoders if any(kind != "identity" for kind in encoders.values()) else "identity",
+                 "actor_mode": "independent", "critic_mode": "local_observation",
+                 "agent_ids": [aid], "groups": {"agents": [aid]}, "routing": {aid: 0}}
+    if structure["encoder"] != "identity":
+        segments = observation_segments(observation["contract"], observation["dim"])
+        structure["observation_segments"] = {
+            "actor": {aid: segments} if encoders["actor"] != "identity" else None,
+            "critic": segments if encoders["critic"] != "identity" else None}
+    validate_checkpoint_compatibility(stored["structure"], structure)
+    with torch.device("meta"):
+        actor = build_actor(observation["dim"], stored["contracts"]["actions"]["dim"], network,
+                            observation_contract=observation["contract"])
+        critic = build_critic(observation["dim"], network, observation_contract=observation["contract"])
+    validate_checkpoint_compatibility(checkpoint, {}, states=[
+        (role, checkpoint["models"][role], model.state_dict()) for role, model in (("actor", actor), ("critic", critic))])
+    return observation
+
+
+def _prepare_model_transfer(state, expected, source_network, target_network, source_observation,
+                            expand_inputs, *, role):
+    """Prepare an entire model state, copying a validated driving feature prefix."""
+    from agents.common.networks import model_spec, expand_observation_inputs
+    from agents.common.encoders import fusion_feature_segments
+    from agents.common.observations import observation_segments
+
+    source_spec, target_spec = (model_spec(config, role) for config in (source_network, target_network))
+    cnn = source_spec["encoder"]["type"] != "identity"
+    # Only the newly introduced neighbor branch may have independent settings.
+    specs = [dict(source_spec), dict(target_spec)]
+    if cnn and expand_inputs:
+        for spec in specs:
+            spec["encoder"] = {key: value for key, value in spec["encoder"].items()
+                               if key not in {"neighbor_hidden_dims", "neighbor_features"}}
+    validate_checkpoint_compatibility({f"{role}_spec": specs[0]}, {f"{role}_spec": specs[1]})
+    width = source_observation["dim"]
+    if cnn:
+        segments = observation_segments(source_observation["contract"], width)
+        width = fusion_feature_segments(source_spec["encoder"], segments)["neighbors"][1]
+    return expand_observation_inputs(state, expected, target_network, role=role, source_width=width,
+        expand_inputs=expand_inputs, new_parameter_prefixes=("encoder.neighbors.",) if cnn and expand_inputs else ())
+
+
 def initialize_from_checkpoint(policy, path, *, scope, observation_extension=None):
-    """Transfer into a newly constructed policy, retaining fresh training state."""
+    """Validate and prepare all model states before applying a fresh transfer."""
     if scope not in {"actor_only", "actor_and_critic"}:
         raise ValueError("Transfer scope must be actor_only or actor_and_critic")
     if policy.optimizer is not None and policy.optimizer.state:
@@ -191,65 +257,49 @@ def initialize_from_checkpoint(policy, path, *, scope, observation_extension=Non
     if stored["algorithm"] != "ppo" or stored["adaptation"]["lora"] is not None:
         raise ValueError("Transfer requires a complete PPO source policy")
     from agents.common.ppo_policy import PPOPolicy
+    from agents.common.networks import resolve_network_config
     validate_checkpoint_compatibility(stored, {"implementation": PPOPolicy.implementation})
     if scope == "actor_and_critic" and expected["algorithm"] != "ppo":
         raise ValueError("MAPPO transfer supports actor_only; its centralized critic must be fresh")
-    from agents.common.networks import model_spec, resolve_network_config
     source_network = resolve_network_config({"network": stored["network"]}, default_hidden_dims=[])
     validate_checkpoint_compatibility(stored, {"network": source_network})
-    source_actor = model_spec(stored["network"], "actor")
-    target_actor = model_spec(expected["network"], "actor")
-    cnn = any(model_spec(network, role)["encoder"]["type"] != "identity"
-              for network in (stored["network"], expected["network"]) for role in ("actor", "critic"))
-    if cnn and (expected["algorithm"] == "mappo"
-                or stored["contracts"]["observations"] != expected["contracts"]["observations"]):
-        raise ValueError("CNN PPO-to-MAPPO transfer and observation expansion are reserved for Phase 4")
-    if cnn:
-        validate_checkpoint_compatibility(stored["structure"], {
-            "observation_segments": expected["structure"].get("observation_segments")})
-    if expected["algorithm"] == "mappo" and any(
-            model_spec(network, role)["architecture"] == "resmlp"
-            for network in (stored["network"], expected["network"]) for role in ("actor", "critic")):
-        raise ValueError("PPO-to-MAPPO transfer with residual MLP architectures is unsupported (reserved for Phase 4)")
-    validate_checkpoint_compatibility({"actor_spec": source_actor}, {"actor_spec": target_actor})
-    validate_checkpoint_compatibility(stored["structure"], {key: expected["structure"][key]
-                                                          for key in ("encoder", "distribution")})
+    source = _validate_ppo_transfer_source(checkpoint, source_network)
+    validate_checkpoint_compatibility(stored["structure"], {"distribution": expected["structure"]["distribution"]})
     validate_checkpoint_compatibility(stored["contracts"], {
         "actions": expected["contracts"]["actions"], "physics": expected["contracts"]["physics"]})
-    observations = stored["contracts"]["observations"]
-    if len(observations) != 1:
-        raise ValueError("PPO transfer requires one source observation contract")
-    source = next(iter(observations.values()))
     expansions = [_observation_transfer(source, target, observation_extension)
                   for target in expected["contracts"]["observations"].values()]
-    recipient = policy.actor.actors[policy.agent_ids[0]] if getattr(policy, "actor_mode", None) == "independent" and expected["algorithm"] == "mappo" else policy.actor
-    actor_expected = recipient.base_state_dict() if getattr(policy, "lora_config", None) else recipient.state_dict()
-    from agents.common.networks import expand_observation_inputs
-    actor_state = expand_observation_inputs(checkpoint["models"]["actor"], actor_expected,
-        policy.network_config, source_width=source["dim"], expand_inputs=any(expansions))
-    states = [("actor", actor_state, actor_expected)]
+    independent = expected["algorithm"] == "mappo" and policy.actor_mode == "independent"
+    recipients = list(policy.actor.actors.values()) if independent else [policy.actor]
+    prepared, states = [], []
+    for index, actor in enumerate(recipients):
+        target = actor.base_state_dict() if getattr(policy, "lora_config", None) else actor.state_dict()
+        state = _prepare_model_transfer(checkpoint["models"]["actor"], target, source_network,
+            policy.network_config, source, any(expansions), role="actor")
+        prepared.append((actor, state))
+        states.append((f"actor.{index}", state, target))
     critic_state = None
     if scope == "actor_and_critic":
-        validate_checkpoint_compatibility(stored["network"], expected["network"])
-        critic_state = expand_observation_inputs(checkpoint["models"]["critic"], policy.critic.state_dict(),
-            policy.network_config, source_width=source["dim"], expand_inputs=any(expansions), role="critic")
+        critic_state = _prepare_model_transfer(checkpoint["models"]["critic"], policy.critic.state_dict(),
+            source_network, policy.network_config, source, any(expansions), role="critic")
         states.append(("critic", critic_state, policy.critic.state_dict()))
     validate_checkpoint_compatibility(checkpoint, {}, states=states)
     if getattr(policy, "lora_config", None):
+        actor_state = prepared[0][1]
         policy.actor.reset_adapters()
         if policy.lora_config.get("per_agent_log_std"):
             actor_state.update({f"log_stds.{i}": actor_state["log_std"].clone() for i in range(len(policy.agent_ids))})
         policy.actor.load_state_dict({**policy.actor.state_dict(), **actor_state}, strict=True)
         policy._lora_ready = True
-    elif expected["algorithm"] == "mappo" and policy.actor_mode == "independent":
-        for actor in policy.actor.actors.values():
-            actor.load_state_dict(actor_state, strict=True)
     else:
-        policy.actor.load_state_dict(actor_state, strict=True)
+        for actor, state in prepared:
+            actor.load_state_dict(state, strict=True)
     if critic_state is not None:
         policy.critic.load_state_dict(critic_state, strict=True)
-    policy.set_training_progress(0)
-    policy.source_checkpoint = {**checkpoint["_identity"], "algorithm": "ppo", "scope": scope}
+    if policy.optimizer is not None:
+        policy.set_training_progress(0)
+    policy.source_checkpoint = {**checkpoint["_identity"], "algorithm": "ppo", "scope": scope,
+                                "provenance": stored["provenance"]}
 
 
 def capture_rng(cuda_device=None):

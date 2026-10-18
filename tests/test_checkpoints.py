@@ -341,3 +341,258 @@ def test_observation_expansion_rejects_a_changed_driving_prefix(tmp_path):
         target.initialize_from_checkpoint(source_path, scope="actor_only", observation_extension="frenet_neighbors")
     for key, value in before.items():
         torch.testing.assert_close(value, target.actor.state_dict()[key])
+
+
+def modular_transfer_pair(preset="cnn1d_base", head="mlp", actor_mode="shared", beams=108, *, native_schedule=False):
+    """Small models with real resolved contracts and deliberately different critics."""
+    from agents.common.mappo_policy import MAPPOPolicy
+    from agents.torchrl_mappo import TorchRLMAPPOAgent
+    from core.scenario import load_and_expand_scenario
+    from test_torchrl_mappo import BOUNDS, IDS, params as team_params
+    from wrappers.observations.composer import ObservationComposer
+
+    configs, composers = [], []
+    for path in ("ppo_lap_completion_pretrain", "mappo_2v2_completion_scratch"):
+        choices = [f"network={preset}", f"environment.lidar_beams={beams}",
+                   "network.actor_hidden_dims=[8,6]", "network.critic_hidden_dims=[7]"]
+        if "cnn" in preset:
+            choices += ["network.actor.encoder.channels=[4,8]", "network.actor.encoder.pool_bins=3",
+                        "network.actor.encoder.lidar_features=8", "network.actor.encoder.vehicle_features=4",
+                        "network.actor.encoder.neighbor_features=4", "network.actor.encoder.vehicle_hidden_dims=[5]",
+                        "network.actor.encoder.neighbor_hidden_dims=[5]"]
+            if preset == "rescnn1d_base":
+                choices += ["network.actor.encoder.num_blocks=1"]
+        if head == "resmlp":
+            choices += ["network.actor.architecture=resmlp", "++network.actor.width=16", "++network.actor.num_blocks=2"]
+        config = load_and_expand_scenario(f"scenarios/{path}.yaml", overrides=choices)
+        configs.append(config)
+        composers.append(ObservationComposer.from_config(config["agents"]["car_0"]["observation"], config["environment"]))
+    source_config, target_config = configs
+    # A CNN source critic must never restrict the independently chosen global-state critic.
+    if "cnn" in preset:
+        source_config["network"]["critic"]["encoder"] = deepcopy(source_config["network"]["actor"]["encoder"])
+        target_config["network"]["actor"]["encoder"].update(neighbor_features=6, neighbor_hidden_dims=[7])
+    target_config["network"]["critic"].update(architecture="resmlp", width=13, num_blocks=1)
+    common = dict(device="cpu", learning_rate=.001, lr_schedule="linear", learning_rate_end=.0001)
+    source_params = dict(common, network=source_config["network"], _observation_contract=composers[0].contract)
+    target_params = team_params(**common, network=target_config["network"], actor_mode=actor_mode,
+                               _observation_contract=composers[1].contract)
+    if native_schedule:
+        target_params.update(lr_schedule="step", learning_rate_end=None,
+                             lr_scheduler_kwargs={"step_size": 1, "gamma": .5})
+    torch.manual_seed(101)
+    source = PPOPolicy(composers[0].obs_dim, *BOUNDS, source_params, training=True)
+    with torch.no_grad():
+        source.actor.log_std.copy_(torch.tensor([-.4, .3]))
+    source.set_training_progress(.8)
+    torch.manual_seed(202)
+    target = TorchRLMAPPOAgent(composers[1].obs_dim, 3, *BOUNDS, IDS, target_params)
+    torch.manual_seed(202)
+    control = MAPPOPolicy(composers[1].obs_dim, 3, *BOUNDS, IDS, target_params)
+    for key, value in control.critic.state_dict().items():
+        torch.testing.assert_close(value, target.critic.state_dict()[key], rtol=0, atol=0)
+    return source, target
+
+
+TRANSFER_ARCHITECTURES = [("mlp_base", "mlp"), ("mlp_base", "resmlp"),
+                          ("cnn1d_base", "mlp"), ("rescnn1d_base", "mlp"),
+                          ("cnn1d_base", "resmlp"), ("rescnn1d_base", "resmlp")]
+
+
+@pytest.mark.parametrize("preset,head", TRANSFER_ARCHITECTURES)
+@pytest.mark.parametrize("actor_mode", ["shared", "independent"])
+@pytest.mark.parametrize("beams", [108, 1080])
+def test_modular_transfer_preserves_distribution_weights_and_fresh_critic(preset, head, actor_mode, beams, tmp_path):
+    source, target = modular_transfer_pair(preset, head, actor_mode, beams)
+    path = tmp_path / "ppo.pt"
+    source.save_checkpoint(path, provenance={"run_id": "source-ppo", "seed": 101})
+    source_bytes = path.read_bytes()
+    before_actor = deepcopy(target.actor.state_dict())
+    before_critic = deepcopy(target.critic.state_dict())
+    optimizer = deepcopy(target.optimizer.state_dict())
+    rng = torch.random.get_rng_state().clone()
+    target.initialize_from_checkpoint(path, scope="actor_only", observation_extension="frenet_neighbors")
+    assert torch.equal(rng, torch.random.get_rng_state())
+    assert target.optimizer.state_dict() == optimizer and not target.optimizer.state
+    assert target.optimizer.param_groups[0]["lr"] == target.lr != source.optimizer.param_groups[0]["lr"]
+    assert all(parameter.requires_grad for parameter in target.actor.parameters())
+    assert all(parameter.requires_grad for parameter in target.critic.parameters())
+    actors = list(target.actor.actors.values()) if actor_mode == "independent" else [target.actor]
+    key = "net.0.weight" if head == "mlp" else "net.input_projection.0.weight"
+    old_width = source.actor.encoder.output_dim
+    source_state = source.actor.state_dict()
+    for i, actor in enumerate(actors):
+        prefix = f"actors.{target.agent_ids[i]}." if actor_mode == "independent" else ""
+        for name, weight in actor.state_dict().items():
+            if name.startswith("encoder.neighbors."):
+                torch.testing.assert_close(weight, before_actor[prefix + name], rtol=0, atol=0)
+            elif name == key:
+                torch.testing.assert_close(weight[:, :old_width], source_state[name], rtol=0, atol=0)
+                assert torch.count_nonzero(weight[:, old_width:]) == 0
+            else:
+                torch.testing.assert_close(weight, source_state[name], rtol=0, atol=0)
+        observations = torch.randn(7, source.obs_dim)
+        mean, std = source.actor(observations)
+        for scale in (0., 1., 100.):
+            neighbors = torch.randn(7, target.obs_dim - source.obs_dim) * scale
+            full = torch.cat((observations, neighbors), dim=-1)
+            transferred_mean, transferred_std = actor(full)
+            torch.testing.assert_close(transferred_mean, mean, rtol=1e-6, atol=1e-6)
+            torch.testing.assert_close(transferred_std, std, rtol=0, atol=0)
+            torch.testing.assert_close(actor.get_action(full, deterministic=True)[0], mean.tanh(), rtol=1e-6, atol=1e-6)
+    if actor_mode == "independent":
+        assert next(actors[0].parameters()).data_ptr() != next(actors[1].parameters()).data_ptr()
+        data = torch.randn(2, target.obs_dim)
+        routed_mean, _ = target.actor(data, adapter_indices=torch.tensor([0, 1]))
+        torch.testing.assert_close(routed_mean, source.actor(data[:, :source.obs_dim])[0], rtol=1e-6, atol=1e-6)
+    for name, weight in target.critic.state_dict().items():
+        torch.testing.assert_close(weight, before_critic[name], rtol=0, atol=0)
+    saved = tmp_path / "mappo.pt"
+    target.save_checkpoint(saved)
+    payload = read_checkpoint(saved)
+    assert payload["schema_version"] == 1
+    assert payload["metadata"]["structure"]["actor_mode"] == actor_mode
+    assert payload["metadata"]["adaptation"]["source_checkpoint"]["provenance"]["run_id"] == "source-ppo"
+    target.load_for_evaluation(saved)
+    assert target.source_checkpoint["sha256"] == read_checkpoint(path)["_identity"]["sha256"]
+    assert path.read_bytes() == source_bytes
+
+
+@pytest.mark.parametrize("preset,head", TRANSFER_ARCHITECTURES[1:])
+def test_transferred_actor_and_new_neighbor_connections_learn_with_native_mappo(preset, head, tmp_path):
+    from test_torchrl_mappo import IDS, transition
+
+    source, target = modular_transfer_pair(preset, head)
+    path = tmp_path / "source.pt"
+    source.save_checkpoint(path)
+    target.initialize_from_checkpoint(path, scope="actor_only", observation_extension="frenet_neighbors")
+    projection = target.actor.net[0] if head == "mlp" else target.actor.net.input_projection[0]
+    width = source.actor.encoder.output_dim
+    for step in range(2):
+        target.optimizer.zero_grad(set_to_none=True)
+        x = torch.randn(9, target.obs_dim)
+        loss = (target.actor(x)[0] - torch.randn(9, 2)).square().mean()
+        loss += (target.critic(torch.randn(9, 3)) - 1).square().mean()
+        loss.backward()
+        assert torch.count_nonzero(projection.weight.grad[:, :width]) > 0
+        assert torch.count_nonzero(projection.weight.grad[:, width:]) > 0
+        if "cnn" in preset:
+            assert any(torch.count_nonzero(p.grad) > 0 for p in target.actor.encoder.lidar_backbone.parameters())
+            neighbor_gradient = sum(p.grad.abs().sum() for p in target.actor.encoder.neighbors.parameters())
+            assert (neighbor_gradient == 0) if step == 0 else (neighbor_gradient > 0)
+        assert any(torch.count_nonzero(p.grad) > 0 for p in target.critic.parameters())
+        target.optimizer.step()
+    observations = {aid: np.random.default_rng(i).normal(size=target.obs_dim).astype(np.float32) for i, aid in enumerate(IDS)}
+    data = torch.stack([transition(target, IDS, step, 1., terminal=step == 2, observations=observations) for step in range(3)])
+    metrics = target.update(data)
+    assert metrics["train/optimizer_steps"] > 0
+    assert all(np.isfinite(value) for value in metrics.values())
+
+
+@pytest.mark.parametrize("field", ["beams", "normalization", "range", "preview", "kernel", "stride", "channels", "blocks",
+    "head_width", "head_activation", "features", "physics", "actions", "distribution", "missing_contract", "malformed_contract",
+    "extension", "tensor", "dtype", "extra_key", "missing_key", "segments", "source_critic", "late_actor"])
+def test_modular_transfer_rejections_leave_all_destination_weights_unchanged(field, tmp_path):
+    source, target = modular_transfer_pair("rescnn1d_base", "resmlp", "independent")
+    path = tmp_path / "source.pt"
+    source.save_checkpoint(path)
+    payload = read_checkpoint(path)
+    meta = payload["metadata"]
+    encoder = meta["network"]["actor"]["encoder"]
+    contract = meta["contracts"]["observations"]["policy"]["contract"]
+    extension = "frenet_neighbors"
+    if field == "beams":
+        contract["lidar_beams"] += 1
+    elif field == "normalization":
+        contract["observation"]["lidar"]["normalize"] = False
+    elif field == "range":
+        contract["lidar_range"] += 1
+    elif field == "preview":
+        contract["observation"]["frenet_vehicle_track"]["points"] += 1
+    elif field in {"kernel", "stride", "channels", "blocks", "features"}:
+        option = {"kernel": "kernel_size", "stride": "stride", "channels": "channels", "blocks": "num_blocks", "features": "lidar_features"}[field]
+        encoder[option] = [5, 8] if field == "channels" else encoder[option] + (2 if field == "kernel" else 1)
+    elif field == "head_width":
+        meta["network"]["actor"]["width"] += 1
+    elif field == "head_activation":
+        meta["network"]["actor"]["activation"] = "relu"
+    elif field == "physics":
+        meta["contracts"]["physics"] = {"changed": True}
+    elif field == "actions":
+        meta["contracts"]["actions"]["low"][0] -= 1
+    elif field == "distribution":
+        meta["structure"]["distribution"] = "normal"
+    elif field == "missing_contract":
+        meta["contracts"]["observations"]["policy"]["contract"] = None
+    elif field == "malformed_contract":
+        meta["contracts"]["observations"]["policy"]["contract"] = {"version": 1}
+    elif field == "extension":
+        extension = "arbitrary_features"
+    elif field in {"tensor", "dtype"}:
+        key = "net.input_projection.0.weight"
+        payload["models"]["actor"][key] = torch.zeros(1) if field == "tensor" else payload["models"]["actor"][key].double()
+    elif field == "extra_key":
+        payload["models"]["actor"]["encoder.neighbors.unexpected"] = torch.zeros(1)
+    elif field == "missing_key":
+        payload["models"]["actor"].pop("log_std")
+    elif field == "segments":
+        meta["structure"]["observation_segments"]["actor"]["policy"]["lidar"][1] += 1
+    elif field == "source_critic":
+        payload["models"]["critic"] = {}
+    else:
+        # A mismatch discovered after preparing actor zero must still be atomic.
+        target.actor.actors[target.agent_ids[1]].net.output = torch.nn.Linear(16, 3)
+    atomic_save(payload, path)
+    before = {role: deepcopy(getattr(target, role).state_dict()) for role in ("actor", "critic")}
+    optimizer = deepcopy(target.optimizer.state_dict())
+    rng = torch.random.get_rng_state().clone()
+    with pytest.raises(ValueError):
+        target.initialize_from_checkpoint(path, scope="actor_only", observation_extension=extension)
+    for role in before:
+        for name, weight in before[role].items():
+            torch.testing.assert_close(weight, getattr(target, role).state_dict()[name], rtol=0, atol=0)
+    assert target.optimizer.state_dict() == optimizer
+    assert target.source_checkpoint is None
+    assert torch.equal(rng, torch.random.get_rng_state())
+
+
+
+def test_transfer_keeps_a_fresh_native_scheduler_and_optimizer(tmp_path):
+    source, target = modular_transfer_pair(native_schedule=True)
+    source.optimizer.zero_grad()
+    sum(p.square().mean() for p in source.actor.parameters()).backward()
+    source.optimizer.step()
+    assert source.optimizer.state
+    path = tmp_path / "source.pt"
+    source.save_checkpoint(path)
+    schedule = deepcopy(target.scheduler.state_dict())
+    target.initialize_from_checkpoint(path, scope="actor_only", observation_extension="frenet_neighbors")
+    assert not target.optimizer.state
+    assert target.scheduler.state_dict() == schedule
+    assert target.optimizer.param_groups[0]["lr"] == target.lr
+
+
+def test_transfer_rejects_consistent_but_different_lidar_resolutions(tmp_path):
+    source, _ = modular_transfer_pair(beams=108)
+    _, target = modular_transfer_pair(beams=1080)
+    path = tmp_path / "source.pt"
+    source.save_checkpoint(path)
+    before = {role: deepcopy(getattr(target, role).state_dict()) for role in ("actor", "critic")}
+    with pytest.raises(ValueError, match="observation|Frenet"):
+        target.initialize_from_checkpoint(path, scope="actor_only", observation_extension="frenet_neighbors")
+    for role in before:
+        for name, weight in before[role].items():
+            torch.testing.assert_close(weight, getattr(target, role).state_dict()[name], rtol=0, atol=0)
+
+
+def test_evaluation_only_transfer_with_a_linear_schedule_needs_no_optimizer(tmp_path):
+    source = agent(hidden_dims=[4])
+    path = tmp_path / "source.pt"
+    source.save_checkpoint(path)
+    destination = PPOPolicy(1, source.action_low, source.action_high, {"hidden_dims": [4],
+        "device": "cpu", "lr_schedule": "linear", "learning_rate_end": .0001})
+    destination.initialize_from_checkpoint(path, scope="actor_and_critic")
+    assert destination.optimizer is None
+    for role in ("actor", "critic"):
+        for key, value in getattr(source, role).state_dict().items():
+            torch.testing.assert_close(value, getattr(destination, role).state_dict()[key], rtol=0, atol=0)

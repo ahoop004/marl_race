@@ -158,6 +158,20 @@ def test_native_cpu_training_evaluation_and_recovery(preset, algorithm, tmp_path
         config["mappo"]["actor_mode"] = "shared"
         config["network"]["actor"]["parameter_sharing"] = "shared"
     validate_experiment_scenario(config)
+    source_path = tmp_path / "ppo-source.pt"
+    if algorithm == "mappo":
+        source_config = scenario("ppo", preset, small=True)
+        source_config["network"]["critic"]["encoder"] = deepcopy(source_config["network"]["actor"]["encoder"])
+        source_task = create_race_task(source_config)
+        try:
+            source = create_learner("ppo", source_task.spec, learner_params(source_config, source_task.spec, "ppo"), training=False)
+            source.save_checkpoint(source_path, provenance={"run_id": "pretrained-cnn"})
+            source_bytes = source_path.read_bytes()
+        finally:
+            source_task.close()
+        config = scenario("mappo", preset, small=True, overrides=["adaptation=full_finetune",
+            f"adaptation.checkpoint={source_path}", "network.actor.parameter_sharing=shared"])
+        validate_experiment_scenario(config)
 
     class Stop(Capture):
         def on_update(self, metrics):
@@ -168,6 +182,10 @@ def test_native_cpu_training_evaluation_and_recovery(preset, algorithm, tmp_path
         task = create_race_task(config)
         params = learner_params(config, task.spec, algorithm)
         learner = create_learner(algorithm, task.spec, params)
+        if stop and algorithm == "mappo":
+            learner.initialize_from_checkpoint(params["pretrained_actor_checkpoint"],
+                scope=config["adaptation"]["load_scope"],
+                observation_extension=params["pretrained_actor_observation_extension"])
         hook = Stop(False) if stop else Capture(False)
         return OnPolicyTrainer(task, learner, hooks=[hook], scenario=config), hook
 
@@ -199,6 +217,10 @@ def test_native_cpu_training_evaluation_and_recovery(preset, algorithm, tmp_path
         restore_rng(state["rng"])
         recovered.train(total_steps=7)
         assert recovered.collected_steps == 7
+        if algorithm == "mappo":
+            assert recovered.agent.source_checkpoint == original.agent.source_checkpoint
+            assert recovered.agent.source_checkpoint["provenance"]["run_id"] == "pretrained-cnn"
+            assert source_path.read_bytes() == source_bytes
     finally:
         original.task.close()
         recovered.task.close()
@@ -237,7 +259,7 @@ def test_checkpoint_mismatches_reject_before_mutation(field, tmp_path):
 
 
 @pytest.mark.parametrize("preset", PRESETS)
-def test_lora_global_state_and_transfer_boundaries(preset, tmp_path):
+def test_lora_global_state_and_actor_transfer_boundaries(preset, tmp_path):
     config = scenario("mappo", preset, small=True, overrides=["adaptation=lora"])
     with pytest.raises(ScenarioError, match="CNN encoders.*LoRA"):
         validate_experiment_scenario(config)
@@ -262,11 +284,14 @@ def test_lora_global_state_and_transfer_boundaries(preset, tmp_path):
             learner_params(identity_config, tasks[0].spec, "ppo"), training=False)
         with pytest.raises(ValueError, match="Incompatible"):
             identity.initialize_from_checkpoint(path, scope="actor_only")
-        before = deepcopy(target.actor.state_dict())
-        with pytest.raises(ValueError, match="Phase 4"):
-            target.initialize_from_checkpoint(path, scope="actor_only", observation_extension="frenet_neighbors")
-        for key, value in before.items():
-            torch.testing.assert_close(value, target.actor.state_dict()[key], rtol=0, atol=0)
+        critic_before = deepcopy(target.critic.state_dict())
+        target.initialize_from_checkpoint(path, scope="actor_only", observation_extension="frenet_neighbors")
+        for actor in target.actor.actors.values():
+            observations = torch.randn(4, target.obs_dim)
+            torch.testing.assert_close(actor(observations)[0], source.actor(observations[:, :source.obs_dim])[0],
+                                       rtol=1e-6, atol=1e-6)
+        for key, value in critic_before.items():
+            torch.testing.assert_close(value, target.critic.state_dict()[key], rtol=0, atol=0)
     finally:
         for task in tasks:
             task.close()
@@ -333,3 +358,28 @@ def test_representative_process_collector_copies_and_updates_cnn_weights():
         assert {child.pid for child in multiprocessing.active_children()} <= existing
     finally:
         task.close()
+
+
+@pytest.mark.parametrize("preset", PRESETS)
+def test_default_1080_beam_cnn_transfer_preserves_driving_policy(preset, tmp_path):
+    from agents.common.ppo_policy import PPOPolicy
+    from agents.common.mappo_policy import MAPPOPolicy
+    from test_torchrl_mappo import BOUNDS, IDS, params as team_params
+
+    source_config = scenario("ppo", preset, overrides=["environment.lidar_beams=1080"])
+    target_config = scenario("mappo", preset, overrides=["environment.lidar_beams=1080"])
+    source_config["network"]["critic"]["encoder"] = deepcopy(source_config["network"]["actor"]["encoder"])
+    source_obs, target_obs = composer(source_config), composer(target_config)
+    source = PPOPolicy(source_obs.obs_dim, *BOUNDS, {"network": source_config["network"],
+        "device": "cpu", "_observation_contract": source_obs.contract})
+    target = MAPPOPolicy(target_obs.obs_dim, 3, *BOUNDS, IDS, team_params(
+        network=target_config["network"], _observation_contract=target_obs.contract))
+    path = tmp_path / "source.pt"
+    source.save_checkpoint(path)
+    target.initialize_from_checkpoint(path, scope="actor_only", observation_extension="frenet_neighbors")
+    assert source.actor.encoder.output_dim == 192 and target.actor.encoder.output_dim == 224
+    observations = torch.randn(5, target_obs.obs_dim)
+    mean, std = target.actor(observations)
+    original_mean, original_std = source.actor(observations[:, :source_obs.obs_dim])
+    torch.testing.assert_close(mean, original_mean, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(std, original_std, rtol=0, atol=0)

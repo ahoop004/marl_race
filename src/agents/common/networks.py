@@ -269,19 +269,34 @@ def route_actor(actor, agent_ids, *, actor_mode="shared", lora_config=None, inpu
     return actor
 
 
-def expand_observation_inputs(state, expected, config, *, source_width, expand_inputs, role="actor"):
-    """Expand an explicitly validated observation prefix, preserving all weights."""
+def expand_observation_inputs(state, expected, config, *, source_width, expand_inputs, role="actor",
+                              new_parameter_prefixes=()):
+    """Expand a validated feature prefix and retain newly initialized branches.
+
+    The head specification identifies its input projection. Everything else
+    must match exactly; callers validate the complete prepared state before use.
+    """
     result = dict(state)
+    if new_parameter_prefixes:
+        added = {key for key in expected if key.startswith(new_parameter_prefixes)}
+        if not added or set(result) != set(expected) - added:
+            raise ValueError("Incompatible checkpoint actor: unexpected source or new-branch state keys")
+        result.update({key: expected[key].clone() for key in added})
     if not expand_inputs:
         return result
     spec = model_spec(config, role)
-    if spec["architecture"] != "mlp" or spec["encoder"]["type"] != "identity":
-        raise ValueError("Observation expansion requires an identity encoder and MLP head; CNN transfer is reserved for Phase 4")
-    weight, target = result.get("net.0.weight"), expected["net.0.weight"]
-    if (not isinstance(weight, torch.Tensor) or weight.shape != (target.shape[0], source_width)
+    if spec["architecture"] == "mlp":
+        key = "net.0.weight"
+    elif spec["architecture"] == "resmlp" and spec["input_projection"]:
+        key = "net.input_projection.0.weight"
+    else:
+        raise ValueError("Observation expansion requires a compatible MLP or residual MLP input projection")
+    weight, target = result.get(key), expected.get(key)
+    if (not isinstance(target, torch.Tensor) or target.ndim != 2
+            or not isinstance(weight, torch.Tensor) or weight.shape != (target.shape[0], source_width)
             or weight.dtype != target.dtype or source_width >= target.shape[1]):
         raise ValueError("First-layer weights do not match the observation-prefix dimensions")
     expanded = torch.zeros_like(target)
     expanded[:, :source_width] = weight
-    result["net.0.weight"] = expanded
+    result[key] = expanded
     return result
