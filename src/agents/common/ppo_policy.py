@@ -64,8 +64,10 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         self.actor = build_actor(
             obs_dim, self.action_dim, self.network_config,
             log_std_init=float(params.get("log_std_init", 0.0)),
+            observation_contract=self.observation_contract,
         ).to(self.device)
-        self.critic = build_critic(obs_dim, self.network_config).to(self.device)
+        self.critic = build_critic(obs_dim, self.network_config,
+                                   observation_contract=self.observation_contract).to(self.device)
         from agents.common.compilation import configure_compilation
         configure_compilation(self, params.get("compile_networks", False))
         self.build_optimizer((*self.actor.parameters(), *self.critic.parameters()), training=training)

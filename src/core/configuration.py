@@ -121,6 +121,20 @@ def validate_configuration(config):
         resolved_network = resolve_network_config({"network": network,
             "lora": adaptation["lora"] or config["training_defaults"].get("lora")},
             default_hidden_dims=[256, 256])
+        if (algorithm["name"] == "mappo"
+                and model_spec(resolved_network, "critic")["encoder"]["type"] != "identity"):
+            raise ValueError("MAPPO global-state critic has no compatible LiDAR layout; use an identity critic encoder")
+        if any(model_spec(resolved_network, role)["encoder"]["type"] != "identity"
+               for role in ("actor", "critic")):
+            from wrappers.observations.composer import ObservationComposer
+            from agents.common.observations import observation_segments
+            layouts = []
+            for agent in config["agents"].values():
+                if agent.get("trainable"):
+                    composer = ObservationComposer.from_config(agent["observation"], config["environment"])
+                    layouts.append(observation_segments(composer.contract, composer.obs_dim))
+            if any(layout != layouts[0] for layout in layouts[1:]):
+                raise ValueError("CNN actors require identical observation segments across learners")
     except ValueError as exc:
         raise ScenarioError(str(exc)) from exc
     actor = network.get("actor", {})

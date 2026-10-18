@@ -123,7 +123,8 @@ class MAPPOPolicy(OnPolicyOptimizationSettings):
         self.device = resolve_device([device_str])
 
         # Shared actor (local obs → action)
-        self.actor = build_actor(obs_dim, self.action_dim, self.network_config).to(self.device)
+        self.actor = build_actor(obs_dim, self.action_dim, self.network_config,
+                                 observation_contracts=self.observation_contracts).to(self.device)
 
         # The team critic estimates one shared V(s).  The agent-conditioned
         # critic estimates V_i(s) by appending a focal-agent one-hot vector.

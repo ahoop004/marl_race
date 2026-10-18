@@ -23,6 +23,42 @@ def observation_layout(contract):
     return common, driving, driving + extra
 
 
+def observation_segments(contract, input_dim):
+    """Derive ordered, half-open encoder segments from the composer contract.
+
+    Dimension arithmetic stays in observation_layout, shared with transfer.
+    CNNs require explicit contracts rather than guessing a scan from its width.
+    """
+    if (not isinstance(contract, dict) or type(contract.get("version")) is not int
+            or contract["version"] != 1):
+        raise ValueError("CNN encoder requires an explicit version 1 LiDAR/Frenet observation contract; global-state inputs are unsupported")
+    obs = contract.get("observation")
+    if not isinstance(obs, dict) or any(not isinstance(value, dict) for value in obs.values()):
+        raise ValueError("Observation contract components must be mappings")
+    for key, settings in obs.items():
+        if type(settings.get("enabled", False)) is not bool:
+            raise ValueError(f"Observation contract {key}.enabled must be a boolean")
+    for label, value in (("lidar_beams", contract.get("lidar_beams")),
+                         ("points", obs.get("frenet_vehicle_track", {}).get("points", 20)),
+                         ("input_dim", input_dim)):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"Observation layout {label} must be a positive integer")
+    neighbors = obs.get("frenet_neighbors", {})
+    if neighbors.get("enabled"):
+        count = neighbors.get("max_neighbors", 1)
+        ids = neighbors.get("agent_ids")
+        if type(count) is not int or count <= 0 or type(neighbors.get("include_team", False)) is not bool:
+            raise ValueError("Observation layout requires positive max_neighbors and boolean include_team")
+        if ids is not None and (not isinstance(ids, (list, tuple)) or not ids
+                or any(not isinstance(aid, str) or not aid for aid in ids) or len(set(ids)) != len(ids)):
+            raise ValueError("Observation layout requires unique nonempty neighbor agent_ids")
+    _, driving, total = observation_layout(contract)
+    if total != input_dim:
+        raise ValueError(f"Observation segments sum to {total}, but actual observation dimension is {input_dim}")
+    return {"lidar": [0, contract["lidar_beams"]],
+            "vehicle_track": [contract["lidar_beams"], driving], "neighbors": [driving, total]}
+
+
 def pack_observations(agent_ids, observations, obs_dims, width):
     if not isinstance(observations, Mapping) and len(observations) != len(agent_ids):
         raise ValueError("Observation batch shape must match the agent IDs")

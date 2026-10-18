@@ -1,0 +1,19 @@
+defaults:
+- mlp_base
+- _self_
+
+actor:
+  encoder:
+    type: cnn1d_fusion
+    channels: [32, 64, 128]
+    kernel_size: 5
+    stride: 2
+    pool_bins: 8
+    lidar_features: 128
+    vehicle_hidden_dims: [64]
+    vehicle_features: 64
+    neighbor_hidden_dims: [32]
+    neighbor_features: 32
+    activation: ${network.activation}
+critic:
+  encoder: identity

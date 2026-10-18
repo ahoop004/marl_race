@@ -2,63 +2,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from functools import partial
 import math
-from typing import List, Optional
+from typing import List
 
 import torch
 import torch.nn as nn
 
 from agents.common.distributions import SquashedGaussianActor
 from agents.common.encoders import build_encoder, resolve_encoder_config
-
-# Fixed as part of the "leaky_relu" checkpoint activation contract.
-LEAKY_RELU_NEGATIVE_SLOPE = 0.2
-
-
-def make_activation(activation):
-    act_map = {
-        "relu": nn.ReLU, "tanh": nn.Tanh, "silu": nn.SiLU, "swish": nn.SiLU,
-        "leaky_relu": partial(nn.LeakyReLU, negative_slope=LEAKY_RELU_NEGATIVE_SLOPE),
-    }
-    if not isinstance(activation, str) or activation.lower() not in act_map:
-        raise ValueError(f"Unsupported network activation: {activation!r}")
-    return act_map[activation.lower()]()
-
-
-def _positive_int(value, field):
-    if type(value) is not int or value <= 0:
-        raise ValueError(f"{field} must be a positive integer")
-    return value
-
-
-def _hidden_dims(value, field):
-    if not isinstance(value, (list, tuple)) or any(type(d) is not int or d <= 0 for d in value):
-        raise ValueError(f"{field} must be a sequence of positive integers")
-    return list(value)
-
-
-def make_mlp(
-    input_dim: int,
-    hidden_dims: List[int],
-    output_dim: int,
-    activation: str = "tanh",
-    output_activation: Optional[str] = None,
-) -> nn.Sequential:
-    """Build a fully-connected MLP."""
-    make_activation(activation)  # Validate even a linear-only head.
-
-    layers: List[nn.Module] = []
-    prev = input_dim
-    for h in hidden_dims:
-        layers += [nn.Linear(prev, h), make_activation(activation)]
-        prev = h
-    layers.append(nn.Linear(prev, output_dim))
-
-    if output_activation:
-        layers.append(make_activation(output_activation))
-
-    return nn.Sequential(*layers)
+from agents.common.network_layers import (
+    LEAKY_RELU_NEGATIVE_SLOPE, make_activation, make_mlp, _positive_int, _hidden_dims,
+)
 
 
 class ResidualDenseBlock(nn.Module):
@@ -119,13 +73,13 @@ class Actor(SquashedGaussianActor):
         action_dim: int,
         hidden_dims: List[int],
         activation: str = "tanh",
-        *, model_spec=None,
+        *, model_spec=None, observation_contract=None,
     ) -> None:
         super().__init__()
         self.action_dim = _positive_int(action_dim, "actor.action_dim")
         spec = model_spec or dict(architecture="mlp", hidden_dims=hidden_dims, activation=activation,
                                   encoder="identity")
-        self.encoder = build_encoder(obs_dim, spec["encoder"])
+        self.encoder = build_encoder(obs_dim, spec["encoder"], observation_contract=observation_contract)
         # Keep net directly on the actor: legacy state keys and RNG order are unchanged.
         self.net = build_head(self.encoder.output_dim, action_dim, spec)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
@@ -148,12 +102,12 @@ class Critic(nn.Module):
         input_dim: int,
         hidden_dims: List[int],
         activation: str = "tanh",
-        *, model_spec=None,
+        *, model_spec=None, observation_contract=None,
     ) -> None:
         super().__init__()
         spec = model_spec or dict(architecture="mlp", hidden_dims=hidden_dims, activation=activation,
                                   encoder="identity")
-        self.encoder = build_encoder(input_dim, spec["encoder"])
+        self.encoder = build_encoder(input_dim, spec["encoder"], observation_contract=observation_contract)
         self.net = build_head(self.encoder.output_dim, 1, spec)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -172,11 +126,12 @@ def _resolve_model_spec(value, *, architecture, encoder, hidden_dims, activation
         raise ValueError(f"Unsupported network.{role} architecture: {kind!r}; supported: mlp, resmlp")
     act = value.get("activation", activation)
     make_activation(act)
-    layout = value.get("observation_layout", "flat")
-    if layout != "flat":
-        raise ValueError(f"network.{role}.observation_layout must be 'flat' for identity encoders")
-    spec = dict(architecture=kind, encoder=resolve_encoder_config(value.get("encoder", encoder)),
-                activation=act, observation_layout=layout)
+    encoder = resolve_encoder_config(value.get("encoder", encoder))
+    required_layout = "flat" if encoder["type"] == "identity" else "lidar_frenet_v1"
+    layout = value.get("observation_layout", required_layout)
+    if layout != required_layout:
+        raise ValueError(f"network.{role}.observation_layout must be {required_layout!r} for {encoder['type']}")
+    spec = dict(architecture=kind, encoder=encoder, activation=act, observation_layout=layout)
     if kind == "mlp":
         if set(value) & {"width", "num_blocks", "input_projection"}:
             raise ValueError(f"network.{role}: width/num_blocks/input_projection require resmlp")
@@ -251,8 +206,11 @@ def resolve_network_config(params, *, default_hidden_dims):
                 params.get("hidden_dims", default_hidden_dims))), f"network.{role}_hidden_dims")
             specs[role] = _resolve_model_spec(network.get(role, {}), architecture=architecture,
                 encoder=encoder, hidden_dims=dims, activation=activation, role=role)
-    if params.get("lora") is not None and any(spec["architecture"] != "mlp" for spec in specs.values()):
-        raise ValueError("LoRA requires MLP actor and critic; residual MLP + LoRA is unsupported")
+    if params.get("lora") is not None:
+        if any(spec["architecture"] != "mlp" for spec in specs.values()):
+            raise ValueError("LoRA requires MLP actor and critic; residual MLP + LoRA is unsupported")
+        if any(spec["encoder"]["type"] != "identity" for spec in specs.values()):
+            raise ValueError("CNN encoders + LoRA are unsupported; current MLP LoRA requires identity encoders")
     if (all(spec["architecture"] == "mlp" and spec["encoder"] == {"type": "identity"}
             for spec in specs.values()) and specs["actor"]["activation"] == specs["critic"]["activation"]):
         return dict(architecture="mlp", actor_hidden_dims=specs["actor"]["hidden_dims"],
@@ -269,21 +227,31 @@ def model_spec(config, role):
                 observation_layout="flat")
 
 
-def build_actor(obs_dim, action_dim, config, *, log_std_init=0.0):
+def build_actor(obs_dim, action_dim, config, *, log_std_init=0.0,
+                observation_contract=None, observation_contracts=None):
     """Return an actor mapping observations to (mean, scale)."""
     spec = model_spec(config, "actor")
     if not math.isfinite(log_std_init) or not Actor.LOG_STD_MIN <= log_std_init <= Actor.LOG_STD_MAX:
         raise ValueError("log_std_init must be within the actor's log standard deviation bounds")
-    actor = Actor(obs_dim, action_dim, spec.get("hidden_dims", []), spec["activation"], model_spec=spec)
+    if observation_contracts is not None:
+        observation_contract = next(iter(observation_contracts.values()))
+        if spec["encoder"]["type"] != "identity":
+            from agents.common.observations import observation_segments
+            layouts = [observation_segments(contract, obs_dim) for contract in observation_contracts.values()]
+            if any(layout != layouts[0] for layout in layouts[1:]):
+                raise ValueError("CNN actors require identical observation segments across learners")
+    actor = Actor(obs_dim, action_dim, spec.get("hidden_dims", []), spec["activation"],
+                  model_spec=spec, observation_contract=observation_contract)
     with torch.no_grad():
         actor.log_std.fill_(log_std_init)
     return actor
 
 
-def build_critic(input_dim, config):
+def build_critic(input_dim, config, *, observation_contract=None):
     """Return a critic mapping local observations or global states to values."""
     spec = model_spec(config, "critic")
-    return Critic(input_dim, spec.get("hidden_dims", []), spec["activation"], model_spec=spec)
+    return Critic(input_dim, spec.get("hidden_dims", []), spec["activation"],
+                  model_spec=spec, observation_contract=observation_contract)
 
 
 def route_actor(actor, agent_ids, *, actor_mode="shared", lora_config=None, input_dims=None):
@@ -307,8 +275,8 @@ def expand_observation_inputs(state, expected, config, *, source_width, expand_i
     if not expand_inputs:
         return result
     spec = model_spec(config, role)
-    if spec["architecture"] != "mlp":
-        raise ValueError(f"Observation expansion is unsupported for {spec['architecture']!r}")
+    if spec["architecture"] != "mlp" or spec["encoder"]["type"] != "identity":
+        raise ValueError("Observation expansion requires an identity encoder and MLP head; CNN transfer is reserved for Phase 4")
     weight, target = result.get("net.0.weight"), expected["net.0.weight"]
     if (not isinstance(weight, torch.Tensor) or weight.shape != (target.shape[0], source_width)
             or weight.dtype != target.dtype or source_width >= target.shape[1]):

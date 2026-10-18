@@ -32,17 +32,29 @@ def _plain(value):
 
 
 def policy_metadata(policy):
+    from agents.common.networks import model_spec
+    from agents.common.observations import observation_segments
+
     algorithm = policy.algorithm
     ids = list(policy.agent_ids)
     observations = (policy.observation_contracts if algorithm == "mappo"
                     else dict.fromkeys(ids, policy.observation_contract))
     dims = policy.obs_dims if algorithm == "mappo" else dict.fromkeys(ids, policy.obs_dim)
+    encoders = {role: model_spec(policy.network_config, role)["encoder"]["type"]
+                for role in ("actor", "critic")}
+    convolutional = any(kind != "identity" for kind in encoders.values())
+    segments = ({"actor": ({aid: observation_segments(observations[aid], dims[aid]) for aid in ids}
+                           if encoders["actor"] != "identity" else None),
+                 "critic": (observation_segments(policy.observation_contract, policy.obs_dim)
+                            if encoders["critic"] != "identity" else None)} if convolutional else {})
     return {
         "algorithm": algorithm,
         "implementation": policy.implementation,
         "network": dict(policy.network_config),
         "structure": {
-            "encoder": "identity", "distribution": "squashed_gaussian_pre_tanh_v1",
+            "encoder": encoders if convolutional else "identity",
+            **({"observation_segments": segments} if convolutional else {}),
+            "distribution": "squashed_gaussian_pre_tanh_v1",
             "actor_mode": getattr(policy, "actor_mode", "independent"),
             "critic_mode": getattr(policy, "critic_mode", "local_observation"),
             "agent_ids": ids, "groups": {"agents": ids},
@@ -187,6 +199,14 @@ def initialize_from_checkpoint(policy, path, *, scope, observation_extension=Non
     validate_checkpoint_compatibility(stored, {"network": source_network})
     source_actor = model_spec(stored["network"], "actor")
     target_actor = model_spec(expected["network"], "actor")
+    cnn = any(model_spec(network, role)["encoder"]["type"] != "identity"
+              for network in (stored["network"], expected["network"]) for role in ("actor", "critic"))
+    if cnn and (expected["algorithm"] == "mappo"
+                or stored["contracts"]["observations"] != expected["contracts"]["observations"]):
+        raise ValueError("CNN PPO-to-MAPPO transfer and observation expansion are reserved for Phase 4")
+    if cnn:
+        validate_checkpoint_compatibility(stored["structure"], {
+            "observation_segments": expected["structure"].get("observation_segments")})
     if expected["algorithm"] == "mappo" and any(
             model_spec(network, role)["architecture"] == "resmlp"
             for network in (stored["network"], expected["network"]) for role in ("actor", "critic")):

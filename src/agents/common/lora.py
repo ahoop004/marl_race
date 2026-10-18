@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from agents.common.networks import Actor
+from agents.common.encoders import IdentityEncoder
 from agents.common.distributions import SquashedGaussianActor
 
 
@@ -72,6 +73,8 @@ class LoRAActor(SquashedGaussianActor):
         super().__init__()
         if not isinstance(base, Actor) or not isinstance(base.net, nn.Sequential):
             raise ValueError("LoRA currently supports the MLP actor only; residual MLP + LoRA is unsupported")
+        if not isinstance(base.encoder, IdentityEncoder):
+            raise ValueError("CNN encoders + LoRA are unsupported; current MLP LoRA requires an identity encoder")
         self.action_dim = base.action_dim
         self.net = base.net
         self.log_std = base.log_std

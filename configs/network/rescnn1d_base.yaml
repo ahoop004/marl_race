@@ -1,0 +1,8 @@
+defaults:
+- cnn1d_base
+- _self_
+
+actor:
+  encoder:
+    type: rescnn1d_fusion
+    num_blocks: 2
