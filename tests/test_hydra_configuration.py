@@ -249,7 +249,7 @@ def test_adaptation_choices_do_not_change_the_task(adaptation):
     (TEAM, "algorithm=ppo", "PPO completion experiments require one vehicle"),
     (PRETRAIN, "algorithm=mappo", "Unsupported evaluation selection strategy"),
     (PRETRAIN, "adaptation=lora", "LoRA requires MAPPO"),
-    (PRETRAIN, "network.architecture=cnn", "Only the MLP"),
+    (PRETRAIN, "network.architecture=cnn", "Unsupported network architecture"),
     (PRETRAIN, "network.encoder=cnn", "identity observation encoder"),
     (PRETRAIN, "network.actor.distribution=normal", "tanh_normal"),
     (TEAM, "network.critic.input_type=local_observation", "global_state input"),

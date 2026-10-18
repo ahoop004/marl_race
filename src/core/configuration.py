@@ -116,29 +116,22 @@ def validate_configuration(config):
         validate_objective(algorithm["name"], algorithm["loss"], algorithm["critic_loss"])
     except ValueError as exc:
         raise ScenarioError(str(exc)) from exc
-    allowed = {"architecture", "actor_hidden_dims", "critic_hidden_dims", "activation",
-               "encoder", "actor", "critic"}
-    if set(network) - allowed or network.get("architecture") != "mlp":
-        raise ScenarioError("Only the MLP network architecture is implemented")
-    if network.get("encoder", "identity") != "identity":
-        raise ScenarioError("Only the identity observation encoder is implemented")
-    if network.get("activation") not in {"relu", "tanh", "silu", "swish", "leaky_relu"}:
-        raise ScenarioError("Unsupported network activation")
-    for key in ("actor_hidden_dims", "critic_hidden_dims"):
-        dims = network.get(key)
-        if not isinstance(dims, list) or any(type(d) is not int or d <= 0 for d in dims):
-            raise ScenarioError(f"network.{key} must be a list of positive integers")
+    from agents.common.networks import resolve_network_config, model_spec
+    try:
+        resolved_network = resolve_network_config({"network": network,
+            "lora": adaptation["lora"] or config["training_defaults"].get("lora")},
+            default_hidden_dims=[256, 256])
+    except ValueError as exc:
+        raise ScenarioError(str(exc)) from exc
     actor = network.get("actor", {})
     critic = network.get("critic", {})
-    if actor and (set(actor) - {"architecture", "distribution", "parameter_sharing"}
-                  or actor.get("architecture") != "mlp" or actor.get("distribution") != "tanh_normal"):
-        raise ScenarioError("Only an MLP actor with a tanh_normal distribution is implemented")
+    if actor and actor.get("distribution", "tanh_normal") != "tanh_normal":
+        raise ScenarioError("Only an actor with a tanh_normal distribution is implemented")
     expected_input = "local_observation" if algorithm["name"] == "ppo" else "global_state"
     expected_sharing = "independent" if algorithm["name"] == "ppo" else "shared_team"
-    if critic and (set(critic) - {"architecture", "input_type", "parameter_sharing"}
-                   or critic.get("architecture") != "mlp" or critic.get("input_type") != expected_input
+    if critic and (critic.get("input_type") != expected_input
                    or critic.get("parameter_sharing") != expected_sharing):
-        raise ScenarioError(f"{algorithm['name'].upper()} requires an MLP critic with {expected_input} input and {expected_sharing} parameters")
+        raise ScenarioError(f"{algorithm['name'].upper()} requires a critic with {expected_input} input and {expected_sharing} parameters")
     if actor and actor.get("parameter_sharing") not in {"independent", "shared"}:
         raise ScenarioError("Actor parameter_sharing must be independent or shared")
     if adaptation["mode"] not in {"scratch", "full_finetune", "lora"}:
@@ -161,9 +154,10 @@ def validate_configuration(config):
             lora = resolve_lora_config(adaptation["lora"])
         except ValueError as exc:
             raise ScenarioError(str(exc)) from exc
-        if lora["mode"] != "per_agent" or not network["actor_hidden_dims"]:
+        actor_dims = model_spec(resolved_network, "actor")["hidden_dims"]
+        if lora["mode"] != "per_agent" or not actor_dims:
             raise ScenarioError("LoRA requires per_agent adapters and actor hidden layers")
-        if lora["rank"] > min(network["actor_hidden_dims"]):
+        if lora["rank"] > min(actor_dims):
             raise ScenarioError("lora.rank cannot exceed actor hidden dimensions")
     for key in ("train", "selection", "final_test"):
         value = config["maps"].get(key)

@@ -1,0 +1,9 @@
+defaults:
+- mlp
+- _self_
+
+# Per-role architecture overrides remain available; the common choice is a fallback.
+actor:
+  architecture: ${network.architecture}
+critic:
+  architecture: ${network.architecture}

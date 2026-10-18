@@ -70,8 +70,8 @@ class LoRAActor(SquashedGaussianActor):
 
     def __init__(self, base: Actor, config, n_agents, input_dims=None):
         super().__init__()
-        if not isinstance(base, Actor):
-            raise ValueError("LoRA currently supports the MLP actor only")
+        if not isinstance(base, Actor) or not isinstance(base.net, nn.Sequential):
+            raise ValueError("LoRA currently supports the MLP actor only; residual MLP + LoRA is unsupported")
         self.action_dim = base.action_dim
         self.net = base.net
         self.log_std = base.log_std

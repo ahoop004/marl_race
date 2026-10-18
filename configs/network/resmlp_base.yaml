@@ -1,0 +1,13 @@
+defaults:
+- mlp_base
+- _self_
+
+architecture: resmlp
+actor:
+  width: 256
+  num_blocks: 4
+  input_projection: true
+critic:
+  width: 256
+  num_blocks: 4
+  input_projection: true

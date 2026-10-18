@@ -182,8 +182,16 @@ def initialize_from_checkpoint(policy, path, *, scope, observation_extension=Non
     validate_checkpoint_compatibility(stored, {"implementation": PPOPolicy.implementation})
     if scope == "actor_and_critic" and expected["algorithm"] != "ppo":
         raise ValueError("MAPPO transfer supports actor_only; its centralized critic must be fresh")
-    validate_checkpoint_compatibility(stored["network"], {key: expected["network"][key] for key in (
-        "architecture", "actor_hidden_dims", "activation")})
+    from agents.common.networks import model_spec, resolve_network_config
+    source_network = resolve_network_config({"network": stored["network"]}, default_hidden_dims=[])
+    validate_checkpoint_compatibility(stored, {"network": source_network})
+    source_actor = model_spec(stored["network"], "actor")
+    target_actor = model_spec(expected["network"], "actor")
+    if expected["algorithm"] == "mappo" and any(
+            model_spec(network, role)["architecture"] == "resmlp"
+            for network in (stored["network"], expected["network"]) for role in ("actor", "critic")):
+        raise ValueError("PPO-to-MAPPO transfer with residual MLP architectures is unsupported (reserved for Phase 4)")
+    validate_checkpoint_compatibility({"actor_spec": source_actor}, {"actor_spec": target_actor})
     validate_checkpoint_compatibility(stored["structure"], {key: expected["structure"][key]
                                                           for key in ("encoder", "distribution")})
     validate_checkpoint_compatibility(stored["contracts"], {
@@ -204,7 +212,7 @@ def initialize_from_checkpoint(policy, path, *, scope, observation_extension=Non
     if scope == "actor_and_critic":
         validate_checkpoint_compatibility(stored["network"], expected["network"])
         critic_state = expand_observation_inputs(checkpoint["models"]["critic"], policy.critic.state_dict(),
-            policy.network_config, source_width=source["dim"], expand_inputs=any(expansions))
+            policy.network_config, source_width=source["dim"], expand_inputs=any(expansions), role="critic")
         states.append(("critic", critic_state, policy.critic.state_dict()))
     validate_checkpoint_compatibility(checkpoint, {}, states=states)
     if getattr(policy, "lora_config", None):

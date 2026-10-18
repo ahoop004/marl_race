@@ -8,7 +8,7 @@ import torch
 
 from agents.common.outputs import PolicyOutput
 from agents.common.optimization import OnPolicyOptimizationSettings
-from agents.common.networks import build_actor, build_critic, resolve_network_config
+from agents.common.networks import build_actor, build_critic, resolve_network_config, model_spec
 from agents.common.checkpoints import (
     save_checkpoint, load_for_evaluation, initialize_from_checkpoint, resume_training,
 )
@@ -54,9 +54,9 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         if self.min_rollout_steps < 1:
             raise ValueError("min_rollout_steps must be positive")
         self.network_config = resolve_network_config(params, default_hidden_dims=[64, 64])
-        self.actor_hidden_dims = self.network_config["actor_hidden_dims"]
-        self.critic_hidden_dims = self.network_config["critic_hidden_dims"]
-        self.activation = self.network_config["activation"]
+        self.actor_hidden_dims = model_spec(self.network_config, "actor").get("hidden_dims", [])
+        self.critic_hidden_dims = model_spec(self.network_config, "critic").get("hidden_dims", [])
+        self.activation = model_spec(self.network_config, "actor")["activation"]
 
         device_str = str(params.get("device", "cpu"))
         self.device = resolve_device([device_str])

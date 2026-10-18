@@ -13,11 +13,11 @@ def resolve_training_params(agent_cfg: dict, scenario: dict) -> dict:
     environment = scenario.get("environment", {})
     decision_dt = float(environment.get("timestep", 0.01)) * int(environment.get("action_repeat", 1))
     network = scenario.get("network", {})
-    # Routing/input choices are validated at the application boundary; the
-    # existing MLP factory accepts these four architecture fields.
+    # Routing/input choices stay at the application boundary. Model settings
+    # follow the same projection for every head and encoder.
     if "_configuration" in scenario and "algorithm" in scenario:
-        network = {key: value for key, value in network.items() if key in {
-            "architecture", "actor_hidden_dims", "critic_hidden_dims", "activation"}}
+        from agents.common.networks import project_network_config
+        network = project_network_config(network)
     optimization = {key: scenario["algorithm"].get(key, default) for key, default in (
         ("optimizer", "adam"), ("optimizer_kwargs", {}),
         ("loss", "clip_ppo" if scenario["algorithm"]["name"] == "ppo" else "mappo"),
