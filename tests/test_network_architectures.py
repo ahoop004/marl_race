@@ -133,9 +133,11 @@ def test_independent_heads_activations_and_centralized_critic_inputs(actor, crit
 
 
 @pytest.mark.parametrize("actor,critic", [("resmlp", "mlp"), ("mlp", "resmlp"), ("resmlp", "resmlp")])
-@pytest.mark.parametrize("algorithm", ["ppo", "mappo_shared", "mappo_independent"])
+@pytest.mark.parametrize("algorithm", ["ppo", "mappo_shared", "mappo_independent", "mappo_lora"])
 def test_native_cpu_updates_checkpoint_evaluation_and_resume(actor, critic, algorithm, tmp_path):
     raw = network(actor, critic)
+    if algorithm == "mappo_lora":
+        PPOPolicy(1, *BOUNDS, {"network": raw}).save_checkpoint(tmp_path / "source.pt")
 
     class Stop(Capture):
         def on_update(self, metrics):
@@ -147,8 +149,12 @@ def test_native_cpu_updates_checkpoint_evaluation_and_resume(actor, critic, algo
         if algorithm == "ppo":
             return ppo_trainer(hook, network=raw, n_epochs=1)
         task = team_task({3: ((), True, (), (*IDS, "car_2", "car_3"))})
-        policy = TorchRLMAPPOAgent(1, task.state_space().shape[0], *BOUNDS, IDS,
-                                  mappo_params(network=raw, n_steps=8, actor_mode=algorithm.removeprefix("mappo_")))
+        options = mappo_params(network=raw, n_steps=8, actor_mode=algorithm.removeprefix("mappo_"))
+        if algorithm == "mappo_lora":
+            options.update(actor_mode="shared", lora={"mode": "per_agent", "rank": 1, "per_agent_log_std": True})
+        policy = TorchRLMAPPOAgent(1, task.state_space().shape[0], *BOUNDS, IDS, options)
+        if stop and algorithm == "mappo_lora":
+            policy.initialize_from_checkpoint(tmp_path / "source.pt", scope="actor_only")
         return OnPolicyTrainer(task, policy, hooks=[hook]), None
 
     original, _ = construct(stop=True)
@@ -211,10 +217,10 @@ def test_incompatible_architectures_reject_before_loading_weights(change, tmp_pa
 
 
 @pytest.mark.parametrize("actor,critic", [("resmlp", "mlp"), ("mlp", "resmlp")])
-def test_residual_lora_rejected_and_ppo_to_mappo_transfer_supported(actor, critic, tmp_path):
+def test_residual_lora_and_ppo_to_mappo_transfer_supported(actor, critic, tmp_path):
     raw = network(actor, critic)
-    with pytest.raises(ValueError, match="residual MLP.*LoRA"):
-        MAPPOPolicy(7, 17, *BOUNDS, IDS, mappo_params(network=raw, lora={"rank": 1}))
+    adapted = MAPPOPolicy(7, 17, *BOUNDS, IDS, mappo_params(network=raw, lora={"rank": 1}))
+    assert all(not p.requires_grad for p in adapted.actor.net.parameters())
     source = PPOPolicy(7, *BOUNDS, {"network": raw})
     source.save_checkpoint(tmp_path / "ppo.pt")
     target = MAPPOPolicy(7, 17, *BOUNDS, IDS, mappo_params(network=raw))
@@ -225,8 +231,7 @@ def test_residual_lora_rejected_and_ppo_to_mappo_transfer_supported(actor, criti
     for key, value in critic_before.items():
         torch.testing.assert_close(value, target.critic.state_dict()[key], rtol=0, atol=0)
     config = load_and_expand_scenario(TEAM, overrides=["network=resmlp_base", "adaptation=lora"])
-    with pytest.raises(ScenarioError, match="residual MLP.*LoRA"):
-        validate_experiment_scenario(config)
+    validate_experiment_scenario(config)
 
 
 @pytest.mark.parametrize("override,message", [
@@ -284,3 +289,29 @@ def test_residual_transfer_requires_an_input_projection():
     resolved["actor"]["input_projection"] = False
     with pytest.raises(ValueError, match="input projection"):
         expand_observation_inputs({}, {}, resolved, source_width=7, expand_inputs=True)
+
+
+@pytest.mark.parametrize("preset", ["mlp_base", "resmlp_base", "cnn1d_base", "rescnn1d_base"])
+@pytest.mark.parametrize("bad", ["target", "rank", "no_targets"])
+def test_modular_lora_configuration_validates_targets_and_every_layer(preset, bad):
+    overrides = [f"network={preset}", "adaptation=lora", "execution.params.device=cpu"]
+    if bad == "target":
+        overrides.append("adaptation.lora.target=encoder")
+    elif bad == "rank":
+        overrides.append("adaptation.lora.rank=1000")
+    else:
+        overrides += ["network.actor.architecture=mlp", "network.actor_hidden_dims=[]"]
+        if preset == "resmlp_base":
+            # Residual-only options are intentionally not legal for an MLP head.
+            overrides += ["~network.actor.width", "~network.actor.num_blocks", "~network.actor.input_projection"]
+    config = load_and_expand_scenario(TEAM, overrides=overrides)
+    with pytest.raises(ScenarioError, match="lora.target|lora.rank|hidden layer"):
+        validate_experiment_scenario(config)
+
+
+def test_lora_rank_validation_uses_encoded_feature_dimensions():
+    config = load_and_expand_scenario(TEAM, overrides=["network=cnn1d_base", "adaptation=lora",
+        "network.actor.encoder.lidar_features=2", "network.actor.encoder.vehicle_features=2",
+        "network.actor.encoder.neighbor_features=2", "network.actor_hidden_dims=[8]", "adaptation.lora.rank=7"])
+    with pytest.raises(ScenarioError, match="net.0.*dimensions"):
+        validate_experiment_scenario(config)

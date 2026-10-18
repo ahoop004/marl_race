@@ -596,3 +596,240 @@ def test_evaluation_only_transfer_with_a_linear_schedule_needs_no_optimizer(tmp_
     for role in ("actor", "critic"):
         for key, value in getattr(source, role).state_dict().items():
             torch.testing.assert_close(value, getattr(destination, role).state_dict()[key], rtol=0, atol=0)
+
+
+def modular_lora_pair(preset="cnn1d_base", head="mlp", beams=108, *, mode="per_agent", train_log_std=True):
+    from agents.torchrl_mappo import TorchRLMAPPOAgent
+    from test_torchrl_mappo import BOUNDS, IDS, params
+
+    source, control = modular_transfer_pair(preset, head, beams=beams)
+    options = params(network=control.network_config, _observation_contract=control.observation_contract,
+        actor_mode="shared", learning_rate=.02, optimizer="adamw", optimizer_kwargs={"weight_decay": .2},
+        lora={"target": "actor_head", "mode": mode, "rank": 2, "alpha": 3.,
+              "train_log_std": train_log_std, "per_agent_log_std": mode == "per_agent"})
+    torch.manual_seed(202)
+    target = TorchRLMAPPOAgent(control.obs_dim, control.global_state_dim, *BOUNDS, IDS, options)
+    for name, value in control.critic.state_dict().items():
+        torch.testing.assert_close(value, target.critic.state_dict()[name], rtol=0, atol=0)
+    return source, target, options
+
+
+@pytest.mark.parametrize("preset,head", TRANSFER_ARCHITECTURES)
+@pytest.mark.parametrize("beams", [108, 1080])
+@pytest.mark.parametrize("mode,train_log_std", [("per_agent", True), ("shared", False)])
+def test_modular_lora_initial_equivalence_freezing_and_accounting(preset, head, beams, mode, train_log_std, tmp_path):
+    from agents.common.lora import parameter_accounting
+
+    source, target, _ = modular_lora_pair(preset, head, beams, mode=mode, train_log_std=train_log_std)
+    source.save_checkpoint(tmp_path / "source.pt", provenance={"run_id": "ppo-lora-source"})
+    neighbor_before = deepcopy(target.actor.encoder.neighbors.state_dict()) if "cnn" in preset else {}
+    target.initialize_from_checkpoint(tmp_path / "source.pt", scope="actor_only", observation_extension="frenet_neighbors")
+    base = target.actor.base_state_dict()
+    first = "net.0.weight" if head == "mlp" else "net.input_projection.0.weight"
+    width = source.actor.encoder.output_dim
+    for name, weight in source.actor.state_dict().items():
+        torch.testing.assert_close(base[name][:, :width] if name == first else base[name], weight, rtol=0, atol=0)
+    assert torch.count_nonzero(base[first][:, width:]) == 0
+    first_key = next(iter(target.actor.adapters[0]))
+    assert target.actor.adapters[0][first_key].A.shape[1] == target.actor.encoder.output_dim
+    assert all(torch.count_nonzero(adapter.B) == 0 for bank in target.actor.adapters for adapter in bank.values())
+    if "cnn" in preset:
+        for name, value in neighbor_before.items():
+            torch.testing.assert_close(value, target.actor.encoder.neighbors.state_dict()[name], rtol=0, atol=0)
+        assert all(not p.requires_grad for p in target.actor.encoder.lidar_backbone.parameters())
+        assert all(not p.requires_grad for p in target.actor.encoder.lidar_projection.parameters())
+        assert all(not p.requires_grad for p in target.actor.encoder.vehicle_track.parameters())
+        assert all(p.requires_grad for p in target.actor.encoder.neighbors.parameters())
+    assert all(not p.requires_grad for p in target.actor.net.parameters())
+    assert all(p.requires_grad for p in target.actor.adapters.parameters())
+    assert all(p.requires_grad for p in target.critic.parameters())
+    for _ in range(3):
+        driving = torch.randn(6, source.obs_dim)
+        expected_mean, expected_std = source.actor(driving)
+        for scale in (0., 1., 30.):
+            obs = torch.cat((driving, torch.randn(6, target.obs_dim - source.obs_dim) * scale), dim=-1)
+            kwargs = {"adapter_indices": torch.tensor([0, 1, 1, 0, 1, 0])} if mode == "per_agent" else {}
+            mean, std = target.actor(obs, **kwargs)
+            torch.testing.assert_close(mean, expected_mean, rtol=1e-6, atol=1e-6)
+            torch.testing.assert_close(std.expand_as(mean), expected_std.expand_as(mean), rtol=0, atol=0)
+            actions = target.actor.get_action(obs, deterministic=True, **kwargs)[0]
+            torch.testing.assert_close(actions, expected_mean.tanh(), rtol=1e-6, atol=1e-6)
+    counts = parameter_accounting(target)
+    assert counts["actor_total"] == counts["actor_trainable"] + counts["actor_frozen"]
+    assert counts["actor_trainable"] == counts["lora_trainable"] + counts["neighbor_encoder_trainable"] + counts["exploration_trainable"]
+    assert counts["exploration_trainable"] == (4 if train_log_std else 0)
+    assert counts["critic_trainable"] == sum(p.numel() for p in target.critic.parameters())
+    frozen_ids = {id(p) for p in target.actor.parameters() if not p.requires_grad}
+    optimizer_ids = {id(p) for group in target.optimizer.param_groups for p in group["params"]}
+    assert not frozen_ids.intersection(optimizer_ids)
+    assert optimizer_ids == {id(p) for module in (target.actor, target.critic) for p in module.parameters() if p.requires_grad}
+    target.save_checkpoint(tmp_path / "lora.pt")
+    metadata = read_checkpoint(tmp_path / "lora.pt")["metadata"]
+    assert metadata["parameter_counts"] == counts
+    assert target.source_checkpoint["network"] == source.network_config
+    if not target.actor.legacy:
+        assert metadata["adaptation"]["lora"]["target_modules"] == target.actor.target_modules
+        assert metadata["adaptation"]["lora"]["freezing"]["neighbor_encoder_shared"]
+
+
+@pytest.mark.parametrize("preset,head", TRANSFER_ARCHITECTURES)
+def test_modular_lora_learns_neighbors_without_changing_frozen_weights(preset, head, tmp_path):
+    from test_torchrl_mappo import IDS, transition
+
+    source, target, _ = modular_lora_pair(preset, head)
+    source_path = tmp_path / "source.pt"
+    source.save_checkpoint(source_path)
+    source_bytes = source_path.read_bytes()
+    target.initialize_from_checkpoint(source_path, scope="actor_only", observation_extension="frenet_neighbors")
+    frozen = {name: p.detach().clone() for name, p in target.actor.named_parameters() if not p.requires_grad}
+    before_banks = [deepcopy(bank.state_dict()) for bank in target.actor.adapters]
+    neighbor_before = deepcopy(target.actor.encoder.neighbors.state_dict()) if "cnn" in preset else {}
+    critic_before = deepcopy(target.critic.state_dict())
+    driving = torch.randn(12, source.obs_dim)
+    extra = torch.randn(12, target.obs_dim - source.obs_dim)
+    observations = torch.cat((driving, extra), dim=-1)
+    teacher = torch.stack((extra[:, 0].tanh(), extra[:, 1].tanh()), dim=-1)
+    saw_neighbor_gradient = False
+    for step in range(16):
+        target.optimizer.zero_grad(set_to_none=True)
+        bank_id = 0 if step == 0 else step % 2
+        indices = torch.full((12,), bank_id, dtype=torch.long)
+        mean, _ = target.actor(observations, adapter_indices=indices)
+        loss = (mean - teacher).square().mean() + (target.critic(torch.randn(12, 3)) - .7).square().mean()
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert all(torch.isfinite(p.grad).all() for p in target._optim_parameters if p.grad is not None)
+        if "cnn" in preset:
+            magnitude = sum(p.grad.abs().sum() for p in target.actor.encoder.neighbors.parameters())
+            if step == 0:
+                assert magnitude == 0
+            saw_neighbor_gradient |= bool(magnitude > 0)
+        target.optimizer.step()
+        if step == 0:
+            for key, value in before_banks[1].items():
+                torch.testing.assert_close(value, target.actor.adapters[1].state_dict()[key], rtol=0, atol=0)
+    for i, bank in enumerate(target.actor.adapters):
+        assert any(not torch.equal(value, before_banks[i][key]) for key, value in bank.state_dict().items() if key.endswith(".A"))
+        assert any(not torch.equal(value, before_banks[i][key]) for key, value in bank.state_dict().items() if key.endswith(".B"))
+    if "cnn" in preset:
+        assert saw_neighbor_gradient
+        assert any(not torch.equal(value, neighbor_before[key]) for key, value in target.actor.encoder.neighbors.state_dict().items())
+    with torch.no_grad():
+        a = target.actor(observations, adapter_indices=torch.zeros(12, dtype=torch.long))[0]
+        b = target.actor(torch.cat((driving, -extra), dim=-1), adapter_indices=torch.zeros(12, dtype=torch.long))[0]
+    assert (a - b).abs().max() > 1e-5
+    assert any(not torch.equal(value, critic_before[key]) for key, value in target.critic.state_dict().items())
+    # Native MAPPO scoring and optimization must use the same encoded adapter path.
+    obs = {aid: observations[i].numpy() for i, aid in enumerate(IDS)}
+    data = torch.stack([transition(target, IDS, i, i + 1, terminal=i == 2, observations=obs) for i in range(3)])
+    assert target.update(data)["train/optimizer_steps"] > 0
+    for name, value in frozen.items():
+        torch.testing.assert_close(value, dict(target.actor.named_parameters())[name], rtol=0, atol=0)
+    assert source_path.read_bytes() == source_bytes
+
+
+@pytest.mark.parametrize("preset,head", TRANSFER_ARCHITECTURES)
+def test_modular_lora_checkpoint_routing_pickle_and_historical_layout(preset, head, tmp_path):
+    import pickle
+    from agents.common.checkpoints import evaluation_routing
+    from agents.torchrl_mappo import TorchRLMAPPOAgent
+    from test_torchrl_mappo import BOUNDS, IDS
+
+    source, target, options = modular_lora_pair(preset, head)
+    path = tmp_path / "source.pt"
+    source.save_checkpoint(path)
+    target.initialize_from_checkpoint(path, scope="actor_only", observation_extension="frenet_neighbors")
+    with torch.no_grad():
+        for bank in target.actor.adapters:
+            for residual in bank.values():
+                residual.B.normal_(std=.03)
+    saved = tmp_path / "lora.pt"
+    target.save_checkpoint(saved)
+    payload = read_checkpoint(saved)
+    if target.actor.legacy:
+        assert payload["metadata"]["adaptation"]["lora"]["version"] == 1
+        assert "adapters.0.0.A" in payload["models"]["actor"]
+        assert not any(key.startswith("encoder.") for key in payload["models"]["actor"])
+        # Original schema-1 files did not contain these additive provenance/count fields.
+        payload["metadata"].pop("parameter_counts")
+        payload["metadata"]["adaptation"]["source_checkpoint"].pop("network")
+        atomic_save(payload, saved)
+    config = {**options, **evaluation_routing(payload)}
+    loaded = TorchRLMAPPOAgent(target.obs_dim, 3, *BOUNDS, IDS, config)
+    loaded.load_for_evaluation(saved)
+    x = torch.randn(5, target.obs_dim)
+    indices = torch.tensor([0, 1, 1, 0, 1])
+    expected = target.actor(x, adapter_indices=indices)
+    for actor in (loaded.actor, pickle.loads(pickle.dumps(loaded.actor))):
+        for actual, original in zip(actor(x, adapter_indices=indices), expected):
+            torch.testing.assert_close(actual, original, rtol=0, atol=0)
+    assert loaded.source_checkpoint["sha256"] == target.source_checkpoint["sha256"]
+
+
+@pytest.mark.parametrize("field", ["rank", "target", "freeze", "layout", "source", "tensor", "targets"])
+def test_modular_lora_checkpoint_rejection_is_atomic(field, tmp_path):
+    source, target, _ = modular_lora_pair("rescnn1d_base", "resmlp")
+    source.save_checkpoint(tmp_path / "source.pt")
+    target.initialize_from_checkpoint(tmp_path / "source.pt", scope="actor_only", observation_extension="frenet_neighbors")
+    target.save_checkpoint(tmp_path / "lora.pt")
+    payload = read_checkpoint(tmp_path / "lora.pt")
+    contract = payload["metadata"]["adaptation"]["lora"]
+    if field == "rank":
+        contract["rank"] += 1
+    elif field == "target":
+        contract["target"] = "encoder"
+    elif field == "freeze":
+        contract["freezing"]["base_head"] = False
+    elif field == "layout":
+        payload["metadata"]["structure"]["observation_segments"]["actor"]["car_0"]["lidar"][1] += 1
+    elif field == "source":
+        payload["metadata"]["adaptation"]["source_checkpoint"]["sha256"] = "0" * 64
+    elif field == "tensor":
+        name = next(key for key in payload["models"]["actor"] if key.startswith("adapters."))
+        payload["models"]["actor"][name] = torch.zeros(1)
+    else:
+        contract["target_modules"] = ["net.output"]
+    atomic_save(payload, tmp_path / "lora.pt")
+    before = {role: deepcopy(getattr(target, role).state_dict()) for role in ("actor", "critic")}
+    for operation in ("load_for_evaluation", "resume_training"):
+        if operation == "resume_training":
+            # Model-only resume rejects before mutation as usual.
+            pattern = "model-only"
+        else:
+            pattern = "Incompatible"
+        with pytest.raises(ValueError, match=pattern):
+            getattr(target, operation)(tmp_path / "lora.pt")
+        for role in before:
+            for key, value in before[role].items():
+                torch.testing.assert_close(value, getattr(target, role).state_dict()[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("preset", ["cnn1d_base", "rescnn1d_base"])
+def test_lora_rejects_pretrained_neighbor_branches_without_mutation(preset, tmp_path):
+    from test_torchrl_mappo import BOUNDS
+
+    _, target, _ = modular_lora_pair(preset)
+    source = PPOPolicy(target.obs_dim, *BOUNDS, {"network": target.network_config,
+        "device": "cpu", "_observation_contract": target.observation_contract})
+    source.save_checkpoint(tmp_path / "source.pt")
+    before = deepcopy(target.actor.state_dict())
+    with pytest.raises(ValueError, match="driving-only PPO source"):
+        target.initialize_from_checkpoint(tmp_path / "source.pt", scope="actor_only")
+    for key, value in before.items():
+        torch.testing.assert_close(value, target.actor.state_dict()[key], rtol=0, atol=0)
+
+
+def test_modular_lora_initialization_is_deterministic_across_trials(tmp_path):
+    from agents.torchrl_mappo import TorchRLMAPPOAgent
+    from test_torchrl_mappo import BOUNDS, IDS
+
+    source, original, options = modular_lora_pair("rescnn1d_base", "resmlp")
+    source.save_checkpoint(tmp_path / "source.pt")
+    states = []
+    for _ in range(2):
+        torch.manual_seed(81)
+        target = TorchRLMAPPOAgent(original.obs_dim, 3, *BOUNDS, IDS, options)
+        target.initialize_from_checkpoint(tmp_path / "source.pt", scope="actor_only", observation_extension="frenet_neighbors")
+        states.append(deepcopy(target.actor.state_dict()))
+    for key, value in states[0].items():
+        torch.testing.assert_close(value, states[1][key], rtol=0, atol=0)

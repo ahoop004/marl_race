@@ -124,15 +124,25 @@ def validate_configuration(config):
         if (algorithm["name"] == "mappo"
                 and model_spec(resolved_network, "critic")["encoder"]["type"] != "identity"):
             raise ValueError("MAPPO global-state critic has no compatible LiDAR layout; use an identity critic encoder")
-        if any(model_spec(resolved_network, role)["encoder"]["type"] != "identity"
-               for role in ("actor", "critic")):
+        convolutional = any(model_spec(resolved_network, role)["encoder"]["type"] != "identity"
+                            for role in ("actor", "critic"))
+        if convolutional or adaptation["lora"] is not None:
             from wrappers.observations.composer import ObservationComposer
             from agents.common.observations import observation_segments
             layouts = []
             for agent in config["agents"].values():
                 if agent.get("trainable"):
                     composer = ObservationComposer.from_config(agent["observation"], config["environment"])
-                    layouts.append(observation_segments(composer.contract, composer.obs_dim))
+                    if convolutional:
+                        layouts.append(observation_segments(composer.contract, composer.obs_dim))
+                    if adaptation["lora"] is not None:
+                        from agents.common.lora import validate_lora_spec
+                        from agents.common.encoders import fusion_feature_segments
+                        actor_spec = model_spec(resolved_network, "actor")
+                        width = composer.obs_dim
+                        if actor_spec["encoder"]["type"] != "identity":
+                            width = fusion_feature_segments(actor_spec["encoder"], layouts[-1])["neighbors"][1]
+                        validate_lora_spec(actor_spec, adaptation["lora"], input_dim=width)
             if any(layout != layouts[0] for layout in layouts[1:]):
                 raise ValueError("CNN actors require identical observation segments across learners")
     except ValueError as exc:
@@ -168,11 +178,8 @@ def validate_configuration(config):
             lora = resolve_lora_config(adaptation["lora"])
         except ValueError as exc:
             raise ScenarioError(str(exc)) from exc
-        actor_dims = model_spec(resolved_network, "actor")["hidden_dims"]
-        if lora["mode"] != "per_agent" or not actor_dims:
-            raise ScenarioError("LoRA requires per_agent adapters and actor hidden layers")
-        if lora["rank"] > min(actor_dims):
-            raise ScenarioError("lora.rank cannot exceed actor hidden dimensions")
+        if lora["mode"] != "per_agent":
+            raise ScenarioError("LoRA requires per_agent adapters")
     for key in ("train", "selection", "final_test"):
         value = config["maps"].get(key)
         if not isinstance(value, list) or not value or any(not isinstance(v, str) or not v for v in value):

@@ -22,11 +22,15 @@ def resolve_training_params(agent_cfg: dict, scenario: dict) -> dict:
         ("optimizer", "adam"), ("optimizer_kwargs", {}),
         ("loss", "clip_ppo" if scenario["algorithm"]["name"] == "ppo" else "mappo"),
         ("critic_loss", "l2"))} if "algorithm" in scenario else {}
-    return {"network": network, **defaults, **params, **optimization,
+    resolved = {"network": network, **defaults, **params, **optimization,
             "_physics_contract": physics_contract(environment),
             "_action_contract": ActionComposer.contract_from_config(
         agent_cfg.get("action_constraints", {}), decision_dt,
     )}
+    if resolved.get("lora") is not None:
+        from agents.common.lora import resolve_lora_config
+        resolved["lora"] = resolve_lora_config(resolved["lora"])
+    return resolved
 
 
 def select_algorithm(scenario, policy_agents):

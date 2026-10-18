@@ -179,9 +179,10 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
         learner.initialize_from_checkpoint(pretrained_actor_path, scope=scenario["adaptation"]["load_scope"],
             observation_extension=params.get("pretrained_actor_observation_extension"))
         console.print_info(f"Initialized MAPPO actors from checkpoint: {pretrained_actor_path}")
+    from agents.common.lora import parameter_accounting
+    counts = parameter_accounting(learner)
     if getattr(learner, "lora_config", None) is not None:
-        trainable = sum(p.numel() for p in learner.actor.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in learner.actor.parameters())
+        trainable, total = counts["actor_trainable"], counts["actor_total"]
         console.print_info(f"LoRA mode={learner.lora_config['mode']} rank={learner.lora_config['rank']} "
                            f"actor_trainable={trainable}/{total}; centralized critic fully trainable")
 
@@ -206,6 +207,10 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
     if wandb_logger:
         provenance["wandb_run_id"] = wandb_logger.wandb_run_id
     provenance["network"] = learner.network_config
+    provenance["parameter_counts"] = counts
+    if getattr(learner, "lora_config", None) is not None:
+        provenance["lora"] = {**learner.lora_contract, "target": "actor_head",
+                              "target_modules": learner.actor.target_modules}
     if distributed:
         provenance["distributed"] = distributed.metadata()
         provenance["distributed"].update(global_workers=exp_cfg.get("parallel_envs", 1),

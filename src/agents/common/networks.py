@@ -207,10 +207,8 @@ def resolve_network_config(params, *, default_hidden_dims):
             specs[role] = _resolve_model_spec(network.get(role, {}), architecture=architecture,
                 encoder=encoder, hidden_dims=dims, activation=activation, role=role)
     if params.get("lora") is not None:
-        if any(spec["architecture"] != "mlp" for spec in specs.values()):
-            raise ValueError("LoRA requires MLP actor and critic; residual MLP + LoRA is unsupported")
-        if any(spec["encoder"]["type"] != "identity" for spec in specs.values()):
-            raise ValueError("CNN encoders + LoRA are unsupported; current MLP LoRA requires identity encoders")
+        from agents.common.lora import validate_lora_spec
+        validate_lora_spec(specs["actor"], params["lora"])
     if (all(spec["architecture"] == "mlp" and spec["encoder"] == {"type": "identity"}
             for spec in specs.values()) and specs["actor"]["activation"] == specs["critic"]["activation"]):
         return dict(architecture="mlp", actor_hidden_dims=specs["actor"]["hidden_dims"],

@@ -34,6 +34,7 @@ def _plain(value):
 def policy_metadata(policy):
     from agents.common.networks import model_spec
     from agents.common.observations import observation_segments
+    from agents.common.lora import parameter_accounting
 
     algorithm = policy.algorithm
     ids = list(policy.agent_ids)
@@ -75,6 +76,7 @@ def policy_metadata(policy):
             "lora": getattr(policy, "lora_contract", None), "source_checkpoint": policy.source_checkpoint,
         },
         "versions": {"torch": str(torch.__version__), "torchrl": str(torchrl.__version__)},
+        **({"parameter_counts": parameter_accounting(policy)} if getattr(policy, "lora_config", None) else {}),
     }
 
 
@@ -134,6 +136,18 @@ def _validate_models(policy, checkpoint, *, critic=False):
     validate_checkpoint_compatibility(stored, {key: expected[key] for key in (
         "algorithm", "implementation", "network", "structure", "contracts")})
     validate_checkpoint_compatibility(stored["adaptation"], {"lora": expected["adaptation"]["lora"]})
+    if getattr(policy, "lora_config", None):
+        source = stored["adaptation"]["source_checkpoint"]
+        if (not isinstance(source, dict) or source.get("algorithm") != "ppo" or source.get("scope") != "actor_only"
+                or not isinstance(source.get("path"), str) or not source["path"]
+                or not isinstance(source.get("sha256"), str) or len(source["sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in source["sha256"])):
+            raise ValueError("LoRA checkpoint has a missing or invalid source identity")
+        if policy.source_checkpoint is not None:
+            fields = {key: policy.source_checkpoint[key] for key in ("sha256", "algorithm", "scope")}
+            if "network" in source and "network" in policy.source_checkpoint:
+                fields["network"] = policy.source_checkpoint["network"]
+            validate_checkpoint_compatibility(source, fields)
     states = [("actor", checkpoint["models"]["actor"], policy.actor.state_dict())]
     if critic:
         states.append(("critic", checkpoint["models"]["critic"], policy.critic.state_dict()))
@@ -157,7 +171,7 @@ def evaluation_routing(checkpoint):
     lora = metadata["adaptation"]["lora"]
     return {"actor_mode": metadata["structure"]["actor_mode"],
             "lora": ({key: value for key, value in lora.items() if key in {
-                "mode", "rank", "alpha", "train_log_std", "per_agent_log_std"}} if lora else None)}
+                "mode", "rank", "alpha", "train_log_std", "per_agent_log_std", "target"}} if lora else None)}
 
 
 def _observation_transfer(source, destination, extension):
@@ -269,6 +283,9 @@ def initialize_from_checkpoint(policy, path, *, scope, observation_extension=Non
         "actions": expected["contracts"]["actions"], "physics": expected["contracts"]["physics"]})
     expansions = [_observation_transfer(source, target, observation_extension)
                   for target in expected["contracts"]["observations"].values()]
+    if (getattr(policy, "lora_config", None) and getattr(policy.actor.encoder, "neighbors", None) is not None
+            and source["contract"]["observation"].get("frenet_neighbors", {}).get("enabled")):
+        raise ValueError("CNN head LoRA requires a driving-only PPO source; pretrained neighbor encoders must stay frozen")
     independent = expected["algorithm"] == "mappo" and policy.actor_mode == "independent"
     recipients = list(policy.actor.actors.values()) if independent else [policy.actor]
     prepared, states = [], []
@@ -299,7 +316,8 @@ def initialize_from_checkpoint(policy, path, *, scope, observation_extension=Non
     if policy.optimizer is not None:
         policy.set_training_progress(0)
     policy.source_checkpoint = {**checkpoint["_identity"], "algorithm": "ppo", "scope": scope,
-                                "provenance": stored["provenance"]}
+                                "provenance": stored["provenance"],
+                                **({"network": source_network} if getattr(policy, "lora_config", None) else {})}
 
 
 def capture_rng(cuda_device=None):
@@ -394,6 +412,11 @@ def resume_training(policy, path):
         validate_checkpoint_compatibility(scheduler_state, {"_last_lr": rates, "base_lrs": [policy.lr]})
     elif scheduler_state is not None:
         raise ValueError("Checkpoint has unexpected scheduler state")
+    groups = state["optimizer"].get("param_groups", [])
+    if len(groups) != len(policy.optimizer.param_groups) or any(
+            len(stored.get("params", [])) != len(current["params"])
+            for stored, current in zip(groups, policy.optimizer.param_groups)):
+        raise ValueError("Checkpoint optimizer parameter ownership differs from the configured trainable parameters")
     policy.actor.load_state_dict(checkpoint["models"]["actor"], strict=True)
     policy.critic.load_state_dict(checkpoint["models"]["critic"], strict=True)
     policy.optimizer.load_state_dict(state["optimizer"])

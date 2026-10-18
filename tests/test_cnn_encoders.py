@@ -148,9 +148,12 @@ def test_independent_encoder_and_head_choices(preset, actor_head, critic_encoder
 
 
 @pytest.mark.parametrize("preset", PRESETS)
-@pytest.mark.parametrize("algorithm", ["ppo", "mappo"])
-def test_native_cpu_training_evaluation_and_recovery(preset, algorithm, tmp_path):
-    config = scenario(algorithm, preset, small=True)
+@pytest.mark.parametrize("algorithm,adaptation,head", [("ppo", "scratch", "mlp"), ("mappo", "full_finetune", "mlp"),
+    ("mappo", "lora", "mlp"), ("mappo", "lora", "resmlp")])
+def test_native_cpu_training_evaluation_and_recovery(preset, algorithm, adaptation, head, tmp_path):
+    head_overrides = (["network.actor.architecture=resmlp", "++network.actor.width=16", "++network.actor.num_blocks=2"]
+                      if head == "resmlp" else [])
+    config = scenario(algorithm, preset, small=True, overrides=head_overrides)
     # Also exercise a convolutional PPO critic and shared MAPPO actor routing.
     if algorithm == "ppo":
         config["network"]["critic"]["encoder"] = deepcopy(config["network"]["actor"]["encoder"])
@@ -160,7 +163,7 @@ def test_native_cpu_training_evaluation_and_recovery(preset, algorithm, tmp_path
     validate_experiment_scenario(config)
     source_path = tmp_path / "ppo-source.pt"
     if algorithm == "mappo":
-        source_config = scenario("ppo", preset, small=True)
+        source_config = scenario("ppo", preset, small=True, overrides=head_overrides)
         source_config["network"]["critic"]["encoder"] = deepcopy(source_config["network"]["actor"]["encoder"])
         source_task = create_race_task(source_config)
         try:
@@ -169,7 +172,7 @@ def test_native_cpu_training_evaluation_and_recovery(preset, algorithm, tmp_path
             source_bytes = source_path.read_bytes()
         finally:
             source_task.close()
-        config = scenario("mappo", preset, small=True, overrides=["adaptation=full_finetune",
+        config = scenario("mappo", preset, small=True, overrides=[*head_overrides, f"adaptation={adaptation}",
             f"adaptation.checkpoint={source_path}", "network.actor.parameter_sharing=shared"])
         validate_experiment_scenario(config)
 
@@ -209,8 +212,33 @@ def test_native_cpu_training_evaluation_and_recovery(preset, algorithm, tmp_path
         recovered.agent.load_for_evaluation(tmp_path / "latest.pt")
         for key, value in original.agent.actor.state_dict().items():
             torch.testing.assert_close(value, recovered.agent.actor.state_dict()[key], rtol=0, atol=0)
+        if adaptation == "lora":
+            before_load = {role: deepcopy(getattr(recovered.agent, role).state_dict()) for role in ("actor", "critic")}
+            for field in ("rank", "targets", "source", "optimizer"):
+                invalid = deepcopy(payload)
+                if field == "rank":
+                    invalid["metadata"]["adaptation"]["lora"]["rank"] += 1
+                elif field == "targets":
+                    invalid["metadata"]["adaptation"]["lora"]["target_modules"] = ["net.output"]
+                elif field == "source":
+                    invalid["metadata"]["adaptation"]["source_checkpoint"]["sha256"] = "0" * 64
+                else:
+                    invalid["training"]["optimizer"]["param_groups"][0]["params"].pop()
+                atomic_save(invalid, tmp_path / "invalid.pt")
+                with pytest.raises(ValueError):
+                    recovered.agent.resume_training(tmp_path / "invalid.pt")
+                for role in before_load:
+                    for key, value in before_load[role].items():
+                        torch.testing.assert_close(value, getattr(recovered.agent, role).state_dict()[key], rtol=0, atol=0)
+                assert not recovered.agent.optimizer.state
         state, _ = recovered.agent.resume_training(tmp_path / "latest.pt")
         assert recovered.agent.optimizer.state
+        saved_optimizer = original.agent.optimizer.state_dict()
+        actual_optimizer = recovered.agent.optimizer.state_dict()
+        assert saved_optimizer["param_groups"] == actual_optimizer["param_groups"]
+        for index, slots in saved_optimizer["state"].items():
+            for name, value in slots.items():
+                torch.testing.assert_close(value, actual_optimizer["state"][index][name], rtol=0, atol=0)
         for key, value in original.agent.critic.state_dict().items():
             torch.testing.assert_close(value, recovered.agent.critic.state_dict()[key], rtol=0, atol=0)
         recovered.restore_training_state(state)
@@ -261,8 +289,7 @@ def test_checkpoint_mismatches_reject_before_mutation(field, tmp_path):
 @pytest.mark.parametrize("preset", PRESETS)
 def test_lora_global_state_and_actor_transfer_boundaries(preset, tmp_path):
     config = scenario("mappo", preset, small=True, overrides=["adaptation=lora"])
-    with pytest.raises(ScenarioError, match="CNN encoders.*LoRA"):
-        validate_experiment_scenario(config)
+    validate_experiment_scenario(config)
     config = scenario("mappo", preset, small=True, overrides=["network.critic.encoder=${network.actor.encoder}"])
     with pytest.raises(ScenarioError, match="global-state critic"):
         validate_experiment_scenario(config)
@@ -271,8 +298,8 @@ def test_lora_global_state_and_actor_transfer_boundaries(preset, tmp_path):
         source, target = [create_learner(algorithm, task.spec,
             learner_params(scenario(algorithm, preset, small=True), task.spec, algorithm), training=False)
             for algorithm, task in zip(("ppo", "mappo"), tasks)]
-        with pytest.raises(ValueError, match="CNN encoders.*LoRA"):
-            LoRAActor(source.actor, {"rank": 1}, 1)
+        adapted = LoRAActor(deepcopy(source.actor), {"rank": 1}, 1)
+        assert all(not p.requires_grad for p in adapted.encoder.parameters())
         with pytest.raises(ValueError, match="global-state inputs"):
             build_critic(target.critic_input_dim, source.network_config | {
                 "critic": source.network_config["actor"]})

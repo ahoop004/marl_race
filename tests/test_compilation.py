@@ -162,3 +162,21 @@ def test_compiled_collectors_sync_and_reload(algorithm, backend, device, tmp_pat
         assert result["perf/compilation/actor/cpu/calls"] > 0
     assert any(value > 0 for key, value in result.items()
                if key.startswith("perf/compilation/critic/") and key.endswith("/calls"))
+
+
+def test_modular_residual_head_lora_compilation_matches_eager(tmp_path):
+    from agents.common.compilation import configure_compilation
+    from test_checkpoints import modular_lora_pair
+
+    source, eager, _ = modular_lora_pair("rescnn1d_base", "resmlp")
+    source.save_checkpoint(tmp_path / "source.pt")
+    eager.initialize_from_checkpoint(tmp_path / "source.pt", scope="actor_only", observation_extension="frenet_neighbors")
+    compiled = deepcopy(eager)
+    configure_compilation(compiled, {"actor": True, "backend": "aot_eager"})
+    observations = torch.randn(5, eager.obs_dim)
+    indices = torch.tensor([0, 1, 1, 0, 1])
+    expected = eager.actor(observations, adapter_indices=indices)[0]
+    actual = compiled.actor(observations, adapter_indices=indices)[0]
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    actual.square().mean().backward()
+    assert all(torch.isfinite(p.grad).all() for p in compiled.actor.adapters.parameters() if p.grad is not None)

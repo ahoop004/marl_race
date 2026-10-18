@@ -148,7 +148,7 @@ class MAPPOPolicy(OnPolicyOptimizationSettings):
         self.lora_contract = None
         if self.lora_config is not None:
             self.lora_contract = {
-                "version": 1, **self.lora_config,
+                "version": 1, **self.lora_config, **self.actor.adaptation_contract(),
                 "target_layers": self.actor.target_layers,
                 "agent_to_adapter": {aid: (i if self.lora_config["mode"] == "per_agent" else 0)
                                      for i, aid in enumerate(self.agent_ids)},
