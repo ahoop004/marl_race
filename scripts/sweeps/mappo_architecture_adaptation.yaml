@@ -1,0 +1,29 @@
+# Six architectures x three arms x two MAPPO seeds = 36 trials.
+# Transfer arms use PPO seed 42 independently of the MAPPO training seed.
+# Populate the manifest from real PPO best.pt files before running preflight.
+name: MAPPO architecture adaptation comparison
+experiment_id: phase6-mappo-adaptation-v1
+algorithm: mappo
+scenario: scenarios/mappo_2v2_completion_scratch.yaml
+total_steps: 24576000
+seeds: [42, 43]
+sweep_seed: 2026
+source_manifest: scripts/sweeps/ppo_sources.template.yaml
+pretraining_seeds: [42]
+search:
+  method: grid
+  parameters:
+    network:
+      type: choice
+      values: [mlp_base, mlp_wide, mlp_deep, resmlp_base, cnn1d_base, rescnn1d_base]
+    adaptation:
+      type: choice
+      values: [scratch, full_finetune, lora]
+fixed_overrides:
+  - environment.lidar_beams=1080
+  - experiment.parallel_envs=8
+  - experiment.envs_per_worker=8
+max_concurrent_trials: 6
+resources_per_trial: {cpu: 10, gpu: 1}
+evaluation: {seed: 10042, episodes: 20, every_steps: 2048000, max_steps: 8000}
+wandb: {mode: online, project: marl-f110-complete, group: phase6-mappo-adaptation}

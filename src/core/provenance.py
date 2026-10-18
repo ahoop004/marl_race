@@ -21,6 +21,23 @@ from utils.cpu_affinity import cpu_placement, slurm_allocation
 PROVENANCE_VERSION = "1.1"
 
 
+def learner_parameter_counts(policy):
+    """Extend native accounting for reporting across independent actor banks."""
+    from agents.common.lora import parameter_accounting
+    counts = parameter_accounting(policy)
+    actors = getattr(policy.actor, "actors", None)
+    if actors is not None:
+        neighbors = [getattr(actor.encoder, "neighbors", None) for actor in actors.values()]
+        counts["neighbor_encoder_trainable"] = sum(
+            p.numel() for branch in neighbors if branch is not None
+            for p in branch.parameters() if p.requires_grad)
+        counts["exploration_trainable"] = sum(
+            p.numel() for actor in actors.values() for name, p in actor.named_parameters()
+            if p.requires_grad and name == "log_std")
+    counts["learner_trainable"] = counts["actor_trainable"] + counts["critic_trainable"]
+    return counts
+
+
 def physics_contract(environment: Mapping[str, Any]) -> dict | None:
     """Strict nonlinear physics identity; legacy dynamics have no nonlinear contract."""
     params = environment.get("vehicle_params", environment.get("params", {})) or {}

@@ -1,0 +1,23 @@
+# Six architectures x two training seeds = 12 independent trials.
+# Uses historical PPO updates; collector counts are explicit for the target allocation.
+name: PPO architecture pretraining
+experiment_id: phase6-ppo-architectures-v1
+algorithm: ppo
+scenario: scenarios/ppo_lap_completion_pretrain.yaml
+total_steps: 24576000
+seeds: [42, 43]
+sweep_seed: 2026
+search:
+  method: grid
+  parameters:
+    network:
+      type: choice
+      values: [mlp_base, mlp_wide, mlp_deep, resmlp_base, cnn1d_base, rescnn1d_base]
+fixed_overrides:
+  - environment.lidar_beams=1080
+  - experiment.parallel_envs=8
+  - experiment.envs_per_worker=8
+max_concurrent_trials: 6
+resources_per_trial: {cpu: 10, gpu: 1}
+evaluation: {seed: 10042, episodes: 20, every_steps: 2048000, max_steps: 8000}
+wandb: {mode: online, project: marl-f110-complete, group: phase6-ppo-pretraining}

@@ -115,6 +115,13 @@ trap 'exit 130' INT
 
 echo "Git=$RAY_TUNE_GIT_SHA job=$SLURM_JOB_ID nodes=$NODE_COUNT GPUs=$RAY_EXPECTED_GPUS CPUs/node=$CPUS_PER_NODE"
 echo "Experiment=$EXPERIMENT_ID sweep=$SWEEP_SPEC outputs=$RAY_TUNE_JOB_ROOT"
+# Reject invalid architecture/source matrices before starting any Ray workers.
+# Validation uses temporary CPU models and never writes the saved experiment.
+if [[ "$RESTORE" == 0 ]]; then
+  "$CRUN" -p "$VENV" python3 scripts/ray_tune_trials.py \
+    --sweep-spec "$SWEEP_SPEC" --preflight-only --checkpoint-every-steps 65536 \
+    --cluster-nodes "$NODE_COUNT" --cpus-per-node "$CPUS_PER_NODE" --gpus-per-node "$GPUS_PER_NODE"
+fi
 "${srun_base[@]}" --nodelist="$HEAD" "$CRUN" -p "$VENV" ray --version
 "${srun_base[@]}" --nodelist="$HEAD" "$CRUN" -p "$VENV" ray start \
   --head --node-ip-address="$HEAD_IP" --port="$GCS_PORT" \

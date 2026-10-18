@@ -26,7 +26,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 from ray_tune_sweeps import (read_spec, generate_plan, trial_settings, preflight, ranking,
-                             digest, identifier, select_path)
+                             digest, identifier, select_path, sampled_value, uses_model_groups)
+from ray_tune_sources import configuration_digest, verify_source, inspect_model
 SCENARIOS = {
     "ppo": "scenarios/ppo_lap_completion_pretrain.yaml",
     "mappo": "scenarios/mappo_2v2_completion_scratch.yaml",
@@ -239,8 +240,13 @@ def checkpoint_payload(path, identity):
         if configuration["experiment"]["seed"] != entry["seed"]:
             raise ValueError("Checkpoint training seed differs from the sweep trial")
         for path, value in entry["parameters"].items():
-            if select_path(configuration, path) != value:
+            if sampled_value(configuration, path, entry) != value:
                 raise ValueError(f"Checkpoint hyperparameter differs: {path}")
+        if entry.get("config_digest") and configuration_digest(configuration) != entry["config_digest"]:
+            raise ValueError("Checkpoint frozen architecture/adaptation configuration differs")
+        source = metadata["adaptation"]["source_checkpoint"]
+        if entry.get("source") and (not source or source.get("sha256") != entry["source"]["sha256"]):
+            raise ValueError("Checkpoint PPO source identity differs from frozen trial")
     return payload
 
 
@@ -288,12 +294,20 @@ def trainer_command(settings, identity, out):
     smoke = [] if settings.get("sweep") else ["algorithm.params.n_steps=1024", "algorithm.params.frames_per_batch=256",
                                             "algorithm.params.batch_size=128", "algorithm.params.n_epochs=2"]
     device = "cuda" if settings.get("resources_per_trial", {}).get("gpu", 1) else "cpu"
-    overrides = ["experiment.parallel_envs=2", "experiment.envs_per_worker=1", "experiment.distributed=false", *smoke,
+    # Preserve historical T5 collector settings; architecture sweeps inherit the
+    # scenario's execution settings unless the specification explicitly overrides.
+    architecture_sweep = uses_model_groups(settings.get("sweep"))
+    collectors = [] if architecture_sweep else ["experiment.parallel_envs=2", "experiment.envs_per_worker=1"]
+    overrides = [*collectors, "experiment.distributed=false", *smoke,
                  f"checkpoint.every_steps={settings['checkpoint_every_steps']}",
                  f"checkpoint.every_updates={settings['checkpoint_every_updates'] or 'null'}",
                  f"evaluation.enabled={str(settings['evaluation']).lower()}",
                  f"execution.params.device={device}", "execution.params.collection_device=cpu", *settings["overrides"]]
-    if settings.get("sweep"):
+    if entry.get("input_path"):
+        # Frozen files have no Hydra defaults. Never reapply group selections or
+        # rematerialize a different adaptation topology during remote recovery.
+        overrides = []
+    if settings.get("sweep") and not entry.get("input_path"):
         spec = settings["sweep"]
         strategy = "completion_progress" if identity["algorithm"] == "ppo" else "team_completion"
         evaluation = {"enabled": True, "selection_strategy": strategy, **spec["evaluation"]}
@@ -308,14 +322,21 @@ def trainer_command(settings, identity, out):
                         training_seed=settings["seed"], total_steps=settings["total_steps"],
                         configuration_id=entry["configuration_id"], sampled_parameters=entry["parameters"],
                         sample_index=entry["sample_index"], replicate=entry["replicate"])
+        if entry.get("model") and not entry.get("input_path"):
+            metadata.update(**entry["model"], network_preset=entry["network_preset"], adaptation=entry["adaptation"],
+                            source_sha256=entry.get("source", {}).get("sha256"),
+                            source_checkpoint=entry.get("source", {}).get("checkpoint"),
+                            pretraining_seed=entry.get("pretraining_seed"), trial_key=entry["trial_key"], config_digest=entry["config_digest"])
     wb = {"enabled": wandb["mode"] != "disabled", "mode": wandb["mode"],
           "name": identity["run_id"], "id": identity["wandb_id"],
-          "group": wandb["group"] or settings["experiment_id"], "job_type": identity["algorithm"], "tune": metadata}
+          "group": wandb["group"] or (settings["experiment_id"] + ("-pretraining" if identity["algorithm"] == "ppo" else "-adaptation")
+                                     if architecture_sweep else settings["experiment_id"]),
+          "job_type": identity["algorithm"], "tune": metadata}
     wb.update({key: wandb[key] for key in ("project", "entity") if wandb[key] is not None})
     overrides.extend(f"++wandb.{key}={json.dumps(value)}" for key, value in wb.items() if key != "tune")
     # Dot-containing parameter paths are values inside a JSON string, so Hydra
     # does not mistake them for nested override keys.
-    overrides.extend(f"++wandb.tune.{key}={json.dumps(json.dumps(value) if isinstance(value, dict) else value)}"
+    overrides.extend(f"++wandb.tune.{key}={json.dumps(json.dumps(value) if isinstance(value, (dict, list)) else value)}"
                      for key, value in metadata.items())
     for override in overrides:
         cmd.extend(["--set", override])
@@ -373,8 +394,16 @@ def supervise(parent_pid, command):
 def trial(config):
     import ray
     from ray import tune
+    sys.path.insert(0, str(REPO / "src"))
 
     settings = trial_settings(config["settings"], config.get("sweep_trial"))
+    entry = settings.get("sweep_trial", {})
+    if entry.get("source"):
+        # Runs on the allocated node, including every recovery attempt. The
+        # frozen record, rather than a mutable external manifest, is authoritative.
+        verify_source(entry["source"])
+        from core.scenario import load_and_expand_scenario
+        inspect_model(load_and_expand_scenario(entry["input_path"]), entry["source"])
     label, trial_id = config["algorithm"], tune.get_context().get_trial_id()
     out = Path(settings["root"]) / "trial_runs" / f"{label}_{trial_id}"
     identity = {"algorithm": label, "trial_id": trial_id, "settings": settings,
@@ -440,6 +469,7 @@ def trial(config):
             base.update(seed=entry["seed"], hyperparameters=entry["parameters"], configuration_id=entry["configuration_id"],
                         sample_index=entry["sample_index"], replicate=entry["replicate"],
                         total_steps=settings["total_steps"], schedule=entry["schedule"], ray_trial_id=trial_id)
+            base.update({key: entry.get(key) for key in ("network_preset", "adaptation", "pretraining_seed", "source", "model", "trial_key", "config_digest")})
 
         def report(completed=False):
             nonlocal checkpoint_stamp
@@ -561,9 +591,15 @@ def validate_restoration(settings, spec, experiment_id, root):
         raise ValueError("Sweep specification differs from the saved experiment; sampled configurations cannot change")
     if "manifest_digest" in settings and settings["manifest_digest"] != digest({k: v for k, v in settings.items() if k != "manifest_digest"}):
         raise ValueError("Saved experiment configuration/plan was modified")
+    if settings.get("source_manifest_sha256"):
+        path = Path(settings["sweep"]["source_manifest"])
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != settings["source_manifest_sha256"]:
+            raise ValueError("Source manifest changed from the frozen experiment")
     for entry in settings.get("trial_plan", []):
         if hashlib.sha256(Path(entry["input_path"]).read_bytes()).hexdigest() != entry["input_sha256"]:
             raise ValueError("Frozen sweep configuration was modified")
+        if entry.get("source"):
+            verify_source(entry["source"])
 
 
 def prepare_settings(args, spec, root, tune, git_sha):
@@ -582,8 +618,8 @@ def prepare_settings(args, spec, root, tune, git_sha):
                         resources_per_trial=spec["resources_per_trial"], max_concurrent_trials=spec["max_concurrent_trials"])
         settings["scenarios"][spec["algorithm"]] = spec["scenario"]
         settings["wandb"].update({"mode": "online", **spec["wandb"]})
-        settings["trial_plan"] = generate_plan(spec, tune)
         sys.path.insert(0, str(REPO / "src"))
+        settings["trial_plan"] = generate_plan(spec, tune)
         preflight(settings, trainer_command, REPO)
     return settings
 
@@ -687,7 +723,8 @@ def main():
                 if "trial_plan" in settings:
                     entry = (getattr(result, "config", {}) or {}).get("sweep_trial", {})
                     row.update({key: metrics.get(key, entry.get(key)) for key in
-                                ("seed", "configuration_id", "sample_index", "replicate", "schedule")})
+                                ("seed", "configuration_id", "sample_index", "replicate", "schedule", "network_preset", "adaptation",
+                                 "pretraining_seed", "source", "model", "trial_key", "config_digest")})
                     row.update(algorithm=settings["mode"], hyperparameters=entry.get("parameters", metrics.get("hyperparameters")),
                                total_steps=settings["total_steps"], last_attempt_training_seconds=metrics.get("perf/elapsed_seconds"))
                 results.append(row)

@@ -9,7 +9,7 @@ from application.checkpoints import resolve_checkpoint_path, validate_resume_exp
 from agents.common.checkpoints import read_checkpoint
 from core.task_builder import create_race_task
 from core.run_id import resolve_run_id, set_run_id_env
-from core.provenance import build_run_provenance
+from core.provenance import build_run_provenance, learner_parameter_counts
 from loggers.csv_logger import CSVLogger
 from loggers.wandb_logger import WandbLogger
 from loggers.metric_policy import MetricPolicy
@@ -179,8 +179,11 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
         learner.initialize_from_checkpoint(pretrained_actor_path, scope=scenario["adaptation"]["load_scope"],
             observation_extension=params.get("pretrained_actor_observation_extension"))
         console.print_info(f"Initialized MAPPO actors from checkpoint: {pretrained_actor_path}")
-    from agents.common.lora import parameter_accounting
-    counts = parameter_accounting(learner)
+    tune_metadata = wandb_cfg.get("tune")
+    expected_source = tune_metadata.get("source_sha256") if isinstance(tune_metadata, dict) else None
+    if expected_source and (learner.source_checkpoint or {}).get("sha256") != expected_source:
+        raise ValueError("Loaded PPO source differs from the frozen sweep SHA-256")
+    counts = learner_parameter_counts(learner)
     if getattr(learner, "lora_config", None) is not None:
         trainable, total = counts["actor_trainable"], counts["actor_total"]
         console.print_info(f"LoRA mode={learner.lora_config['mode']} rank={learner.lora_config['rank']} "

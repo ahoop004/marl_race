@@ -1,0 +1,9 @@
+# No pretrained checkpoint identities are assumed. Preflight lists missing keys.
+# Generate each real source record with:
+# PYTHONPATH=src python3 scripts/ray_tune_sources.py <selected-best.pt> --network <preset> --pretraining-seed 42
+# Combine the emitted records below. Paths are absolute or relative to this file.
+# Each record contains network, pretraining_seed, checkpoint, sha256, source_git,
+# architecture_sha256 and selection_sha256; all derive from checkpoint metadata.
+# Publish this manifest with immutable copies of the selected PPO checkpoints.
+schema_version: 1
+sources: []

@@ -1,0 +1,27 @@
+# Four native CPU trials; 8 decisions each. Restore with the same spec and --restore.
+# For local Ray use RAY_EXPECTED_NODES=1 RAY_EXPECTED_GPUS=0 and RAY_ADDRESS.
+name: Architecture CPU functional smoke
+experiment_id: phase6-architecture-cpu-smoke
+algorithm: ppo
+scenario: scenarios/ppo_serial_profile.yaml
+total_steps: 8
+seeds: [42]
+sweep_seed: 2026
+search:
+  method: grid
+  parameters:
+    network:
+      type: choice
+      values: [mlp_base, resmlp_base, cnn1d_base, rescnn1d_base]
+fixed_overrides:
+  - experiment.parallel_envs=1
+  - experiment.envs_per_worker=1
+  - environment.max_steps=3
+  - algorithm.params.n_steps=4
+  - algorithm.params.frames_per_batch=4
+  - algorithm.params.n_epochs=1
+  - algorithm.params.batch_size=4
+max_concurrent_trials: 1
+resources_per_trial: {cpu: 1, gpu: 0}
+evaluation: {seed: 10042, episodes: 1, every_steps: 4, max_steps: 3}
+wandb: {mode: disabled, group: phase6-cpu-smoke}
