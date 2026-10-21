@@ -24,6 +24,110 @@ from wrappers.observations.ego import LidarComponent
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize("adaptation", ["ppo", "scratch", "full_finetune", "lora"])
+def test_solo_actor_extraction_preserves_identity_and_native_deterministic_actions(tmp_path, adaptation, monkeypatch):
+    from agents.common.checkpoints import read_checkpoint, solo_evaluation_actor
+    from application.evaluate import solo_scenario
+    from core.scenario import load_and_expand_scenario
+    from core.task_builder import create_race_task
+    from training.algorithms import learner_params, create_learner
+
+    ppo_config = load_and_expand_scenario("scenarios/ppo_lap_completion_pretrain.yaml",
+        overrides=["network=mlp_base", "environment.lidar_beams=108"])
+    with_task = create_race_task(ppo_config)
+    try:
+        params = learner_params(ppo_config, with_task.spec, "ppo")
+        params["device"] = "cpu"
+        ppo = create_learner("ppo", with_task.spec, params, training=False)
+        source = tmp_path / "ppo.pt"
+        ppo.save_checkpoint(source, configuration=ppo_config)
+    finally:
+        with_task.close()
+    if adaptation == "ppo":
+        config, policy, checkpoint = ppo_config, ppo, source
+        ids = ["car_0"]
+    else:
+        config = load_and_expand_scenario("scenarios/mappo_2v2_completion_scratch.yaml",
+            overrides=["network=mlp_base", "environment.lidar_beams=108", f"adaptation={adaptation}"])
+        task = create_race_task(config)
+        try:
+            params = learner_params(config, task.spec, "mappo")
+            params.update(device="cpu", compile_networks=False)
+            policy = create_learner("mappo", task.spec, params, training=False)
+            if adaptation != "scratch":
+                policy.initialize_from_checkpoint(source, scope="actor_only", observation_extension="frenet_neighbors")
+            with torch.no_grad():
+                if adaptation == "lora":
+                    for adapter in policy.actor.adapters[1].values():
+                        adapter.B.fill_(0.07)
+                else:
+                    policy.actor.actors["car_1"].net[-1].bias.add_(0.4)
+            checkpoint = tmp_path / "mappo.pt"
+            policy.save_checkpoint(checkpoint, configuration=config)
+        finally:
+            task.close()
+
+        ids = ["car_0", "car_1"]
+    payload = read_checkpoint(checkpoint)
+    for aid in ids:
+        solo = solo_scenario(config, aid)
+        task = create_race_task(solo, mode="eval")
+        try:
+            assert task.physical_agents == (aid,) and task.env.n_agents == 1
+            params = learner_params(solo, task.spec, payload["metadata"]["algorithm"])
+            params.update(device="cpu", compile_networks=False)
+            def forbidden(*args, **kwargs):
+                pytest.fail("Actor-only inference attempted to construct a centralized critic")
+            monkeypatch.setattr("agents.common.networks.build_critic", forbidden)
+            selected = solo_evaluation_actor(payload, task.spec, params, aid)
+            snapshot = task.reset(seed=30042)
+            obs = snapshot.observations[aid]
+            if adaptation != "ppo":
+                # Three empty 10-value slots plus the original four-value ego ID.
+                np.testing.assert_array_equal(obs[-34:-4], np.zeros(30))
+                np.testing.assert_array_equal(obs[-4:], np.eye(4)[int(aid[-1])])
+            expected = policy.evaluation_actions([aid], {aid: obs})[aid]
+            actual = selected.evaluation_actions([aid], {aid: obs})[aid]
+            np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-6)
+            assert not hasattr(selected, "critic")
+            assert selected.identity["adapter_active"] == (adaptation == "lora")
+            assert selected.identity["source_adapter_index"] == (int(aid[-1]) if adaptation == "lora" else None)
+            bad = deepcopy(payload)
+            bad["metadata"]["contracts"]["observations"][aid]["dim"] += 1
+            with pytest.raises(ValueError, match="Incompatible"):
+                solo_evaluation_actor(bad, task.spec, params, aid)
+        finally:
+            task.close()
+
+    # Exercise report writing through the existing standalone evaluator with a
+    # two-step cap; this checks inference/report plumbing, not policy skill.
+    import json
+    import application.evaluate as evaluator
+    from loggers.console import ConsoleLogger
+    native_episode = evaluator.run_evaluation_episode
+    def short_episode(task, *args, **kwargs):
+        maximum = task.env.max_steps
+        task.env.max_steps = 2
+        try:
+            return native_episode(task, *args, **kwargs)
+        finally:
+            task.env.max_steps = maximum
+    monkeypatch.setattr(evaluator, "run_evaluation_episode", short_episode)
+    evaluation_config = deepcopy(config)
+    evaluation_config["training_defaults"]["device"] = "cpu"
+    folder = tmp_path / "solo_report"
+    evaluator.run_evaluation(evaluation_config, SimpleNamespace(checkpoint=str(checkpoint), eval_actor=ids[-1],
+        eval_protocol="final", eval_episodes=1, scenario=config["_configuration"]["source"], run_id="solo-test", output_dir=str(folder)),
+        ConsoleLogger(verbose=False), ROOT / "scenarios")
+    report = json.loads((folder / "evaluation_report.json").read_text())
+    assert report["checkpoint_sha256"] == payload["_identity"]["sha256"]
+    assert report["actor_identity"]["source_actor"] == ids[-1]
+    assert report["target_laps"] == 3 and report["max_steps"] == 16000
+    assert report["seeds"] == [30042]
+    assert report["episode_results"][0]["race_record"]["physics_steps"] == 2
+    assert "stationary" in report["episode_results"][0]["race_record"]["agents"][ids[-1]]
+
+
 def two_policy_task():
     core = ScriptedEnv({1: (("learner",), False, ("learner",), ()),
                         2: ((), True, (), ("opponent",))})

@@ -213,10 +213,6 @@ def update_agent_step_facts(
             progress = _float_or_none(centerline.get("progress"))
             if progress is not None:
                 facts.final_progress = float(np.clip(progress, 0.0, 1.0))
-            speed = _float_or_none(centerline.get("vs"))
-            if speed is not None and collect_speed:
-                facts.speed_samples.append(abs(speed))
-
         state = agent_states.get(agent_id)
         if state is not None:
             progress = getattr(state, "progress", None)
@@ -224,12 +220,12 @@ def update_agent_step_facts(
                 state_progress = _float_or_none(getattr(progress, "progress", None))
                 if state_progress is not None:
                     facts.final_progress = float(np.clip(state_progress, 0.0, 1.0))
-            if not facts.speed_samples and collect_speed:
-                velocity = getattr(state, "velocity", None)
-                if velocity is not None:
-                    speed = float(np.linalg.norm(np.asarray(velocity, dtype=np.float32)))
-                    if np.isfinite(speed):
-                        facts.speed_samples.append(speed)
+        if collect_speed:
+            velocity = getattr(state, "velocity", None) if state is not None else None
+            speed = (float(np.linalg.norm(np.asarray(velocity, dtype=np.float32))) if velocity is not None
+                     else _float_or_none(centerline.get("vs")) if isinstance(centerline, Mapping) else None)
+            if speed is not None and np.isfinite(speed):
+                facts.speed_samples.append(abs(speed))
 
 
 def finalize_episode_facts(episode: EvalEpisodeFacts) -> EvalEpisodeFacts:
@@ -268,6 +264,11 @@ def episode_race_record(episode: EvalEpisodeFacts, *, timestep: float,
                 if finite_race and f.clean_finish and f.finish_elapsed_steps is not None else None),
             "valid_lap_count": len(valid), "measured_lap_count": len(f.lap_times_steps),
             "mean_valid_lap_time_s": float(np.mean(valid)) if valid else None,
+            "valid_lap_times_s": valid,
+            "fastest_valid_lap_s": min(valid) if valid else None,
+            "mean_speed_m_s": float(np.mean(f.speed_samples)) if f.speed_samples else None,
+            "zero_progress": abs(f.net_progress) <= 1e-3 if f.progress_delta_samples else None,
+            "stationary": max(f.speed_samples) < 0.1 if f.speed_samples else None,
         }
         if include_rewards and aid in episode.trainable_team:
             agents[aid].update(reward=f.reward_total, individual_reward=f.individual_reward_total,
@@ -485,7 +486,17 @@ def aggregate_eval_episodes(
             "clean_finish_count": sum(f.clean_finish for f in facts),
             "finish_time_sample_count": len(times),
             "mean_clean_finish_time_s": float(np.mean(times)) if times else None,
+            "collision_rate": _rate(f.collided for f in facts),
+            "mean_net_progress": _mean(f.net_progress for f in facts) if all(f.progress_delta_samples for f in facts) else None,
+            "zero_progress_episode_count": sum(abs(f.net_progress) <= 1e-3 for f in facts if f.progress_delta_samples),
+            "stationary_episode_count": sum(max(f.speed_samples) < 0.1 for f in facts if f.speed_samples),
         }
+    summary["stationary_threshold_m_s"] = 0.1
+    summary["zero_progress_threshold_laps"] = 1e-3
+    summary["zero_progress_episode_count"] = sum(summary["per_car"][aid]["zero_progress_episode_count"] for aid in trainable_ids)
+    summary["zero_progress_rate"] = summary["zero_progress_episode_count"] / (total * len(trainable_ids))
+    summary["stationary_episode_count"] = sum(summary["per_car"][aid]["stationary_episode_count"] for aid in trainable_ids)
+    summary["stationary_rate"] = summary["stationary_episode_count"] / (total * len(trainable_ids))
     for prefix, ids in (("own", trainable_ids), ("opponent", opponent_ids)):
         for kind in ("collision_dnf", "boundary_dnf", "timeout"):
             summary[f"{prefix}_{kind}_count"] = sum(summary["per_car"][aid][f"{kind}_count"] for aid in ids)

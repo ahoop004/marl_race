@@ -27,7 +27,7 @@ PRESETS = ("mlp_base", "cnn1d_base")
 SEED = 42
 
 
-def select_sources(sweep_root):
+def select_sources(sweep_root, *, presets=PRESETS, lidar_beams=1080, pretraining_seed=SEED):
     """Match trial metadata, then revalidate only those native selection results."""
     summary = json.loads((sweep_root / "ranked_summary.json").read_text())
     selected = {}
@@ -35,10 +35,10 @@ def select_sources(sweep_root):
         identity = json.loads(path.read_text())
         entry = identity["settings"].get("sweep_trial", {})
         preset = entry.get("network_preset")
-        if identity["algorithm"] != "ppo" or preset not in PRESETS or entry.get("seed") != SEED:
+        if identity["algorithm"] != "ppo" or preset not in presets or entry.get("seed") != pretraining_seed:
             continue
         if preset in selected:
-            raise ValueError(f"Ambiguous PPO seed-{SEED} trials for {preset}; select explicitly before preparing sources")
+            raise ValueError(f"Ambiguous PPO seed-{pretraining_seed} trials for {preset}; select explicitly before preparing sources")
         matches = [row for row in summary["ranked_trials"]
                    if Path(row["training_output_dir"]).resolve() == path.parent.resolve()]
         if len(matches) != 1:
@@ -50,28 +50,29 @@ def select_sources(sweep_root):
         metadata = read_checkpoint(best)["metadata"]
         config = metadata["configuration"]
         if (config["wandb"]["tune"].get("network_preset") != preset
-                or config["experiment"]["seed"] != SEED or config["environment"]["lidar_beams"] != 1080
+                or config["experiment"]["seed"] != pretraining_seed or config["environment"]["lidar_beams"] != lidar_beams
                 or entry["parameters"].get("network") != preset):
-            raise ValueError(f"PPO source preset/seed/1080-beam metadata differs: {best}")
-        selected[preset] = (best, source_record(best, preset, SEED))
-    if set(selected) != set(PRESETS):
-        raise ValueError(f"Missing ranked PPO seed-{SEED} trials: {sorted(set(PRESETS) - set(selected))}")
+            raise ValueError(f"PPO source preset/seed/{lidar_beams}-beam metadata differs: {best}")
+        selected[preset] = (best, source_record(best, preset, pretraining_seed))
+    if set(selected) != set(presets):
+        raise ValueError(f"Missing ranked PPO seed-{pretraining_seed} trials: {sorted(set(presets) - set(selected))}")
     return selected
 
 
-def prepare(sweep_root, destination):
+def prepare(sweep_root, destination, *, presets=PRESETS, lidar_beams=1080, pretraining_seed=SEED,
+            target_spec=None):
     if not sweep_root.is_dir():
         raise ValueError(f"Completed PPO sweep unavailable: {sweep_root}. Run this command on Wahab with the original shared outputs.")
-    selected = select_sources(sweep_root)
-    pilot = read_spec(REPO / "scripts/sweeps/mappo_pilot_phase6.yaml", REPO)
+    selected = select_sources(sweep_root, presets=presets, lidar_beams=lidar_beams, pretraining_seed=pretraining_seed)
+    pilot = read_spec(target_spec or REPO / "scripts/sweeps/mappo_pilot_phase6.yaml", REPO)
     # Reuse native complete-source/transfer checks before publishing copies.
     for preset, (path, record) in selected.items():
         for arm in ("full_finetune", "lora"):
             config = load_and_expand_scenario(pilot["scenario"], overrides=[*pilot["fixed_overrides"],
                 f"network={preset}", f"adaptation={arm}", f"adaptation.checkpoint={json.dumps(str(path))}"])
             inspect_model(config, record)
-    records = [{**selected[preset][1], "checkpoint": str(destination / f"{preset}_ppo_seed{SEED}_best.pt")}
-               for preset in PRESETS]
+    records = [{**selected[preset][1], "checkpoint": str(destination / f"{preset}_ppo_seed{pretraining_seed}_best.pt")}
+               for preset in presets]
     manifest = destination / "manifest.yaml"
     destination.parent.mkdir(parents=True, exist_ok=True)
     with exclusive(destination.parent / f".{destination.name}.lock"):
@@ -99,7 +100,7 @@ def prepare(sweep_root, destination):
         for record in records:
             verify_source(record)
     for record in records:
-        print(f"{record['network']} PPO seed {SEED}\n  selected: {selected[record['network']][0]}"
+        print(f"{record['network']} PPO seed {pretraining_seed}\n  selected: {selected[record['network']][0]}"
               f"\n  preserved: {record['checkpoint']}\n  SHA-256: {record['sha256']}")
     print(f"Verified source manifest: {manifest}")
     return records

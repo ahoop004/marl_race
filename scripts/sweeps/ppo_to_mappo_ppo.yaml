@@ -1,0 +1,22 @@
+# Single native PPO source. The pipeline freezes a copy with its run identity/budget.
+name: PPO source for matched MAPPO adaptation
+experiment_id: ppo-mappo-mlp108-v1-ppo
+algorithm: ppo
+scenario: scenarios/ppo_lap_completion_pretrain.yaml
+total_steps: 120000000
+seeds: [42]
+sweep_seed: 2026
+search:
+  method: grid
+  parameters:
+    network: {type: choice, values: [mlp_base]}
+fixed_overrides:
+  - maps=solo_pretrain
+  - environment.lidar_beams=108
+  - environment.max_speed=8.0
+  - experiment.parallel_envs=16
+  - experiment.envs_per_worker=8
+max_concurrent_trials: 1
+resources_per_trial: {cpu: 20, gpu: 1}
+evaluation: {seed: 10042, episodes: 20, every_steps: 2048000, max_steps: 8000}
+wandb: {mode: online, project: marl-f110-complete, group: ppo-mappo-mlp108-v1-pretraining}

@@ -174,6 +174,118 @@ def evaluation_routing(checkpoint):
                 "mode", "rank", "alpha", "train_log_std", "per_agent_log_std", "target"}} if lora else None)}
 
 
+def solo_evaluation_actor(checkpoint, spec, params, agent_id):
+    """Strictly extract one decentralized actor; never construct a critic.
+
+    Validate the complete actor tensor layout on meta storage, then materialize
+    only the chosen actor/base and adapter bank. Empty neighbors are supplied by
+    the unchanged observation composer in the one-vehicle task.
+    """
+    from types import SimpleNamespace
+    from agents.common.networks import build_actor, route_actor, resolve_network_config, model_spec
+    from agents.common.observations import observation_segments
+    from utils.torch_io import resolve_device
+
+    stored = checkpoint["metadata"]
+    algorithm = stored["algorithm"]
+    if algorithm not in {"ppo", "mappo"}:
+        raise ValueError("Unsupported solo checkpoint algorithm")
+    structure, contracts = stored["structure"], stored["contracts"]
+    ids = structure["agent_ids"]
+    if agent_id not in ids or list(spec.agent_ids) != [agent_id]:
+        raise ValueError("Solo evaluation requires the selected original vehicle identity")
+    network = resolve_network_config(params, default_hidden_dims=[])
+    validate_checkpoint_compatibility(stored, {
+        "implementation": "torchrl.clip_ppo.v1" if algorithm == "ppo" else "torchrl.mappo.v1", "network": network})
+    observation = contracts["observations"][agent_id]
+    validate_checkpoint_compatibility(observation, {
+        "dim": spec.observation_dims[agent_id], "contract": spec.observation_contracts[agent_id]})
+    validate_checkpoint_compatibility(contracts, {
+        "actions": {"dim": len(spec.action_lows[agent_id]), "low": spec.action_lows[agent_id],
+                    "high": spec.action_highs[agent_id], "contract": params["_action_contract"]},
+        "physics": params["_physics_contract"]})
+    mode = structure["actor_mode"]
+    if mode not in {"independent", "shared"} or len(set(ids)) != len(ids):
+        raise ValueError("Invalid checkpoint actor routing")
+    validate_checkpoint_compatibility(structure, {
+        "distribution": "squashed_gaussian_pre_tanh_v1", "groups": {"agents": ids},
+        "routing": {aid: i if mode == "independent" else 0 for i, aid in enumerate(ids)}})
+    encoders = {role: model_spec(network, role)["encoder"]["type"] for role in ("actor", "critic")}
+    convolutional = any(kind != "identity" for kind in encoders.values())
+    validate_checkpoint_compatibility(structure, {"encoder": encoders if convolutional else "identity"})
+    if encoders["actor"] != "identity":
+        validate_checkpoint_compatibility(structure["observation_segments"], {"actor": {
+            aid: observation_segments(contracts["observations"][aid]["contract"], contracts["observations"][aid]["dim"])
+            for aid in ids}})
+    routing = evaluation_routing(checkpoint)
+    lora = routing["lora"]
+    if algorithm == "ppo" and lora:
+        raise ValueError("PPO solo evaluation cannot load MAPPO adapters")
+    dims = [contracts["observations"][aid]["dim"] for aid in ids]
+    with torch.device("meta"):
+        template = build_actor(max(dims), contracts["actions"]["dim"], network,
+                               observation_contracts={aid: contracts["observations"][aid]["contract"] for aid in ids})
+        if algorithm == "mappo":
+            template = route_actor(template, ids, actor_mode=mode, lora_config=lora,
+                                   input_dims=dims if lora and lora["mode"] == "per_agent" else None)
+    validate_checkpoint_compatibility(checkpoint, {}, states=[("actor", checkpoint["models"]["actor"], template.state_dict())])
+    if lora:
+        expected_lora = {"version": 1, **template.config, **template.adaptation_contract(),
+            "target_layers": template.target_layers,
+            "agent_to_adapter": {aid: i if lora["mode"] == "per_agent" else 0 for i, aid in enumerate(ids)}}
+        if len(set(dims)) > 1:
+            expected_lora["observation_dims"] = dict(zip(ids, dims))
+        validate_checkpoint_compatibility(stored["adaptation"], {"lora": expected_lora})
+        source = stored["adaptation"]["source_checkpoint"]
+        if (not isinstance(source, dict) or source.get("algorithm") != "ppo" or source.get("scope") != "actor_only"
+                or not isinstance(source.get("sha256"), str) or len(source["sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in source["sha256"])):
+            raise ValueError("LoRA solo evaluation requires a valid PPO source identity")
+    actor = build_actor(observation["dim"], contracts["actions"]["dim"], network,
+                        observation_contract=observation["contract"])
+    state = checkpoint["models"]["actor"]
+    adapter_index = None
+    if algorithm == "mappo" and mode == "independent":
+        prefix = f"actors.{agent_id}."
+        state = {key[len(prefix):]: value for key, value in state.items() if key.startswith(prefix)}
+    elif lora:
+        adapter_index = stored["adaptation"]["lora"]["agent_to_adapter"][agent_id]
+        actor = route_actor(actor, [agent_id], lora_config=lora,
+                            input_dims=[observation["dim"]] if lora["mode"] == "per_agent" else None)
+        selected = {}
+        for key, tensor in state.items():
+            if key.startswith(("adapters.", "log_stds.")):
+                parts = key.split(".")
+                if int(parts[1]) != adapter_index:
+                    continue
+                parts[1] = "0"
+                key = ".".join(parts)
+            selected[key] = tensor
+        state = selected
+    actor.load_state_dict(state, strict=True)
+    actor.requires_grad_(False)
+    device = resolve_device([params.get("device", "cpu")])
+    actor.to(device).eval()
+
+    @torch.no_grad()
+    def actions(active_ids, observations):
+        if not active_ids:
+            return {}
+        if list(active_ids) != [agent_id]:
+            raise ValueError("Solo inference received a different vehicle identity")
+        from agents.common.observations import pack_observations
+        packed = pack_observations(active_ids, observations, spec.observation_dims, observation["dim"])
+        inputs = torch.as_tensor(packed, dtype=torch.float32, device=device)
+        kwargs = {"adapter_indices": torch.zeros(1, dtype=torch.long, device=device)} if lora and lora["mode"] == "per_agent" else {}
+        action, _ = actor.get_action(inputs, deterministic=True, **kwargs)
+        return {agent_id: action[0].cpu().numpy()}
+
+    return SimpleNamespace(actor=actor, device=device, evaluation_actions=actions,
+        identity={"source_actor": agent_id, "source_adapter_index": adapter_index,
+                  "adapter_active": bool(lora), "critic_loaded": False,
+                  "exploration": lora, "checkpoint_sha256": checkpoint["_identity"]["sha256"]})
+
+
 def _observation_transfer(source, destination, extension):
     if extension not in (None, "frenet_neighbors"):
         raise ValueError("Unsupported observation extension; only frenet_neighbors is supported")

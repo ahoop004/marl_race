@@ -370,6 +370,15 @@ def supervise(parent_pid, command):
     group. Signal handlers run here on the main thread, outside Ray's threads.
     """
     process = None
+    runtime_path = os.environ.get("RAY_TUNE_ATTEMPT_PATH")
+    started_unix, started_clock = time.time(), time.monotonic()
+
+    def runtime(complete=False):
+        if runtime_path:
+            atomic_json(Path(runtime_path) / "execution.json", {
+                "started_unix": started_unix, "observed_unix": time.time(),
+                "wall_seconds": time.monotonic() - started_clock,
+                "closed": complete, "returncode": process.returncode if process else None})
 
     def interrupted(signum, frame):
         raise SystemExit(128 + signum)
@@ -378,9 +387,14 @@ def supervise(parent_pid, command):
     signal.signal(signal.SIGINT, interrupted)
     try:
         process = subprocess.Popen(command, start_new_session=True)
+        runtime()
+        next_sample = time.monotonic() + 5
         while process.poll() is None:
             if os.getppid() != parent_pid:
                 raise SystemExit("Ray worker exited; terminating trainer process group")
+            if time.monotonic() >= next_sample:
+                runtime()
+                next_sample = time.monotonic() + 5
             time.sleep(.5)
         return process.wait()
     finally:
@@ -389,6 +403,7 @@ def supervise(parent_pid, command):
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             stop_group(process)
             process.wait()
+        runtime(complete=True)
 
 
 def trial(config):
@@ -451,6 +466,7 @@ def trial(config):
                     "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
         atomic_json(attempt / "attempt.json", metadata)
         env = os.environ.copy()
+        env["RAY_TUNE_ATTEMPT_PATH"] = str(attempt)
         env.update({"PYTHONUNBUFFERED": "1", "WEIGHT_SYNC_TIMEOUT": "900", "OMP_NUM_THREADS": "1",
                     "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "NUMBA_NUM_THREADS": "1",
                     "NUMEXPR_NUM_THREADS": "1", "PYGLET_HEADLESS": "true", "F110_SUMMARY_EVERY": "10"})

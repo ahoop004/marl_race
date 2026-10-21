@@ -27,6 +27,34 @@ from training.runtime import evaluation_mode, seed_process
 from utils.torch_io import resolve_device
 
 
+def solo_scenario(scenario, agent_id):
+    """Use the existing solo spawn/termination protocol with the saved actor inputs."""
+    from core.scenario import load_and_expand_scenario
+    if agent_id not in resolve_agent_roles(scenario["agents"]).policy_agents:
+        raise ValueError("--eval-actor must select a policy vehicle in the checkpoint scenario")
+    baseline = load_and_expand_scenario("scenarios/ppo_lap_completion_pretrain.yaml")
+    result = copy.deepcopy(scenario)
+    # A single physical vehicle keeps its original ID, including the neighbor
+    # composer's ego one-hot. No invisible car_0 is created for car_1.
+    result["agents"] = {agent_id: copy.deepcopy(scenario["agents"][agent_id])}
+    cfg = result["agents"][agent_id]
+    cfg.pop("target_id", None)
+    cfg["reward"] = copy.deepcopy(baseline["agents"]["car_0"]["reward"])
+    env = result["environment"]
+    for key in ("spawn", "random_spawn", "episode_termination", "terminal_agents", "lap_counting"):
+        env[key] = copy.deepcopy(baseline["environment"][key])
+    env["spawn"]["target"] = {"enabled": False}
+    for key in ("spawn_points", "start_poses", "spawn_policy", "spawn_centerline", "spawn_offsets",
+                "spawn_target", "spawn_ego", "controlled_agents", "trainable_agents", "fixed_policy_agents"):
+        env.pop(key, None)
+    env.update(physical_agent_ids=[agent_id], agent_teams={agent_id: "learners"},
+               target_laps=3, max_steps=16000)
+    result["evaluation"].update(target_laps=3, max_steps=16000, episode_termination_mode="any_agent",
+        lap_completion=True, terminate_on_collision=True,
+        final_test={"seed": 30042, "episodes": 100, "target_laps": 3, "max_steps": 16000})
+    return result
+
+
 def run_evaluation(scenario, args, console, scenario_dir):
     with ExitStack() as resources:
         _run_evaluation(scenario, args, console, scenario_dir, resources)
@@ -46,6 +74,9 @@ def _run_evaluation(
         sys.exit(1)
 
     checkpoint_path = resolve_checkpoint_path(checkpoint)
+    solo_actor = getattr(args, "eval_actor", None)
+    if solo_actor:
+        scenario = solo_scenario(scenario, solo_actor)
     compact_laps = MetricPolicy(scenario.get("wandb", {}).get("logging"), scenario).lap_completion
 
     agent_configs = scenario.get("agents", {})
@@ -107,8 +138,12 @@ def _run_evaluation(
     stored_provenance = metadata["provenance"]
     if algorithm == "mappo":
         params.update(evaluation_routing(checkpoint_payload))
-    agent = create_learner(algorithm, spec, params, training=False)
-    agent.load_for_evaluation(checkpoint_payload)
+    if solo_actor:
+        from agents.common.checkpoints import solo_evaluation_actor
+        agent = solo_evaluation_actor(checkpoint_payload, spec, params, solo_actor)
+    else:
+        agent = create_learner(algorithm, spec, params, training=False)
+        agent.load_for_evaluation(checkpoint_payload)
     mismatches = []
     if isinstance(stored_provenance, dict):
         current_provenance = build_run_provenance(
@@ -223,6 +258,8 @@ def _run_evaluation(
         opponent_agent_id=opponent_agent_id,
         timestep=float(env.timestep),
     )
+    summary["strict_clean_finish_count"] = sum(record["strict_clean_finish"] for record in eval_records.values())
+    summary["strict_clean_completion_rate"] = summary["strict_clean_finish_count"] / eval_episodes
     if not opponent_ids and len(trainable_ids) > 1:
         summary["success_rate"] = summary.get("team_both_finished_rate", 0.0)
     elif "team_win_rate" in summary:
@@ -262,6 +299,7 @@ def _run_evaluation(
         "checkpoint": str(checkpoint_path.resolve()),
         "checkpoint_sha256": checkpoint_hash,
         "checkpoint_provenance": stored_provenance,
+        "actor_identity": getattr(agent, "identity", None),
         "provenance_mismatches": mismatches,
         "evaluation_provenance": evaluation_provenance,
         "protocol": protocol_name or "custom",
@@ -301,7 +339,19 @@ def _run_evaluation(
         ],
     }
     report_path = output_dir / "evaluation_report.json"
-    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # An interrupted write must never masquerade as a completed final evaluation.
+    import os
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", dir=output_dir, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            json.dump(report, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary.replace(report_path)
+        finally:
+            temporary.unlink(missing_ok=True)
     console.print_info(f"Evaluation report: {report_path}")
 
 

@@ -1,0 +1,26 @@
+# Three arms x two MAPPO seeds. All transfer arms use the single PPO seed-42 source.
+name: Matched MAPPO adaptation after PPO pretraining
+experiment_id: ppo-mappo-mlp108-v1-mappo
+algorithm: mappo
+scenario: scenarios/mappo_2v2_completion_scratch.yaml
+total_steps: 24576000
+seeds: [42, 43]
+sweep_seed: 2026
+source_manifest: outputs/ppo_mappo_pipeline/ppo-mappo-mlp108-v1/sources/manifest.yaml
+pretraining_seeds: [42]
+search:
+  method: grid
+  parameters:
+    network: {type: choice, values: [mlp_base]}
+    adaptation: {type: choice, values: [scratch, full_finetune, lora]}
+fixed_overrides:
+  - maps=solo_pretrain
+  - environment.lidar_beams=108
+  - environment.max_speed=8.0
+  - environment.max_steps=8000
+  - experiment.parallel_envs=8
+  - experiment.envs_per_worker=8
+max_concurrent_trials: 4
+resources_per_trial: {cpu: 10, gpu: 1}
+evaluation: {seed: 10042, episodes: 20, every_steps: 2048000, max_steps: 8000}
+wandb: {mode: online, project: marl-f110-complete, group: ppo-mappo-mlp108-v1-adaptation}

@@ -502,6 +502,10 @@ class EvaluationCheckpointHook(CheckpointHook):
             "is_best": is_best,
             **summary,
         }
+        if self._trainer is not None:
+            import os
+            record["recorded_unix"] = time.time()
+            record["training_attempt"] = os.environ.get("RAY_TUNE_ATTEMPT_PATH")
         with self._history_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
 

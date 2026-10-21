@@ -471,7 +471,10 @@ class RaceEnv:
             + lifecycle_dims
             + len(_CENTERLINE_GLOBAL_STATE_KEYS)
         )
-        self.possible_agents = [f"car_{i}" for i in range(self.n_agents)]
+        self.possible_agents = list(cfg.get("physical_agent_ids") or [f"car_{i}" for i in range(self.n_agents)])
+        if (len(self.possible_agents) != self.n_agents or len(set(self.possible_agents)) != self.n_agents
+                or any(not isinstance(aid, str) or not aid for aid in self.possible_agents)):
+            raise ValueError("physical_agent_ids must provide one unique nonempty ID per vehicle")
         self.physical_agents = tuple(self.possible_agents)
         self._agent_id_to_index = {aid: idx for idx, aid in enumerate(self.possible_agents)}
         self.agents = self.possible_agents.copy()

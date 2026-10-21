@@ -46,6 +46,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--eval-episodes", type=int, default=None, help="Evaluation episodes; defaults to --episodes")
     p.add_argument("--eval-protocol", choices=("selection", "final"), default=None,
                    help="Use fixed scenario evaluation seeds, episodes, and horizon; requires --eval.")
+    p.add_argument("--eval-actor", help="Evaluate only this checkpoint actor alone, retaining its vehicle/adapter identity")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--run-id", type=str, default=None)
     p.add_argument("--output-dir", type=str, default=None)
@@ -106,6 +107,8 @@ def apply_cli_overrides(scenario: dict, args: argparse.Namespace) -> dict:
 
 def main() -> None:
     args = parse_args()
+    if args.eval_actor and not args.eval:
+        raise ValueError("--eval-actor requires --eval")
     console = ConsoleLogger(verbose=not args.quiet)
     if args.eval_protocol and (not args.eval or args.eval_episodes is not None):
         raise ValueError("--eval-protocol requires --eval and uses fixed episodes; omit --eval-episodes.")

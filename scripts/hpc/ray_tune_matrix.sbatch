@@ -16,30 +16,92 @@
 set -Eeuo pipefail
 umask 077
 
-REPO="$HOME/marl_race"
-VENV="$HOME/envs/marl-race"
+REPO="${RAY_TUNE_REPO:-$HOME/marl_race}"
+VENV="${VENV:-$HOME/envs/marl-race}"
 RESTORE="${RESTORE:-0}"
 GPUS_PER_NODE="${PROFILE_GPUS_PER_NODE:-1}"
 ENABLE_DASHBOARD="${ENABLE_DASHBOARD:-0}"
 PROFILE_GPU_MONITOR="${PROFILE_GPU_MONITOR:-1}"
 [[ "$RESTORE" =~ ^[01]$ && "$GPUS_PER_NODE" =~ ^[1-4]$ && "$ENABLE_DASHBOARD" =~ ^[01]$ && "$PROFILE_GPU_MONITOR" =~ ^[01]$ ]] || exit 2
 [[ -d "$VENV" ]] || { echo "Missing project environment" >&2; exit 2; }
-[[ -n "${SWEEP_SPEC:-}" && -n "${EXPERIMENT_ID:-}" ]] || { echo "SWEEP_SPEC and EXPERIMENT_ID required" >&2; exit 2; }
-[[ "$EXPERIMENT_ID" =~ ^[a-zA-Z0-9_-]+$ ]] || exit 2
 cd "$REPO"
 [[ "$(git branch --show-current)" == multiNode ]] || { echo "Expected multiNode branch" >&2; exit 2; }
 # Reuse the same source integrity contract as the current T5 launcher.
 git diff --quiet -- HEAD -- src configs scenarios scripts run.py || { echo "Uncommitted source files" >&2; exit 2; }
 [[ -z "$(git ls-files --others --exclude-standard -- src configs scenarios scripts run.py)" ]] || { echo "Untracked source files" >&2; exit 2; }
-CRUN="$(command -v crun || true)"
+CRUN="${CRUN:-$(command -v crun || true)}"
 [[ -n "$CRUN" ]] || CRUN=/cm/shared/containers/python3/2025.1-py312/crun.python3
 [[ -x "$CRUN" ]] || { echo "Cannot execute $CRUN" >&2; exit 2; }
+
+pipeline_action() {
+  "$CRUN" -p "$VENV" python3 scripts/ppo_mappo_pipeline.py --root "$PIPELINE_ROOT" \
+    --stage "$PIPELINE_STAGE" --stage-action "$1"
+}
+pipeline_interrupted=0
+pipeline_outcome() {
+  local rc="$1"
+  if [[ -n "${PIPELINE_ROOT:-}" && "$rc" != 0 ]]; then
+    if (( pipeline_interrupted )); then
+      pipeline_action interrupted || true
+      if (( ${SLURM_RESTART_COUNT:-0} < PIPELINE_MAX_RESTARTS )); then
+        echo "Requeuing incomplete $PIPELINE_STAGE stage, job=$SLURM_JOB_ID" >&2
+        # Requeue while RUNNING: afterok retains the same unfinished parent ID.
+        # An actual failed/timeout parent cannot revive an afterok dependency.
+        scontrol requeue "$SLURM_JOB_ID" || { pipeline_action failed || true; return 1; }
+      else
+        echo "Pipeline retry limit reached" >&2
+        pipeline_action failed || true
+      fi
+    else
+      pipeline_action failed || true
+    fi
+  fi
+  return "$rc"
+}
+if [[ -n "${PIPELINE_ROOT:-}" ]]; then
+  pipeline_exports="$(pipeline_action environment)"
+  eval "$pipeline_exports"
+  if [[ "$PIPELINE_STAGE" == team || "$PIPELINE_STAGE" == solo ]]; then
+    export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYGLET_HEADLESS=true
+    exec 9>"$PIPELINE_ROOT/.${PIPELINE_STAGE}_allocation.lock"
+    flock -n 9 || { echo "Evaluation allocation already active" >&2; exit 2; }
+    evaluation_pid=""
+    evaluation_cleanup() {
+      local rc=$?
+      trap - EXIT TERM INT USR1
+      if [[ -n "$evaluation_pid" ]]; then
+        kill -- "-$evaluation_pid" 2>/dev/null || true
+        wait "$evaluation_pid" 2>/dev/null || true
+      fi
+      pipeline_outcome "$rc"
+      exit "$?"
+    }
+    trap evaluation_cleanup EXIT
+    trap 'pipeline_interrupted=1; exit 75' USR1
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    setsid "$CRUN" -p "$VENV" python3 scripts/ppo_mappo_pipeline.py \
+      --root "$PIPELINE_ROOT" --stage "$PIPELINE_STAGE" --stage-action evaluate &
+    evaluation_pid="$!"
+    wait "$evaluation_pid"
+    exit 0
+  fi
+  GPUS_PER_NODE="$PROFILE_GPUS_PER_NODE"
+fi
+[[ -n "${SWEEP_SPEC:-}" && -n "${EXPERIMENT_ID:-}" ]] || { echo "SWEEP_SPEC and EXPERIMENT_ID required" >&2; exit 2; }
+[[ "$EXPERIMENT_ID" =~ ^[a-zA-Z0-9_-]+$ ]] || exit 2
+CHECKPOINT_STEPS="${RAY_TUNE_CHECKPOINT_STEPS:-65536}"
+[[ "$CHECKPOINT_STEPS" =~ ^[1-9][0-9]*$ ]] || exit 2
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 NODE_COUNT="${#NODES[@]}"
 CPUS_PER_NODE="${SLURM_CPUS_PER_TASK:?SBATCH --cpus-per-task required}"
 [[ "$NODE_COUNT" -ge 1 && "$NODE_COUNT" -le 8 ]] || { echo "Expected 1..8 nodes" >&2; exit 2; }
 [[ "$CPUS_PER_NODE" =~ ^[0-9]+$ && "$CPUS_PER_NODE" -ge 1 ]] || exit 2
+if [[ -n "${PIPELINE_ROOT:-}" ]]; then
+  [[ "$NODE_COUNT" == "$PIPELINE_EXPECTED_NODES" && "$CPUS_PER_NODE" == "$PIPELINE_CPUS_PER_NODE" ]] || { echo "Allocation differs from pipeline" >&2; exit 2; }
+  if [[ "$PIPELINE_STAGE_COMPLETE" == 1 ]]; then pipeline_action finish; exit 0; fi
+fi
 export RAY_EXPECTED_NODES="$NODE_COUNT"
 export RAY_EXPECTED_GPUS="$(( NODE_COUNT * GPUS_PER_NODE ))"
 export RAY_DISABLE_USAGE_STATS=1 PYTHONUNBUFFERED=1
@@ -51,6 +113,7 @@ chmod 700 "$RAY_TUNE_JOB_ROOT"
 exec 9>"$RAY_TUNE_JOB_ROOT/.allocation.lock"
 flock -n 9 || { echo "Another allocation is using this experiment" >&2; exit 2; }
 ATTEMPT_ROOT="$RAY_TUNE_JOB_ROOT/attempts/${SLURM_JOB_ID}"
+if [[ -n "${PIPELINE_ROOT:-}" ]]; then ATTEMPT_ROOT="${ATTEMPT_ROOT}_r${SLURM_RESTART_COUNT:-0}"; fi
 mkdir -p "$ATTEMPT_ROOT"
 export RAY_AUTH_MODE=token
 unset RAY_AUTH_TOKEN || true
@@ -95,11 +158,21 @@ common_args=(--num-cpus="$CPUS_PER_NODE" --num-gpus="$GPUS_PER_NODE"
 steps=()
 cleanup() {
   local rc=$?
-  trap - EXIT INT TERM
+  trap - EXIT INT TERM USR1
   # Driver is last in steps; stop it before shutting down Ray.
   for ((i=${#steps[@]}-1; i>=0; i--)); do
     kill "${steps[i]}" 2>/dev/null || true
   done
+  # Leave time for native trainer supervisors to release their leases before
+  # self-requeue, but bound teardown inside the four-minute warning window.
+  deadline=$((SECONDS + 60))
+  while (( SECONDS < deadline )); do
+    alive=0
+    for p in "${steps[@]}"; do kill -0 "$p" 2>/dev/null && alive=1 || true; done
+    (( alive )) || break
+    sleep 1
+  done
+  for p in "${steps[@]}"; do kill -KILL "$p" 2>/dev/null || true; done
   for p in "${steps[@]}"; do wait "$p" 2>/dev/null || true; done
   rm -f -- "$RAY_AUTH_TOKEN_PATH"
   if (( rc != 0 )); then
@@ -107,11 +180,13 @@ cleanup() {
     for f in "$ATTEMPT_ROOT"/*.log; do [[ -f "$f" ]] && tail -n 25 "$f" >&2; done
   fi
   echo "Ray matrix allocation exited=$rc, output=$RAY_TUNE_JOB_ROOT"
-  exit "$rc"
+  pipeline_outcome "$rc"
+  exit "$?"
 }
 trap cleanup EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
+if [[ -n "${PIPELINE_ROOT:-}" ]]; then trap 'pipeline_interrupted=1; exit 75' USR1; fi
 
 echo "Git=$RAY_TUNE_GIT_SHA job=$SLURM_JOB_ID nodes=$NODE_COUNT GPUs=$RAY_EXPECTED_GPUS CPUs/node=$CPUS_PER_NODE"
 echo "Experiment=$EXPERIMENT_ID sweep=$SWEEP_SPEC outputs=$RAY_TUNE_JOB_ROOT"
@@ -119,7 +194,7 @@ echo "Experiment=$EXPERIMENT_ID sweep=$SWEEP_SPEC outputs=$RAY_TUNE_JOB_ROOT"
 # Validation uses temporary CPU models and never writes the saved experiment.
 if [[ "$RESTORE" == 0 ]]; then
   "$CRUN" -p "$VENV" python3 scripts/ray_tune_trials.py \
-    --sweep-spec "$SWEEP_SPEC" --preflight-only --checkpoint-every-steps 65536 \
+    --sweep-spec "$SWEEP_SPEC" --preflight-only --checkpoint-every-steps "$CHECKPOINT_STEPS" \
     --cluster-nodes "$NODE_COUNT" --cpus-per-node "$CPUS_PER_NODE" --gpus-per-node "$GPUS_PER_NODE"
 fi
 "${srun_base[@]}" --nodelist="$HEAD" "$CRUN" -p "$VENV" ray --version
@@ -160,9 +235,10 @@ fi
 
 "${srun_base[@]}" --nodelist="$HEAD" "$CRUN" -p "$VENV" \
   python3 -u scripts/ray_tune_trials.py --sweep-spec "$SWEEP_SPEC" \
-  --trial-timeout 0 --checkpoint-every-steps 65536 \
+  --trial-timeout 0 --checkpoint-every-steps "$CHECKPOINT_STEPS" \
   > "$ATTEMPT_ROOT/driver.log" 2>&1 &
 driver="$!"
 steps+=("$driver")
 echo "Driver log: $ATTEMPT_ROOT/driver.log"
 wait "$driver"
+if [[ -n "${PIPELINE_ROOT:-}" ]]; then pipeline_action finish; fi

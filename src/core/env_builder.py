@@ -48,7 +48,12 @@ def build_env_kwargs(
     effective_config: Dict[str, Any] = dict(env_config)
     effective_config.update(spawn_norm)
 
-    num_agents = derive_num_agents(effective_config, agent_configs)
+    physical_ids = effective_config.get("physical_agent_ids")
+    if physical_ids is not None and (not isinstance(physical_ids, list)
+            or not physical_ids or len(set(physical_ids)) != len(physical_ids)
+            or set(physical_ids) != set(agent_configs)):
+        raise ValueError("physical_agent_ids must name every configured vehicle exactly once")
+    num_agents = len(physical_ids) if physical_ids is not None else derive_num_agents(effective_config, agent_configs)
     env_seed = env_config.get("seed", seed)
     env_kwargs: Dict[str, Any] = {
         "map": env_config["map"],
@@ -77,6 +82,7 @@ def build_env_kwargs(
         env_kwargs["vehicle_params"] = env_config["vehicle_params"]
 
     passthrough_keys = [
+        "physical_agent_ids",
         "track_limits",
         "no_progress",
         "friction",

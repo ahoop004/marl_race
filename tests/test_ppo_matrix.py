@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import signal
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -58,6 +60,108 @@ print(8000+n)
 def submitter(env, *args):
     return subprocess.run(["bash", "scripts/hpc/submit_ppo_matrix.sh", *args], cwd=adapter.REPO,
                           env=env, text=True, capture_output=True, timeout=30)
+
+
+def test_pipeline_plan_separates_budgets_and_submits_held_dependency_chain(tmp_path, tune, monkeypatch):
+    import ppo_mappo_pipeline as pipeline
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(tune=tune))
+    root = tmp_path / "pipeline"
+    value = pipeline.write_plan(root, "pipeline-test", 120000000, "24:00:00", 3, "revision")
+    ppo = yaml.safe_load(Path(value["stages"]["ppo"]["spec"]).read_text())
+    mappo = yaml.safe_load(Path(value["stages"]["mappo"]["spec"]).read_text())
+    assert ppo["total_steps"] == 120000000 and mappo["total_steps"] == 24576000
+    assert ppo["seeds"] == [42] and mappo["seeds"] == [42, 43]
+    assert mappo["resources_per_trial"] == {"cpu": 10, "gpu": 1}
+    assert mappo["max_concurrent_trials"] == 4
+    assert "environment.max_steps=8000" in mappo["fixed_overrides"]
+    pipeline.preflight_stage(value, "ppo")
+    # Validate all six real destination configurations using a native, untrained
+    # model fixture. No collectors, environment steps or Ray cluster are started.
+    from core.task_builder import create_race_task
+    from training.algorithms import learner_params, create_learner
+    from ray_tune_sources import source_record
+    source_dir = root / "sources"
+    source_dir.mkdir()
+    source_config = load_and_expand_scenario("scenarios/ppo_lap_completion_pretrain.yaml",
+        overrides=["network=mlp_base", "environment.lidar_beams=108", "execution.params.device=cpu"])
+    task = create_race_task(source_config)
+    try:
+        policy = create_learner("ppo", task.spec, learner_params(source_config, task.spec, "ppo"), training=False)
+        checkpoint = source_dir / "best.pt"
+        policy.save_checkpoint(checkpoint, configuration=source_config, selection={
+            "selection_strategy": "completion_progress", "evaluation_protocol": {"name": "selection"}, "is_best": True})
+        record = source_record(checkpoint, "mlp_base", 42)
+    finally:
+        task.close()
+    (source_dir / "manifest.yaml").write_text(yaml.safe_dump({"schema_version": 1, "sources": [record]}))
+    pipeline.preflight_stage(value, "mappo")
+    submissions, releases = [], []
+    def submit(command, **kwargs):
+        submissions.append(command)
+        return str(8000 + len(submissions)) + "\n"
+    monkeypatch.setattr(pipeline.subprocess, "check_output", submit)
+    monkeypatch.setattr(pipeline.subprocess, "run", lambda command, **kwargs: releases.append(command))
+    pipeline.queue_pipeline(value)
+    assert len(submissions) == 4
+    assert all("--hold" in c and "--signal=B:USR1@240" in c for c in submissions)
+    assert "--nodes=1" in submissions[0] and "--gres=gpu:1" in submissions[0]
+    assert "--nodes=2" in submissions[1] and "--ntasks=2" in submissions[1] and "--gres=gpu:2" in submissions[1]
+    assert [next((a for a in c if a.startswith("--dependency")), None) for c in submissions] == [
+        None, "--dependency=afterok:8001", "--dependency=afterok:8002", "--dependency=afterok:8003"]
+    assert releases == [["scontrol", "release", str(job)] for job in range(8001, 8005)]
+    assert json.loads((root / "jobs.json").read_text())["status"] == "released"
+    with pytest.raises(ValueError, match="already submitted"):
+        pipeline.queue_pipeline(value)
+    Path(value["stages"]["ppo"]["spec"]).chmod(0o644)
+    Path(value["stages"]["ppo"]["spec"]).write_text("modified: true")
+    monkeypatch.setattr(pipeline, "current_revision", lambda: "revision")
+    with pytest.raises(ValueError, match="modified"):
+        pipeline.load_pipeline(root)
+
+
+@pytest.mark.parametrize("restart,expected", [(0, ["evaluating", "interrupted", "requeue"]),
+                                              (1, ["evaluating", "interrupted", "failed"])])
+def test_pipeline_pretimeout_requeues_same_job_with_explicit_limit(tmp_path, restart, expected):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    events = tmp_path / "events"
+    commands = {
+        "git": '#!/usr/bin/env bash\nif [[ "$1" == branch ]]; then echo multiNode; fi\n',
+        "scontrol": '#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "$TEST_EVENTS"\n',
+        "crun": '''#!/usr/bin/env python3
+import os,sys,time
+from pathlib import Path
+action=sys.argv[sys.argv.index('--stage-action')+1]
+if action=='environment':
+ print('export PIPELINE_MAX_RESTARTS=1')
+else:
+ with Path(os.environ['TEST_EVENTS']).open('a') as f:
+  f.write(('evaluating' if action=='evaluate' else action)+'\\n')
+ if action=='evaluate': time.sleep(60)
+'''}
+    for name, source in commands.items():
+        path = bindir / name
+        path.write_text(source)
+        path.chmod(0o755)
+    env = {**os.environ, "PATH": str(bindir) + os.pathsep + os.environ["PATH"],
+        "CRUN": str(bindir / "crun"), "VENV": str(tmp_path), "RAY_TUNE_REPO": str(adapter.REPO),
+        "PIPELINE_ROOT": str(tmp_path), "PIPELINE_STAGE": "team", "SLURM_JOB_ID": "9001",
+        "SLURM_RESTART_COUNT": str(restart), "TEST_EVENTS": str(events)}
+    process = subprocess.Popen(["bash", str(adapter.REPO / "scripts/hpc/ray_tune_matrix.sbatch")],
+        env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 5
+        while not events.exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        assert events.exists()
+        process.send_signal(signal.SIGUSR1)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 75, stdout + stderr
+        assert events.read_text().splitlines() == expected
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 def test_all_seven_profiles_pass_native_preflight_without_cluster_or_manifest(tmp_path, matrix_env, tune, monkeypatch):
