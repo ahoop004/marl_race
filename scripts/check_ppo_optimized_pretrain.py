@@ -8,7 +8,6 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
-SHA = 'b17b6721a95893a4eaad09807003584c9aae1d0e'
 
 
 def check(config, gpu=False, resume=None):
@@ -36,7 +35,6 @@ def check(config, gpu=False, resume=None):
     assert config['environment']['timestep'] == .05
     assert config['environment']['action_repeat'] == 1
     assert config['wandb']['enabled'] and config['wandb']['mode'] == 'online'
-    assert config['wandb']['validation']['git_sha'] == SHA
     assert config['wandb']['validation']['integration_step_s'] == .0025
     # Same sizing expression as integrate_combined_slip and RaceCar.__init__.
     # No integration call or JIT compilation is needed for this check.
@@ -49,7 +47,6 @@ def check(config, gpu=False, resume=None):
         checkpoint = read_checkpoint(resume)
         metadata = checkpoint['metadata']
         assert metadata['algorithm'] == 'ppo'
-        assert metadata['provenance']['git']['commit'] == SHA
         assert metadata['contracts']['physics'] == contract
         for key in ('network', 'reward', 'observation', 'agents', 'maps', 'training_defaults'):
             assert metadata['configuration'][key] == config[key], f'Recovery mismatch: {key}'

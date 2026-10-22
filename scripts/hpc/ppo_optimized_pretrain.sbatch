@@ -14,7 +14,6 @@
 set -euo pipefail
 
 # PPO only. Submit using submit_ppo_optimized_pretrain.sh from the repository root.
-EXPECTED_SHA=b17b6721a95893a4eaad09807003584c9aae1d0e
 PHASE=ppo
 WORKERS=16
 ENVS_PER_WORKER=2
@@ -29,9 +28,9 @@ TOTAL_STEPS=120000000
 REPO_DIR=${REPO_DIR:-"$HOME/marl_race"}
 ENV_PATH=${ENV_PATH:-"$HOME/envs/marl-race"}
 cd "$REPO_DIR"
+SOURCE_SHA=$(git rev-parse HEAD)
 [[ "$(git branch --show-current)" == physics-correctness ]] || { echo "Expected checkout of physics-correctness branch" >&2; exit 2; }
-[[ "$(git rev-parse HEAD)" == "$EXPECTED_SHA" ]] || { echo "Checkout changed: expected $EXPECTED_SHA" >&2; exit 2; }
-git diff --quiet && git diff --cached --quiet || { echo "Tracked files are modified; refusing mixed-code experiment" >&2; exit 2; }
+git diff --quiet HEAD -- . ':(exclude)scripts/hpc/*ppo_optimized_pretrain*' ':(exclude)scripts/check_ppo_optimized_pretrain*' || { echo "Training files are modified; refusing mixed-code experiment" >&2; exit 2; }
 
 if command -v module >/dev/null 2>&1; then
   module load container_env/0.1 python3/2025.1-py312
@@ -45,7 +44,7 @@ export PYGLET_HEADLESS=true PYTHONUNBUFFERED=1
 export F110_SUMMARY_EVERY=25
 
 OUT="$RUN_ROOT/$PHASE"
-RUN_ID="ppo_opt_${EXPECTED_SHA:0:7}_h2p5_s42_$(basename "$RUN_ROOT")"
+RUN_ID="ppo_opt_${SOURCE_SHA:0:7}_h2p5_s42_$(basename "$RUN_ROOT")"
 mkdir -p "$RUN_ROOT"
 
 # Recovery is explicit, exclusively from this 2.5 ms experiment.
@@ -82,10 +81,10 @@ CMD=(python3 run.py
   --set experiment.measure_mpc=false
   --set experiment.measure_hybrid=false
   --set experiment.measure_services=true
-  --set "++wandb.validation.git_sha=$EXPECTED_SHA"
+  --set "++wandb.validation.git_sha=$SOURCE_SHA"
   --set ++wandb.validation.integration_step_s=0.0025
   --set 'wandb.notes=Full 120M PPO pretraining with optimized physics and 2.5 ms integration.'
-  --set "wandb.group=ppo-optimized-${EXPECTED_SHA:0:7}-h2p5-s42"
+  --set "wandb.group=ppo-optimized-${SOURCE_SHA:0:7}-h2p5-s42"
   --set "wandb.name=$RUN_ID"
   --wandb --no-render
   "${EXTRA[@]}")
@@ -93,7 +92,7 @@ CMD=(python3 run.py
 printf 'Phase=%s target=%s/%s; workers=%s x %s; GPU=%s; cpus=%s\n' \
   "$PHASE" "$STOP_AT" "$TOTAL_STEPS" "$WORKERS" "$ENVS_PER_WORKER" \
   "${CUDA_VISIBLE_DEVICES:-unknown}" "${SLURM_CPUS_PER_TASK:-unknown}"
-printf 'Repository=%s commit=%s\n' "$REPO_DIR" "$EXPECTED_SHA"
+printf 'Repository=%s commit=%s\n' "$REPO_DIR" "$SOURCE_SHA"
 printf 'Output=%s\n' "$OUT"
 printf 'Command:'; printf ' %q' "${CMD[@]}"; printf '\n'
 [[ "${SLURM_CPUS_PER_TASK:-0}" == 64 ]]

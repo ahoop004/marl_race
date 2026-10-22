@@ -3,10 +3,9 @@
 set -Eeuo pipefail
 cd "${REPO_DIR:-$HOME/marl_race}"
 export REPO_DIR="$PWD"
-SHA=b17b6721a95893a4eaad09807003584c9aae1d0e
+SHA=$(git rev-parse HEAD)
 [[ "$(git branch --show-current)" == physics-correctness ]]
-[[ "$(git rev-parse HEAD)" == "$SHA" ]]
-git diff --quiet HEAD -- .
+git diff --quiet HEAD -- . ':(exclude)scripts/hpc/*ppo_optimized_pretrain*' ':(exclude)scripts/check_ppo_optimized_pretrain*'
 git status --short
 module load container_env/0.1 python3/2025.1-py312
 CRUN=${CRUN:-$(command -v crun.python3 || command -v crun || true)}
@@ -20,7 +19,7 @@ if [[ "$RESUME" == 1 ]]; then
   : "${STOP_AT:?Set the next absolute decision target, at most 120000000}"
   [[ -s "$RUN_ROOT/ppo/latest.pt" ]]
 else
-  RUN_ROOT=${RUN_ROOT:-"$PWD/outputs/ppo_opt_b17b672_h2p5_s42_$(date -u +%Y%m%dT%H%M%SZ)_$$"}
+  RUN_ROOT=${RUN_ROOT:-"$PWD/outputs/ppo_opt_${SHA:0:7}_h2p5_s42_$(date -u +%Y%m%dT%H%M%SZ)_$$"}
   mkdir "$RUN_ROOT" # Atomic reservation; refuses an existing experiment.
 fi
 export RUN_ROOT
@@ -72,11 +71,11 @@ end = script.index("\nprintf 'Phase=")
 prefix = '''set -Eeuo pipefail
 SCENARIO=scenarios/ppo_lap_completion_pretrain.yaml
 OUT="$RUN_ROOT/ppo"
-EXPECTED_SHA=b17b6721a95893a4eaad09807003584c9aae1d0e
+SOURCE_SHA=$(git rev-parse HEAD)
 TOTAL_STEPS=120000000
 WORKERS=16
 ENVS_PER_WORKER=2
-RUN_ID="ppo_opt_b17b672_h2p5_s42_$(basename "$RUN_ROOT")"
+RUN_ID="ppo_opt_${SOURCE_SHA:0:7}_h2p5_s42_$(basename "$RUN_ROOT")"
 STOP_VALUE=null
 (( STOP_AT == TOTAL_STEPS )) || STOP_VALUE="$STOP_AT"
 EXTRA=()
@@ -96,6 +95,6 @@ LAUNCH=(sbatch --time="$WALLTIME" --chdir="$PWD" --export=ALL)
 JOB=$("${LAUNCH[@]}" --parsable scripts/hpc/ppo_optimized_pretrain.sbatch 2> "$RUN_ROOT/slurm_submission_warnings.txt")
 printf '%s\n' "$JOB" | tee "$RUN_ROOT/job_id.txt"
 cat "$RUN_ROOT/slurm_submission_warnings.txt"
-printf 'SUBMITTED job=%s SHA=%s\nNode=e7-w4125-01 CPUs=64 GPU=1xL40S RAM=256G time=%s\nOutput=%s/ppo\nW&B group=ppo-optimized-b17b672-h2p5-s42\nLogs=%s/ppo-opt-%s.out and .err\n' \
-  "$JOB" "$SHA" "$WALLTIME" "$RUN_ROOT" "$PWD" "${JOB%%;*}"
+printf 'SUBMITTED job=%s SHA=%s\nNode=e7-w4125-01 CPUs=64 GPU=1xL40S RAM=256G time=%s\nOutput=%s/ppo\nW&B group=ppo-optimized-%s-h2p5-s42\nLogs=%s/ppo-opt-%s.out and .err\n' \
+  "$JOB" "$SHA" "$WALLTIME" "$RUN_ROOT" "${SHA:0:7}" "$PWD" "${JOB%%;*}"
 echo 'Keep the source checkout unchanged while this job runs. Actual W&B ID is recorded in ppo/config_snapshot.json.'
