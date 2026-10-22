@@ -7,7 +7,9 @@ from numba import njit
 
 from physics.integration import Integrator
 from physics.vehicle import RaceCar
-from physics.collision_models import collision_multiple
+from physics.collision_models import (
+    collision_multiple, swept_contact, swept_map_contact, map_motion_trace,
+)
 
 
 ENV_COLLISION_IDX = -2
@@ -99,6 +101,7 @@ class Simulator(object):
         self.collisions = np.zeros((self.num_agents,), dtype=np.float32)
         self.collidable_mask = np.ones(self.num_agents, dtype=np.bool_)
         self.collision_idx = -1 * np.ones((self.num_agents,), dtype=np.int32)
+        self.collision_times = np.full(self.num_agents, np.inf)
         
 
         # Cars within one environment share a scanner/distance transform. Each
@@ -194,6 +197,85 @@ class Simulator(object):
             if hasattr(agent, "set_seed"):
                 agent.set_seed(self.seed)
 
+    def _resolve_swept_contacts(self, env_mask):
+        """Resolve events chronologically, rechecking motion against stopped cars.
+
+        Physical wall contacts stop even when predictive TTC response is disabled.
+        The flag wall_collision_response still controls predictive TTC stops only.
+        Equal-time pair events use the lowest other-agent index; a pair takes
+        precedence over a wall at the same time, matching the public index API.
+        """
+        visible = np.flatnonzero(self.collidable_mask)
+        count = self.num_agents
+        stopped = np.full(count, np.inf)
+        wall_times = np.full(count, np.inf)
+        col_flags = np.zeros(count)
+        hit_indices = np.full(count, -1, dtype=np.int64)
+        extents = [np.array([a.geometry.front, a.geometry.rear,
+                             a.geometry.left, a.geometry.right]) for a in self.agents]
+        predictive = [bool(a.in_collision) for a in self.agents]
+        for index in visible:
+            agent = self.agents[index]
+            scanner = agent.scan_simulator
+            if getattr(scanner, "map_height", None) is not None:
+                local_trace = map_motion_trace(agent._pose_trace, scanner.origin)
+                wall_times[index] = swept_map_contact(
+                    local_trace, extents[index], scanner.map_img, scanner.map_resolution)
+        now = 0.
+        tie_tolerance = 1e-8  # step fraction, only for deterministic grouping
+        # Every event group stops at least one previously unstopped car.
+        for _ in range(count + 1):
+            events = []
+            for index in visible:
+                if not np.isfinite(stopped[index]) and np.isfinite(wall_times[index]):
+                    events.append((wall_times[index], int(index), ENV_COLLISION_IDX))
+            for position, index in enumerate(visible):
+                for other in visible[position + 1:]:
+                    if np.isfinite(stopped[index]) and np.isfinite(stopped[other]):
+                        continue
+                    time = swept_contact(self.agents[index]._pose_trace, extents[index],
+                                         self.agents[other]._pose_trace, extents[other],
+                                         start=now, stop_a=stopped[index], stop_b=stopped[other])
+                    if np.isfinite(time):
+                        events.append((time, int(index), int(other)))
+            if not events:
+                break
+            now = min(event[0] for event in events)
+            for time, index, other in sorted(events):
+                if time > now + tie_tolerance:
+                    continue
+                participants = ((index, other),) if other == ENV_COLLISION_IDX else ((index, other), (other, index))
+                for participant, obstacle in participants:
+                    stopped[participant] = min(stopped[participant], now)
+                    first = self.collision_times[participant] / self.time_step
+                    if not np.isfinite(first) or now < first - tie_tolerance:
+                        self.collision_times[participant] = now * self.time_step
+                        hit_indices[participant] = obstacle
+                    elif abs(now - first) <= tie_tolerance and obstacle >= 0:
+                        previous = hit_indices[participant]
+                        if previous < 0 or obstacle < previous:
+                            hit_indices[participant] = obstacle
+                    if obstacle == ENV_COLLISION_IDX:
+                        env_mask[participant] = True
+                    else:
+                        col_flags[participant] = 1.
+        for index in visible:
+            agent = self.agents[index]
+            if np.isfinite(stopped[index]):
+                agent.stop_at_contact(stopped[index])
+                agent.compute_scan()
+            elif predictive[index]:
+                env_mask[index] = True
+                self.collision_times[index] = self.time_step
+                if self.wall_collision_response:
+                    # CCD certified this endpoint free of physical contact.
+                    # A predictive TTC stop now holds here rather than rewinding
+                    # an entire step, which could introduce new pair overlaps.
+                    agent.stop_at_contact(1.)
+                    agent.compute_scan()
+        # Only pair indices feed the merger; environment-only contacts use -2.
+        return col_flags, hit_indices
+
     def step(self, control_inputs: np.ndarray) -> dict:
         """
         Advance all agents one physics step and return vectorized observations.
@@ -213,6 +295,7 @@ class Simulator(object):
 
         self.collisions.fill(0.0)
         self.collision_idx.fill(-1)
+        self.collision_times.fill(np.inf)
         env_collision_mask = self._env_collision_mask
         env_collision_mask.fill(False)
 
@@ -227,60 +310,37 @@ class Simulator(object):
             np.copyto(state_buffer[i], agent.physics_state)
             agent.update_pose(float(control_inputs[i, 0]), float(control_inputs[i, 1]))
 
-            with self.profile_region("physics_collisions") if self.profile_region else nullcontext():
-                if self.wall_collision_response and getattr(agent, "in_collision", False):
-                    if agent.nonlinear:
-                        # Stop at contact. Lifecycle handling latches a terminal
-                        # freeze; nonterminating collision experiments may resume.
-                        agent.freeze_motion(state_buffer[i], hold=False)
-                    else:
-                        np.copyto(agent.state, state_buffer[i])
-                        agent.state[3] = 0.0
-                        agent.state[5] = 0.0
-                    agent.compute_scan()
-                    env_collision_mask[i] = True
+        with self.profile_region("physics_collisions") if self.profile_region else nullcontext():
+            col_flags, hit_idx = self._resolve_swept_contacts(env_collision_mask)
 
-            pose_buffer[i, 0] = agent.state[0]
-            pose_buffer[i, 1] = agent.state[1]
-            pose_buffer[i, 2] = agent.state[4]
-
+        for i, agent in enumerate(self.agents):
+            pose_buffer[i] = agent.state[[0, 1, 4]]
             with self.profile_region("physics_collisions") if self.profile_region else nullcontext():
                 verts = agent.geometry.world_vertices(pose_buffer[i])
-                verts_buffer_f64[i, :, :] = verts
-                verts_buffer_f32[i, :, :] = verts
-
-            self.agent_poses[i, 0] = np.float32(agent.state[0])
-            self.agent_poses[i, 1] = np.float32(agent.state[1])
-            self.agent_poses[i, 2] = np.float32(agent.state[4])
-
-            v_long, v_lat = (agent.body_velocity if getattr(agent, "nonlinear", False)
-                                  else _body_velocity_from_state(agent.state))
+                verts_buffer_f64[i] = verts
+                verts_buffer_f32[i] = verts
+            self.agent_poses[i] = pose_buffer[i]
+            v_long, v_lat = agent.body_velocity
             self._linear_vels_x[i] = np.float32(v_long)
             self._linear_vels_y[i] = np.float32(v_lat)
             self._ang_vels_z[i] = np.float32(agent.state[5])
-
             scan_row = np.asarray(agent.scan, dtype=np.float32)
             if scan_row.shape[0] != self._scan_buffer.shape[1]:
                 self._ensure_scan_capacity(scan_row.shape[0])
                 for j in range(i):
-                    prev = np.asarray(self.agents[j].scan, dtype=np.float32)
-                    np.copyto(self._scan_buffer[j], prev)
+                    np.copyto(self._scan_buffer[j], self.agents[j].scan)
                 self.num_beams = self._scan_buffer.shape[1]
             np.copyto(self._scan_buffer[i], scan_row)
 
-        # --- 2) agent-agent collisions (GJK)
+        # Retain endpoint GJK as a compatibility check (e.g. initial overlaps).
         with self.profile_region("physics_collisions") if self.profile_region else nullcontext():
             visible = np.flatnonzero(self.collidable_mask)
-            if len(visible) == N:
-                col_flags, hit_idx = collision_multiple(verts_buffer_f64)
-            else:
-                flags, hits = collision_multiple(verts_buffer_f64[visible])
-                col_flags = np.zeros(N, dtype=np.float64)
-                hit_idx = np.full(N, -1, dtype=np.int64)
-                col_flags[visible] = flags
-                for local, hit in enumerate(hits):
-                    if hit >= 0:
-                        hit_idx[visible[local]] = visible[int(hit)]
+            flags, hits = collision_multiple(verts_buffer_f64[visible])
+            for local, index in enumerate(visible):
+                if flags[local] and not col_flags[index]:
+                    col_flags[index] = 1.
+                    hit_idx[index] = visible[int(hits[local])]
+                    self.collision_times[index] = min(self.collision_times[index], self.time_step)
 
         # --- 3) opponent occlusions via LiDAR footprints, etc.
         if N > 1:
@@ -417,6 +477,7 @@ class Simulator(object):
 
         self.collisions.fill(0.0)
         self.collision_idx.fill(-1)
+        self.collision_times.fill(np.inf)
         env_collision_mask = self._env_collision_mask
         env_collision_mask.fill(False)
 

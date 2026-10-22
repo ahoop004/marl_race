@@ -157,7 +157,7 @@ def build_run_provenance(
     environment = scenario.get("environment", {}) or {}
     experiment = scenario.get("experiment", {}) or {}
     repo_root = Path(__file__).resolve().parents[2]
-    from physics.collision_models import GEOMETRY_COLLISION_VERSION
+    from physics.collision_models import GEOMETRY_COLLISION_VERSION, SWEPT_COLLISION_VERSION
     from physics.laser_models import MAP_LIDAR_VERSION
     import torch
     trainable_agents = list(trainable_agents)
@@ -198,6 +198,7 @@ def build_run_provenance(
         },
         "behavior_contracts": {
             "vehicle_geometry_collision": GEOMETRY_COLLISION_VERSION,
+            "swept_collision": SWEPT_COLLISION_VERSION,
             "map_lidar": MAP_LIDAR_VERSION,
             "fixed_opponent_episode_reset": "1.0",
             "seeded_map_schedule": "1.0",

@@ -7,6 +7,7 @@ import numpy as np
 from physics.dynamic_models import (
     vehicle_dynamics_st, pid, validate_vehicle_params, first_order_actuator_step,
     combined_slip_dynamics, integrate_combined_slip,
+    write_rk4_trace, sample_wheel_actuators,
 )
 from physics.integration import Integrator
 from physics.collision_models import VehicleGeometry
@@ -217,7 +218,7 @@ class CombinedSlipVehicle:
             "yaw_acceleration": float(rhs[5]),
         }
 
-    def advance(self, timestep: float) -> np.ndarray:
+    def advance(self, timestep: float, *, motion_trace=None) -> np.ndarray:
         """RK4 chassis integration with exact actuator samples at every stage.
 
         Explicit max_integration_step limits stiffness near zero contact speed.
@@ -230,6 +231,7 @@ class CombinedSlipVehicle:
             self._chassis, actuators._state, actuators._reference,
             actuators._time_constants, actuators._rate_limits,
             self._dynamics_params, timestep, self.params["max_integration_step"],
+            motion_trace,
         )
         # Commit both subsystems only after every stage and final validation pass.
         actuators._state[:] = final_actuators
@@ -301,6 +303,11 @@ class RaceCar(object):
         if not np.isfinite(time_step) or time_step <= 0:
             raise ValueError("physics time_step must be positive and finite")
         self.time_step = time_step
+        trace_steps = (int(np.ceil(time_step / self._physics.params["max_integration_step"]))
+                       if self.nonlinear else 1)
+        self._motion_trace = np.zeros((trace_steps, 4, 6 if self.nonlinear else 7))
+        self._pose_trace = np.zeros((trace_steps, 4, 3))
+        self._motion_actuator_start = np.zeros(2)
         self.num_beams = int(num_beams)
         self.fov = fov
         self.integrator = integrator
@@ -470,7 +477,31 @@ class RaceCar(object):
             self._motion_frozen = hold
             self._sync_physics_view()
         else:
+            if previous_state is not None:
+                self.state[:] = previous_state
             self.state[[3, 5, 6]] = 0.0
+
+    def stop_at_contact(self, fraction):
+        """Sample the existing integration path, then hold for the step remainder.
+
+        Chassis velocities and wheel speed stop without impulses. Steering uses
+        the exact held-command actuator solution at contact, then holds there;
+        neither subsystem is left at a different simulation time.
+        """
+        from physics.collision_models import trace_state
+        contact = trace_state(self._motion_trace, fraction)
+        if self.nonlinear:
+            actuators = self._physics._actuators
+            at_contact = sample_wheel_actuators(
+                self._motion_actuator_start, actuators._reference,
+                fraction * self.time_step, actuators._time_constants, actuators._rate_limits)
+            state = np.concatenate((contact, at_contact))
+            self.freeze_motion(state, hold=self._motion_frozen)
+        else:
+            contact[4] = (contact[4] + np.pi) % (2 * np.pi) - np.pi
+            contact[2] = np.clip(contact[2], self._steer_min, self._steer_max)
+            self.freeze_motion(contact, hold=False)
+        self.accel = self.steer_angle_vel = 0.0
 
     def set_seed(self, seed):
         """
@@ -628,8 +659,14 @@ class RaceCar(object):
         if self.nonlinear:
             if not self._motion_frozen:
                 self._physics.command(raw_steer, vel)  # rad, rad/s references
-                self._physics.advance(self.time_step)
+                self._motion_actuator_start[:] = self._physics._actuators._state
+                self._physics.advance(self.time_step, motion_trace=self._motion_trace)
                 self._sync_physics_view()
+            else:
+                self._motion_trace.fill(0.)
+                self._motion_trace[:, 0] = self._physics._chassis
+                self._motion_actuator_start[:] = self._physics._actuators._state
+            self._pose_trace[:] = self._motion_trace[:, :, :3]
             return self.compute_scan()
 
         # state is [x, y, steer_angle, vel, yaw_angle, yaw_rate, slip_angle]
@@ -689,6 +726,7 @@ class RaceCar(object):
             np.add(self.state, rk_delta, out=rk_state3)
 
             k4 = vehicle_dynamics_st(rk_state3, control_vec, *dyn_params)
+            write_rk4_trace(self._motion_trace[0], self.state, k1, k2, k3, k4, self.time_step)
 
             rk_accum[:] = k1
             rk_accum += k2
@@ -702,6 +740,9 @@ class RaceCar(object):
 
         elif mode == 'EULER':
             f = vehicle_dynamics_st(self.state, control_vec, *dyn_params)
+            self._motion_trace.fill(0.)
+            self._motion_trace[0, 0] = self.state
+            self._motion_trace[0, 1] = self.time_step * f
             np.multiply(f, self.time_step, out=self._rk_delta)
             np.add(self.state, self._rk_delta, out=self.state)
 
@@ -716,6 +757,8 @@ class RaceCar(object):
         if not np.all(np.isfinite(self.state)):
             # numerical blow-up; revert to previous stable state
             np.copyto(self.state, prev_state)
+            self._motion_trace.fill(0.)
+            self._motion_trace[0, 0] = self.state
         else:
             # clamp state components to physically reasonable ranges
             steer_min = self._steer_min
@@ -736,6 +779,7 @@ class RaceCar(object):
             # ensure any remaining NaN/inf entries are neutralised
             np.nan_to_num(self.state, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
+        self._pose_trace[:] = self._motion_trace[:, :, [0, 1, 4]]
         # update scan
         scan_pose = self.geometry.lidar_pose(self.state[[0, 1, 4]], self._scan_pose)
         current_scan = self.scan_simulator.scan(scan_pose, self.scan_rng)

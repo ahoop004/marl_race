@@ -362,3 +362,198 @@ def get_vertices(pose, length, width, center_x=0.0, center_y=0.0):
         verts[i, 1] = verts_h[i, 1]
 
     return verts
+
+
+# Separate from geometry v2: continuous detection and stop-at-contact response.
+SWEPT_COLLISION_VERSION = 1
+CONTACT_DISTANCE_TOL = 1e-7  # metres; conservative numerical uncertainty, not TTC margin
+CONTACT_TIME_TOL = 1e-10   # fraction of one environment step
+
+
+@njit(cache=True)
+def trace_state(trace, fraction):
+    """Evaluate a piecewise integration polynomial, including unwrapped yaw."""
+    scaled = min(1., max(0., fraction)) * len(trace)
+    index = min(int(scaled), len(trace) - 1)
+    t = scaled - index
+    return ((trace[index, 3] * t + trace[index, 2]) * t + trace[index, 1]) * t + trace[index, 0]
+
+
+@njit(cache=True)
+def _footprint_radius(extents):
+    return np.hypot(max(extents[0], extents[1]), max(extents[2], extents[3]))
+
+
+@njit(cache=True)
+def _trace_bounds(trace, extents):
+    """Bernstein control-point hull bounds all translations, then adds body radius."""
+    lower = np.full(2, np.inf)
+    upper = np.full(2, -np.inf)
+    for segment in trace:
+        for axis in range(2):
+            c0, c1, c2, c3 = segment[:, axis]
+            controls = (c0, c0 + c1 / 3., c0 + 2. * c1 / 3. + c2 / 3., c0 + c1 + c2 + c3)
+            for value in controls:
+                lower[axis] = min(lower[axis], value)
+                upper[axis] = max(upper[axis], value)
+    radius = _footprint_radius(extents)
+    return lower - radius, upper + radius
+
+
+@njit(cache=True)
+def _motion_bound(trace, extents):
+    """Upper bound on any footprint point's speed per environment-step fraction.
+
+    For c0+c1*t+c2*t²+c3*t³, translation speed is bounded by the
+    triangle inequality on c1+2*c2*t+3*c3*t². Rotation adds R*|yaw'|.
+    Multiplication by segment count converts local fraction to global fraction.
+    """
+    radius = _footprint_radius(extents)
+    bound = 0.
+    for segment in trace:
+        translation, angular = 0., 0.
+        for power in range(1, 4):
+            translation += power * np.hypot(segment[power, 0], segment[power, 1])
+            angular += power * abs(segment[power, 2])
+        bound = max(bound, translation + radius * angular)
+    return bound * len(trace)
+
+
+@njit(cache=True)
+def _relative_motion_bound(trace_a, ext_a, trace_b, ext_b):
+    """Remove shared translation when both traces use the same time segments."""
+    bound = 0.
+    radius_a, radius_b = _footprint_radius(ext_a), _footprint_radius(ext_b)
+    for index in range(len(trace_a)):
+        speed = 0.
+        for power in range(1, 4):
+            delta = trace_b[index, power, :2] - trace_a[index, power, :2]
+            speed += power * (np.hypot(delta[0], delta[1])
+                              + radius_a * abs(trace_a[index, power, 2])
+                              + radius_b * abs(trace_b[index, power, 2]))
+        bound = max(bound, speed)
+    return bound * len(trace_a)
+
+
+@njit(cache=True)
+def _trace_vertices(trace, extents, fraction):
+    pose = trace_state(trace, fraction)
+    return get_vertices(pose, extents[0] + extents[1], extents[2] + extents[3],
+                        (extents[0] - extents[1]) / 2., (extents[2] - extents[3]) / 2.)
+
+
+@njit(cache=True)
+def _separation(trace_a, ext_a, trace_b, ext_b, fraction, stop_a, stop_b, map_width, map_height):
+    a = _trace_vertices(trace_a, ext_a, min(fraction, stop_a))
+    if map_width > 0.:
+        # Distance from footprint to the occupied exterior of the map rectangle.
+        return min(np.min(a[:, 0]), np.min(a[:, 1]),
+                   map_width - np.max(a[:, 0]), map_height - np.max(a[:, 1]))
+    b = _trace_vertices(trace_b, ext_b, min(fraction, stop_b))
+    # Separating-axis gaps are lower bounds on Euclidean distance. SAT is exact
+    # for rectangles, including grazing contact (GJK's legacy API tests overlap).
+    gap = -np.inf
+    for vertices in (a, b):
+        for edge in range(2):
+            delta = vertices[edge + 1] - vertices[edge]
+            norm = np.hypot(delta[0], delta[1])
+            nx, ny = -delta[1] / norm, delta[0] / norm
+            amin, amax, bmin, bmax = np.inf, -np.inf, np.inf, -np.inf
+            for corner in range(4):
+                av = a[corner, 0] * nx + a[corner, 1] * ny
+                bv = b[corner, 0] * nx + b[corner, 1] * ny
+                amin, amax = min(amin, av), max(amax, av)
+                bmin, bmax = min(bmin, bv), max(bmax, bv)
+            gap = max(gap, bmin - amax, amin - bmax)
+    return gap
+
+
+@njit(cache=True)
+def swept_contact(trace_a, ext_a, trace_b, ext_b, start=0., stop_a=np.inf,
+                  stop_b=np.inf, map_width=0., map_height=0.):
+    """Earliest conservative contact fraction, or infinity for a certified miss.
+
+    An interval is discarded only when midpoint separation exceeds the maximum
+    possible Hausdorff displacement over that entire interval. Otherwise bisect
+    left-first. Thus even a transient/grazing collision between all query points
+    cannot be discarded. Uncertainty <= 1e-7 m (or 1e-10 step fraction) is contact;
+    the returned left endpoint prevents advancing through an unresolved interval.
+    This is adaptive interval certification, not fixed sampling.
+    """
+    if map_width == 0.:
+        lo_a, hi_a = _trace_bounds(trace_a, ext_a)
+        lo_b, hi_b = _trace_bounds(trace_b, ext_b)
+        if np.any(lo_a > hi_b + CONTACT_DISTANCE_TOL) or np.any(lo_b > hi_a + CONTACT_DISTANCE_TOL):
+            return np.inf
+    bound_a, bound_b = _motion_bound(trace_a, ext_a), _motion_bound(trace_b, ext_b)
+    relative_bound = bound_a + bound_b
+    if map_width == 0. and len(trace_a) == len(trace_b):
+        relative_bound = min(relative_bound, _relative_motion_bound(trace_a, ext_a, trace_b, ext_b))
+    if map_width > 0.:
+        bound_b = 0.
+    if _separation(trace_a, ext_a, trace_b, ext_b, start, stop_a, stop_b, map_width, map_height) <= CONTACT_DISTANCE_TOL:
+        return start
+    left_stack, right_stack = np.empty(64), np.empty(64)
+    left_stack[0], right_stack[0], count = start, 1., 1
+    while count:
+        count -= 1
+        left, right = left_stack[count], right_stack[count]
+        middle = (left + right) / 2.
+        bound = (bound_a if left < stop_a else 0.) + (bound_b if left < stop_b else 0.)
+        if right <= stop_a and right <= stop_b:
+            bound = min(bound, relative_bound)
+        gap = _separation(trace_a, ext_a, trace_b, ext_b, middle, stop_a, stop_b, map_width, map_height)
+        if gap > bound * (right - left) / 2. + CONTACT_DISTANCE_TOL:
+            continue
+        if bound * (right - left) <= CONTACT_DISTANCE_TOL or right - left <= CONTACT_TIME_TOL:
+            return left
+        # Push right first so left is examined first; depth <= 35 at time tolerance.
+        left_stack[count], right_stack[count] = middle, right
+        left_stack[count + 1], right_stack[count + 1] = left, middle
+        count += 2
+    return np.inf
+
+
+@njit(cache=True)
+def map_motion_trace(trace, origin):
+    """Transform all polynomial coefficients into the F4 occupancy-grid frame."""
+    result = trace.copy()
+    c, s = np.cos(origin[2]), np.sin(origin[2])
+    for index in range(len(trace)):
+        for power in range(4):
+            x, y = trace[index, power, 0], trace[index, power, 1]
+            if power == 0:
+                x, y = x - origin[0], y - origin[1]
+            result[index, power, 0] = c * x + s * y
+            result[index, power, 1] = -s * x + c * y
+        result[index, 0, 2] -= origin[2]
+    return result
+
+
+@njit(cache=True)
+def swept_map_contact(trace, extents, occupancy, resolution):
+    """Sweep the entire body against occupied closed cells and map exterior.
+
+    occupancy is the scanner's authoritative, bottom-up free-cell mask. A broad
+    swept AABB limits cell enumeration; every candidate gets certified CCD.
+    """
+    height, width = occupancy.shape
+    stationary = np.zeros((1, 4, 3))
+    cell_extents = np.full(4, resolution / 2.)
+    earliest = swept_contact(trace, extents, stationary, cell_extents,
+                             map_width=width * resolution, map_height=height * resolution)
+    lower, upper = _trace_bounds(trace, extents)
+    c0 = max(0, int(np.floor(lower[0] / resolution)) - 1)
+    c1 = min(width - 1, int(np.floor(upper[0] / resolution)) + 1)
+    r0 = max(0, int(np.floor(lower[1] / resolution)) - 1)
+    r1 = min(height - 1, int(np.floor(upper[1] / resolution)) + 1)
+    for row in range(r0, r1 + 1):
+        for col in range(c0, c1 + 1):
+            if occupancy[row, col]:
+                continue
+            stationary[0, 0, 0] = (col + .5) * resolution
+            stationary[0, 0, 1] = (row + .5) * resolution
+            earliest = min(earliest, swept_contact(trace, extents, stationary, cell_extents))
+            if earliest == 0.:
+                return earliest
+    return earliest

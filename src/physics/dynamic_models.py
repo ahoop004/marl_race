@@ -390,8 +390,23 @@ def sample_wheel_actuators(state, reference, elapsed, constants, rates):
 
 
 @njit(cache=True)
+def write_rk4_trace(out, state, k1, k2, k3, k4, dt):
+    """Cubic RK4 continuous extension in local step fraction, not new dynamics.
+
+    At fraction 1 the weights are (1/6, 1/3, 1/3, 1/6), matching the
+    existing endpoint update to rounding. Derivatives can be bounded over the
+    whole polynomial, so collision queries need no fixed-time sampling.
+    """
+    out[0] = state
+    out[1] = dt * k1
+    out[2] = dt * (-1.5 * k1 + k2 + k3 - .5 * k4)
+    out[3] = dt * (2. / 3.) * (k1 - k2 - k3 + k4)
+
+
+@njit(cache=True)
 def integrate_combined_slip(
     chassis, actuator_state, reference, constants, rates, params, timestep, max_step,
+    motion_trace=None,
 ):
     """Integrate and validate a proposed state; the caller commits it atomically."""
     # Keep stage arithmetic and held-reference sampling identical to scalar RK4.
@@ -408,6 +423,8 @@ def integrate_combined_slip(
         k2, _ = combined_slip_dynamics(state + dt / 2 * k1, at_middle, params)
         k3, _ = combined_slip_dynamics(state + dt / 2 * k2, at_middle, params)
         k4, _ = combined_slip_dynamics(state + dt * k3, at_end, params)
+        if motion_trace is not None:
+            write_rk4_trace(motion_trace[index], state, k1, k2, k3, k4, dt)
         state += dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
     final_actuators = sample_wheel_actuators(actuator_state, reference, timestep, constants, rates)
     combined_slip_dynamics(state, final_actuators, params)

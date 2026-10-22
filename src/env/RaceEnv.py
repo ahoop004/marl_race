@@ -973,7 +973,8 @@ class RaceEnv:
         # Apply speed locking AFTER simulation step (restore locked velocities)
         if self._lock_speed_steps > 0 and self._episode_step_count <= self._lock_speed_steps:
             for agent_id, locked_vel in self._locked_velocities.items():
-                if agent_id in agent_index:
+                if (agent_id in agent_index
+                        and not obs_joint["collisions"][agent_index[agent_id]]):
                     idx = agent_index[agent_id]
                     self.sim.set_agent_speed(idx, float(locked_vel))
             # set_agent_speed updates both body-frame velocity components;
