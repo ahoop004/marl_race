@@ -88,3 +88,72 @@ def test_actuator_sampling_reuses_output_through_linear_and_exponential_regions(
     snapshot = sample_wheel_actuators(state, reference, 1., constants, rates)
     assert not np.shares_memory(snapshot, state)
     assert not np.shares_memory(snapshot, reference)
+
+
+def test_finish_filter_never_rejects_original_hull_candidates():
+    from env.centerline_state import _finish_candidate_parts
+    rng = np.random.default_rng(721)
+    normal = np.array([.6, -.8], dtype=np.float32)
+    offset, hysteresis = np.float32(2.), .1
+    poses = rng.normal(size=(1000, 4, 3))
+    poses[:, 0, :2] *= 10.
+    # Include constant paths, tangencies, endpoint roots and cancellation.
+    poses[:4] = 0.
+    poses[:4, 0, 0] = float(offset) / float(normal[0])
+    poses[1, 1, 0], poses[1, 2, 0] = -2., 2.
+    poses[2, 1, 0], poses[2, 2, 0], poses[2, 3, 0] = 3., -9., 6.
+    poses[3, 1, 0] = np.nextafter(0., 1.)
+    out = np.empty(len(poses), dtype=np.int64)
+    for limit in (0., .12345, .5, 1.):
+        count, visited = _finish_candidate_parts(poses, normal, offset, hysteresis, limit, out)
+        candidates = set(out[:count])
+        distances = poses[:, :, :2] @ normal
+        distances[:, 0] -= offset
+        for part, coefficients in enumerate(distances):
+            if limit * len(poses) - part < 0.:
+                break
+            c0, c1, c2, c3 = coefficients
+            controls = (c0, c0 + c1 / 3., c0 + 2*c1 / 3. + c2 / 3., coefficients.sum())
+            if any(min(controls) <= level <= max(controls) for level in (0., -hysteresis)):
+                assert part in candidates
+        assert visited == min(len(poses), int(limit * len(poses)) + 1)
+        assert all(part < visited for part in candidates)
+
+
+def test_clearance_retains_strict_numpy_distance_thresholds():
+    from agents.fixed.hybrid import _path_clearance
+    rng = np.random.default_rng(17)
+    path = rng.normal(size=(40, 2))
+    distances = np.linspace(0., 10., len(path))
+    points = rng.normal(size=(108, 2))
+    for radii in (np.full(108, .1), rng.uniform(.001, .3, 108)):
+        hit = np.any(np.sum((path[:, None, :] - points[None, :, :]) ** 2, axis=2)
+                     < radii[None, :] ** 2, axis=1)
+        indices = np.flatnonzero(hit)
+        expected = float(distances[indices[0]]) if len(indices) else float('inf')
+        assert _path_clearance(path, distances, points, radii) == expected
+    for separation in (np.nextafter(1., 0.), 1., np.nextafter(1., 2.)):
+        assert _path_clearance(np.zeros((1, 2)), np.array([2.]),
+                               np.array([[separation, 0.]]), np.ones(1)) == (2. if separation < 1. else float('inf'))
+
+
+def test_state_detach_keeps_mutable_storage_independent_and_shared_aliases():
+    from env.types import GlobalState, AgentState, ProgressState, StepFacts
+    from tasks.race_task import _detach
+    shared = np.array([1., 2.], dtype=np.float32)
+    readonly = shared.copy(); readonly.setflags(write=False)
+    global_state = GlobalState(('car',), readonly, {'active_mask': np.array([True])}, {'nested': [shared]})
+    agent = AgentState('car', shared, shared, 0., False, ProgressState(), {'copy': shared})
+    source = StepFacts({'car': agent}, global_state, {'car': False}, {}, {}, {'car': {'array': shared}})
+    copied = _detach(source)
+    assert type(copied) is StepFacts and type(copied.agent_states['car']) is AgentState
+    assert type(copied.global_state.metadata['nested']) is list
+    assert copied.agent_states['car'].pose is copied.agent_states['car'].velocity
+    assert copied.agent_states['car'].pose is copied.info['car']['array']
+    assert not copied.global_state.vector.flags.writeable
+    copied.agent_states['car'].pose[:] = 8.
+    copied.global_state.masks['active_mask'][:] = False
+    copied.agent_states['car'].progress.lap_count = 3
+    np.testing.assert_array_equal(shared, [1., 2.])
+    assert source.global_state.masks['active_mask'][0]
+    assert source.agent_states['car'].progress.lap_count == 0
