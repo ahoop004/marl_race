@@ -5,10 +5,22 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 import yaml
+import numpy as np
 from PIL import Image
 
 from env.types import MapRuntimeConfig
 from utils.map_loader import parse_surface_metadata
+
+
+def map_world_bounds(metadata, image_size):
+    """World AABB of the map rectangle, including a rotated grid origin."""
+    width, height = np.asarray(image_size) * float(metadata.get("resolution", 1.0))
+    x, y, yaw = metadata.get("origin", (0., 0., 0.))
+    corners = np.array([[0., 0.], [width, 0.], [0., height], [width, height]])
+    c, s = np.cos(yaw), np.sin(yaw)
+    world = corners @ np.array([[c, s], [-s, c]]) + [x, y]
+    lower, upper = world.min(axis=0), world.max(axis=0)
+    return lower[0], upper[0], lower[1], upper[1]
 
 
 def normalize_map_identifier(identifier: Optional[Any]) -> Optional[str]:

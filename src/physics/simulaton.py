@@ -292,6 +292,10 @@ class Simulator(object):
         N = self.num_agents
         if not isinstance(control_inputs, np.ndarray) or control_inputs.shape != (N, 2):
             raise ValueError(f"control_inputs must have shape ({N}, 2)")
+        if not np.isfinite(control_inputs).all():
+            raise ValueError("control_inputs must be finite")
+        if any(not np.isfinite(agent.physics_state).all() for agent in self.agents):
+            raise ValueError("Vehicle states must be finite before stepping")
 
         self.collisions.fill(0.0)
         self.collision_idx.fill(-1)
@@ -399,6 +403,13 @@ class Simulator(object):
         }
         return obs_dict
 
+    def freeze_agent(self, agent_idx: int) -> None:
+        """Freeze a terminal car and immediately synchronize published velocities."""
+        agent = self.agents[agent_idx]
+        agent.freeze_motion()
+        self._linear_vels_x[agent_idx], self._linear_vels_y[agent_idx] = agent.body_velocity
+        self._ang_vels_z[agent_idx] = agent.state[5]
+
     def set_agent_speed(self, agent_idx: int, speed: float) -> None:
         """Override the longitudinal speed of a specific agent."""
         if agent_idx < 0 or agent_idx >= self.num_agents:
@@ -463,15 +474,19 @@ class Simulator(object):
             raise ValueError(f"poses must be an array with shape (N,3); got {getattr(poses, 'shape', None)}")
         if poses.shape[0] != self.num_agents:
             raise ValueError("Number of poses for reset does not match number of agents.")
-        if agent_indices is None:
-            self.collidable_mask.fill(True)
-        else:
-            self.collidable_mask[list(agent_indices)] = True
+        if not np.isfinite(poses).all():
+            raise ValueError("Reset poses must be finite")
         if velocities is not None:
             if not isinstance(velocities, np.ndarray):
                 velocities = np.array(velocities, dtype=np.float32)
             if velocities.ndim != 1 or velocities.shape[0] != self.num_agents:
                 raise ValueError(f"velocities must be a 1D array with {self.num_agents} elements; got shape {velocities.shape}")
+            if np.isinf(velocities).any():
+                raise ValueError("Reset velocities must be finite (NaN means use the default)")
+        if agent_indices is None:
+            self.collidable_mask.fill(True)
+        else:
+            self.collidable_mask[list(agent_indices)] = True
 
         N = self.num_agents
 
@@ -487,18 +502,15 @@ class Simulator(object):
 
         selected = set(range(N) if agent_indices is None else agent_indices)
         for i, agent in enumerate(self.agents):
-            if i not in selected:
-                np.copyto(self._scan_buffer[i], agent.compute_scan())
-                continue
-            if friction_mu is not None:
+            if i in selected and friction_mu is not None:
                 if not agent.nonlinear:
                     raise ValueError("Episode friction requires combined_slip_st")
                 agent.reset(poses[i], friction_mu=friction_mu)
-            else:
+            elif i in selected:
                 agent.reset(poses[i])
 
             # Set custom initial velocity if provided (skip if NaN)
-            if velocities is not None and i < len(velocities):
+            if i in selected and velocities is not None and i < len(velocities):
                 vel = float(velocities[i])
                 if not np.isnan(vel):
                     # agent.state[3] is v_long (longitudinal velocity)
@@ -514,7 +526,7 @@ class Simulator(object):
 
             v_long, v_lat = (agent.body_velocity if getattr(agent, "nonlinear", False)
                                   else _body_velocity_from_state(agent.state))
-            yaw_rate = float(getattr(agent, "yaw_rate", agent.state[5]))
+            yaw_rate = float(agent.state[5])
 
             self._linear_vels_x[i] = np.float32(v_long)
             self._linear_vels_y[i] = np.float32(v_lat)
@@ -571,6 +583,7 @@ class Simulator(object):
             self.collision_idx,
             ENV_COLLISION_IDX,
         )
+        self.collision_times[self.collisions != 0.] = 0.
 
         obs_dict = {
             "scans": self._scan_buffer.copy(),

@@ -33,7 +33,7 @@ from env.info_builder import (
     build_step_facts,
     filter_info_payloads,
 )
-from env.map_config import normalize_map_identifier, resolve_map_runtime_config
+from env.map_config import normalize_map_identifier, resolve_map_runtime_config, map_world_bounds
 from env.map_schedule import MapScheduler
 from env.obs_assembly import split_joint_obs
 from env.render_adapter import (
@@ -388,14 +388,7 @@ class RaceEnv:
         self._lap_tracker: Optional[LapTracker] = None
         self._configure_lap_tracker(meta, map_data=map_data)
 
-        R = float(meta.get("resolution", 1.0))
-        x0, y0, _ = meta.get('origin', (0.0, 0.0, 0.0))
-        x_min = x0
-        x_max = x0 + width * R
-        y_min = y0
-        y_max = y0 + height * R
-
-        self._build_observation_spaces(x_min, x_max, y_min, y_max)
+        self._build_observation_spaces(*map_world_bounds(meta, (width, height)))
 
         # stateful observations for rendering
         default_lidar_skip = int(merged.get("lidar_beams", self._lidar_beam_count))
@@ -612,10 +605,7 @@ class RaceEnv:
             self.set_centerline(map_data.centerline, path=map_data.centerline_path)
 
         # Update observation bounds based on new map
-        width, height = map_data.image_size
-        R = float(self.map_meta.get("resolution", 1.0))
-        x0, y0, _ = self.map_meta.get("origin", (0.0, 0.0, 0.0))
-        self._build_observation_spaces(x0, x0 + width * R, y0, y0 + height * R)
+        self._build_observation_spaces(*map_world_bounds(self.map_meta, map_data.image_size))
 
         if bundle is not None:
             self._map_bundle_active = bundle
@@ -641,9 +631,9 @@ class RaceEnv:
     def observation_space(self, agent: str):
         return self.observation_spaces[agent]
 
-    def _update_state(self, obs_dict):
+    def _update_state(self, obs_dict, *, advance_history=True):
         self._invalidate_global_state_cache()
-        self.state_buffers.update(obs_dict)
+        self.state_buffers.update(obs_dict, advance_history=advance_history)
 
     def _refresh_render_observations(self, obs: Dict[str, Dict[str, Any]]) -> None:
         if not self._collect_render_data:
@@ -949,13 +939,11 @@ class RaceEnv:
             if aid in actions:
                 joint[agent_index[aid]] = np.asarray(actions[aid], dtype=np.float32)
 
+        if not np.all(np.isfinite(joint)):
+            raise ValueError("Physical actions must be finite")
         if self.params.get("model") == "combined_slip_st":
-            if not np.all(np.isfinite(joint)):
-                raise ValueError("Wheel-reference actions must be finite")
             space = self.action_space(self.possible_agents[0])
             np.clip(joint, space.low, space.high, out=joint)
-
-        self._record_control_commands(joint, active_before_step)
 
         self._terminal_controller.apply(
             joint,
@@ -963,7 +951,7 @@ class RaceEnv:
             simulator=self.sim,
             step=self._elapsed_steps,
         )
-
+        self._record_control_commands(joint, self.possible_agents)
 
         # Increment episode step counter
         self._episode_step_count += 1
@@ -981,7 +969,6 @@ class RaceEnv:
             # refresh the copied observation returned by sim.step accordingly.
             obs_joint = self.sim.current_observation()
 
-        obs = self._split_obs(obs_joint)
         self._update_state(obs_joint)
         self.current_time += self.timestep
         infos = {aid: {} for aid in self.possible_agents}
@@ -993,6 +980,9 @@ class RaceEnv:
                 self.linear_vels_x_curr,
                 self.linear_vels_y_curr,
                 step=self._elapsed_steps,
+                motion_paths=[(car._pose_trace, car._motion_trace, car.nonlinear,
+                               min(1., self.sim.collision_times[index] / self.timestep))
+                              for index, car in enumerate(self.sim.agents)],
             )
         else:
             self.lifecycle.begin_step()
@@ -1091,11 +1081,16 @@ class RaceEnv:
                                             step=self._elapsed_steps)
             if not np.array_equal(previous_visibility, self.sim.collidable_mask):
                 self.sim.refresh_scans()
-                scans = self.sim.current_observation()["scans"]
-                for aid in obs:
-                    if "scans" in obs[aid]:
-                        obs[aid]["scans"] = scans[agent_index[aid]]
-                        obs[aid]["lidar"] = obs[aid]["scans"]
+            self._record_control_commands(joint, self.possible_agents)
+            obs_joint = self.sim.current_observation()
+            self._update_state(obs_joint, advance_history=False)
+            # Freeze changes velocity, not position/progress. Refresh only the
+            # velocity projection; a second progress update would erase delta_s.
+            for aid, facts in self._last_centerline_facts.items():
+                index = agent_index[aid]
+                vx, vy = self.linear_vels_x_curr[index], self.linear_vels_y_curr[index]
+                c, s = np.cos(facts["heading_error"]), np.sin(facts["heading_error"])
+                facts["vs"], facts["vd"] = vx * c - vy * s, vx * s + vy * c
             self._inject_frenet_neighbors(infos)
         add_time_limit_info(infos, truncations=truncations)
         for aid, info in infos.items():
@@ -1123,6 +1118,8 @@ class RaceEnv:
             episode_step_count=self._episode_step_count,
         )
 
+        # Assemble once from the resolved terminal state and updated lap facts.
+        obs = self._split_obs(obs_joint, post_step=True)
         self._refresh_render_observations(obs)
 
         infos = filter_info_payloads(infos, info_level=self.info_level)
@@ -1562,7 +1559,7 @@ class RaceEnv:
         return obs
 
     # helper: joint->per-agent dicts expected by PZ Parallel API
-    def _split_obs(self, joint: Dict[str, np.ndarray]) -> Dict[str, Dict[str, np.ndarray]]:
+    def _split_obs(self, joint: Dict[str, np.ndarray], *, post_step=False) -> Dict[str, Dict[str, np.ndarray]]:
         observations = split_joint_obs(
             joint,
             possible_agents=self.possible_agents,
@@ -1573,8 +1570,8 @@ class RaceEnv:
             timestep=self.timestep,
             lap_counts=self.lap_counts,
             lap_times=self.lap_times,
-            prev_vels_x=self.linear_vels_x_curr,
-            prev_vels_y=self.linear_vels_y_curr,
+            prev_vels_x=self.linear_vels_x_prev if post_step else self.linear_vels_x_curr,
+            prev_vels_y=self.linear_vels_y_prev if post_step else self.linear_vels_y_curr,
             velocity_initialized=self.state_buffers.velocity_initialized,
             fallback_collisions=self.collisions,
         )
@@ -1653,9 +1650,7 @@ class RaceEnv:
         if not self._frenet_neighbor_agents:
             return
         relative = build_relative_frenet_facts(
-            {aid: facts for aid, facts in self._last_centerline_facts.items()
-             if self.sim.collidable_mask[self.possible_agents.index(aid)]}
-            if self._terminal_controller.config.remove_after_clearance else self._last_centerline_facts,
+            self._last_centerline_facts,
             track_length=self._centerline_progress_tracker.track_length,
             closed=self._centerline_progress_tracker.closed,
             agent_teams=self.agent_teams,
@@ -1663,6 +1658,9 @@ class RaceEnv:
         for agent_id, neighbors in relative.items():
             if agent_id not in self._frenet_neighbor_agents:
                 continue
+            if self._terminal_controller.config.remove_after_clearance:
+                neighbors = [item for item in neighbors
+                             if self.sim.collidable_mask[self._agent_id_to_index[item["agent_id"]]]]
             infos.setdefault(agent_id, {})["frenet_neighbors"] = neighbors
             infos[agent_id]["agent_id"] = agent_id
 

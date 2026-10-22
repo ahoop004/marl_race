@@ -309,3 +309,172 @@ def test_public_collision_reason_and_clearance_preserve_stopped_state(tmp_path, 
             np.testing.assert_allclose(car.body_velocity, (0., 0.))
     finally:
         env.close()
+
+
+def finish_env(tmp_path, params, *, finish_x=2.05, wall=True, **settings):
+    from env.RaceEnv import RaceEnv
+    pixels = np.full((120, 120), 255, dtype=np.uint8)
+    if wall:
+        pixels[:, 48] = 0  # x=2.4, reached by either configured footprint at 5 m/s.
+    path = write_map(tmp_path, pixels, resolution=.05)
+    env = RaceEnv(map=path.name, map_dir=str(tmp_path), vehicle_params=params,
+                  n_agents=1, timestep=.05, lidar_beams=17, render_mode=None,
+                  finish_line={"version": 1, "start": [finish_x, 1.], "end": [finish_x, 5.],
+                               "direction": [1., 0.], "hysteresis": .01, "padding": 0.,
+                               "trigger_speed": .5}, **settings)
+    env.reset(seed=42, options={"poses": np.array([[2., 3., 0.]])})
+    env.sim.set_agent_speed(0, 5.)
+    env._update_state(env.sim.current_observation())
+    return env
+
+
+@pytest.mark.parametrize("finish_x,reason", [(2.05, TerminalReason.RACE_COMPLETE),
+                                             (2.3, TerminalReason.COLLISION)])
+def test_finish_and_contact_follow_resolved_motion_chronology(tmp_path, params, finish_x, reason):
+    env = finish_env(tmp_path, params, finish_x=finish_x)
+    try:
+        action = 100. if env.sim.agents[0].nonlinear else 5.
+        obs, _, terminated, _, infos = env.step({"car_0": np.array([0., action])})
+        assert terminated["car_0"]
+        assert infos["car_0"]["collision_event"]
+        assert infos["car_0"]["terminal_reason"] == reason.value
+        assert bool(obs["car_0"]["lap"][0]) == (reason is TerminalReason.RACE_COMPLETE)
+    finally:
+        env.close()
+
+
+def test_zero_clearance_finish_updates_all_public_state_buffers(tmp_path, params):
+    env = finish_env(tmp_path, params, finish_x=2.1, wall=False,
+                     terminal_agents={"remove_after_clearance": True, "finish_clearance_steps": 0})
+    try:
+        env._agent_sensor_spec["car_0"] += ("acceleration",)
+        bounds = env.observation_space("car_0").spaces["pose"]
+        env._build_observation_spaces(bounds.low[0], bounds.high[0], bounds.low[1], bounds.high[1])
+        action = 100. if env.sim.agents[0].nonlinear else 5.
+        obs, _, terminated, _, infos = env.step({"car_0": np.array([0., action])})
+        assert terminated["car_0"] and infos["car_0"]["race_completed"]
+        car = env.sim.agents[0]
+        assert car.body_velocity == (0., 0.)
+        np.testing.assert_array_equal(obs["car_0"]["velocity"], [0., 0.])
+        np.testing.assert_allclose(obs["car_0"]["acceleration"], [-100., 0.], atol=1e-5)
+        np.testing.assert_array_equal(env.sim.current_observation()["linear_vels_x"], [0.])
+        np.testing.assert_array_equal(env.get_agent_state("car_0").velocity, [0., 0.])
+        assert obs["car_0"]["lap"][0] == 1.
+        assert env.get_global_state().vector[3] == 0.
+    finally:
+        env.close()
+
+
+def test_partial_reset_rebuilds_geometry_and_velocity_from_authoritative_state(tmp_path, params):
+    sim = make_sim(tmp_path, params, [(1., 1., 0.), (4., 4., 0.)], [(0., 0.), (0., 0.)])
+    car = sim.agents[0]
+    # A public vehicle reset/state edit need not update the simulator's old buffers.
+    car.reset(np.array([3., 3., .4]))
+    car.set_longitudinal_speed(1.)
+    sim.reset(np.array([[1., 1., 0.], [3.05, 3., .4]]), agent_indices=[1])
+    np.testing.assert_allclose(sim.agent_poses[0], [3., 3., .4], atol=1e-7)
+    np.testing.assert_allclose(sim._verts_buffer_f64[0], car.geometry.world_vertices(np.array([3., 3., .4])))
+    assert sim.current_observation()["linear_vels_x"][0] == 1.
+    np.testing.assert_array_equal(sim.collisions, [1., 1.])
+    np.testing.assert_array_equal(sim.collision_times, [0., 0.])
+
+
+def test_invalid_actions_and_states_are_rejected_before_any_car_advances(tmp_path, params):
+    sim = make_sim(tmp_path, params, [(1., 1., 0.), (4., 4., 0.)], [(1., 0.), (1., 0.)])
+    before = [a.physics_state.copy() for a in sim.agents]
+    actions = actions_for(sim)
+    actions[1, 0] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        sim.step(actions)
+    for car, state in zip(sim.agents, before):
+        np.testing.assert_array_equal(car.physics_state, state)
+    car = sim.agents[1]
+    if car.nonlinear:
+        car._physics._chassis[0] = np.nan
+    else:
+        car.state[0] = np.nan
+    with pytest.raises(ValueError, match="states must be finite"):
+        sim.step(actions_for(sim))
+    np.testing.assert_array_equal(sim.agents[0].physics_state, before[0])
+
+
+def test_physical_contact_with_termination_disabled_keeps_active_state_consistent(tmp_path, params):
+    env = finish_env(tmp_path, params, finish_x=2.3, terminate_on_collision=False)
+    try:
+        action = 100. if env.sim.agents[0].nonlinear else 5.
+        obs, _, terms, truncs, infos = env.step({"car_0": np.array([0., action])})
+        assert not terms["car_0"] and not truncs["car_0"]
+        assert infos["car_0"]["collision_event"] and infos["car_0"]["terminal_reason"] is None
+        assert env.lifecycle.records["car_0"].is_active
+        np.testing.assert_array_equal(obs["car_0"]["velocity"], [0., 0.])
+        # Clearing contact clears the per-step flag; the historical latch remains.
+        env.sim.agents[0].reset(np.array([1., 3., 0.]))
+        obs, _, _, _, infos = env.step({"car_0": np.zeros(2)})
+        assert not infos["car_0"]["collision_event"]
+        assert env.get_agent_state("car_0").collision
+        assert np.isinf(env.sim.collision_times[0]) and env.sim.collision_idx[0] == -1
+    finally:
+        env.close()
+
+
+def test_invalid_trace_and_reset_inputs_leave_committed_states_unchanged(tmp_path, params):
+    sim = make_sim(tmp_path, params, [(1., 1., 0.), (4., 4., 0.)], [(1., 0.), (1., 0.)])
+    before = [car.physics_state.copy() for car in sim.agents]
+    with pytest.raises(ValueError, match="finite"):
+        sim.reset(np.array([[2., 2., 0.], [3., 3., 0.]]), velocities=np.array([1., np.inf]))
+    for car, state in zip(sim.agents, before):
+        np.testing.assert_array_equal(car.physics_state, state)
+    car = sim.agents[0]
+    with pytest.raises(ValueError, match="finite"):
+        car.reset(np.array([np.nan, 0., 0.]))
+    np.testing.assert_array_equal(car.physics_state, before[0])
+    if car.nonlinear:
+        with pytest.raises(ValueError, match="motion_trace"):
+            car._physics.advance(.05, motion_trace=np.zeros((1, 4, 6)))
+        np.testing.assert_array_equal(car.physics_state, before[0])
+
+
+def test_initial_overlap_stops_attempted_motion_at_zero_time(tmp_path, params):
+    sim = make_sim(tmp_path, params, [(3., 3., 0.), (3., 3., 0.)], [(1., 0.), (0., 0.)])
+    before = np.stack([car.state[[0, 1, 4]] for car in sim.agents])
+    obs = sim.step(actions_for(sim))
+    np.testing.assert_array_equal(obs["collisions"], [1., 1.])
+    np.testing.assert_array_equal(sim.collision_times, [0., 0.])
+    np.testing.assert_allclose(sim.agent_poses, before)
+    for car in sim.agents:
+        np.testing.assert_allclose(car.body_velocity, [0., 0.])
+
+
+@pytest.mark.parametrize("predictive_response", [False, True])
+def test_predictive_ttc_event_is_distinct_from_physical_contact(tmp_path, params, predictive_response):
+    from test_vehicle_geometry import WallScanner
+    pixels = np.full((120, 120), 255, dtype=np.uint8)
+    pixels[:, 48] = 0
+    start_x = 2.4 - params["length"] / 2. - .008 - 2. * .05
+    sim = make_sim(tmp_path, params, [(start_x, 3., 0.)], [(2., 0.)], pixels,
+                   wall_collision_response=predictive_response)
+    # Analytic ranges isolate the established 5 ms TTC from grid quantization
+    # and noise; physical sweeps still use the real F4 occupancy mask.
+    analytic = WallScanner(fov=4.7)
+    analytic.normal, analytic.wall_point = np.array([1., 0.]), np.array([2.4, 0.])
+    sim.scan_simulator.scan = analytic.scan
+    obs = sim.step(actions_for(sim))
+    car = sim.agents[0]
+    assert obs["collisions"][0] == 1. and sim.collision_idx[0] == ENV_COLLISION_IDX
+    assert sim.collision_times[0] == .05
+    assert 2.4 - (car.state[0] + car.geometry.front) == pytest.approx(.008)
+    assert car.body_velocity[0] == pytest.approx(0. if predictive_response else 2.)
+
+
+def test_environment_rejects_nonfinite_physical_commands_before_recording_them(tmp_path, params):
+    env = finish_env(tmp_path, params, wall=False)
+    try:
+        before = env.sim.agents[0].physics_state.copy()
+        commands = env._last_control_commands.copy()
+        with pytest.raises(ValueError, match="finite"):
+            env.step({"car_0": np.array([np.nan, 1.])})
+        np.testing.assert_array_equal(env.sim.agents[0].physics_state, before)
+        np.testing.assert_array_equal(env._last_control_commands, commands)
+        assert env.current_time == 0. and env._episode_step_count == 0
+    finally:
+        env.close()

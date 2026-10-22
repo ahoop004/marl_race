@@ -226,3 +226,90 @@ def test_integrated_action_composers_have_independent_state_and_reset():
     first.reset()
     assert first.process(action)[1] == pytest.approx(0.3)
     np.testing.assert_array_equal(action, [0.0, 1.0])
+
+
+def test_wheel_acceleration_units_bounds_and_decision_timing():
+    composer = ActionComposer.from_config(np.array([-.4, -40.]), np.array([.4, 20.]),
+        {"speed_control": "wheel_acceleration", "max_wheel_acceleration": 100.,
+         "max_wheel_deceleration": 100., "prevent_reverse": True}, decision_dt=.15)
+    # One decision lasts three 0.05 s physics steps; conversion happens once.
+    action = np.array([1., 1.], dtype=np.float32)
+    for expected in (15., 20., 20.):
+        np.testing.assert_allclose(composer.process(action), [.4, expected])
+    for expected in (5., 0., 0.):
+        assert composer.process(np.array([-1., -1.], dtype=np.float32))[1] == expected
+    composer.reset()
+    assert composer.process(action)[1] == 15.
+    np.testing.assert_array_equal(action, [1., 1.])
+
+
+def test_motion_lap_tracking_orders_finishers_and_preserves_first_terminal_cause():
+    from env.centerline_state import LapTracker, parse_finish_line
+    from test_swept_collision import linear_trace
+    lifecycle = RaceLifecycle(("first_slot", "second_slot"), target_laps=1)
+    finish = parse_finish_line({"start": [0., -1.], "end": [0., 1.],
+                               "direction": [1., 0.], "hysteresis": .1, "trigger_speed": .5})
+    tracker = LapTracker(lifecycle.agent_ids, finish, lifecycle)
+    tracker.reset(np.array([-1., -1.]), np.zeros(2))
+    paths = []
+    for end in (.5, 2.):
+        pose = linear_trace((-1., 0., 0.), (end, 0., 0.))
+        state = np.zeros((1, 4, 6))
+        state[:, :, :3] = pose
+        state[0, 0, 3] = (end + 1.) / .05
+        paths.append((pose, state, True, .8))
+    crossed = tracker.update(np.array([.2, 1.4]), np.zeros(2), np.zeros(2), np.zeros(2),
+                             step=0, motion_paths=paths)
+    assert all(crossed.values())
+    assert [lifecycle.records[aid].finish_position for aid in lifecycle.agent_ids] == [2, 1]
+    for aid in lifecycle.agent_ids:
+        assert not lifecycle.record_collision(aid, step=0)
+        assert lifecycle.records[aid].terminal_reason.value == "race_complete"
+    # A same-fraction reached finish retains historical finish-first precedence.
+    lifecycle.reset()
+    tracker.reset(np.array([-1., -1.]), np.zeros(2))
+    paths[0] = (*paths[0][:3], 2./3.)
+    crossed = tracker.update(np.array([0., 1.4]), np.zeros(2), np.zeros(2), np.zeros(2),
+                             step=0, motion_paths=paths)
+    assert crossed["first_slot"]
+
+
+def test_motion_lap_tracking_reverse_debt_initial_lap_and_segment_root_deduplication():
+    from env.centerline_state import LapTracker, parse_finish_line
+    from test_swept_collision import linear_trace
+    lifecycle = RaceLifecycle(("car",), target_laps=3)
+    finish = parse_finish_line({"start": [0., -1.], "end": [0., 1.], "direction": [1., 0.],
+                               "hysteresis": .1})
+    tracker = LapTracker(("car",), finish, lifecycle, count_initial_crossing_as_lap=False)
+    tracker.reset(np.array([-1.]), np.zeros(1))
+    def move(start, end, step):
+        pose = np.concatenate([linear_trace((start, 0., 0.), (0., 0., 0.)),
+                               linear_trace((0., 0., 0.), (end, 0., 0.))])
+        state = np.zeros((2, 4, 6))
+        state[:, :, :3] = pose
+        state[:, 0, 3] = 1.
+        return tracker.update(np.array([end]), np.zeros(1), np.ones(1), np.zeros(1),
+                              step=step, motion_paths=[(pose, state, True, 1.)])
+    assert not move(-1., 1., 0)["car"]  # first crossing starts, not completes, a lap
+    assert lifecycle.records["car"].lap_start_step == 0
+    move(1., -1., 1)
+    assert tracker._reverse_crossings[0] == 1
+    assert not move(-1., 1., 2)["car"]  # only repay one reverse crossing
+    assert tracker._reverse_crossings[0] == 0
+    assert lifecycle.records["car"].lap_count == 0
+
+
+def test_frenet_velocity_rotation_is_consistent_with_body_frame_observations():
+    from env.centerline_state import CenterlineProgressTracker
+    for yaw in (0., .7, -1.2):
+        rotation = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+        centerline = np.array([[-10., 0., 0.], [0., 0., 0.], [10., 0., 0.]])
+        centerline[:, :2] = centerline[:, :2] @ rotation.T
+        centerline[:, 2] = yaw
+        position = rotation @ [1., .4]
+        tracker = CenterlineProgressTracker(["car"])
+        facts = tracker.update(centerline, np.array([position[0]]), np.array([position[1]]),
+            np.array([yaw + .3]), np.array([2.]), np.array([.5]), {"car": 0})["car"]
+        assert facts["vs"] == pytest.approx(2*np.cos(.3) - .5*np.sin(.3), abs=1e-6)
+        assert facts["vd"] == pytest.approx(2*np.sin(.3) + .5*np.cos(.3), abs=1e-6)
+        assert facts["d"] == pytest.approx(.4, abs=1e-6)

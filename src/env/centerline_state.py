@@ -531,8 +531,11 @@ class LapTracker:
         linear_vels_y: np.ndarray,
         *,
         step: int,
+        motion_paths=None,
     ) -> Dict[str, bool]:
         """Return accepted crossings for active agents."""
+        if motion_paths is not None:
+            return self._update_motion(poses_x, poses_y, motion_paths, step=step)
         self.lifecycle.begin_step()
         crossings = {agent_id: False for agent_id in self.agent_ids}
         hysteresis = float(self.finish_line["hysteresis"])
@@ -588,6 +591,104 @@ class LapTracker:
 
             crossings[agent_id] = True
             self.lifecycle.record_lap_crossing(agent_id, step=step)
+        return crossings
+
+    def _update_motion(self, poses_x, poses_y, motion_paths, *, step):
+        """Order center-point crossings on the integrator path up to contact.
+
+        Keep net-crossing debt, hysteresis, body-speed gating and initial-lap
+        semantics. Evaluate speed at the crossing, before a later contact stop.
+        Accepted finish events precede collision lifecycle transitions, retaining
+        the existing immutable first terminal cause (including equal-time ties).
+        """
+        from physics.collision_models import trace_state
+
+        self.lifecycle.begin_step()
+        crossings = dict.fromkeys(self.agent_ids, False)
+        segment_unit = self.finish_line["segment_unit"]
+        normal = self._forward_sign * np.array([-segment_unit[1], segment_unit[0]])
+        hysteresis = float(self.finish_line["hysteresis"])
+        events = []
+        for index, (poses, states, nonlinear, limit) in enumerate(motion_paths):
+            if not self.lifecycle.records[self.agent_ids[index]].is_active:
+                continue
+            distances = poses[:, :, :2] @ normal
+            distances[:, 0] -= np.dot(self.finish_line["start"], normal)
+            for part, coefficients in enumerate(distances):
+                end = min(1., limit * len(poses) - part)
+                if end < 0.:
+                    break
+                # Bernstein hull excludes roots without solving a polynomial.
+                c0, c1, c2, c3 = coefficients
+                controls = (c0, c0 + c1 / 3., c0 + 2*c1 / 3. + c2 / 3., coefficients.sum())
+                for level, event_type in ((0., "cross"), (-hysteresis, "arm")):
+                    if not min(controls) <= level <= max(controls):
+                        continue
+                    polynomial = coefficients.copy()
+                    polynomial[0] -= level
+                    # A constant path on the line is not a crossing.
+                    if not np.any(polynomial[1:]):
+                        continue
+                    for root in np.polynomial.polynomial.polyroots(polynomial):
+                        if abs(root.imag) > 1e-9:
+                            continue
+                        local = float(root.real)
+                        fraction = (part + local) / len(poses)
+                        if local < -1e-10 or local > end + 1e-10 or fraction <= 1e-12:
+                            continue
+                        slope = c1 + local * (2*c2 + 3*c3 * local)
+                        # Even-multiplicity tangencies do not change sides.
+                        if abs(slope) <= 1e-12:
+                            if abs(2*c2 + 6*c3*local) > 1e-12 or abs(c3) <= 1e-12:
+                                continue
+                            slope = c3
+                        forward = slope > 0.
+                        if event_type == "arm":
+                            if not forward:
+                                events.append((fraction, index, "arm", 0.))
+                            continue
+                        point = trace_state(poses, fraction)[:2]
+                        projection = np.dot(point - self.finish_line["start"], self.finish_line["segment"]) / self.finish_line["segment_length_sq"]
+                        padding = self.finish_line["padding"]
+                        if not -padding <= projection <= 1. + padding:
+                            continue
+                        state = trace_state(states, fraction)
+                        speed = float(state[3])
+                        if not nonlinear and abs(speed) >= .5:
+                            speed *= float(np.cos(state[6]))
+                        events.append((fraction, index, "forward" if forward else "backward", speed))
+        previous_events = {}
+        for fraction, index, kind, speed in sorted(events):
+            # Adjacent RK segments share an endpoint root. Count it only once.
+            key = (index, kind)
+            if abs(fraction - previous_events.get(key, -np.inf)) <= 1e-10:
+                continue
+            previous_events[key] = fraction
+            agent_id = self.agent_ids[index]
+            record = self.lifecycle.records[agent_id]
+            if not record.is_active:
+                continue
+            if kind == "arm":
+                self._armed[index] = True
+            elif kind == "backward":
+                self._reverse_crossings[index] += 1
+            elif self._reverse_crossings[index] > 0:
+                self._reverse_crossings[index] -= 1
+                self._armed[index] = False
+            elif self._armed[index] and speed >= float(self.finish_line["min_speed"]):
+                self._armed[index] = False
+                if not self.count_initial_crossing_as_lap and not self._initial_crossing_seen[index]:
+                    self._initial_crossing_seen[index] = True
+                    record.lap_start_step = int(step)
+                else:
+                    crossings[agent_id] = True
+                    self.lifecycle.record_lap_crossing(agent_id, step=step)
+        for index in range(len(self.agent_ids)):
+            point = np.array([poses_x[index], poses_y[index]], dtype=np.float32)
+            self._previous[index] = self._oriented_distance(point)
+            self._previous_points[index] = point
+            if self._previous[index] <= -hysteresis:
+                self._armed[index] = True
         return crossings
 
     def _oriented_distance(self, point: np.ndarray) -> float:

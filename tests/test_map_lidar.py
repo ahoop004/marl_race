@@ -292,3 +292,20 @@ def test_environment_passes_processed_occupancy_through_initialization_and_hot_s
         np.testing.assert_array_equal(env.sim.scan_simulator.map_img, expected[::-1])
     finally:
         env.close()
+
+
+def test_rotated_map_pose_bounds_contain_world_coordinates_on_reset_and_switch(tmp_path):
+    from env.RaceEnv import RaceEnv
+    path = write_map(tmp_path, np.full((20, 40), 255), resolution=.1, origin=(2., 3., np.pi / 2))
+    env = RaceEnv(map=path.name, map_dir=str(tmp_path), n_agents=1, lidar_beams=17, render_mode=None)
+    try:
+        poses = np.array([[1., 5., 0.]])  # Center of the rotated 4 m by 2 m map.
+        obs, _ = env.reset(options={"poses": poses})
+        spec = env.observation_space("car_0").spaces["pose"]
+        assert np.all(obs["car_0"]["pose"] >= spec.low)
+        assert np.all(obs["car_0"]["pose"] <= spec.high)
+        env.update_map(str(path), ".png")
+        np.testing.assert_allclose(env.observation_space("car_0").spaces["pose"].low[:2], [0., 3.], atol=1e-6)
+        np.testing.assert_allclose(env.observation_space("car_0").spaces["pose"].high[:2], [2., 7.], atol=1e-6)
+    finally:
+        env.close()

@@ -234,3 +234,80 @@ def test_parameter_updates_preserve_collision_geometry_contract(params):
     assert sim.agents[1].geometry.left == .15
     assert sim.agents[1]._mu == .8
     assert sim.agents[1].geometry.lf == sim.agents[1]._lf
+
+
+@pytest.mark.parametrize("speed", [2., .2, -.2])
+def test_straight_and_low_speed_motion_preserve_physical_units(params, speed):
+    car = RaceCar(params, seed=7, time_step=.05, num_beams=17, fov=2*np.pi,
+                  integrator="RK4", scan_simulator=WallScanner())
+    car.reset(np.array([1., 2., .4]))
+    car.set_longitudinal_speed(speed)
+    command = speed / params["wheel_actuators"]["wheel_radius"] if car.nonlinear else speed
+    for _ in range(10):
+        car.update_pose(0., command)
+    expected = np.array([1., 2.]) + .5 * speed * np.array([np.cos(.4), np.sin(.4)])
+    np.testing.assert_allclose(car.state[:2], expected, atol=2e-12)
+    np.testing.assert_allclose(car.body_velocity, [speed, 0.], atol=1e-12)
+
+
+def test_constant_radius_turning_uses_unchanged_integrators(params):
+    car = RaceCar(params, seed=7, time_step=.05, num_beams=17, fov=2*np.pi,
+                  integrator="RK4", scan_simulator=WallScanner())
+    if car.nonlinear:
+        from scipy.optimize import root
+        from physics.dynamic_models import combined_slip_dynamics
+        # Solve a steady turn for the existing synthetic tires, then compare
+        # the integrated world pose to the analytic circle. No tire changes.
+        vx, yaw_rate = 2., .2
+        def residual(values):
+            delta, omega, vy = values
+            state = np.array([0., 0., 0., vx, vy, yaw_rate])
+            return combined_slip_dynamics(state, np.array([delta, omega]), car._physics._dynamics_params)[0][3:6]
+        solved = root(residual, [.033, 40., .02])
+        assert solved.success and np.linalg.norm(residual(solved.x)) < 1e-8
+        delta, omega, vy = solved.x
+        car._physics.reset(velocity=(vx, vy), yaw_rate=yaw_rate, steering_angle=delta, wheel_speed=omega)
+        car._sync_physics_view()
+        reference = omega
+    else:
+        vx, vy, delta = .2, 0., .1
+        yaw_rate = vx / (params["lf"] + params["lr"]) * np.tan(delta)
+        car.state[2:4] = [delta, vx]
+        car._steer_buf.fill(delta)
+        reference = vx
+    for _ in range(10):
+        car.update_pose(delta, reference)
+    angle = yaw_rate * .5
+    expected = [(vx*np.sin(angle) + vy*(np.cos(angle)-1.))/yaw_rate,
+                (vx*(1.-np.cos(angle)) + vy*np.sin(angle))/yaw_rate, angle]
+    np.testing.assert_allclose(car.state[[0, 1, 4]], expected, atol=1e-9)
+    if car.nonlinear:
+        state = car.physics_state
+        vx, vy, rate, delta = state[3:7]
+        front_vy = vy + params["lf"] * rate
+        expected_velocity = [[vx*np.cos(delta) + front_vy*np.sin(delta),
+                              -vx*np.sin(delta) + front_vy*np.cos(delta)],
+                             [vx, vy - params["lr"]*rate]]
+        diagnostics = car.physics_diagnostics()
+        np.testing.assert_allclose(diagnostics["contact_velocity"], expected_velocity, atol=1e-12)
+        np.testing.assert_allclose(diagnostics["body_acceleration"], [-rate*vy, rate*vx], atol=1e-8)
+
+
+def test_acceleration_braking_and_trace_reset(params):
+    car = RaceCar(params, seed=7, time_step=.05, num_beams=17, fov=2*np.pi,
+                  integrator="RK4", scan_simulator=WallScanner())
+    trace_id = id(car._motion_trace)
+    command = 60. if car.nonlinear else 3.
+    for _ in range(10):
+        car.update_pose(0., command)
+    accelerated = car.body_velocity[0]
+    assert accelerated > .1
+    for _ in range(10):
+        car.update_pose(0., 0.)
+    assert abs(car.body_velocity[0]) < accelerated
+    car.reset(np.array([2., 3., .4]))
+    assert id(car._motion_trace) == trace_id
+    from physics.collision_models import trace_state
+    np.testing.assert_allclose(trace_state(car._pose_trace, .7), [2., 3., .4])
+    np.testing.assert_array_equal(car._motion_trace[:, 1:], np.zeros_like(car._motion_trace[:, 1:]))
+    assert car.body_velocity == (0., 0.)

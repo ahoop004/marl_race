@@ -362,6 +362,10 @@ def test_real_physics_seeded_task_parity_specs_and_short_rollouts(name, repeat, 
             for key in initial.keys(include_nested=True, leaves_only=True):
                 torch.testing.assert_close(current[key], initial[key], rtol=0, atol=0)
             reference_snapshot = reference.reset(seed=seed, options=options)
+            sampled_mu = reference_snapshot.infos["car_0"]["physics"]["mu"]
+            assert native.snapshot.infos["car_0"]["physics"]["mu"] == sampled_mu
+            for task in (native.task, reference):
+                assert all(car._physics.params["mu"] == sampled_mu for car in task.env.sim.agents)
             assert native.task.episode_metadata.map_id == (
                 "circle_map" if profiling or episode_index == 2 else "Budapest_map")
             if profiling:
@@ -386,6 +390,12 @@ def test_real_physics_seeded_task_parity_specs_and_short_rollouts(name, repeat, 
                 transition = native.step(current)
                 nxt = transition["next"]
                 expected = reference.step(actions)
+                for aid in reference.physical_agents:
+                    car = reference.env.sim.agents[reference.env.possible_agents.index(aid)]
+                    raw = expected.after.raw_observations[aid]
+                    np.testing.assert_allclose(raw["velocity"], car.body_velocity, rtol=1e-6, atol=1e-7)
+                    assert raw["steering_angle"] == np.float32(car.physics_state[6])
+                    assert raw["wheel_speed"] == np.float32(car.physics_state[7])
                 np.testing.assert_array_equal(nxt["state"].numpy(), expected.after.global_state.vector)
                 for i, aid in enumerate(native.agent_ids):
                     decision = expected.decisions.get(aid)

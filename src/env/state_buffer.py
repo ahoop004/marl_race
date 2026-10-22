@@ -123,6 +123,9 @@ class TerminalVehicleController:
 
     @staticmethod
     def _freeze(simulator: Any, index: int) -> None:
+        if hasattr(simulator, "freeze_agent"):
+            simulator.freeze_agent(index)
+            return
         agent = simulator.agents[index]
         if getattr(agent, "nonlinear", False):
             agent.freeze_motion()
@@ -182,15 +185,16 @@ class StateBuffers:
             array.fill(0.0)
         self.velocity_initialized = False
 
-    def update(self, obs_dict: Dict[str, np.ndarray]) -> None:
+    def update(self, obs_dict: Dict[str, np.ndarray], *, advance_history=True) -> None:
         self._assign(self.poses_x, obs_dict.get("poses_x"))
         self._assign(self.poses_y, obs_dict.get("poses_y"))
         self._assign(self.poses_theta, obs_dict.get("poses_theta"))
         self._assign(self.collisions, obs_dict.get("collisions"))
 
-        self.linear_vels_x_prev[:] = self.linear_vels_x_curr
-        self.linear_vels_y_prev[:] = self.linear_vels_y_curr
-        self.angular_vels_prev[:] = self.angular_vels_curr
+        if advance_history:
+            self.linear_vels_x_prev[:] = self.linear_vels_x_curr
+            self.linear_vels_y_prev[:] = self.linear_vels_y_curr
+            self.angular_vels_prev[:] = self.angular_vels_curr
 
         self._assign(self.linear_vels_x_curr, obs_dict.get("linear_vels_x"))
         self._assign(self.linear_vels_y_curr, obs_dict.get("linear_vels_y"))

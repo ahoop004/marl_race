@@ -119,9 +119,13 @@ def test_lidar_alias_after_terminal_vehicle_removal(race_env):
     poses = np.stack([env.get_agent_state(agent).pose for agent in env.possible_agents])
     poses[2] = poses[0]
     env.reset(seed=42, options={"poses": poses})
-    observations, _, terminations, _, _ = env.step({
+    observations, _, terminations, _, infos = env.step({
         agent: np.zeros(2, dtype=np.float32) for agent in env.agents
     })
     assert terminations["car_0"] and terminations["car_2"]
     assert not env.sim.collidable_mask[0]
     assert_observation_contract(env, observations)
+    for aid, info in infos.items():
+        for neighbor in info.get("frenet_neighbors", []):
+            assert env.sim.collidable_mask[env.possible_agents.index(neighbor["agent_id"])]
+        np.testing.assert_allclose(observations[aid]["velocity"], env.get_agent_state(aid).velocity)

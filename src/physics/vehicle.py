@@ -226,6 +226,11 @@ class CombinedSlipVehicle:
         """
         if not np.isfinite(timestep) or timestep <= 0:
             raise ValueError("timestep must be finite and positive")
+        if motion_trace is not None:
+            expected = (int(np.ceil(timestep / self.params["max_integration_step"])), 4, 6)
+            if (not isinstance(motion_trace, np.ndarray) or motion_trace.shape != expected
+                    or motion_trace.dtype != np.float64 or not motion_trace.flags.writeable):
+                raise ValueError(f"motion_trace must be a writable float64 array with shape {expected}")
         actuators = self._actuators
         state, final_actuators = integrate_combined_slip(
             self._chassis, actuators._state, actuators._reference,
@@ -538,6 +543,9 @@ class RaceCar(object):
         Returns:
             None
         """
+        pose = np.asarray(pose, dtype=np.float64)
+        if pose.shape != (3,) or not np.isfinite(pose).all():
+            raise ValueError("Reset pose must be a finite (x, y, yaw) vector")
         if friction_mu is not None and not self.nonlinear:
             raise ValueError("Episode friction requires combined_slip_st")
         if self.nonlinear:
@@ -560,6 +568,11 @@ class RaceCar(object):
         self.state[4] = pose[2]
         if self.nonlinear:
             self._sync_physics_view()
+        self._motion_trace.fill(0.)
+        self._motion_trace[:, 0] = self._physics._chassis if self.nonlinear else self.state
+        self._pose_trace[:] = self._motion_trace[:, :, :3] if self.nonlinear else self._motion_trace[:, :, [0, 1, 4]]
+        if self.nonlinear:
+            self._motion_actuator_start[:] = self._physics._actuators._state
         self.steer_buffer = np.empty((0, ))
         self._steer_buf.fill(0.0)
         self._sb_head = 0
