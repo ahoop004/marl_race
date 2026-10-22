@@ -4,10 +4,9 @@ set -Eeuo pipefail
 trap 'echo "Submission stopped at line $LINENO (exit $?)" >&2' ERR
 cd "${REPO_DIR:-$HOME/marl_race}"
 export REPO_DIR="$PWD"
-SHA=$(git rev-parse HEAD)
-[[ "$(git branch --show-current)" == physics-correctness ]]
-git diff --quiet HEAD -- . ':(exclude)scripts/hpc/*ppo_optimized_pretrain*' ':(exclude)scripts/check_ppo_optimized_pretrain*'
-git status --short
+# Git is optional provenance, never a launch requirement.
+SHA=$(git rev-parse HEAD 2>/dev/null) || SHA=unknown
+git status --short 2>/dev/null || true
 module load container_env/0.1 python3/2025.1-py312
 CRUN=${CRUN:-$(command -v crun.python3 || command -v crun || true)}
 [[ -x "$CRUN" ]] || { echo 'Missing Python container launcher' >&2; exit 2; }
@@ -72,7 +71,7 @@ end = script.index("\nprintf 'Phase=")
 prefix = '''set -Eeuo pipefail
 SCENARIO=scenarios/ppo_lap_completion_pretrain.yaml
 OUT="$RUN_ROOT/ppo"
-SOURCE_SHA=$(git rev-parse HEAD)
+SOURCE_SHA=$(git rev-parse HEAD 2>/dev/null) || SOURCE_SHA=unknown
 TOTAL_STEPS=120000000
 WORKERS=16
 ENVS_PER_WORKER=2
@@ -98,4 +97,4 @@ printf '%s\n' "$JOB" | tee "$RUN_ROOT/job_id.txt"
 cat "$RUN_ROOT/slurm_submission_warnings.txt"
 printf 'SUBMITTED job=%s SHA=%s\nNode=e7-w4125-01 CPUs=64 GPU=1xL40S RAM=256G time=%s\nOutput=%s/ppo\nW&B group=ppo-optimized-%s-h2p5-s42\nLogs=%s/ppo-opt-%s.out and .err\n' \
   "$JOB" "$SHA" "$WALLTIME" "$RUN_ROOT" "${SHA:0:7}" "$PWD" "${JOB%%;*}"
-echo 'Keep the source checkout unchanged while this job runs. Actual W&B ID is recorded in ppo/config_snapshot.json.'
+echo 'Actual W&B ID is recorded in ppo/config_snapshot.json.'

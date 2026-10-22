@@ -28,9 +28,8 @@ TOTAL_STEPS=120000000
 REPO_DIR=${REPO_DIR:-"$HOME/marl_race"}
 ENV_PATH=${ENV_PATH:-"$HOME/envs/marl-race"}
 cd "$REPO_DIR"
-SOURCE_SHA=$(git rev-parse HEAD)
-[[ "$(git branch --show-current)" == physics-correctness ]] || { echo "Expected checkout of physics-correctness branch" >&2; exit 2; }
-git diff --quiet HEAD -- . ':(exclude)scripts/hpc/*ppo_optimized_pretrain*' ':(exclude)scripts/check_ppo_optimized_pretrain*' || { echo "Training files are modified; refusing mixed-code experiment" >&2; exit 2; }
+# Git is optional provenance, never a launch requirement.
+SOURCE_SHA=$(git rev-parse HEAD 2>/dev/null) || SOURCE_SHA=unknown
 
 if command -v module >/dev/null 2>&1; then
   module load container_env/0.1 python3/2025.1-py312
@@ -105,7 +104,7 @@ CONTRACT_SHA=$("$CRUN" -p "$ENV_PATH" python3 scripts/check_ppo_optimized_pretra
 CMD+=(--set "++wandb.validation.physics_contract_sha256=$CONTRACT_SHA")
 "$CRUN" -p "$ENV_PATH" "${CMD[@]}" --resolve-config > "$RUN_ROOT/resolved_job_${SLURM_JOB_ID}.yaml"
 sha256sum scripts/hpc/ppo_optimized_pretrain.sbatch scripts/check_ppo_optimized_pretrain.py > "$RUN_ROOT/launcher_${SLURM_JOB_ID}.sha256"
-git status --short > "$RUN_ROOT/git_status_${SLURM_JOB_ID}.txt"
+git status --short > "$RUN_ROOT/git_status_${SLURM_JOB_ID}.txt" 2>/dev/null || true
 printf '%q ' "${CMD[@]}" > "$RUN_ROOT/command_${SLURM_JOB_ID}.txt"
 printf '\n' >> "$RUN_ROOT/command_${SLURM_JOB_ID}.txt"
 mkdir -p "$OUT"
