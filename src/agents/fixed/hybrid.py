@@ -8,8 +8,21 @@ from __future__ import annotations
 from time import perf_counter
 
 import numpy as np
+from numba import njit
 
 from utils.centerline import prepare_centerline_geometry, project_to_centerline
+
+
+@njit(cache=True)
+def _path_clearance(path, distances, points, radii):
+    """First occupied sample, without a path-by-obstacle broadcast workspace."""
+    for sample in range(len(path)):
+        for obstacle in range(len(points)):
+            dx = path[sample, 0] - points[obstacle, 0]
+            dy = path[sample, 1] - points[obstacle, 1]
+            if dx * dx + dy * dy < radii[obstacle] ** 2:
+                return float(distances[sample])
+    return float("inf")
 
 
 class _DecisionTiming:
@@ -57,12 +70,16 @@ class HybridPPFTGAgent:
         self.profile_hybrid = None  # Run-owned callback; survives episode/map resets.
         self._map_source = None
         self._scan_key = None
+        self._envelope_times = np.linspace(0., min(self.reaction_time, 0.75), 4)
+        self._emergency_times = np.linspace(0., self.reaction_time + 0.2, 8)
+        self._gap_horizon = None
         self.reset()
 
     def set_env(self, env):
         if self.agent_id not in env.possible_agents:
             raise ValueError("hybrid_pp_ftg requires a valid agent_id")
         self.env = env
+        self._sensor_index = env.possible_agents.index(self.agent_id)
         params = env.params
         self.wheelbase = float(params["lf"] + params["lr"])
         self.half_width = float(params["width"]) / 2
@@ -116,18 +133,21 @@ class HybridPPFTGAgent:
         if scan.ndim != 1 or scan.size < 3:
             return None
         # Use simulator angles, including its exact discretization and sensor offset.
-        sensor = self.env.sim.agents[self.env.possible_agents.index(self.agent_id)]
-        key = (scan.size, id(sensor))
-        if key != self._scan_key:
+        sensor = self.env.sim.agents[self._sensor_index]
+        key = (scan.size, id(sensor), self.gap_fov)
+        if key != self._scan_key or not np.array_equal(sensor.scan_angles, self._angles):
             self._angles = np.array(sensor.scan_angles, dtype=np.float64)
             if self._angles.shape != scan.shape:
                 raise ValueError("hybrid_pp_ftg scan does not match sensor geometry")
             self._directions = np.column_stack((np.cos(self._angles), np.sin(self._angles)))
             self._angle_step = float(np.max(np.diff(self._angles)))
+            self._gap_candidates = np.flatnonzero(np.abs(self._angles) <= self.gap_fov / 2)
+            self._gap_directions = self._directions[self._gap_candidates]
             self._scan_key = key
         # Invalid returns represent unknown space. Positive infinity means no return.
         limit = float(self.env.lidar_range)
-        ranges = np.clip(np.nan_to_num(scan, nan=0., posinf=limit, neginf=0.), 0., limit)
+        ranges = np.nan_to_num(scan, nan=0., posinf=limit, neginf=0.)
+        np.clip(ranges, 0., limit, out=ranges)
         hits = ranges < limit - 0.01
         points = ranges[hits, None] * self._directions[hits]
         points[:, 0] += float(self.env.lidar_dist)
@@ -142,46 +162,56 @@ class HybridPPFTGAgent:
         vehicle states cover nearby cars, including retired stationary wrecks.
         Four positions per neighbor keep this conservative check inexpensive.
         """
-        extra = []
         self._traffic = []
-        times = np.linspace(0., min(self.reaction_time, 0.75), 4)
+        times = self._envelope_times
+        combined_points = combined_radii = None
+        used = len(points)
         for aid in self.env.possible_agents:
             if aid == self.agent_id:
                 continue
             state = self.env.get_agent_state(aid)
             relative = state.pose[:2] - pose[:2]
-            if np.linalg.norm(relative) > self.env.lidar_range or (relative @ rotation)[0] < 0.:
+            if np.linalg.norm(relative) > self.env.lidar_range:
+                continue
+            local_relative = relative @ rotation
+            if local_relative[0] < 0.:
                 continue
             heading = state.pose[2]
             vx, vy = state.velocity
-            world_velocity = np.array([np.cos(heading) * vx - np.sin(heading) * vy,
-                                       np.sin(heading) * vx + np.cos(heading) * vy])
-            self._traffic.append((relative @ rotation, world_velocity @ rotation, heading - pose[2]))
-            extra.append((relative + times[:, None] * world_velocity) @ rotation)
-        if extra:
-            extra = np.concatenate(extra)
-            radius = 2 * self.half_width + self.margin
-            points = np.vstack((points, extra))
-            radii = np.r_[radii, np.full(len(extra), radius)]
+            co, si = np.cos(heading), np.sin(heading)
+            world_velocity = np.array([co * vx - si * vy, si * vx + co * vy])
+            self._traffic.append((local_relative, world_velocity @ rotation, heading - pose[2]))
+            if combined_points is None:
+                capacity = len(points) + len(times) * (len(self.env.possible_agents) - 1)
+                combined_points = np.empty((capacity, 2), dtype=np.result_type(points.dtype, rotation.dtype, np.float64))
+                combined_radii = np.empty(capacity, dtype=np.result_type(radii.dtype, np.float64))
+                combined_points[:used] = points
+                combined_radii[:used] = radii
+            combined_points[used:used + len(times)] = (relative + times[:, None] * world_velocity) @ rotation
+            combined_radii[used:used + len(times)] = 2 * self.half_width + self.margin
+            used += len(times)
+        if combined_points is not None:
+            points, radii = combined_points[:used], combined_radii[:used]
         return points, radii
 
     def _traffic_emergency(self, velocity, yaw):
         # A time-aligned short sweep catches closing traffic while steering is
         # still lagging. Only cars ahead participate, so the leader can leave.
-        times = np.linspace(0., self.reaction_time + 0.2, 8)
+        if not self._traffic:
+            return False
+        times = self._emergency_times
         theta = yaw * times
+        co, si = np.cos(theta), np.sin(theta)
         vx, vy = velocity
         if abs(yaw) > 1e-5:
-            ego = np.column_stack(((vx * np.sin(theta) + vy * (np.cos(theta) - 1)) / yaw,
-                                   (vx * (1 - np.cos(theta)) + vy * np.sin(theta)) / yaw))
+            ego = np.column_stack(((vx * si + vy * (co - 1)) / yaw,
+                                   (vx * (1 - co) + vy * si) / yaw))
         else:
             ego = times[:, None] * velocity
         half_length = float(self.env.params["length"]) / 2
         hl, hw = half_length + self.margin / 2, self.half_width + self.margin / 2
-        co, si = np.cos(theta), np.sin(theta)
         for relative, other_velocity, other_heading in self._traffic:
             predicted = relative + times[:, None] * other_velocity - ego
-            distances = np.linalg.norm(predicted, axis=1)
             delta = other_heading - theta
             cd, sd = np.abs(np.cos(delta)), np.abs(np.sin(delta))
             # Separating-axis test for two padded rectangles at each time.
@@ -192,17 +222,16 @@ class HybridPPFTGAgent:
             other_y = np.abs(-predicted[:, 0] * other_si + predicted[:, 1] * other_co)
             overlap = ((ego_x < hl + hl * cd + hw * sd) & (ego_y < hw + hl * sd + hw * cd)
                        & (other_x < hl + hl * cd + hw * sd) & (other_y < hw + hl * sd + hw * cd))
-            if np.any(overlap) and distances[-1] < distances[0]:
-                return True
+            if np.any(overlap):
+                distances = np.linalg.norm(predicted, axis=1)
+                if distances[-1] < distances[0]:
+                    return True
         return False
 
     def _clearance(self, path, distances, points, radii):
         if not len(points):
             return float("inf")
-        hit = np.any(np.sum((path[:, None, :] - points[None, :, :]) ** 2, axis=2)
-                     < radii[None, :] ** 2, axis=1)
-        indices = np.flatnonzero(hit)
-        return float(distances[indices[0]]) if len(indices) else float("inf")
+        return _path_clearance(path, distances, points, radii)
 
     def _arc(self, curvature, distances):
         if abs(curvature) < 1e-6:
@@ -211,7 +240,7 @@ class HybridPPFTGAgent:
         return np.column_stack((np.sin(theta) / curvature,
                                 (1 - np.cos(theta)) / curvature))
 
-    def _motion_path(self, steer, speed, distances):
+    def _motion_path(self, steer, speed, distances, steps=None):
         """Bounded kinematic sweep through actuator lag for collision checks."""
         desired = np.tan(steer) / self.wheelbase
         lag_distance = max(speed, 0.5) * self.actuator_delay
@@ -220,15 +249,20 @@ class HybridPPFTGAgent:
         heading = (desired * distances + (self._initial_curvature - desired) * lag_distance
                    * (-np.expm1(-distances / lag_distance)))
         directions = np.column_stack((np.cos(heading), np.sin(heading)))
-        increments = np.diff(distances)[:, None] * (directions[1:] + directions[:-1]) / 2
-        return np.vstack((np.zeros(2), np.cumsum(increments, axis=0)))
+        if steps is None:
+            steps = np.diff(distances)
+        increments = steps[:, None] * (directions[1:] + directions[:-1]) / 2
+        path = np.empty((len(distances), 2))
+        path[0] = 0.
+        np.cumsum(increments, axis=0, dtype=increments.dtype, out=path[1:])
+        return path
 
     def _gap(self, bearing, speed, points, radii, obstacle_distance, timing=None):
         horizon = float(self.env.lidar_range)
         # Inflated radial clearance is equivalent to extending every obstacle's
         # angular disparity by the vehicle half-width plus a safety margin.
-        candidates = np.flatnonzero(np.abs(self._angles) <= self.gap_fov / 2)
-        directions = self._directions[candidates]
+        candidates = self._gap_candidates
+        directions = self._gap_directions
         if len(points):
             along = directions @ points.T
             across = directions[:, :1] * points[None, :, 1] - directions[:, 1:] * points[None, :, 0]
@@ -263,21 +297,34 @@ class HybridPPFTGAgent:
         if not choices:
             return 0., 0., None
         best_by_tier = {}
-        distances = np.linspace(0., horizon, 40)
+        if self._gap_horizon != horizon:
+            self._gap_distances = np.linspace(0., horizon, 40)
+            self._gap_steps = np.diff(self._gap_distances)
+            self._gap_horizon = horizon
+        distances = self._gap_distances
+        evaluated = {}  # Only this decision: tiers may select the same ray.
+        choices = dict.fromkeys(choices)
         if timing is not None:
-            timing.context["gap_candidates"] = len(dict.fromkeys(choices))
-        for tier, local in dict.fromkeys(choices):
+            timing.context["gap_candidates"] = len(choices)
+        for tier, local in choices:
+            if local in evaluated:
+                result = evaluated[local]
+                if tier not in best_by_tier or result[0] > best_by_tier[tier][0]:
+                    best_by_tier[tier] = result
+                continue
             angle = float(self._angles[candidates[local]])
             target_distance = max(1., min(radial[local], self.lookahead_base + self.lookahead_time * speed))
             steer = float(np.clip(np.arctan(2 * self.wheelbase * np.sin(angle) / target_distance),
                                   self.steer_min, self.steer_max))
-            clearance = self._clearance(self._motion_path(steer, speed, distances),
+            clearance = self._clearance(self._motion_path(steer, speed, distances, self._gap_steps),
                                         distances, points, radii) - self.front
             score = min(clearance, horizon) - 1.5 * abs(angle - bearing)
             if self._gap_angle is not None:
                 score -= 0.5 * abs(angle - self._gap_angle)
+            result = (score, steer, max(0., clearance), angle)
+            evaluated[local] = result
             if tier not in best_by_tier or score > best_by_tier[tier][0]:
-                best_by_tier[tier] = (score, steer, max(0., clearance), angle)
+                best_by_tier[tier] = result
         # Prefer a gap that passes the blocking object. On a bend, radial rays
         # can terminate at the outer wall; fall back to nearer gaps when needed.
         best = best_by_tier.get(1)
@@ -315,7 +362,8 @@ class HybridPPFTGAgent:
             timing.mark("map_preparation")
         pose = np.asarray(obs["pose"], dtype=np.float64)
         velocity = np.asarray(obs["velocity"], dtype=np.float64)
-        if pose.shape != (3,) or velocity.shape != (2,) or not np.isfinite(np.r_[pose, velocity]).all():
+        if (pose.shape != (3,) or velocity.shape != (2,)
+                or not np.isfinite(pose).all() or not np.isfinite(velocity).all()):
             self.reset()
             if timing is not None:
                 timing.context["invalid_state"] = 1

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+from numba import njit
 
 from utils.centerline import (
     CenterlineGeometry,
@@ -477,6 +478,39 @@ def validate_finish_line(
     return parsed
 
 
+@njit(cache=True)
+def _finish_candidate_parts(poses, normal, offset, hysteresis, limit, out):
+    """Conservatively bound the complete cubics, retaining contact's segment.
+
+    The sum of absolute nonconstant coefficients bounds every Bernstein control
+    point used by the precise filter. Include the full partial-contact segment
+    so the existing root tolerances and shared-endpoint handling remain intact.
+    Scalar projection is only a broad phase: a roundoff allowance covers its
+    arithmetic and the later NumPy projection, which still supplies root inputs.
+    """
+    count, visited = 0, 0
+    for part in range(len(poses)):
+        if min(1., limit * len(poses) - part) < 0.:
+            break
+        visited += 1
+        base = poses[part, 0, 0] * normal[0] + poses[part, 0, 1] * normal[1] - offset
+        variation = 0.
+        scale = abs(offset) + 1.
+        for power in range(4):
+            x = poses[part, power, 0] * normal[0]
+            y = poses[part, power, 1] * normal[1]
+            scale += abs(x) + abs(y)
+            if power:
+                variation += abs(x + y)
+        allowance = 64. * np.finfo(np.float64).eps * scale
+        lower, upper = base - variation - allowance, base + variation + allowance
+        if (not np.isfinite(lower) or not np.isfinite(upper)
+                or lower <= 0. <= upper or lower <= -hysteresis <= upper):
+            out[count] = part
+            count += 1
+    return count, visited
+
+
 class LapTracker:
     """Count net forward passages through a track-spanning finish segment.
 
@@ -510,6 +544,10 @@ class LapTracker:
         if abs(orientation) <= 1e-6:
             raise ValueError("finish_line.direction must cross, not run along, the line")
         self._forward_sign = 1.0 if orientation > 0.0 else -1.0
+        segment_unit = self.finish_line["segment_unit"]
+        self._motion_normal = self._forward_sign * np.array([-segment_unit[1], segment_unit[0]])
+        self._motion_offset = np.dot(self.finish_line["start"], self._motion_normal)
+        self._finish_parts = np.empty(0, dtype=np.int64)
 
     def reset(self, poses_x: np.ndarray, poses_y: np.ndarray) -> None:
         self.lifecycle.reset()
@@ -606,9 +644,13 @@ class LapTracker:
 
         self.lifecycle.begin_step()
         crossings = dict.fromkeys(self.agent_ids, False)
-        segment_unit = self.finish_line["segment_unit"]
-        normal = self._forward_sign * np.array([-segment_unit[1], segment_unit[0]])
+        normal = self._motion_normal
         hysteresis = float(self.finish_line["hysteresis"])
+        start = self.finish_line["start"]
+        segment = self.finish_line["segment"]
+        length_sq = self.finish_line["segment_length_sq"]
+        padding = self.finish_line["padding"]
+        min_speed = float(self.finish_line["min_speed"])
         events = []
         counts = getattr(self, "profile_counts", None)
         region = getattr(self, "profile_region", None)
@@ -617,14 +659,23 @@ class LapTracker:
                 continue
             if counts is not None:
                 counts[0] += 1  # active paths
-            distances = poses[:, :, :2] @ normal
-            distances[:, 0] -= np.dot(self.finish_line["start"], normal)
-            for part, coefficients in enumerate(distances):
+            if len(self._finish_parts) < len(poses):
+                self._finish_parts = np.empty(len(poses), dtype=np.int64)
+            candidate_count, visited = _finish_candidate_parts(
+                poses, normal, self._motion_offset, hysteresis, limit, self._finish_parts)
+            if counts is not None:
+                counts[1] += visited  # segments before contact limit
+                counts[2] += 2 * (visited - candidate_count)
+                counts[3] += 2 * (visited - candidate_count)  # both hulls excluded
+            if candidate_count == 0:
+                continue
+            # Preserve the precise projection arithmetic for candidate paths.
+            distances = poses[:visited, :, :2] @ normal
+            distances[:, 0] -= self._motion_offset
+            for candidate in range(candidate_count):
+                part = int(self._finish_parts[candidate])
+                coefficients = distances[part]
                 end = min(1., limit * len(poses) - part)
-                if end < 0.:
-                    break
-                if counts is not None:
-                    counts[1] += 1  # segments before contact limit
                 # Bernstein hull excludes roots without solving a polynomial.
                 c0, c1, c2, c3 = coefficients
                 controls = (c0, c0 + c1 / 3., c0 + 2*c1 / 3. + c2 / 3., coefficients.sum())
@@ -666,8 +717,7 @@ class LapTracker:
                                 events.append((fraction, index, "arm", 0.))
                             continue
                         point = trace_state(poses, fraction)[:2]
-                        projection = np.dot(point - self.finish_line["start"], self.finish_line["segment"]) / self.finish_line["segment_length_sq"]
-                        padding = self.finish_line["padding"]
+                        projection = np.dot(point - start, segment) / length_sq
                         if not -padding <= projection <= 1. + padding:
                             continue
                         state = trace_state(states, fraction)
@@ -695,7 +745,7 @@ class LapTracker:
             elif self._reverse_crossings[index] > 0:
                 self._reverse_crossings[index] -= 1
                 self._armed[index] = False
-            elif self._armed[index] and speed >= float(self.finish_line["min_speed"]):
+            elif self._armed[index] and speed >= min_speed:
                 self._armed[index] = False
                 if not self.count_initial_crossing_as_lap and not self._initial_crossing_seen[index]:
                     self._initial_crossing_seen[index] = True
@@ -704,9 +754,9 @@ class LapTracker:
                     crossings[agent_id] = True
                     self.lifecycle.record_lap_crossing(agent_id, step=step)
         for index in range(len(self.agent_ids)):
-            point = np.array([poses_x[index], poses_y[index]], dtype=np.float32)
+            point = self._previous_points[index]
+            point[0], point[1] = poses_x[index], poses_y[index]
             self._previous[index] = self._oriented_distance(point)
-            self._previous_points[index] = point
             if self._previous[index] <= -hysteresis:
                 self._armed[index] = True
         return crossings

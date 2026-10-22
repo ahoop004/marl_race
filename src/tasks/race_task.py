@@ -8,15 +8,26 @@ from typing import Any, Callable, Optional, Sequence
 import numpy as np
 
 from env.spaces import SpaceSpec
+from env.types import AgentState, GlobalState, ProgressState, StepFacts
 from tasks.contracts import AgentDecision, TaskSnapshot, TaskStep, TaskSubstep
 from tasks.reward_context import build_reward_context
 from tasks.specification import TaskSpec, EpisodeMetadata, EpisodeLimits
 
 
+# These state records have ordinary init fields and no custom construction hooks.
+# Keep replace() for other dataclasses, whose InitVars/initialization may differ.
+_DETACH_FIELDS = {
+    cls: tuple(field.name for field in fields(cls) if field.init)
+    for cls in (AgentState, GlobalState, ProgressState, StepFacts)
+}
+_ATOMIC_TYPES = frozenset((str, int, float, bool, bytes, complex, type(None)))
+
+
 def _detach(value, memo=None, counters=None):
     # Most nested info entries are immutable leaves. Avoid allocating a memo
     # and testing Mapping/dataclass protocols for every scalar.
-    if type(value) in (str, int, float, bool, type(None)) or isinstance(value, np.generic):
+    value_type = type(value)
+    if value_type in _ATOMIC_TYPES or isinstance(value, np.generic):
         return value
     if memo is None:
         memo = {}
@@ -34,15 +45,26 @@ def _detach(value, memo=None, counters=None):
     elif isinstance(value, Mapping):
         result = {}
         memo[id(value)] = result
-        result.update({key: _detach(item, memo, counters) for key, item in value.items()})
+        for key, item in value.items():
+            result[key] = item if type(item) in _ATOMIC_TYPES else _detach(item, memo, counters)
+    elif value_type is tuple and all(type(item) in _ATOMIC_TYPES for item in value):
+        # Reusing a tuple of immutable scalars cannot expose a mutable buffer.
+        result = value
     elif isinstance(value, (list, tuple, set, frozenset)):
-        result = type(value)(_detach(item, memo, counters) for item in value)
+        result = value_type(item if type(item) in _ATOMIC_TYPES else _detach(item, memo, counters)
+                            for item in value)
+    elif value_type in _DETACH_FIELDS:
+        detached = {}
+        for name in _DETACH_FIELDS[value_type]:
+            item = getattr(value, name)
+            detached[name] = item if type(item) in _ATOMIC_TYPES else _detach(item, memo, counters)
+        result = value_type(**detached)
     elif is_dataclass(value) and not isinstance(value, type):
         result = replace(value, **{field.name: _detach(getattr(value, field.name), memo, counters)
                                   for field in fields(value) if field.init})
     else:
         return value
-    if counters is not None and not isinstance(value, np.ndarray):
+    if counters is not None and result is not value and not isinstance(value, np.ndarray):
         counters[2] += 1
     memo[id(value)] = result
     return result
@@ -157,7 +179,7 @@ class RaceTask:
     def _capture_episode_metadata(self):
         manager = getattr(self.env, "_spawn_manager", None)
         context = _detach(getattr(manager, "last_spawn_metadata", {}) or {})
-        context["spawn_ids"] = dict(getattr(manager, "last_spawn_mapping", {}) or {})
+        context["spawn_ids"] = _detach(getattr(manager, "last_spawn_mapping", {}) or {})
         context["initial_states"] = {}
         if hasattr(self.env, "get_agent_state"):
             for aid in self.physical_agents:
@@ -171,10 +193,10 @@ class RaceTask:
                     for field in ("pose", "velocity") if getattr(state, field, None) is not None}
         # Some spawn modes publish IDs only in metadata, without a mapping.
         if not context["spawn_ids"]:
-            context["spawn_ids"] = dict((getattr(manager, "last_spawn_metadata", {}) or {}).get("spawn_ids", {}))
+            context["spawn_ids"] = _detach((getattr(manager, "last_spawn_metadata", {}) or {}).get("spawn_ids", {}))
         return EpisodeMetadata(
             getattr(self.env, "_map_bundle_active", None) or getattr(self.env, "map_name", None),
-            _detach(context), getattr(self.env, "seed", None),
+            context, getattr(self.env, "seed", None),
         )
 
     def _detach_state(self, value):
