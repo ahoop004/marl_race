@@ -406,6 +406,8 @@ def test_resolved_config_and_choices_are_saved_with_experiments(tmp_path):
     assert saved == provenance and config == original
     assert saved["resolved_config_sha256"] == digest(config)
     assert saved["observation_contracts"] == contracts and saved["physics_contract"]["version"] == 1
+    assert saved["behavior_contracts"]["vehicle_geometry_collision"] == 2
+    assert saved["physics_contract"]["vehicle_params"]["model_version"] == 2
     assert saved["seed"] == 42 and len(saved["git"]["commit"]) == 40
     runtime = saved["runtime"]
     assert runtime["python"] and runtime["packages"]["tensordict"] and runtime["packages"]["torchrl"]

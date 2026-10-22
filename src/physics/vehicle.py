@@ -9,6 +9,7 @@ from physics.dynamic_models import (
     combined_slip_dynamics, integrate_combined_slip,
 )
 from physics.integration import Integrator
+from physics.collision_models import VehicleGeometry
 from physics.tire_models import MF61_KEYS, validate_mf61_coefficients
 from physics.laser_models import ScanSimulator2D, check_ttc_jit, ray_cast
 
@@ -274,7 +275,7 @@ class RaceCar(object):
             time_step (float, default=0.01): physics sim time step
             num_beams (int, default=1080): number of beams in the laser scan
             fov (float, default=4.7): field of view of the laser
-            lidar_dist (float, default=0): vertical distance between LiDAR and backshaft
+            lidar_dist (float, default=0): forward LiDAR offset from the vehicle state reference
             scan_simulator: optional scanner shared by cars in the same environment
 
         Returns:
@@ -350,38 +351,23 @@ class RaceCar(object):
         # use a different beam count or field of view.
         self.cosines = np.zeros((self.num_beams, ))
         self.scan_angles = np.zeros((self.num_beams, ))
-        self.side_distances = np.zeros((self.num_beams, ))
-
-        dist_sides = params['width']/2.
-        dist_fr = (params['lf']+params['lr'])/2.
 
         for i in range(self.num_beams):
             angle = -fov/2. + i*scan_ang_incr
             self.scan_angles[i] = angle
             self.cosines[i] = np.cos(angle)
+        self._refresh_geometry()
 
-            if angle > 0:
-                if angle < np.pi/2:
-                    # between 0 and pi/2
-                    to_side = dist_sides / np.sin(angle)
-                    to_fr = dist_fr / np.cos(angle)
-                    self.side_distances[i] = min(to_side, to_fr)
-                else:
-                    # between pi/2 and pi
-                    to_side = dist_sides / np.cos(angle - np.pi/2.)
-                    to_fr = dist_fr / np.sin(angle - np.pi/2.)
-                    self.side_distances[i] = min(to_side, to_fr)
-            else:
-                if angle > -np.pi/2:
-                    # between 0 and -pi/2
-                    to_side = dist_sides / np.sin(-angle)
-                    to_fr = dist_fr / np.cos(-angle)
-                    self.side_distances[i] = min(to_side, to_fr)
-                else:
-                    # between -pi/2 and -pi
-                    to_side = dist_sides / np.cos(-angle - np.pi/2)
-                    to_fr = dist_fr / np.sin(-angle - np.pi/2)
-                    self.side_distances[i] = min(to_side, to_fr)
+    def _refresh_geometry(self):
+        # Legacy update_params accepts partial dictionaries. Retain omitted body
+        # dimensions while axle positions follow the existing dynamics defaults.
+        geometry_params = {"lf": self._lf, "lr": self._lr, **self.params}
+        if hasattr(self, "geometry"):
+            geometry_params = {"length": self.geometry.front + self.geometry.rear,
+                               "width": self.geometry.left + self.geometry.right,
+                               **geometry_params}
+        self.geometry = VehicleGeometry.from_params(geometry_params, self.lidar_dist)
+        self._ray_entry_distances, self.side_distances = self.geometry.ray_intersections(self.scan_angles)
 
     def _refresh_param_cache(self) -> None:
         params = self.params
@@ -440,6 +426,7 @@ class RaceCar(object):
             raise ValueError("Recreate the environment to change nonlinear physics parameters or model")
         self.params = validated
         self._refresh_param_cache()
+        self._refresh_geometry()
 
     @property
     def physics_state(self) -> np.ndarray:
@@ -576,11 +563,7 @@ class RaceCar(object):
         if all_verts is None or all_verts.shape[0] <= 1:
             return
 
-        scan_pose = np.array([
-            self.state[0] + self.lidar_dist * np.cos(self.state[4]),
-            self.state[1] + self.lidar_dist * np.sin(self.state[4]),
-            self.state[4]
-        ], dtype=np.float64)
+        scan_pose = self.geometry.lidar_pose(self.state[[0, 1, 4]], self._scan_pose)
 
         scan_view = np.asarray(self.scan, dtype=np.float32)
 
@@ -596,10 +579,7 @@ class RaceCar(object):
     def compute_scan(self) -> np.ndarray:
         """Recompute the LiDAR scan for the vehicle's current pose."""
 
-        scan_pose = self._scan_pose
-        scan_pose[0] = self.state[0] + self.lidar_dist * np.cos(self.state[4])
-        scan_pose[1] = self.state[1] + self.lidar_dist * np.sin(self.state[4])
-        scan_pose[2] = self.state[4]
+        scan_pose = self.geometry.lidar_pose(self.state[[0, 1, 4]], self._scan_pose)
 
         current_scan = self.scan_simulator.scan(scan_pose, self.scan_rng)
         if current_scan is None:
@@ -621,13 +601,13 @@ class RaceCar(object):
             projected = vx * self.cosines + vy * np.sin(self.scan_angles)
             self.in_collision = bool(check_ttc_jit(
                 current_scan, 1.0, self.scan_angles, projected,
-                self.side_distances, self.ttc_thresh))
+                self.side_distances, self.ttc_thresh, self._ray_entry_distances))
             return
         try:
             in_collision = check_ttc_jit(
                 current_scan, self.state[3],
                 self.scan_angles, self.cosines,
-                self.side_distances, self.ttc_thresh
+                self.side_distances, self.ttc_thresh, self._ray_entry_distances
             )
             self.in_collision = bool(in_collision)
         except Exception as e:
@@ -759,10 +739,7 @@ class RaceCar(object):
             np.nan_to_num(self.state, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
         # update scan
-        scan_pose = self._scan_pose
-        scan_pose[0] = self.state[0] + self.lidar_dist * np.cos(self.state[4])
-        scan_pose[1] = self.state[1] + self.lidar_dist * np.sin(self.state[4])
-        scan_pose[2] = self.state[4]
+        scan_pose = self.geometry.lidar_pose(self.state[[0, 1, 4]], self._scan_pose)
         current_scan = self.scan_simulator.scan(scan_pose, self.scan_rng)
         self.check_ttc(current_scan)
 

@@ -7,7 +7,7 @@ from numba import njit
 
 from physics.integration import Integrator
 from physics.vehicle import RaceCar
-from physics.collision_models import get_vertices, collision_multiple
+from physics.collision_models import collision_multiple
 
 
 ENV_COLLISION_IDX = -2
@@ -78,7 +78,7 @@ class Simulator(object):
             seed (int): seed of the rng in scan simulation
             time_step (float, default=0.01): physics time step
 
-            lidar_dist (float, default=0): vertical distance between LiDAR and backshaft
+            lidar_dist (float, default=0): forward LiDAR offset from the vehicle state reference
 
         Returns:
             None
@@ -242,11 +242,7 @@ class Simulator(object):
             pose_buffer[i, 2] = agent.state[4]
 
             with self.profile_region("physics_collisions") if self.profile_region else nullcontext():
-                verts = get_vertices(
-                    pose_buffer[i],
-                    self.params['length'],
-                    self.params['width'],
-                )
+                verts = agent.geometry.world_vertices(pose_buffer[i])
                 verts_buffer_f64[i, :, :] = verts
                 verts_buffer_f32[i, :, :] = verts
 
@@ -467,11 +463,8 @@ class Simulator(object):
             np.copyto(self._scan_buffer[i], scan_row)
 
         for i in range(N):
-            verts = get_vertices(
-                pose_buffer[i],
-                self.params["length"],
-                self.params["width"],
-            )
+            agent = self.agents[i]
+            verts = agent.geometry.world_vertices(pose_buffer[i])
             self._verts_buffer_f64[i, :, :] = verts
             self._verts_buffer_f32[i, :, :] = verts
         visible = np.flatnonzero(self.collidable_mask)

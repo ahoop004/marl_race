@@ -28,8 +28,107 @@ Originally from https://github.com/kroitor/gjk.c
 Author: Hongrui Zheng
 """
 
+from dataclasses import dataclass
+
 import numpy as np
 from numba import njit
+
+# Version 1 used a wheelbase-sized wall footprint and ignored the LiDAR mount.
+# Dynamics retain their independent model_version values.
+GEOMETRY_COLLISION_VERSION = 2
+
+
+@dataclass(frozen=True)
+class VehicleGeometry:
+    """Planar body bounds about the dynamics reference: x forward, y left.
+
+    The nonlinear reference is the center of mass (axles at +lf and -lr).
+    Legacy dynamic ST uses the same convention; its low-speed kinematic
+    approximation is preserved. Neither config specifies body overhangs, so
+    from_params preserves the existing GJK body centered on the state pose.
+    Explicit extents also allow an asymmetric body without shifting the axles.
+    LiDAR coordinates are relative to this reference, not the rear axle.
+    """
+
+    front: float
+    rear: float
+    left: float
+    right: float
+    lf: float
+    lr: float
+    lidar_x: float = 0.0
+    lidar_y: float = 0.0
+
+    def __post_init__(self):
+        dimensions = (self.front, self.rear, self.left, self.right, self.lf, self.lr)
+        if not all(np.isfinite(v) and v > 0 for v in dimensions):
+            raise ValueError("Vehicle geometry extents and axle distances must be finite and positive")
+        if not all(np.isfinite(v) for v in self.lidar_position):
+            raise ValueError("LiDAR mounting position must be finite")
+
+    @classmethod
+    def from_params(cls, params, lidar_dist=0.0):
+        return cls(params['length'] / 2.0, params['length'] / 2.0,
+                   params['width'] / 2.0, params['width'] / 2.0,
+                   params['lf'], params['lr'], lidar_x=lidar_dist)
+
+    @property
+    def axle_locations(self):
+        return np.array([[self.lf, 0.0], [-self.lr, 0.0]])
+
+    @property
+    def lidar_position(self):
+        return np.array([self.lidar_x, self.lidar_y])
+
+    @property
+    def footprint(self):
+        return self.world_vertices(np.zeros(3))
+
+    def world_vertices(self, pose):
+        return get_vertices(pose, self.front + self.rear, self.left + self.right,
+                            (self.front - self.rear) / 2.0,
+                            (self.left - self.right) / 2.0)
+
+    def lidar_pose(self, pose, out=None):
+        """Transform the mounting point with the same matrix used by GJK."""
+        if out is None:
+            out = np.empty(3, dtype=np.float64)
+        transform = get_trmtx(pose)
+        out[:2] = transform[:2, :2] @ self.lidar_position + transform[:2, 3]
+        out[2] = pose[2]
+        return out
+
+    def ray_intersections(self, angles):
+        """Entry/exit ranges of body-frame LiDAR rays through the footprint.
+
+        Entry is zero for an in-body sensor. Misses have NaN ranges. Keeping
+        entry as well as exit also handles mounts outside the body: an obstacle
+        between the sensor and body is not itself body contact.
+        """
+        directions = np.column_stack((np.cos(angles), np.sin(angles)))
+        near = np.zeros(len(angles))
+        far = np.full(len(angles), np.inf)
+        bounds = ((-self.rear, self.front), (-self.right, self.left))
+        for axis, (lower, upper) in enumerate(bounds):
+            origin = self.lidar_position[axis]
+            direction = directions[:, axis]
+            parallel = np.abs(direction) < 1e-15
+            axis_near = np.full(len(angles), -np.inf)
+            axis_far = np.full(len(angles), np.inf)
+            moving = ~parallel
+            first = (lower - origin) / direction[moving]
+            second = (upper - origin) / direction[moving]
+            axis_near[moving] = np.minimum(first, second)
+            axis_far[moving] = np.maximum(first, second)
+            if origin < lower or origin > upper:
+                axis_far[parallel] = -np.inf
+            near = np.maximum(near, axis_near)
+            far = np.minimum(far, axis_far)
+        misses = far < near
+        near[misses] = np.nan
+        far[misses] = np.nan
+        return near, far
+
 
 @njit(cache=True)
 def perpendicular(pt):
@@ -241,7 +340,8 @@ def get_trmtx(pose):
     return H
 
 @njit(cache=True)
-def get_vertices(pose, length, width):
+def get_vertices(pose, length, width, center_x=0.0, center_y=0.0):
+    """World corners, with optional body-frame center offsets from the pose."""
     H = get_trmtx(pose)
 
     hl = length / 2.0
@@ -249,10 +349,10 @@ def get_vertices(pose, length, width):
 
     # homogeneous corners
     corners = np.zeros((4, 4), dtype=np.float64)
-    corners[0, 0] = -hl; corners[0, 1] =  hw; corners[0, 3] = 1.0
-    corners[1, 0] = -hl; corners[1, 1] = -hw; corners[1, 3] = 1.0
-    corners[2, 0] =  hl; corners[2, 1] = -hw; corners[2, 3] = 1.0
-    corners[3, 0] =  hl; corners[3, 1] =  hw; corners[3, 3] = 1.0
+    corners[0, 0] = center_x - hl; corners[0, 1] = center_y + hw; corners[0, 3] = 1.0
+    corners[1, 0] = center_x - hl; corners[1, 1] = center_y - hw; corners[1, 3] = 1.0
+    corners[2, 0] = center_x + hl; corners[2, 1] = center_y - hw; corners[2, 3] = 1.0
+    corners[3, 0] = center_x + hl; corners[3, 1] = center_y + hw; corners[3, 3] = 1.0
 
     verts_h = corners @ H.T
 

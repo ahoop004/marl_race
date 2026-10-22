@@ -2,6 +2,14 @@
 
 Reinforcement learning experiments for racing.
 
+Physics baseline for the F0–F2 geometry correction: `origin/multiNode` at
+`7d65c76fadff9081ce59c4a42c7400b892adc92e`. Default dynamics remain
+`combined_slip_st` v2 / MF6.1, RK4 with 0.001 s maximum substeps and a 0.05 s
+simulation step (standalone simulator default: 0.01 s). Its chassis is 0.58 ×
+0.31 m, with axles at +0.15875 / −0.17145 m; the legacy preset keeps its
+0.32 × 0.225 m footprint and v1 dynamics. Run provenance records the independent
+`vehicle_geometry_collision` behavior version (2); dynamics/configs are unchanged.
+
 # 1. Solo PPO pretraining
 python run.py --scenario scenarios/ppo_lap_completion_pretrain.yaml \
   --output-dir outputs/pretrain

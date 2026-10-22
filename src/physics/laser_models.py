@@ -184,7 +184,8 @@ def get_scan(pose, theta_dis, fov, num_beams, theta_index_increment, sines, cosi
     return scan
 
 @njit(cache=True, error_model='numpy')
-def check_ttc_jit(scan, vel, scan_angles, cosines, side_distances, ttc_thresh):
+def check_ttc_jit(scan, vel, scan_angles, cosines, side_distances, ttc_thresh,
+                  entry_distances=None):
     """
     Check time-to-collision for vehicle collision detection.
 
@@ -198,6 +199,8 @@ def check_ttc_jit(scan, vel, scan_angles, cosines, side_distances, ttc_thresh):
         cosines (np.ndarray(num_beams, )): precomped cosines of the scan angles
         side_distances (np.ndarray(num_beams, )): precomped distances at each beam from the laser to the sides of the car
         ttc_thresh (float): threshold for iTTC for collision (default: 0.005s)
+        entry_distances: optional footprint entry ranges for external LiDAR mounts;
+            misses have NaN exit ranges. Angles/ranges are in the sensor/body frame.
 
     Returns:
         in_collision (bool): whether vehicle is in collision with environment
@@ -209,6 +212,8 @@ def check_ttc_jit(scan, vel, scan_angles, cosines, side_distances, ttc_thresh):
     # If any beam shows car edge at or past wall, it's a collision
     contact_thresh = 0.005  # 5mm - only triggers on actual overlap/contact
     for i in range(num_beams):
+        if entry_distances is not None and scan[i] < entry_distances[i]:
+            continue
         clearance = scan[i] - side_distances[i]
         if clearance < contact_thresh:
             in_collision = True
@@ -217,6 +222,8 @@ def check_ttc_jit(scan, vel, scan_angles, cosines, side_distances, ttc_thresh):
     # TTC-based collision detection for moving vehicles
     # Triggers before contact when approaching wall
     for i in range(num_beams):
+        if entry_distances is not None and scan[i] < entry_distances[i]:
+            continue
         proj_vel = vel * cosines[i]
         if proj_vel > 0:  # Only check beams in direction of travel
             ttc = (scan[i] - side_distances[i]) / proj_vel
