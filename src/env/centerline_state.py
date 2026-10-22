@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -609,27 +610,44 @@ class LapTracker:
         normal = self._forward_sign * np.array([-segment_unit[1], segment_unit[0]])
         hysteresis = float(self.finish_line["hysteresis"])
         events = []
+        counts = getattr(self, "profile_counts", None)
+        region = getattr(self, "profile_region", None)
         for index, (poses, states, nonlinear, limit) in enumerate(motion_paths):
             if not self.lifecycle.records[self.agent_ids[index]].is_active:
                 continue
+            if counts is not None:
+                counts[0] += 1  # active paths
             distances = poses[:, :, :2] @ normal
             distances[:, 0] -= np.dot(self.finish_line["start"], normal)
             for part, coefficients in enumerate(distances):
                 end = min(1., limit * len(poses) - part)
                 if end < 0.:
                     break
+                if counts is not None:
+                    counts[1] += 1  # segments before contact limit
                 # Bernstein hull excludes roots without solving a polynomial.
                 c0, c1, c2, c3 = coefficients
                 controls = (c0, c0 + c1 / 3., c0 + 2*c1 / 3. + c2 / 3., coefficients.sum())
                 for level, event_type in ((0., "cross"), (-hysteresis, "arm")):
+                    if counts is not None:
+                        counts[2] += 1  # plane/hysteresis tests
                     if not min(controls) <= level <= max(controls):
+                        if counts is not None:
+                            counts[3] += 1  # rejected by hull
                         continue
                     polynomial = coefficients.copy()
                     polynomial[0] -= level
                     # A constant path on the line is not a crossing.
                     if not np.any(polynomial[1:]):
+                        if counts is not None:
+                            counts[4] += 1
                         continue
-                    for root in np.polynomial.polynomial.polyroots(polynomial):
+                    with region("finish_polyroots") if region else nullcontext():
+                        roots = np.polynomial.polynomial.polyroots(polynomial)
+                    if counts is not None:
+                        counts[5] += 1
+                        counts[6] += len(roots)
+                    for root in roots:
                         if abs(root.imag) > 1e-9:
                             continue
                         local = float(root.real)
@@ -657,6 +675,8 @@ class LapTracker:
                         if not nonlinear and abs(speed) >= .5:
                             speed *= float(np.cos(state[6]))
                         events.append((fraction, index, "forward" if forward else "backward", speed))
+        if counts is not None:
+            counts[7] += len(events)
         previous_events = {}
         for fraction, index, kind, speed in sorted(events):
             # Adjacent RK segments share an endpoint root. Count it only once.

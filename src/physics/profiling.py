@@ -21,6 +21,11 @@ COUNTERS = (
 )
 
 
+FINISH_COUNTERS = ("active_paths", "segments", "level_tests", "hull_rejects",
+                   "constant_candidates", "root_solves", "roots_returned", "event_candidates")
+COPY_COUNTERS = ("arrays", "array_bytes", "containers", "memo_hits")
+
+
 class SerialPhysicsProfile:
     """Exclusive host timing, matching OnPolicyTrainer.measure_region accounting.
 
@@ -33,12 +38,18 @@ class SerialPhysicsProfile:
         self.inclusive_seconds = defaultdict(float)
         self.calls = defaultdict(int)
         self.counters = np.zeros(len(COUNTERS), dtype=np.int64)
+        self.finish_counts = np.zeros(len(FINISH_COUNTERS), dtype=np.int64)
+        self.copy_counts = np.zeros(len(COPY_COUNTERS), dtype=np.int64)
+        self.hybrid_records = []
 
     def clear(self):
         self.seconds.clear()
         self.inclusive_seconds.clear()
         self.calls.clear()
         self.counters.fill(0)
+        self.finish_counts.fill(0)
+        self.copy_counts.fill(0)
+        self.hybrid_records.clear()
 
     @contextmanager
     def region(self, name):
@@ -60,11 +71,14 @@ class SerialPhysicsProfile:
             "inclusive_seconds_do_not_sum": dict(self.inclusive_seconds),
             "calls": dict(self.calls),
             "counters": dict(zip(COUNTERS, map(int, self.counters))),
+            "finish_counts": dict(zip(FINISH_COUNTERS, map(int, self.finish_counts))),
+            "detach_counts": dict(zip(COPY_COUNTERS, map(int, self.copy_counts))),
+            "hybrid_records_separate_inclusive_detail": list(self.hybrid_records),
             "unattributed_seconds": max(0., wall_seconds - sum(self.seconds.values())),
         }
 
     @contextmanager
-    def attach(self, simulator, *, task=None):
+    def attach(self, simulator, *, task=None, environment=None, detail=False):
         """Use with an initialized simulator/task; no global monkeypatches."""
         with ExitStack() as resources:
             def assign(owner, name, value):
@@ -107,7 +121,8 @@ class SerialPhysicsProfile:
                 assign(task, "profile_region", self.region)
                 instrument(task, "step", "task_bookkeeping")
                 instrument(task, "_make_snapshot", "snapshots")
-                env = task.env
+            env = task.env if task is not None else environment
+            if env is not None:
                 instrument(env, "step", "environment_bookkeeping")
                 for name in ("_split_obs", "_attach_central_state", "get_global_state",
                              "_central_state_tensor"):
@@ -119,10 +134,20 @@ class SerialPhysicsProfile:
                 instrument(env, "_inject_track_previews", "track_preview")
                 if env._lap_tracker is not None:
                     instrument(env._lap_tracker, "update", "finish_intersections")
+                if detail and env._lap_tracker is not None:
+                    assign(env._lap_tracker, "profile_counts", self.finish_counts)
+                    assign(env._lap_tracker, "profile_region", self.region)
+            if task is not None:
+                if detail:
+                    assign(task, "profile_copies", self.copy_counts)
+                    instrument(task, "_detach_state", "state_detach")
                 for composer in task.obs_composers.values():
                     instrument(composer, "wrap", "observation_composition")
                 for composer in task.reward_composers.values():
                     instrument(composer, "compute", "rewards")
                 for controller in task.fixed_controllers.values():
                     instrument(controller, "act", "fixed_controller")
+                    hybrid = getattr(controller, "controller", controller)
+                    if detail and hasattr(hybrid, "profile_hybrid"):
+                        assign(hybrid, "profile_hybrid", self.hybrid_records.append)
             yield self

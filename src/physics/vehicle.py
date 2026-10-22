@@ -234,11 +234,17 @@ class CombinedSlipVehicle:
                     or motion_trace.dtype != np.float64 or not motion_trace.flags.writeable):
                 raise ValueError(f"motion_trace must be a writable float64 array with shape {expected}")
         actuators = self._actuators
+        rhs_samples = getattr(self, "profile_rhs_samples", None)
+        if rhs_samples is not None:
+            if (rhs_samples.shape != (4, 8) or rhs_samples.dtype != np.float64
+                    or not rhs_samples.flags.writeable):
+                raise ValueError("profile_rhs_samples must be a writable float64 (4, 8) array")
         state, final_actuators = integrate_combined_slip(
             self._chassis, actuators._state, actuators._reference,
             actuators._time_constants, actuators._rate_limits,
             self._dynamics_params, timestep, self.params["max_integration_step"],
             motion_trace, getattr(self, "profile_counters", None),
+            rhs_samples,
         )
         # Commit both subsystems only after every stage and final validation pass.
         actuators._state[:] = final_actuators

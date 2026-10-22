@@ -116,7 +116,7 @@ def first_order_actuator_step(value, reference, dt, time_constant, rate_min, rat
 
 
 @njit(cache=True)
-def _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters=None):
+def _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters=None, force_samples=None):
     if counters is not None:
         counters[0] += 2  # MF6.1 calls, including zero-load bracket endpoints
     m, inertia, lf, lr, h, mu, floor, radius, front, rear = params
@@ -126,6 +126,12 @@ def _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counte
     if min(fzf, fzr) < -1e-9:
         raise ValueError("Negative axle normal load; wheel lift is outside model validity")
     fzf, fzr = max(0.0, fzf), max(0.0, fzr)
+    if force_samples is not None:
+        row = int(force_samples[0, 0]) + 1
+        if row >= force_samples.shape[0] or force_samples.shape[1] != 8:
+            raise ValueError("force_samples requires room for the complete force trace")
+        force_samples[row] = np.array([uf, vf, ur, vr, radius * omega, fzf, fzr, ax])
+        force_samples[0, 0] += 1
     fxf, fyf, kf, af = mf61_tire_force(uf, vf, radius * omega, fzf, mu, front, floor)
     fxr, fyr, kr, ar = mf61_tire_force(ur, vr, radius * omega, fzr, mu, rear, floor)
     residual = ax - (fxf * cos_delta - fyf * sin_delta + fxr) / m
@@ -134,12 +140,15 @@ def _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counte
 
 
 @njit(cache=True)
-def combined_slip_dynamics(state, actuators, params, counters=None):
+def combined_slip_dynamics(state, actuators, params, counters=None, force_samples=None):
     """Planar MF6.1 chassis dynamics with simultaneous longitudinal load transfer.
 
     Solve ax=sum(Fx_body(Fz(ax)))/m inside the nonnegative-load interval.
     A safeguarded secant solve replaces the reduced tire law's linear shortcut.
     """
+    if force_samples is not None:
+        if force_samples.shape != (63, 8) or force_samples[0, 0] != 0.:
+            raise ValueError("force_samples must be a cleared (63, 8) buffer")
     if counters is not None:
         counters[1] += 1  # RHS / load-equilibrium solves
     m, inertia, lf, lr, h, mu, floor, radius, front, rear = params
@@ -151,19 +160,19 @@ def combined_slip_dynamics(state, actuators, params, counters=None):
     vf = -vx * sin_delta + vf_body * cos_delta
     ur, vr = vx, vy - lr * yaw_rate
     if h == 0.0:
-        residual, axles = _axle_forces(0.0, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters)
+        residual, axles = _axle_forces(0.0, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples)
         ax = -residual
     else:
         lo, hi = -GRAVITY * lf / h, GRAVITY * lr / h
-        flo, _ = _axle_forces(lo, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters)
-        fhi, _ = _axle_forces(hi, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters)
+        flo, _ = _axle_forces(lo, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples)
+        fhi, _ = _axle_forces(hi, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples)
         if flo > 0.0 or fhi < 0.0:
             raise ValueError("No nonnegative normal load equilibrium; wheel lift is outside model validity")
         ax = 0.0
         for iteration in range(60):
             if counters is not None:
                 counters[2] += 1  # actual solver iterations, excluding brackets
-            residual, axles = _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters)
+            residual, axles = _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples)
             if abs(residual) < 1e-10:
                 break
             if residual < 0.0:
@@ -414,7 +423,7 @@ def write_rk4_trace(out, state, k1, k2, k3, k4, dt):
 @njit(cache=True)
 def integrate_combined_slip(
     chassis, actuator_state, reference, constants, rates, params, timestep, max_step,
-    motion_trace=None, counters=None,
+    motion_trace=None, counters=None, rhs_samples=None,
 ):
     """Integrate and validate a proposed state; the caller commits it atomically."""
     # Keep stage arithmetic and held-reference sampling identical to scalar RK4.
@@ -431,9 +440,21 @@ def integrate_combined_slip(
         at_start = sample_wheel_actuators(actuator_state, reference, start, constants, rates, counters)
         at_middle = sample_wheel_actuators(actuator_state, reference, start + dt / 2, constants, rates, counters)
         at_end = sample_wheel_actuators(actuator_state, reference, (index + 1) * dt, constants, rates, counters)
+        if rhs_samples is not None and index == 0:
+            rhs_samples[0, :6] = state
+            rhs_samples[0, 6:] = at_start
         k1, _ = combined_slip_dynamics(state, at_start, params, counters)
+        if rhs_samples is not None and index == 0:
+            rhs_samples[1, :6] = state + dt / 2 * k1
+            rhs_samples[1, 6:] = at_middle
         k2, _ = combined_slip_dynamics(state + dt / 2 * k1, at_middle, params, counters)
+        if rhs_samples is not None and index == 0:
+            rhs_samples[2, :6] = state + dt / 2 * k2
+            rhs_samples[2, 6:] = at_middle
         k3, _ = combined_slip_dynamics(state + dt / 2 * k2, at_middle, params, counters)
+        if rhs_samples is not None and index == 0:
+            rhs_samples[3, :6] = state + dt * k3
+            rhs_samples[3, 6:] = at_end
         k4, _ = combined_slip_dynamics(state + dt * k3, at_end, params, counters)
         if motion_trace is not None:
             write_rk4_trace(motion_trace[index], state, k1, k2, k3, k4, dt)

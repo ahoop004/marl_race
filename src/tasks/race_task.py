@@ -13,7 +13,7 @@ from tasks.reward_context import build_reward_context
 from tasks.specification import TaskSpec, EpisodeMetadata, EpisodeLimits
 
 
-def _detach(value, memo=None):
+def _detach(value, memo=None, counters=None):
     # Most nested info entries are immutable leaves. Avoid allocating a memo
     # and testing Mapping/dataclass protocols for every scalar.
     if type(value) in (str, int, float, bool, type(None)) or isinstance(value, np.generic):
@@ -21,22 +21,29 @@ def _detach(value, memo=None):
     if memo is None:
         memo = {}
     if id(value) in memo:
+        if counters is not None:
+            counters[3] += 1
         return memo[id(value)]
     if isinstance(value, np.ndarray):
         result = value.copy()
+        if counters is not None:
+            counters[0] += 1
+            counters[1] += value.nbytes
         if not value.flags.writeable:
             result.setflags(write=False)
     elif isinstance(value, Mapping):
         result = {}
         memo[id(value)] = result
-        result.update({key: _detach(item, memo) for key, item in value.items()})
+        result.update({key: _detach(item, memo, counters) for key, item in value.items()})
     elif isinstance(value, (list, tuple, set, frozenset)):
-        result = type(value)(_detach(item, memo) for item in value)
+        result = type(value)(_detach(item, memo, counters) for item in value)
     elif is_dataclass(value) and not isinstance(value, type):
-        result = replace(value, **{field.name: _detach(getattr(value, field.name), memo)
+        result = replace(value, **{field.name: _detach(getattr(value, field.name), memo, counters)
                                   for field in fields(value) if field.init})
     else:
         return value
+    if counters is not None and not isinstance(value, np.ndarray):
+        counters[2] += 1
     memo[id(value)] = result
     return result
 
@@ -83,6 +90,7 @@ class RaceTask:
         self._physics_steps = 0
         self._closed = False
         self.profile_region = None
+        self.profile_copies = None
         self._episode_metadata = None
 
     @property
@@ -169,14 +177,17 @@ class RaceTask:
             _detach(context), getattr(self.env, "seed", None),
         )
 
+    def _detach_state(self, value):
+        return _detach(value, counters=self.profile_copies)
+
     def _make_snapshot(self, raw_obs, infos, observations, global_state):
         active = tuple(self.env.agents)
         agents = tuple(aid for aid in self.possible_agents if aid in active)
         return TaskSnapshot(
             agents=agents, active_physical_agents=active,
             observations={aid: observations[aid].copy() for aid in agents},
-            raw_observations=_detach(raw_obs), infos=_detach(infos),
-            global_state=_detach(global_state), decision_steps=self._decision_steps,
+            raw_observations=self._detach_state(raw_obs), infos=self._detach_state(infos),
+            global_state=self._detach_state(global_state), decision_steps=self._decision_steps,
             physics_steps=self._physics_steps,
             episode_done=bool(self.env.episode_done) or not active,
         )
@@ -235,7 +246,7 @@ class RaceTask:
             supplied_actions = {aid: action.copy() for aid, action in physical.items()}
             raw_obs, _, terms, truncs, infos = self.env.step(physical)
             self._physics_steps += 1
-            facts = _detach(self.env.last_step_facts)
+            facts = self._detach_state(self.env.last_step_facts)
             global_state = facts.global_state
             substep = TaskSubstep(self._physics_steps, self.timestep, supplied_actions, facts)
             substeps.append(substep)
@@ -278,7 +289,7 @@ class RaceTask:
 
         next_observations, decisions = {}, {}
         for aid in before.agents:
-            info = _detach(infos.get(aid, {}))
+            info = self._detach_state(infos.get(aid, {}))
             if aid not in self.env.agents and not (terminated[aid] or truncated[aid]):
                 truncated[aid] = True
                 info["task_boundary"] = "episode_policy"
