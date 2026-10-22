@@ -5,7 +5,7 @@ from types import MappingProxyType
 import numpy as np
 
 from physics.dynamic_models import (
-    vehicle_dynamics_st, pid, validate_vehicle_params, first_order_actuator_step,
+    vehicle_dynamics_st, pid, validate_vehicle_params,
     combined_slip_dynamics, integrate_combined_slip,
     write_rk4_trace, sample_wheel_actuators,
 )
@@ -113,11 +113,8 @@ class WheelActuators:
         """Sample a held command at an integration stage without advancing state."""
         if not np.isfinite(elapsed) or elapsed < 0:
             raise ValueError("elapsed must be finite and nonnegative")
-        return np.array([
-            first_order_actuator_step(value, reference, elapsed, tau, *rates)
-            for value, reference, tau, rates in zip(
-                self._state, self._reference, self._time_constants, self._rate_limits)
-        ])
+        return sample_wheel_actuators(
+            self._state, self._reference, elapsed, self._time_constants, self._rate_limits)
 
     def advance(self, timestep: float) -> np.ndarray:
         if not np.isfinite(timestep) or timestep <= 0:
@@ -179,7 +176,7 @@ class CombinedSlipVehicle:
 
     @property
     def state(self) -> np.ndarray:
-        return np.concatenate((self._chassis, self._actuators.state))
+        return np.concatenate((self._chassis, self._actuators._state))
 
     @property
     def reference(self) -> np.ndarray:
@@ -197,7 +194,7 @@ class CombinedSlipVehicle:
         # Validate the complete initial condition before changing either subsystem.
         actuators = WheelActuators(self._actuators.params)
         actuators.reset(steering_angle=steering_angle, forward_speed=velocity[0], wheel_speed=wheel_speed)
-        combined_slip_dynamics(chassis, actuators.state, self._dynamics_params,
+        combined_slip_dynamics(chassis, actuators._state, self._dynamics_params,
                                getattr(self, "profile_counters", None))
         self._chassis[:] = chassis
         self._actuators = actuators
@@ -207,7 +204,7 @@ class CombinedSlipVehicle:
         self._actuators.command(steering_angle, wheel_speed)
 
     def diagnostics(self) -> dict:
-        rhs, axles = combined_slip_dynamics(self._chassis, self._actuators.state, self._dynamics_params,
+        rhs, axles = combined_slip_dynamics(self._chassis, self._actuators._state, self._dynamics_params,
                                            getattr(self, "profile_counters", None))
         yaw_rate = self._chassis[5]
         return {

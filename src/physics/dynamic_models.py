@@ -23,7 +23,7 @@ Author: Hongrui Zheng
 import numpy as np
 from numba import njit
 from collections.abc import Mapping
-from physics.tire_models import mf61_tire_force
+from physics.tire_models import mf61_tire_force, _mf61_contact_terms
 
 
 LEGACY_MODEL = "legacy_st"
@@ -117,6 +117,15 @@ def first_order_actuator_step(value, reference, dt, time_constant, rate_min, rat
 
 @njit(cache=True)
 def _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters=None, force_samples=None):
+    """Diagnostic wrapper retained for direct force queries and profiling."""
+    residual, front, rear = _axle_force_values(
+        ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples)
+    return residual, np.array((front, rear))
+
+
+@njit(cache=True)
+def _axle_force_values(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters=None, force_samples=None, contact_terms=None):
+    """Return scalar tuples so load-equilibrium trials allocate no diagnostics."""
     if counters is not None:
         counters[0] += 2  # MF6.1 calls, including zero-load bracket endpoints
     m, inertia, lf, lr, h, mu, floor, radius, front, rear = params
@@ -130,21 +139,27 @@ def _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counte
         row = int(force_samples[0, 0]) + 1
         if row >= force_samples.shape[0] or force_samples.shape[1] != 8:
             raise ValueError("force_samples requires room for the complete force trace")
-        force_samples[row] = np.array([uf, vf, ur, vr, radius * omega, fzf, fzr, ax])
+        for column, value in enumerate((uf, vf, ur, vr, radius * omega, fzf, fzr, ax)):
+            force_samples[row, column] = value
         force_samples[0, 0] += 1
-    fxf, fyf, kf, af = mf61_tire_force(uf, vf, radius * omega, fzf, mu, front, floor)
-    fxr, fyr, kr, ar = mf61_tire_force(ur, vr, radius * omega, fzr, mu, rear, floor)
+    if contact_terms is None:
+        fxf, fyf, kf, af = mf61_tire_force(uf, vf, radius * omega, fzf, mu, front, floor)
+        fxr, fyr, kr, ar = mf61_tire_force(ur, vr, radius * omega, fzr, mu, rear, floor)
+    else:
+        fxf, fyf, kf, af = mf61_tire_force(uf, vf, radius * omega, fzf, mu, front, floor, contact_terms[0])
+        fxr, fyr, kr, ar = mf61_tire_force(ur, vr, radius * omega, fzr, mu, rear, floor, contact_terms[1])
     residual = ax - (fxf * cos_delta - fyf * sin_delta + fxr) / m
-    return residual, np.array([[uf, vf, kf, af, fxf, fyf, fzf],
-                               [ur, vr, kr, ar, fxr, fyr, fzr]])
+    return residual, (uf, vf, kf, af, fxf, fyf, fzf), (ur, vr, kr, ar, fxr, fyr, fzr)
 
 
 @njit(cache=True)
-def combined_slip_dynamics(state, actuators, params, counters=None, force_samples=None):
+def combined_slip_dynamics(state, actuators, params, counters=None, force_samples=None,
+                           rhs_out=None, axles_out=None):
     """Planar MF6.1 chassis dynamics with simultaneous longitudinal load transfer.
 
     Solve ax=sum(Fx_body(Fz(ax)))/m inside the nonnegative-load interval.
     A safeguarded secant solve replaces the reduced tire law's linear shortcut.
+    Optional outputs are caller-owned scratch buffers of shapes (6,) and (2, 7).
     """
     if force_samples is not None:
         if force_samples.shape != (63, 8) or force_samples[0, 0] != 0.:
@@ -159,20 +174,22 @@ def combined_slip_dynamics(state, actuators, params, counters=None, force_sample
     uf = vx * cos_delta + vf_body * sin_delta
     vf = -vx * sin_delta + vf_body * cos_delta
     ur, vr = vx, vy - lr * yaw_rate
+    contact_terms = (_mf61_contact_terms(uf, vf, radius * omega, mu, front, floor),
+                     _mf61_contact_terms(ur, vr, radius * omega, mu, rear, floor))
     if h == 0.0:
-        residual, axles = _axle_forces(0.0, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples)
+        residual, front_values, rear_values = _axle_force_values(0.0, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples, contact_terms)
         ax = -residual
     else:
         lo, hi = -GRAVITY * lf / h, GRAVITY * lr / h
-        flo, _ = _axle_forces(lo, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples)
-        fhi, _ = _axle_forces(hi, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples)
+        flo, _, _ = _axle_force_values(lo, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples, contact_terms)
+        fhi, _, _ = _axle_force_values(hi, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples, contact_terms)
         if flo > 0.0 or fhi < 0.0:
             raise ValueError("No nonnegative normal load equilibrium; wheel lift is outside model validity")
         ax = 0.0
         for iteration in range(60):
             if counters is not None:
                 counters[2] += 1  # actual solver iterations, excluding brackets
-            residual, axles = _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples)
+            residual, front_values, rear_values = _axle_force_values(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters, force_samples, contact_terms)
             if abs(residual) < 1e-10:
                 break
             if residual < 0.0:
@@ -184,16 +201,27 @@ def combined_slip_dynamics(state, actuators, params, counters=None, force_sample
             ax = candidate if iteration % 4 != 3 and lo < candidate < hi else 0.5 * (lo + hi)
         else:
             raise ValueError("MF6.1 normal load equilibrium did not converge")
-    fxf, fyf = axles[0, 4], axles[0, 5]
-    fyr = axles[1, 5]
+    axles = np.empty((2, 7), dtype=np.float64) if axles_out is None else axles_out
+    for column in range(7):
+        axles[0, column] = front_values[column]
+        axles[1, column] = rear_values[column]
+    fxf, fyf = front_values[4], front_values[5]
+    fyr = rear_values[5]
     fy_front_body = fxf * sin_delta + fyf * cos_delta
     ay = (fy_front_body + fyr) / m
-    rhs = np.array([vx * np.cos(psi) - vy * np.sin(psi),
-                    vx * np.sin(psi) + vy * np.cos(psi), yaw_rate,
-                    ax + yaw_rate * vy, ay - yaw_rate * vx,
-                    (lf * fy_front_body - lr * fyr) / inertia])
-    if not np.all(np.isfinite(rhs)) or not np.all(np.isfinite(axles)):
-        raise ValueError("Nonfinite MF6.1 dynamics; outside model validity")
+    rhs = np.empty(6, dtype=np.float64) if rhs_out is None else rhs_out
+    rhs[0] = vx * np.cos(psi) - vy * np.sin(psi)
+    rhs[1] = vx * np.sin(psi) + vy * np.cos(psi)
+    rhs[2] = yaw_rate
+    rhs[3] = ax + yaw_rate * vy
+    rhs[4] = ay - yaw_rate * vx
+    rhs[5] = (lf * fy_front_body - lr * fyr) / inertia
+    for value in rhs:
+        if not np.isfinite(value):
+            raise ValueError("Nonfinite MF6.1 dynamics; outside model validity")
+    for column in range(7):
+        if not np.isfinite(front_values[column]) or not np.isfinite(rear_values[column]):
+            raise ValueError("Nonfinite MF6.1 dynamics; outside model validity")
     return rhs, axles
 
 
@@ -398,12 +426,15 @@ def pid(speed, steer, current_speed, current_steer, max_sv, max_a, max_v, min_v)
 
 
 @njit(cache=True)
-def sample_wheel_actuators(state, reference, elapsed, constants, rates, counters=None):
-    """Sample both held actuator references without changing their initial state."""
+def sample_wheel_actuators(state, reference, elapsed, constants, rates, counters=None, out=None):
+    """Sample held references; optional out is a separate (2,) scratch buffer."""
     if counters is not None:
         counters[4] += 1
-    return np.array([first_order_actuator_step(state[i], reference[i], elapsed,
-                    constants[i], rates[i][0], rates[i][1]) for i in range(2)])
+    result = np.empty(2, dtype=np.float64) if out is None else out
+    for i in range(2):
+        result[i] = first_order_actuator_step(state[i], reference[i], elapsed,
+                                            constants[i], rates[i][0], rates[i][1])
+    return result
 
 
 @njit(cache=True)
@@ -414,10 +445,11 @@ def write_rk4_trace(out, state, k1, k2, k3, k4, dt):
     existing endpoint update to rounding. Derivatives can be bounded over the
     whole polynomial, so collision queries need no fixed-time sampling.
     """
-    out[0] = state
-    out[1] = dt * k1
-    out[2] = dt * (-1.5 * k1 + k2 + k3 - .5 * k4)
-    out[3] = dt * (2. / 3.) * (k1 - k2 - k3 + k4)
+    for column in range(state.size):
+        out[0, column] = state[column]
+        out[1, column] = dt * k1[column]
+        out[2, column] = dt * (-1.5 * k1[column] + k2[column] + k3[column] - .5 * k4[column])
+        out[3, column] = dt * (2. / 3.) * (k1[column] - k2[column] - k3[column] + k4[column])
 
 
 @njit(cache=True)
@@ -435,32 +467,48 @@ def integrate_combined_slip(
         if motion_trace is not None:
             counters[5] += steps  # dense trace segments
     state = chassis.copy()
+    # Per-call scratch never aliases the committed chassis or actuator state.
+    stage_state = np.empty(6, dtype=np.float64)
+    slopes = np.empty((4, 6), dtype=np.float64)
+    k1, k2, k3, k4 = slopes[0], slopes[1], slopes[2], slopes[3]
+    axles = np.empty((2, 7), dtype=np.float64)
+    actuator_samples = np.empty((3, 2), dtype=np.float64)
+    at_start, at_middle, at_end = actuator_samples[0], actuator_samples[1], actuator_samples[2]
     for index in range(steps):
         start = index * dt
-        at_start = sample_wheel_actuators(actuator_state, reference, start, constants, rates, counters)
-        at_middle = sample_wheel_actuators(actuator_state, reference, start + dt / 2, constants, rates, counters)
-        at_end = sample_wheel_actuators(actuator_state, reference, (index + 1) * dt, constants, rates, counters)
+        sample_wheel_actuators(actuator_state, reference, start, constants, rates, counters, at_start)
+        sample_wheel_actuators(actuator_state, reference, start + dt / 2, constants, rates, counters, at_middle)
+        sample_wheel_actuators(actuator_state, reference, (index + 1) * dt, constants, rates, counters, at_end)
         if rhs_samples is not None and index == 0:
             rhs_samples[0, :6] = state
             rhs_samples[0, 6:] = at_start
-        k1, _ = combined_slip_dynamics(state, at_start, params, counters)
+        combined_slip_dynamics(state, at_start, params, counters, rhs_out=k1, axles_out=axles)
+        for column in range(6):
+            stage_state[column] = state[column] + dt / 2 * k1[column]
         if rhs_samples is not None and index == 0:
-            rhs_samples[1, :6] = state + dt / 2 * k1
+            rhs_samples[1, :6] = stage_state
             rhs_samples[1, 6:] = at_middle
-        k2, _ = combined_slip_dynamics(state + dt / 2 * k1, at_middle, params, counters)
+        combined_slip_dynamics(stage_state, at_middle, params, counters, rhs_out=k2, axles_out=axles)
+        for column in range(6):
+            stage_state[column] = state[column] + dt / 2 * k2[column]
         if rhs_samples is not None and index == 0:
-            rhs_samples[2, :6] = state + dt / 2 * k2
+            rhs_samples[2, :6] = stage_state
             rhs_samples[2, 6:] = at_middle
-        k3, _ = combined_slip_dynamics(state + dt / 2 * k2, at_middle, params, counters)
+        combined_slip_dynamics(stage_state, at_middle, params, counters, rhs_out=k3, axles_out=axles)
+        for column in range(6):
+            stage_state[column] = state[column] + dt * k3[column]
         if rhs_samples is not None and index == 0:
-            rhs_samples[3, :6] = state + dt * k3
+            rhs_samples[3, :6] = stage_state
             rhs_samples[3, 6:] = at_end
-        k4, _ = combined_slip_dynamics(state + dt * k3, at_end, params, counters)
+        combined_slip_dynamics(stage_state, at_end, params, counters, rhs_out=k4, axles_out=axles)
         if motion_trace is not None:
             write_rk4_trace(motion_trace[index], state, k1, k2, k3, k4, dt)
-        state += dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
-    final_actuators = sample_wheel_actuators(actuator_state, reference, timestep, constants, rates, counters)
-    combined_slip_dynamics(state, final_actuators, params, counters)
-    if not np.all(np.isfinite(state)):
-        raise ValueError("Nonfinite chassis state; reduce integration step or check parameters")
+        for column in range(6):
+            state[column] += dt / 6 * (k1[column] + 2 * k2[column] + 2 * k3[column] + k4[column])
+    # Sample the original timestep explicitly; steps * dt can round differently.
+    final_actuators = sample_wheel_actuators(actuator_state, reference, timestep, constants, rates, counters, at_end)
+    combined_slip_dynamics(state, final_actuators, params, counters, rhs_out=k1, axles_out=axles)
+    for value in state:
+        if not np.isfinite(value):
+            raise ValueError("Nonfinite chassis state; reduce integration step or check parameters")
     return state, final_actuators

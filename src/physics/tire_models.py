@@ -52,22 +52,46 @@ def validate_mf61_coefficients(config):
 @njit(cache=True)
 def _mf_shape(value, stiffness, shape, curvature, cosine=False):
     z = stiffness * value
-    phase = shape * np.arctan(z - curvature * (z - np.arctan(z)))
+    # Retain the original nonfinite path so invalid forces still fail validation.
+    if curvature == 0.0 and np.isfinite(z):
+        phase = shape * np.arctan(z)
+    else:
+        phase = shape * np.arctan(z - curvature * (z - np.arctan(z)))
     return np.cos(phase) if cosine else np.sin(phase)
 
 
 @njit(cache=True)
-def mf61_tire_force(u, v, rolling_speed, normal_load, mu, p, speed_floor):
+def _mf61_contact_terms(u, v, rolling_speed, mu, p, speed_floor):
+    """Terms unchanged by normal-load trials at a fixed contact velocity."""
+    scale = max(abs(u), speed_floor)
+    kappa = (rolling_speed - u) / scale
+    alpha = np.arctan2(v, scale)
+    fz0 = p[0]
+    ky1, ky2 = p[21:23]
+    bx1, bx2 = p[28:30]
+    by1, by2, by3 = p[34:37]
+    bxa = bx1 / np.sqrt(1.0 + (bx2 * kappa) ** 2)
+    byk = by1 / np.sqrt(1.0 + (by2 * (alpha - by3)) ** 2)
+    return (kappa, alpha, bxa, byk, 10.0 * mu / (1.0 + 9.0 * mu),
+            ky1 * fz0, ky2 * fz0)
+
+
+@njit(cache=True)
+def mf61_tire_force(u, v, rolling_speed, normal_load, mu, p, speed_floor, contact_terms=None):
     """Return Fx, Fy [N], kappa, alpha [rad]; x forward, y left.
 
     Kappa uses ground speed (not wheel speed) as its denominator. The finite
     floor and abs(u) extend the forward-running equations through rest/reverse.
     Alpha is the signed contact-velocity angle; PKY1 < 0 restores lateral slip.
     mu acts as LMUX=LMUY; all other MF scaling factors are unity.
+    Optional contact_terms must match this contact's velocity, mu and coefficients.
     """
-    scale = max(abs(u), speed_floor)
-    kappa = (rolling_speed - u) / scale
-    alpha = np.arctan2(v, scale)
+    if contact_terms is None:
+        scale = max(abs(u), speed_floor)
+        kappa = (rolling_speed - u) / scale
+        alpha = np.arctan2(v, scale)
+    else:
+        kappa, alpha = contact_terms[0], contact_terms[1]
     if normal_load <= 0.0 or mu == 0.0:
         return 0.0, 0.0, kappa, alpha
     (fz0, cx, dx1, dx2, ex1, ex2, ex3, ex4, kx1, kx2, kx3,
@@ -78,8 +102,12 @@ def mf61_tire_force(u, v, rolling_speed, normal_load, mu, p, speed_floor):
     dfz = (normal_load - fz0) / fz0
     mux = mu * (dx1 + dx2 * dfz)
     muy = mu * (dy1 + dy2 * dfz)
+    if contact_terms is None:
+        ky_scale, ky_load = ky1 * fz0, ky2 * fz0
+    else:
+        bxa, byk, mu_prime, ky_scale, ky_load = contact_terms[2:]
     kx = normal_load * (kx1 + kx2 * dfz) * np.exp(kx3 * dfz)
-    ky = ky1 * fz0 * np.sin(ky4 * np.arctan(normal_load / (ky2 * fz0)))
+    ky = ky_scale * np.sin(ky4 * np.arctan(normal_load / ky_load))
     if mux <= 0.0 or muy <= 0.0 or kx <= 0.0 or ky >= 0.0:
         raise ValueError("MF6.1 coefficients outside valid normal-load range")
     dx, dy = mux * normal_load, muy * normal_load
@@ -87,17 +115,19 @@ def mf61_tire_force(u, v, rolling_speed, normal_load, mu, p, speed_floor):
     ex = min(1.0, (ex1 + ex2 * dfz + ex3 * dfz * dfz) * (1.0 - ex4 * np.sign(sx)))
     ey = min(1.0, (ey1 + ey2 * dfz) * (1.0 - ey3 * np.sign(sy)))
     # Prime friction scaling in the longitudinal vertical shift (4.E8/E18).
-    mu_prime = 10.0 * mu / (1.0 + 9.0 * mu)
+    if contact_terms is None:
+        mu_prime = 10.0 * mu / (1.0 + 9.0 * mu)
     fx0 = dx * _mf_shape(sx, kx / (cx * dx), cx, ex) + normal_load * (vx1 + vx2 * dfz) * mu_prime
     fy0 = dy * _mf_shape(sy, ky / (cy * dy), cy, ey) + normal_load * (vy1 + vy2 * dfz) * mu
     # Combined-slip weighting functions, normalized to one at pure slip.
-    bxa = bx1 / np.sqrt(1.0 + (bx2 * kappa) ** 2)
+    if contact_terms is None:
+        bxa = bx1 / np.sqrt(1.0 + (bx2 * kappa) ** 2)
+        byk = by1 / np.sqrt(1.0 + (by2 * (alpha - by3)) ** 2)
     exa = min(1.0, exa1 + exa2 * dfz)
-    byk = by1 / np.sqrt(1.0 + (by2 * (alpha - by3)) ** 2)
     eyk = min(1.0, eyk1 + eyk2 * dfz)
     hyk = hyk1 + hyk2 * dfz
-    gx0 = _mf_shape(hxa, bxa, cxa, exa, True)
-    gy0 = _mf_shape(hyk, byk, cyk, eyk, True)
+    gx0 = 1.0 if hxa == 0.0 and np.isfinite(bxa) and np.isfinite(exa) else _mf_shape(hxa, bxa, cxa, exa, True)
+    gy0 = 1.0 if hyk == 0.0 and np.isfinite(byk) and np.isfinite(eyk) else _mf_shape(hyk, byk, cyk, eyk, True)
     if gx0 <= 1e-10 or gy0 <= 1e-10:
         raise ValueError("MF6.1 combined-slip normalization is singular")
     gx = _mf_shape(alpha + hxa, bxa, cxa, exa, True) / gx0
