@@ -93,6 +93,7 @@ class MapData:
     walls_path: Optional[Path] = None
     walls: Optional[Dict[int, np.ndarray]] = None
     spawn_points: Dict[str, np.ndarray] = field(default_factory=dict)
+    distance_transforms: Dict[float, np.ndarray] = field(default_factory=dict, repr=False)
 
 
 class MapLoader:
@@ -247,6 +248,7 @@ class MapLoader:
             image_size=cached.image_size,
             yaml_path=cached.yaml_path,
             track_mask=track_mask,
+            distance_transforms=cached.distance_transforms.setdefault(mask_key, {}),
             centerline_path=centerline_path,
             centerline=centerline,
             walls_path=walls_path,
@@ -388,6 +390,7 @@ class _CachedMap:
     image_mtime: int
     grayscale: np.ndarray
     track_masks: Dict[tuple[int, bool], np.ndarray] = field(default_factory=dict)
+    distance_transforms: Dict[tuple[int, bool], Dict[float, np.ndarray]] = field(default_factory=dict)
     centerline_path: Optional[Path] = None
     centerline_mtime: Optional[int] = None
     centerline: Optional[np.ndarray] = None

@@ -135,7 +135,7 @@ class Simulator(object):
 
 
 
-    def set_map(self, map_path, map_ext):
+    def set_map(self, map_path, map_ext, *, map_data=None):
         """
         Sets the map of the environment and sets the map for scan simulator of each agent
 
@@ -146,8 +146,11 @@ class Simulator(object):
         Returns:
             None
         """
+        configured = set()
         for agent in self.agents:
-            agent.set_map(map_path, map_ext)
+            if id(agent.scan_simulator) not in configured:
+                agent.set_map(map_path, map_ext, map_data=map_data)
+                configured.add(id(agent.scan_simulator))
 
     def _ensure_scan_capacity(self, beam_count: int) -> None:
         if beam_count <= 0:

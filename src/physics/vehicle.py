@@ -482,7 +482,7 @@ class RaceCar(object):
         self.seed = int(seed)
         self.scan_rng = np.random.default_rng(seed=self.seed)
     
-    def set_map(self, map_path: str, map_ext: str):
+    def set_map(self, map_path: str, map_ext: str, *, map_data=None):
         """
         Configure this environment's scan simulator if the map asset changed.
 
@@ -491,13 +491,11 @@ class RaceCar(object):
             map_ext (str): extension of the map image file
         """
 
-        cache_key = (str(map_path), str(map_ext))
-        cached_key = getattr(self.scan_simulator, "_map_cache_key", None)
-        if cached_key == cache_key:
-            return
-
-        self.scan_simulator.set_map(map_path, map_ext)
-        self.scan_simulator._map_cache_key = cache_key
+        # Cache validity includes processed occupancy, not just the YAML path.
+        if map_data is None:
+            self.scan_simulator.set_map(map_path, map_ext)
+        else:
+            self.scan_simulator.set_map(map_path, map_ext, map_data=map_data)
 
     def reset(self, pose, *, friction_mu=None):
         """

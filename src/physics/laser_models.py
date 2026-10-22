@@ -28,11 +28,15 @@ Author: Hongrui Zheng
 """
 
 import numpy as np
-from numba import njit, float64, int64
+from numba import njit, float64, int64, types
 from scipy.ndimage import distance_transform_edt as edt
-from PIL import Image
-import os
-import yaml
+from pathlib import Path
+
+from utils.map_loader import MapLoader
+
+
+# Independent of vehicle geometry and dynamics versions.
+MAP_LIDAR_VERSION = 2
 
 
 def get_dt(bitmap, resolution):
@@ -74,7 +78,9 @@ def xy_2_rc(x, y, orig_x, orig_y, orig_c, orig_s, height, width, resolution):
     y_rot = -x_trans * orig_s + y_trans * orig_c
 
     # clip the state to be a cell
-    if x_rot < 0 or x_rot >= width * resolution or y_rot < 0 or y_rot >= height * resolution:
+    if (not np.isfinite(x_rot) or not np.isfinite(y_rot)
+            or x_rot < 0 or x_rot >= width * resolution
+            or y_rot < 0 or y_rot >= height * resolution):
         c = -1
         r = -1
     else:
@@ -98,10 +104,36 @@ def distance_transform(x, y, orig_x, orig_y, orig_c, orig_s, height, width, reso
             distance (float): corresponding shortest distance to obstacle in meters
     """
     r, c = xy_2_rc(x, y, orig_x, orig_y, orig_c, orig_s, height, width, resolution)
+    if r < 0 or c < 0:
+        return 0.0  # Outside-map space is occupied; never use negative indices.
     distance = dt[r, c]
     return distance
 
-@njit(float64(float64, float64, float64, float64[:], float64[:], float64, float64, float64, float64, float64, int64, int64, float64, float64[:,:], float64), cache=True)
+
+@njit(cache=True)
+def _map_boundary_range(x, y, c, s, orig_x, orig_y, orig_c, orig_s,
+                        height, width, resolution):
+    """Distance to the map rectangle along a ray; occupied origins give zero."""
+    local_x = (x - orig_x) * orig_c + (y - orig_y) * orig_s
+    local_y = -(x - orig_x) * orig_s + (y - orig_y) * orig_c
+    size_x, size_y = width * resolution, height * resolution
+    if (not np.isfinite(local_x) or not np.isfinite(local_y)
+            or local_x < 0 or local_x >= size_x or local_y < 0 or local_y >= size_y):
+        return 0.0
+    dx, dy = c * orig_c + s * orig_s, -c * orig_s + s * orig_c
+    distance = np.inf
+    if dx > 0.0:
+        distance = min(distance, (size_x - local_x) / dx)
+    elif dx < 0.0:
+        distance = min(distance, -local_x / dx)
+    if dy > 0.0:
+        distance = min(distance, (size_y - local_y) / dy)
+    elif dy < 0.0:
+        distance = min(distance, -local_y / dy)
+    return distance
+
+
+@njit(float64(float64, float64, float64, float64[:], float64[:], float64, float64, float64, float64, float64, int64, int64, float64, types.Array(float64, 2, 'A', readonly=True), float64), cache=True)
 def trace_ray(x, y, theta_index, sines, cosines, eps, orig_x, orig_y, orig_c, orig_s, height, width, resolution, dt, max_range):
     """
     Find the length of a specific ray at a specific scan angle theta
@@ -122,13 +154,17 @@ def trace_ray(x, y, theta_index, sines, cosines, eps, orig_x, orig_y, orig_c, or
     theta_index_ = int(theta_index)
     s = sines[theta_index_]
     c = cosines[theta_index_]
+    ray_limit = min(max_range, _map_boundary_range(
+        x, y, c, s, orig_x, orig_y, orig_c, orig_s, height, width, resolution))
+    if ray_limit <= 0.0:
+        return 0.0
 
     # distance to nearest initialization
     dist_to_nearest = distance_transform(x, y, orig_x, orig_y, orig_c, orig_s, height, width, resolution, dt)
-    total_dist = dist_to_nearest
+    total_dist = min(dist_to_nearest, ray_limit)
 
     # ray tracing iterations
-    while dist_to_nearest > eps and total_dist <= max_range:
+    while dist_to_nearest > eps and total_dist < ray_limit:
         # move in the direction of the ray by dist_to_nearest
         x += dist_to_nearest * c
         y += dist_to_nearest * s
@@ -136,10 +172,7 @@ def trace_ray(x, y, theta_index, sines, cosines, eps, orig_x, orig_y, orig_c, or
         # update dist_to_nearest for current point on ray
         # also keeps track of total ray length
         dist_to_nearest = distance_transform(x, y, orig_x, orig_y, orig_c, orig_s, height, width, resolution, dt)
-        total_dist += dist_to_nearest
-
-    if total_dist > max_range:
-        total_dist = max_range
+        total_dist = min(total_dist + dist_to_nearest, ray_limit)
     
     return total_dist
 
@@ -380,7 +413,9 @@ class ScanSimulator2D(object):
         self.fov = fov
         self.eps = eps
         self.theta_dis = theta_dis
-        self.max_range = max_range
+        self.max_range = float(max_range)
+        if not np.isfinite(self.max_range) or self.max_range <= 0:
+            raise ValueError("LiDAR maximum range must be finite and positive")
         self.angle_increment = self.fov / (self.num_beams - 1)
         self.theta_index_increment = theta_dis * self.angle_increment / (2. * np.pi)
         self.orig_c = None
@@ -397,7 +432,7 @@ class ScanSimulator2D(object):
         self.sines = np.sin(theta_arr)
         self.cosines = np.cos(theta_arr)
     
-    def set_map(self, map_path, map_ext):
+    def set_map(self, map_path, map_ext, *, map_data=None):
         """
         Set the bitmap of the scan simulator by path
 
@@ -408,33 +443,29 @@ class ScanSimulator2D(object):
             Returns:
                 flag (bool): if image reading and loading is successful
         """
-        # TODO: do we open the option to flip the images, and turn rgb into grayscale? or specify the exact requirements in documentation.
-        # TODO: throw error if image specification isn't met
-
-        # load map image
-        map_img_path = os.path.splitext(map_path)[0] + map_ext
-        map_img_pil = Image.open(map_img_path)
-        # Convert to grayscale if RGB
-        if map_img_pil.mode != 'L':
-            map_img_pil = map_img_pil.convert('L')
-        self.map_img = np.array(map_img_pil.transpose(Image.FLIP_TOP_BOTTOM))
-        self.map_img = self.map_img.astype(np.float64)
-
-        # grayscale -> binary
-        self.map_img[self.map_img <= 128.] = 0.
-        self.map_img[self.map_img > 128.] = 255.
+        if map_data is None:
+            if not hasattr(self, "_map_loader"):
+                self._map_loader = MapLoader()
+            path = Path(map_path).resolve()
+            map_data = self._map_loader.load({
+                "map_dir": str(path.parent), "map_yaml": path.name, "map_ext": map_ext,
+                "centerline_autoload": False, "walls_autoload": False,
+            })
+        resolution = float(map_data.metadata['resolution'])
+        origin = np.asarray(map_data.metadata['origin'], dtype=np.float64)
+        if not np.isfinite(resolution) or resolution <= 0:
+            raise ValueError("Map resolution must be finite and positive")
+        if origin.shape != (3,) or not np.isfinite(origin).all():
+            raise ValueError("Map origin must be a finite (x, y, yaw) vector")
+        # MapLoader owns threshold/inversion in image coordinates (row 0 at top).
+        # The ray tracer indexes from the map origin at the bottom: flip once.
+        self.map_img = np.flipud(map_data.track_mask)
 
         self.map_height = self.map_img.shape[0]
         self.map_width = self.map_img.shape[1]
 
-        # load map yaml
-        with open(map_path, 'r') as yaml_stream:
-            try:
-                map_metadata = yaml.safe_load(yaml_stream)
-                self.map_resolution = map_metadata['resolution']
-                self.origin = map_metadata['origin']
-            except yaml.YAMLError as ex:
-                print(ex)
+        self.map_resolution = resolution
+        self.origin = origin.copy()
 
         # calculate map parameters
         self.orig_x = self.origin[0]
@@ -443,7 +474,13 @@ class ScanSimulator2D(object):
         self.orig_c = np.cos(self.origin[2])
 
         # get the distance transform
-        self.dt = get_dt(self.map_img, self.map_resolution)
+        # This cache belongs to one processed occupancy mask. The loader replaces
+        # it when image/YAML sources or threshold/inversion settings change.
+        self.dt = map_data.distance_transforms.get(resolution)
+        if self.dt is None:
+            self.dt = get_dt(self.map_img, resolution)
+            self.dt.setflags(write=False)
+            map_data.distance_transforms[resolution] = self.dt
 
         return True
 
@@ -465,13 +502,19 @@ class ScanSimulator2D(object):
         
         if self.map_height is None:
             raise ValueError('Map is not set for scan simulator.')
+        if np.shape(pose) != (3,) or not np.isfinite(pose).all():
+            raise ValueError("Scan pose must be a finite (x, y, yaw) vector")
+        if not np.isfinite(std_dev) or std_dev < 0:
+            raise ValueError("LiDAR noise standard deviation must be finite and nonnegative")
         
         scan = get_scan(pose, self.theta_dis, self.fov, self.num_beams, self.theta_index_increment, self.sines, self.cosines, self.eps, self.orig_x, self.orig_y, self.orig_c, self.orig_s, self.map_height, self.map_width, self.map_resolution, self.dt, self.max_range)
 
         if rng is not None:
             noise = rng.normal(0., std_dev, size=self.num_beams)
             scan += noise
-            
+        # Keep the physical sensor range independent of policy normalization.
+        np.nan_to_num(scan, copy=False, nan=0.0, neginf=0.0, posinf=self.max_range)
+        np.clip(scan, 0.0, self.max_range, out=scan)
         return scan
 
     def get_increment(self):

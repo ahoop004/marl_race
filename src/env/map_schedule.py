@@ -249,5 +249,7 @@ class MapScheduler:
             "map_yaml": path.name,
             "map": path.name,
             "map_ext": map_ext,
+            "track_threshold": self._track_threshold,
+            "track_inverted": self._track_inverted,
         }
         return self._loader.load(cfg)

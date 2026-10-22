@@ -11,15 +11,13 @@ from wrappers.observations.base import ObservationComponent
 class LidarComponent(ObservationComponent):
     """Raw lidar scan — optionally normalized by lidar_range.
 
-    Lidar beam count and range come from the env config; this component
-    only decides whether to normalize them.
-
-    Normalization uses ``np.minimum`` (not ``np.clip``) because physical
-    sensor readings are always ≥ 0, so only the upper bound needs clamping.
-    This is ~2.3× faster than ``np.clip`` for 108-beam scans.
+    The physical scanner range is independent of the policy normalization
+    distance. Invalid inputs become zero; valid raw ranges retain their units.
     """
 
     def __init__(self, n_beams: int, lidar_range: float, normalize: bool = True) -> None:
+        if not np.isfinite(lidar_range) or lidar_range <= 0:
+            raise ValueError("LiDAR normalization distance must be finite and positive")
         self._n_beams = n_beams
         self._normalize = normalize
         # Store as float32 scalar so multiply stays in float32 arithmetic.
@@ -42,12 +40,14 @@ class LidarComponent(ObservationComponent):
             scan = np.resize(scan, (self._n_beams,))
 
         if self._normalize:
-            # In-place multiply then clamp upper bound.
-            # np.minimum is ~2.5× faster than np.clip for non-negative inputs.
             np.multiply(scan, self._inv_range, out=out)
-            np.minimum(out, 1.0, out=out)
         else:
             np.copyto(out, scan)
+        np.nan_to_num(out, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        if self._normalize:
+            np.clip(out, 0.0, 1.0, out=out)
+        else:
+            np.maximum(out, 0.0, out=out)
 
     def compute(self, raw_obs: Dict, info: Dict) -> np.ndarray:
         out = np.empty(self._n_beams, dtype=np.float32)

@@ -80,8 +80,8 @@ def build_observation_spaces(
 
         if "lidar" in sensors:
             # lidar_range is the policy normalization scale. Raw scans use
-            # the scanner's range and additive Gaussian noise, so neither
-            # that scale nor zero is a hard bound on the returned readings.
+            # the scanner's independent physical range, with Gaussian noise
+            # clipped to its limits. Retain the existing raw space contract.
             components["lidar"] = SpaceSpec(
                 shape=(lidar_beam_count,),
                 low=-np.inf,

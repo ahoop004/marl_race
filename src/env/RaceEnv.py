@@ -347,7 +347,16 @@ class RaceEnv:
                                      or any(self.terminate_on_collision.values())),
         )
 
-        self.sim.set_map(str(self.yaml_path), self.map_ext)
+        scan_map_data = map_data
+        if scan_map_data is None:
+            from utils.map_loader import MapLoader
+            scan_map_data = MapLoader().load({
+                **merged, "map_dir": str(self.map_dir), "map_yaml": str(self.yaml_path),
+                "centerline_autoload": False, "centerline_csv": None,
+                "walls_autoload": False, "walls_csv": None,
+            })
+        self._track_mask = scan_map_data.track_mask
+        self.sim.set_map(str(self.yaml_path), self.map_ext, map_data=scan_map_data)
         meta, img_path, (width, height) = self._load_map_metadata(merged, map_data)
 
         self.map_meta = meta
@@ -581,7 +590,7 @@ class RaceEnv:
         self._configure_lap_tracker(self.map_meta, map_data=map_data)
 
         # Update simulation + renderer
-        self.sim.set_map(str(self.yaml_path), self.map_ext)
+        self.sim.set_map(str(self.yaml_path), self.map_ext, map_data=map_data)
         if self.renderer is not None:
             self.renderer.update_map(
                 str(self.yaml_path.with_suffix("")),
