@@ -197,7 +197,8 @@ class CombinedSlipVehicle:
         # Validate the complete initial condition before changing either subsystem.
         actuators = WheelActuators(self._actuators.params)
         actuators.reset(steering_angle=steering_angle, forward_speed=velocity[0], wheel_speed=wheel_speed)
-        combined_slip_dynamics(chassis, actuators.state, self._dynamics_params)
+        combined_slip_dynamics(chassis, actuators.state, self._dynamics_params,
+                               getattr(self, "profile_counters", None))
         self._chassis[:] = chassis
         self._actuators = actuators
 
@@ -206,7 +207,8 @@ class CombinedSlipVehicle:
         self._actuators.command(steering_angle, wheel_speed)
 
     def diagnostics(self) -> dict:
-        rhs, axles = combined_slip_dynamics(self._chassis, self._actuators.state, self._dynamics_params)
+        rhs, axles = combined_slip_dynamics(self._chassis, self._actuators.state, self._dynamics_params,
+                                           getattr(self, "profile_counters", None))
         yaw_rate = self._chassis[5]
         return {
             "contact_velocity": axles[:, :2].copy(),
@@ -236,7 +238,7 @@ class CombinedSlipVehicle:
             self._chassis, actuators._state, actuators._reference,
             actuators._time_constants, actuators._rate_limits,
             self._dynamics_params, timestep, self.params["max_integration_step"],
-            motion_trace,
+            motion_trace, getattr(self, "profile_counters", None),
         )
         # Commit both subsystems only after every stage and final validation pass.
         actuators._state[:] = final_actuators
@@ -499,7 +501,8 @@ class RaceCar(object):
             actuators = self._physics._actuators
             at_contact = sample_wheel_actuators(
                 self._motion_actuator_start, actuators._reference,
-                fraction * self.time_step, actuators._time_constants, actuators._rate_limits)
+                fraction * self.time_step, actuators._time_constants, actuators._rate_limits,
+                getattr(self._physics, "profile_counters", None))
             state = np.concatenate((contact, at_contact))
             self.freeze_motion(state, hold=self._motion_frozen)
         else:

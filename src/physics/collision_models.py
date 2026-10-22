@@ -470,7 +470,7 @@ def _separation(trace_a, ext_a, trace_b, ext_b, fraction, stop_a, stop_b, map_wi
 
 @njit(cache=True)
 def swept_contact(trace_a, ext_a, trace_b, ext_b, start=0., stop_a=np.inf,
-                  stop_b=np.inf, map_width=0., map_height=0.):
+                  stop_b=np.inf, map_width=0., map_height=0., counters=None):
     """Earliest conservative contact fraction, or infinity for a certified miss.
 
     An interval is discarded only when midpoint separation exceeds the maximum
@@ -480,10 +480,14 @@ def swept_contact(trace_a, ext_a, trace_b, ext_b, start=0., stop_a=np.inf,
     the returned left endpoint prevents advancing through an unresolved interval.
     This is adaptive interval certification, not fixed sampling.
     """
+    if counters is not None:
+        counters[6] += 1  # swept broad-phase queries (pairs, cells, exterior)
     if map_width == 0.:
         lo_a, hi_a = _trace_bounds(trace_a, ext_a)
         lo_b, hi_b = _trace_bounds(trace_b, ext_b)
         if np.any(lo_a > hi_b + CONTACT_DISTANCE_TOL) or np.any(lo_b > hi_a + CONTACT_DISTANCE_TOL):
+            if counters is not None:
+                counters[7] += 1  # AABB rejections
             return np.inf
     bound_a, bound_b = _motion_bound(trace_a, ext_a), _motion_bound(trace_b, ext_b)
     relative_bound = bound_a + bound_b
@@ -491,6 +495,8 @@ def swept_contact(trace_a, ext_a, trace_b, ext_b, start=0., stop_a=np.inf,
         relative_bound = min(relative_bound, _relative_motion_bound(trace_a, ext_a, trace_b, ext_b))
     if map_width > 0.:
         bound_b = 0.
+    if counters is not None:
+        counters[8 if map_width == 0. else 9] += 1
     if _separation(trace_a, ext_a, trace_b, ext_b, start, stop_a, stop_b, map_width, map_height) <= CONTACT_DISTANCE_TOL:
         return start
     left_stack, right_stack = np.empty(64), np.empty(64)
@@ -502,11 +508,16 @@ def swept_contact(trace_a, ext_a, trace_b, ext_b, start=0., stop_a=np.inf,
         bound = (bound_a if left < stop_a else 0.) + (bound_b if left < stop_b else 0.)
         if right <= stop_a and right <= stop_b:
             bound = min(bound, relative_bound)
+        if counters is not None:
+            counters[8 if map_width == 0. else 9] += 1
+            counters[10] += 1  # adaptive interval nodes examined
         gap = _separation(trace_a, ext_a, trace_b, ext_b, middle, stop_a, stop_b, map_width, map_height)
         if gap > bound * (right - left) / 2. + CONTACT_DISTANCE_TOL:
             continue
         if bound * (right - left) <= CONTACT_DISTANCE_TOL or right - left <= CONTACT_TIME_TOL:
             return left
+        if counters is not None:
+            counters[11] += 1  # interval bisections
         # Push right first so left is examined first; depth <= 35 at time tolerance.
         left_stack[count], right_stack[count] = middle, right
         left_stack[count + 1], right_stack[count + 1] = left, middle
@@ -531,7 +542,7 @@ def map_motion_trace(trace, origin):
 
 
 @njit(cache=True)
-def swept_map_contact(trace, extents, occupancy, resolution):
+def swept_map_contact(trace, extents, occupancy, resolution, counters=None):
     """Sweep the entire body against occupied closed cells and map exterior.
 
     occupancy is the scanner's authoritative, bottom-up free-cell mask. A broad
@@ -541,7 +552,7 @@ def swept_map_contact(trace, extents, occupancy, resolution):
     stationary = np.zeros((1, 4, 3))
     cell_extents = np.full(4, resolution / 2.)
     earliest = swept_contact(trace, extents, stationary, cell_extents,
-                             map_width=width * resolution, map_height=height * resolution)
+                             map_width=width * resolution, map_height=height * resolution, counters=counters)
     lower, upper = _trace_bounds(trace, extents)
     c0 = max(0, int(np.floor(lower[0] / resolution)) - 1)
     c1 = min(width - 1, int(np.floor(upper[0] / resolution)) + 1)
@@ -549,11 +560,15 @@ def swept_map_contact(trace, extents, occupancy, resolution):
     r1 = min(height - 1, int(np.floor(upper[1] / resolution)) + 1)
     for row in range(r0, r1 + 1):
         for col in range(c0, c1 + 1):
+            if counters is not None:
+                counters[12] += 1  # occupancy cells inspected, including free
             if occupancy[row, col]:
                 continue
+            if counters is not None:
+                counters[13] += 1  # occupied-cell narrow-phase candidates
             stationary[0, 0, 0] = (col + .5) * resolution
             stationary[0, 0, 1] = (row + .5) * resolution
-            earliest = min(earliest, swept_contact(trace, extents, stationary, cell_extents))
+            earliest = min(earliest, swept_contact(trace, extents, stationary, cell_extents, counters=counters))
             if earliest == 0.:
                 return earliest
     return earliest

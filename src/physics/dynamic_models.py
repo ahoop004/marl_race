@@ -116,7 +116,9 @@ def first_order_actuator_step(value, reference, dt, time_constant, rate_min, rat
 
 
 @njit(cache=True)
-def _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params):
+def _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters=None):
+    if counters is not None:
+        counters[0] += 2  # MF6.1 calls, including zero-load bracket endpoints
     m, inertia, lf, lr, h, mu, floor, radius, front, rear = params
     fzf = m * (GRAVITY * lr - h * ax) / (lf + lr)
     fzr = m * GRAVITY - fzf
@@ -132,12 +134,14 @@ def _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params):
 
 
 @njit(cache=True)
-def combined_slip_dynamics(state, actuators, params):
+def combined_slip_dynamics(state, actuators, params, counters=None):
     """Planar MF6.1 chassis dynamics with simultaneous longitudinal load transfer.
 
     Solve ax=sum(Fx_body(Fz(ax)))/m inside the nonnegative-load interval.
     A safeguarded secant solve replaces the reduced tire law's linear shortcut.
     """
+    if counters is not None:
+        counters[1] += 1  # RHS / load-equilibrium solves
     m, inertia, lf, lr, h, mu, floor, radius, front, rear = params
     psi, vx, vy, yaw_rate = state[2], state[3], state[4], state[5]
     delta, omega = actuators[0], actuators[1]
@@ -147,17 +151,19 @@ def combined_slip_dynamics(state, actuators, params):
     vf = -vx * sin_delta + vf_body * cos_delta
     ur, vr = vx, vy - lr * yaw_rate
     if h == 0.0:
-        residual, axles = _axle_forces(0.0, uf, vf, ur, vr, omega, cos_delta, sin_delta, params)
+        residual, axles = _axle_forces(0.0, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters)
         ax = -residual
     else:
         lo, hi = -GRAVITY * lf / h, GRAVITY * lr / h
-        flo, _ = _axle_forces(lo, uf, vf, ur, vr, omega, cos_delta, sin_delta, params)
-        fhi, _ = _axle_forces(hi, uf, vf, ur, vr, omega, cos_delta, sin_delta, params)
+        flo, _ = _axle_forces(lo, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters)
+        fhi, _ = _axle_forces(hi, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters)
         if flo > 0.0 or fhi < 0.0:
             raise ValueError("No nonnegative normal load equilibrium; wheel lift is outside model validity")
         ax = 0.0
         for iteration in range(60):
-            residual, axles = _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params)
+            if counters is not None:
+                counters[2] += 1  # actual solver iterations, excluding brackets
+            residual, axles = _axle_forces(ax, uf, vf, ur, vr, omega, cos_delta, sin_delta, params, counters)
             if abs(residual) < 1e-10:
                 break
             if residual < 0.0:
@@ -383,8 +389,10 @@ def pid(speed, steer, current_speed, current_steer, max_sv, max_a, max_v, min_v)
 
 
 @njit(cache=True)
-def sample_wheel_actuators(state, reference, elapsed, constants, rates):
+def sample_wheel_actuators(state, reference, elapsed, constants, rates, counters=None):
     """Sample both held actuator references without changing their initial state."""
+    if counters is not None:
+        counters[4] += 1
     return np.array([first_order_actuator_step(state[i], reference[i], elapsed,
                     constants[i], rates[i][0], rates[i][1]) for i in range(2)])
 
@@ -406,28 +414,32 @@ def write_rk4_trace(out, state, k1, k2, k3, k4, dt):
 @njit(cache=True)
 def integrate_combined_slip(
     chassis, actuator_state, reference, constants, rates, params, timestep, max_step,
-    motion_trace=None,
+    motion_trace=None, counters=None,
 ):
     """Integrate and validate a proposed state; the caller commits it atomically."""
     # Keep stage arithmetic and held-reference sampling identical to scalar RK4.
     # No fastmath: tire/load validation and reproducible rounding are intentional.
     steps = int(np.ceil(timestep / max_step))
     dt = timestep / steps
+    if counters is not None:
+        counters[3] += steps
+        if motion_trace is not None:
+            counters[5] += steps  # dense trace segments
     state = chassis.copy()
     for index in range(steps):
         start = index * dt
-        at_start = sample_wheel_actuators(actuator_state, reference, start, constants, rates)
-        at_middle = sample_wheel_actuators(actuator_state, reference, start + dt / 2, constants, rates)
-        at_end = sample_wheel_actuators(actuator_state, reference, (index + 1) * dt, constants, rates)
-        k1, _ = combined_slip_dynamics(state, at_start, params)
-        k2, _ = combined_slip_dynamics(state + dt / 2 * k1, at_middle, params)
-        k3, _ = combined_slip_dynamics(state + dt / 2 * k2, at_middle, params)
-        k4, _ = combined_slip_dynamics(state + dt * k3, at_end, params)
+        at_start = sample_wheel_actuators(actuator_state, reference, start, constants, rates, counters)
+        at_middle = sample_wheel_actuators(actuator_state, reference, start + dt / 2, constants, rates, counters)
+        at_end = sample_wheel_actuators(actuator_state, reference, (index + 1) * dt, constants, rates, counters)
+        k1, _ = combined_slip_dynamics(state, at_start, params, counters)
+        k2, _ = combined_slip_dynamics(state + dt / 2 * k1, at_middle, params, counters)
+        k3, _ = combined_slip_dynamics(state + dt / 2 * k2, at_middle, params, counters)
+        k4, _ = combined_slip_dynamics(state + dt * k3, at_end, params, counters)
         if motion_trace is not None:
             write_rk4_trace(motion_trace[index], state, k1, k2, k3, k4, dt)
         state += dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
-    final_actuators = sample_wheel_actuators(actuator_state, reference, timestep, constants, rates)
-    combined_slip_dynamics(state, final_actuators, params)
+    final_actuators = sample_wheel_actuators(actuator_state, reference, timestep, constants, rates, counters)
+    combined_slip_dynamics(state, final_actuators, params, counters)
     if not np.all(np.isfinite(state)):
         raise ValueError("Nonfinite chassis state; reduce integration step or check parameters")
     return state, final_actuators

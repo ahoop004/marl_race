@@ -87,6 +87,7 @@ class Simulator(object):
         """
         self.num_agents = num_agents
         self.profile_region = None
+        self.profile_counters = None
         self.wall_collision_response = bool(wall_collision_response)
         self.seed = seed
         self.time_step = time_step
@@ -205,6 +206,7 @@ class Simulator(object):
         Equal-time pair events use the lowest other-agent index; a pair takes
         precedence over a wall at the same time, matching the public index API.
         """
+        counters = self.profile_counters
         visible = np.flatnonzero(self.collidable_mask)
         count = self.num_agents
         stopped = np.full(count, np.inf)
@@ -218,13 +220,17 @@ class Simulator(object):
             agent = self.agents[index]
             scanner = agent.scan_simulator
             if getattr(scanner, "map_height", None) is not None:
-                local_trace = map_motion_trace(agent._pose_trace, scanner.origin)
-                wall_times[index] = swept_map_contact(
-                    local_trace, extents[index], scanner.map_img, scanner.map_resolution)
+                with self.profile_region("trajectory_map_transform") if self.profile_region else nullcontext():
+                    local_trace = map_motion_trace(agent._pose_trace, scanner.origin)
+                with self.profile_region("occupancy_sweep") if self.profile_region else nullcontext():
+                    wall_times[index] = swept_map_contact(
+                        local_trace, extents[index], scanner.map_img, scanner.map_resolution, counters)
         now = 0.
         tie_tolerance = 1e-8  # step fraction, only for deterministic grouping
         # Every event group stops at least one previously unstopped car.
-        for _ in range(count + 1):
+        for group in range(count + 1):
+            if counters is not None:
+                counters[14] += 1  # event search passes, including final miss
             events = []
             for index in visible:
                 if not np.isfinite(stopped[index]) and np.isfinite(wall_times[index]):
@@ -233,9 +239,15 @@ class Simulator(object):
                 for other in visible[position + 1:]:
                     if np.isfinite(stopped[index]) and np.isfinite(stopped[other]):
                         continue
-                    time = swept_contact(self.agents[index]._pose_trace, extents[index],
-                                         self.agents[other]._pose_trace, extents[other],
-                                         start=now, stop_a=stopped[index], stop_b=stopped[other])
+                    if counters is not None:
+                        counters[15] += 1
+                        if group > 0:
+                            counters[16] += 1  # repeated pair query after an event
+                    with self.profile_region("pair_sweep") if self.profile_region else nullcontext():
+                        time = swept_contact(self.agents[index]._pose_trace, extents[index],
+                                             self.agents[other]._pose_trace, extents[other],
+                                             start=now, stop_a=stopped[index], stop_b=stopped[other],
+                                             counters=counters)
                     if np.isfinite(time):
                         events.append((time, int(index), int(other)))
             if not events:
@@ -262,8 +274,12 @@ class Simulator(object):
         for index in visible:
             agent = self.agents[index]
             if np.isfinite(stopped[index]):
-                agent.stop_at_contact(stopped[index])
-                agent.compute_scan()
+                if counters is not None:
+                    counters[17] += 1
+                with self.profile_region("contact_resolution") if self.profile_region else nullcontext():
+                    agent.stop_at_contact(stopped[index])
+                with self.profile_region("post_contact_rescan") if self.profile_region else nullcontext():
+                    agent.compute_scan()
             elif predictive[index]:
                 env_mask[index] = True
                 self.collision_times[index] = self.time_step
@@ -271,8 +287,12 @@ class Simulator(object):
                     # CCD certified this endpoint free of physical contact.
                     # A predictive TTC stop now holds here rather than rewinding
                     # an entire step, which could introduce new pair overlaps.
-                    agent.stop_at_contact(1.)
-                    agent.compute_scan()
+                    if counters is not None:
+                        counters[18] += 1
+                    with self.profile_region("contact_resolution") if self.profile_region else nullcontext():
+                        agent.stop_at_contact(1.)
+                    with self.profile_region("post_contact_rescan") if self.profile_region else nullcontext():
+                        agent.compute_scan()
         # Only pair indices feed the merger; environment-only contacts use -2.
         return col_flags, hit_indices
 
