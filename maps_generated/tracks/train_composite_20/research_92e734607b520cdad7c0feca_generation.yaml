@@ -1,0 +1,273 @@
+schema_version: 1
+generator: map_editor.research_tracks.v1
+inventory:
+- name: cluster_1_turn_1
+  family: corner
+  parameters:
+    radius_m: 3.105
+    turn_angle_deg: 95.0
+    direction: left
+    transition_m: 0.75
+    end_radius_m: 2.3
+  straight_after_m: 5.0
+- name: cluster_1_turn_2
+  family: corner
+  parameters:
+    radius_m: 2.65
+    turn_angle_deg: 45
+    direction: right
+    transition_m: 0.75
+  straight_after_m: 6.0
+- name: cluster_1_turn_3
+  family: corner
+  parameters:
+    radius_m: 3.0
+    turn_angle_deg: 80
+    direction: left
+    transition_m: 0.75
+  straight_after_m: 3.0
+- name: cluster_1_turn_4
+  family: corner
+  parameters:
+    radius_m: 1.6
+    turn_angle_deg: 40.0
+    direction: right
+    transition_m: 0.75
+  straight_after_m: 23.12
+- name: e_opposing_window
+  family: s_curve
+  parameters:
+    radii_m:
+    - 4.2
+    - 4.620000000000001
+    turn_angle_rad: 1.05
+    transition_length_m: 0.65
+    direction: left_right
+  straight_after_m: 34.68
+- name: cluster_2_turn_1
+  family: corner
+  parameters:
+    radius_m: 2.65
+    turn_angle_deg: 100
+    direction: left
+    transition_m: 0.75
+  straight_after_m: 6.0
+- name: cluster_2_turn_2
+  family: corner
+  parameters:
+    radius_m: 3.0
+    turn_angle_deg: 55
+    direction: right
+    transition_m: 0.75
+  straight_after_m: 3.0
+- name: cluster_2_turn_3
+  family: corner
+  parameters:
+    radius_m: 1.6
+    turn_angle_deg: 65
+    direction: left
+    transition_m: 0.75
+    end_radius_m: 2.2399999999999998
+  straight_after_m: 4.0
+- name: cluster_2_turn_4
+  family: corner
+  parameters:
+    radius_m: 1.9500000000000002
+    turn_angle_deg: 40.0
+    direction: right
+    transition_m: 0.75
+  straight_after_m: 16.650000000000002
+- name: cluster_3_turn_1
+  family: corner
+  parameters:
+    radius_m: 3.0
+    turn_angle_deg: 65
+    direction: left
+    transition_m: 0.75
+  straight_after_m: 3.0
+- name: cluster_3_turn_2
+  family: corner
+  parameters:
+    radius_m: 1.6
+    turn_angle_deg: 40
+    direction: right
+    transition_m: 0.75
+    end_radius_m: 2.2399999999999998
+  straight_after_m: 4.0
+- name: cluster_3_turn_3
+  family: corner
+  parameters:
+    radius_m: 2.6325000000000003
+    turn_angle_deg: 100
+    direction: left
+    transition_m: 0.75
+    end_radius_m: 1.9500000000000002
+  straight_after_m: 5.0
+- name: cluster_3_turn_4
+  family: corner
+  parameters:
+    radius_m: 2.3
+    turn_angle_deg: 50
+    direction: right
+    transition_m: 0.75
+  straight_after_m: 51.0
+- name: cluster_4_turn_1
+  family: corner
+  parameters:
+    radius_m: 1.6
+    turn_angle_deg: 90
+    direction: left
+    transition_m: 0.75
+    end_radius_m: 2.2399999999999998
+  straight_after_m: 4.0
+- name: cluster_4_turn_2
+  family: corner
+  parameters:
+    radius_m: 1.9500000000000002
+    turn_angle_deg: 40.0
+    direction: right
+    transition_m: 0.75
+  straight_after_m: 5.0
+- name: cluster_4_turn_3
+  family: corner
+  parameters:
+    radius_m: 2.3
+    turn_angle_deg: 55
+    direction: left
+    transition_m: 0.75
+  straight_after_m: 6.0
+- name: cluster_4_turn_4
+  family: corner
+  parameters:
+    radius_m: 2.65
+    turn_angle_deg: 40
+    direction: right
+    transition_m: 0.75
+  straight_after_m: 12.95
+vehicle:
+  length_m: 0.5
+  width_m: 0.27
+  lf_m: 0.15875
+  lr_m: 0.17145
+  steering_min_rad: -0.523599
+  steering_max_rad: 0.523599
+  steering_rate_min_rad_s: -3.2
+  steering_rate_max_rad_s: 3.2
+  source: combined_slip.yaml
+  source_sha256: fb8bab7a7c49cb913c6adafbec84d4560e02d927087ff61956be0145f6288016
+  calibration_status: uncalibrated
+topologies:
+- name: phase5_2e_technical_long_2_families_3_profile_1
+  order:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  turns:
+  - after_index: 2
+    angle_bounds_deg:
+    - 12.0
+    - 55.0
+    radius_m: 6.0
+    transition_m: 0.7
+  - after_index: 7
+    angle_bounds_deg:
+    - 12.0
+    - 55.0
+    radius_m: 6.0
+    transition_m: 0.7
+  - after_index: 11
+    angle_bounds_deg:
+    - 12.0
+    - 55.0
+    radius_m: 6.0
+    transition_m: 0.7
+  - after_index: 15
+    angle_bounds_deg:
+    - 12.0
+    - 55.0
+    radius_m: 6.0
+    transition_m: 0.7
+target_lap_length_m: 397.1335602233794
+lap_length_range_m:
+- 260.0
+- 450.0
+split: train
+slot_id: train_composite_20
+parent_lineage: research_design.v2:lineage_3d4f177a725ba174c56a6589
+topology_family: phase5_2e_technical_long_2_families_3_profile_1
+generation_mode: composite
+target_family: null
+minimum_target_exposure: 0.7
+expected_primary_families: 3
+minimum_family_exposure: 0.025
+maximum_family_exposure: 0.78
+connector_length_bounds_m:
+- 0.4
+- 99.28339005584485
+width:
+  left:
+  - - 0.0
+    - 0.75
+  - - 1.0
+    - 0.75
+  right:
+  - - 0.0
+    - 0.75
+  - - 1.0
+    - 0.75
+  maximum_gradient: 0.12
+candidate_budget: 1
+optimization_iterations: 80
+spacing_m: 0.12
+resolution_m_per_pixel: 0.06
+padding_m: 1.0
+seam_offset_m: 1.7
+maximum_supporting_fraction: 0.4
+minimum_primary_coverage: 0.6
+minimum_useful_corner_m: 0.6
+maximum_offset_curvature: 0.95
+objectives: {}
+limits:
+  minimum_radius_m: 0.5
+  minimum_usable_width_m: 0.7
+  maximum_curvature_rate_inv_m2: 2.0
+  footprint_margin_m: 0.02
+  minimum_nonlocal_boundary_gap_m: 0.1
+seed: 554561422446994353
+attempt: 1
+dataset_id: phase5_v2
+template_version: scaled_maneuver_inventory.v1
+layout_version: bounded_supporting_turns.v1
+assembly_method: bounded_supporting_turns.v1
+support_gap_m: 0.3
+minimum_target_active_fraction: 0.5
+design_version: research_design.v2
+achieved:
+  length_m: 397.1296572404903
+  minimum_radius_m: 1.5998333150498876
+  minimum_width_m: 1.499998655349371
+  maximum_width_m: 1.5000012771442282
+  mean_width_m: 1.4999999390230758
+  sample_count: 3398
+files:
+  map: research_92e734607b520cdad7c0feca.yaml
+  image: research_92e734607b520cdad7c0feca.png
+  pgm: research_92e734607b520cdad7c0feca.pgm
+  centerline: research_92e734607b520cdad7c0feca_centerline.csv
+  walls: research_92e734607b520cdad7c0feca_walls.csv
+  track_profile: research_92e734607b520cdad7c0feca_track_profile.csv
+  metadata: research_92e734607b520cdad7c0feca_metadata.json

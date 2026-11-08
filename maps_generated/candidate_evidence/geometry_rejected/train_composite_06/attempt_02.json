@@ -1,0 +1,220 @@
+{
+  "name": "train_composite_06__2",
+  "slot_id": "train_composite_06",
+  "split": "train",
+  "scale": "short",
+  "family": null,
+  "complexity": 5,
+  "generation_mode": "composite",
+  "attempt": 2,
+  "status": "geometry_rejected",
+  "reason": "Requested research corridor failed: Variable boundary self-intersects",
+  "native_recipe": {
+    "schema_version": 1,
+    "generator": "map_editor.research_tracks.v1",
+    "inventory": [
+      {
+        "name": "chicane_1",
+        "family": "chicane",
+        "parameters": {
+          "radius_m": 2.5099601211570954,
+          "lateral_displacement_m": 2.5335553797175687,
+          "separation_m": 0.25,
+          "transition_length_m": 0.65,
+          "direction": "left_right"
+        },
+        "straight_after_m": 0.0
+      },
+      {
+        "name": "s_curve_2",
+        "family": "s_curve",
+        "parameters": {
+          "radii_m": [
+            3.445440291689536,
+            3.7210755150246992
+          ],
+          "turn_angle_rad": 0.8169139284225255,
+          "transition_length_m": 0.65,
+          "direction": "left_right"
+        },
+        "straight_after_m": 0.0
+      },
+      {
+        "name": "sweeper_3",
+        "family": "sweeper",
+        "parameters": {
+          "radius_m": 6.2,
+          "turn_angle_rad": 0.7853981633974483,
+          "direction": "left",
+          "entry_transition_m": 0.65,
+          "exit_transition_m": 0.65
+        },
+        "straight_after_m": 0.0
+      },
+      {
+        "name": "sweeper_4",
+        "family": "sweeper",
+        "parameters": {
+          "radius_m": 6.2,
+          "turn_angle_rad": 0.7853981633974483,
+          "direction": "right",
+          "entry_transition_m": 0.65,
+          "exit_transition_m": 0.65
+        },
+        "straight_after_m": 0.0
+      },
+      {
+        "name": "straight_5",
+        "family": "straight",
+        "parameters": {
+          "length_m": 16.92222267797926
+        },
+        "straight_after_m": 0.0
+      },
+      {
+        "name": "hairpin_6",
+        "family": "hairpin",
+        "parameters": {
+          "radius_m": 4.631221906294492,
+          "turn_angle_rad": 3.141592653589793,
+          "direction": "left",
+          "entry_transition_m": 0.65,
+          "exit_transition_m": 0.65
+        },
+        "straight_after_m": 0.0
+      }
+    ],
+    "vehicle": {
+      "length_m": 0.5,
+      "width_m": 0.27,
+      "lf_m": 0.15875,
+      "lr_m": 0.17145,
+      "steering_min_rad": -0.523599,
+      "steering_max_rad": 0.523599,
+      "steering_rate_min_rad_s": -3.2,
+      "steering_rate_max_rad_s": 3.2,
+      "source": "combined_slip.yaml",
+      "source_sha256": "fb8bab7a7c49cb913c6adafbec84d4560e02d927087ff61956be0145f6288016",
+      "calibration_status": "uncalibrated"
+    },
+    "topologies": [
+      {
+        "name": "controlled_halfturn_folded_5",
+        "order": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "turns": []
+      }
+    ],
+    "target_lap_length_m": 118.0,
+    "lap_length_range_m": [
+      70.0,
+      140.0
+    ],
+    "split": "train",
+    "slot_id": "train_composite_06",
+    "parent_lineage": "research_design.v2:lineage_d54417cd2952d51ac690330b",
+    "topology_family": "controlled_halfturn_folded_5",
+    "generation_mode": "composite",
+    "target_family": null,
+    "minimum_target_exposure": 0.6,
+    "expected_primary_families": 5,
+    "minimum_family_exposure": 0.025,
+    "maximum_family_exposure": 0.78,
+    "connector_length_bounds_m": [
+      0.3,
+      47.2
+    ],
+    "width": {
+      "left": [
+        [
+          0.0,
+          0.75
+        ],
+        [
+          1.0,
+          0.75
+        ]
+      ],
+      "right": [
+        [
+          0.0,
+          0.75
+        ],
+        [
+          1.0,
+          0.75
+        ]
+      ],
+      "maximum_gradient": 0.12
+    },
+    "candidate_budget": 1,
+    "optimization_iterations": 80,
+    "spacing_m": 0.12,
+    "resolution_m_per_pixel": 0.06,
+    "padding_m": 1.0,
+    "seam_offset_m": 1.7,
+    "maximum_supporting_fraction": 0.4,
+    "minimum_primary_coverage": 0.6,
+    "minimum_useful_corner_m": 0.6,
+    "maximum_offset_curvature": 0.95,
+    "objectives": {},
+    "limits": {
+      "minimum_radius_m": 0.5,
+      "minimum_usable_width_m": 0.7,
+      "maximum_curvature_rate_inv_m2": 2.0,
+      "footprint_margin_m": 0.02,
+      "minimum_nonlocal_boundary_gap_m": 0.1
+    },
+    "seed": 240574579806270043,
+    "attempt": 2,
+    "dataset_id": "phase5_v2",
+    "template_version": "scaled_maneuver_inventory.v1",
+    "layout_version": "bounded_supporting_turns.v1",
+    "assembly_method": "controlled_halfturn.v1",
+    "support_gap_m": 0.45,
+    "minimum_target_active_fraction": 0.5,
+    "design_version": "research_design.v2"
+  },
+  "layout_attempts": [
+    {
+      "candidate": 1,
+      "topology": "controlled_halfturn_five",
+      "method": "controlled_halfturn.v1",
+      "status": "rejected",
+      "order": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "exact_rotated_block_closure": true,
+      "geometric_selection_score": 0.6941201399530844,
+      "composition": {
+        "primary_families": [
+          "chicane",
+          "hairpin",
+          "s_curve",
+          "straight",
+          "sweeper"
+        ],
+        "exposure": {
+          "chicane": 0.10143693376751083,
+          "hairpin": 0.25761524700846217,
+          "s_curve": 0.12125970714411909,
+          "straight": 0.2868227318631958,
+          "sweeper": 0.1871018091344997
+        }
+      },
+      "failure_stage": "corridor",
+      "reason": "Variable boundary self-intersects"
+    }
+  ]
+}

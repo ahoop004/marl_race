@@ -1,0 +1,183 @@
+schema_version: 1
+generator: map_editor.research_tracks.v1
+inventory:
+- name: feature_1
+  family: corner
+  parameters:
+    radius_m: 1.6
+    direction: left
+    turn_angle_deg: 85.0
+    transition_m: 0.65
+  straight_after_m: 3.5
+- name: feature_2
+  family: corner
+  parameters:
+    radius_m: 2.0
+    direction: right
+    turn_angle_deg: 40.0
+    transition_m: 0.65
+  straight_after_m: 2.2
+- name: e_opposing_window
+  family: chicane
+  parameters:
+    radius_m: 3.4
+    lateral_displacement_m: 3.5791508121609588
+    separation_m: 0.25
+    transition_length_m: 0.65
+    direction: left_right
+  straight_after_m: 3.3
+- name: feature_3
+  family: corner
+  parameters:
+    radius_m: 2.4000000000000004
+    direction: left
+    turn_angle_deg: 105
+    transition_m: 0.65
+  straight_after_m: 3.5
+- name: feature_4
+  family: corner
+  parameters:
+    radius_m: 3.92
+    direction: left
+    turn_angle_deg: 60
+    transition_m: 0.65
+    end_radius_m: 2.8000000000000003
+  straight_after_m: 5.5
+- name: feature_5
+  family: corner
+  parameters:
+    radius_m: 1.6
+    direction: right
+    turn_angle_deg: 60
+    transition_m: 0.65
+  straight_after_m: 3.5
+- name: feature_6
+  family: corner
+  parameters:
+    radius_m: 2.0
+    direction: left
+    turn_angle_deg: 90
+    transition_m: 0.65
+    end_radius_m: 3.0
+  straight_after_m: 5.5
+- name: feature_7
+  family: corner
+  parameters:
+    radius_m: 2.4000000000000004
+    direction: left
+    turn_angle_deg: 90
+    transition_m: 0.65
+  straight_after_m: 3.5
+- name: feature_8
+  family: corner
+  parameters:
+    radius_m: 3.92
+    direction: right
+    turn_angle_deg: 45
+    transition_m: 0.65
+    end_radius_m: 2.8000000000000003
+  straight_after_m: 5.5
+- name: feature_9
+  family: corner
+  parameters:
+    radius_m: 1.6
+    direction: left
+    turn_angle_deg: 75
+    transition_m: 0.65
+  straight_after_m: 3.5
+vehicle:
+  length_m: 0.5
+  width_m: 0.27
+  lf_m: 0.15875
+  lr_m: 0.17145
+  steering_min_rad: -0.523599
+  steering_max_rad: 0.523599
+  steering_rate_min_rad_s: -3.2
+  steering_rate_max_rad_s: 3.2
+  source: combined_slip.yaml
+  source_sha256: fb8bab7a7c49cb913c6adafbec84d4560e02d927087ff61956be0145f6288016
+  calibration_status: uncalibrated
+topologies:
+- name: phase5_2e_technical_short_4_families_3_profile_4
+  order:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  turns: []
+target_lap_length_m: 110.82435378659727
+lap_length_range_m:
+- 70.0
+- 140.0
+split: train
+slot_id: train_composite_04
+parent_lineage: research_design.v2:lineage_fd9d28ce0a4991db84a62e30
+topology_family: phase5_2e_technical_short_4_families_3_profile_4
+generation_mode: composite
+target_family: null
+minimum_target_exposure: 0.7
+expected_primary_families: 3
+minimum_family_exposure: 0.025
+maximum_family_exposure: 0.78
+connector_length_bounds_m:
+- 0.4
+- 27.706088446649318
+width:
+  left:
+  - - 0.0
+    - 0.75
+  - - 1.0
+    - 0.75
+  right:
+  - - 0.0
+    - 0.75
+  - - 1.0
+    - 0.75
+  maximum_gradient: 0.12
+candidate_budget: 1
+optimization_iterations: 80
+spacing_m: 0.12
+resolution_m_per_pixel: 0.06
+padding_m: 1.0
+seam_offset_m: 1.7
+maximum_supporting_fraction: 0.4
+minimum_primary_coverage: 0.6
+minimum_useful_corner_m: 0.6
+maximum_offset_curvature: 0.95
+objectives: {}
+limits:
+  minimum_radius_m: 0.5
+  minimum_usable_width_m: 0.7
+  maximum_curvature_rate_inv_m2: 2.0
+  footprint_margin_m: 0.02
+  minimum_nonlocal_boundary_gap_m: 0.1
+seed: 381386303496329692
+attempt: 2
+dataset_id: phase5_v2
+template_version: scaled_maneuver_inventory.v1
+layout_version: bounded_supporting_turns.v1
+assembly_method: bounded_supporting_turns.v1
+support_gap_m: 0.3
+minimum_target_active_fraction: 0.5
+design_version: research_design.v2
+achieved:
+  length_m: 110.82130454315075
+  minimum_radius_m: 1.5996950618727999
+  minimum_width_m: 1.4999988408713048
+  maximum_width_m: 1.500001280159804
+  mean_width_m: 1.4999998842468847
+  sample_count: 954
+files:
+  map: research_152108e5a46bb778a9946ba4.yaml
+  image: research_152108e5a46bb778a9946ba4.png
+  pgm: research_152108e5a46bb778a9946ba4.pgm
+  centerline: research_152108e5a46bb778a9946ba4_centerline.csv
+  walls: research_152108e5a46bb778a9946ba4_walls.csv
+  track_profile: research_152108e5a46bb778a9946ba4_track_profile.csv
+  metadata: research_152108e5a46bb778a9946ba4_metadata.json

@@ -1,0 +1,827 @@
+{
+  "version": "development_screen.v1",
+  "policy": {
+    "version": "development_screen.v1",
+    "normalized_shape_threshold": 0.055,
+    "relative_length_threshold": 0.15,
+    "relative_radius_threshold": 0.2,
+    "family_exposure_l1_threshold": 0.25,
+    "ambiguous_shape_threshold": 0.085,
+    "ambiguous_relative_length_threshold": 0.08,
+    "ambiguous_relative_curvature_threshold": 0.12,
+    "ambiguous_family_exposure_l1_threshold": 0.15
+  },
+  "frozen_before_formal_generation": true,
+  "calibration_sources": "checked-in Phase 4B development pilot and forbidden representation transformations; no held-out formal validation/test candidates",
+  "rationale": "Conservative conjunction of shape (<0.055), physical length (<15%), sustained radius (<20%) and primary exposure L1 (<0.25); ambiguous band (<0.085) also requires close length/p95 curvature, exposure and corner counts. Both classes reject globally. Large physical scale/severity differences can establish independence despite similar normalized shape.",
+  "sources": [
+    {
+      "name": "long_technical_1",
+      "centerline_sha256": "d294f20be59a4ae23f08f4ede6e44919e7f72157172477e2d55e749552d63127"
+    },
+    {
+      "name": "long_technical_2",
+      "centerline_sha256": "bbd53912145a7ae31278ba9147a980fe794f2d17a2cbd33095f1b0e6754f117c"
+    },
+    {
+      "name": "long_technical_3",
+      "centerline_sha256": "da19fe74b5b7d11b8e93b81d47845dcef83ac5714431192591de7d320b0c4727"
+    },
+    {
+      "name": "long_technical_4",
+      "centerline_sha256": "962bbfab025f76edc9faf3b628ab594ec4d6d1f4cd9736198662aecc3cd04690"
+    },
+    {
+      "name": "long_irregular_mixed_1",
+      "centerline_sha256": "55689fb7d0ae4e87e0e4ae7b5fa7af258756c37d1747e4800d72531de99e8b39"
+    },
+    {
+      "name": "long_irregular_mixed_2",
+      "centerline_sha256": "439494ac13e87ff95c2da9d6d3c441b89ec92833a2a6be810f032cf64fbb98bb"
+    },
+    {
+      "name": "long_irregular_mixed_3",
+      "centerline_sha256": "3aa42ed1187488515bc915f20ffd2def2e675ef16b22e1c3ed991d10468cd924"
+    },
+    {
+      "name": "long_irregular_mixed_4",
+      "centerline_sha256": "24a965eea2f59dc9a9ea53f5928b99a84de7f7bc5aa9d1461ea336ddb47773c6"
+    },
+    {
+      "name": "width_pair_1_uniform",
+      "centerline_sha256": "4a0d0dfb489d27bd89393289aaac33963a437fd8786314d37f4e4506fe696aa1"
+    },
+    {
+      "name": "width_pair_1_variable",
+      "centerline_sha256": "4a0d0dfb489d27bd89393289aaac33963a437fd8786314d37f4e4506fe696aa1"
+    },
+    {
+      "name": "width_pair_2_uniform",
+      "centerline_sha256": "4ec285c9d62c13977005c288e3295dc2a96771846aa4d45d54766d622083fada"
+    },
+    {
+      "name": "width_pair_2_variable",
+      "centerline_sha256": "4ec285c9d62c13977005c288e3295dc2a96771846aa4d45d54766d622083fada"
+    }
+  ],
+  "development_pairs": [
+    {
+      "first": "long_technical_1",
+      "second": "long_technical_2",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.10245048296943875,
+      "relative_length": 0.1014496769442734,
+      "relative_sustained_radius": 0.17873047072343812,
+      "relative_p95_curvature": 0.08982323873084833,
+      "family_exposure_l1": 0.07954240837094169,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "long_technical_1",
+      "second": "long_technical_3",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.09443965573019178,
+      "relative_length": 0.1948053973252402,
+      "relative_sustained_radius": 0.09602105177874452,
+      "relative_p95_curvature": 0.034037632983499454,
+      "family_exposure_l1": 0.04165203116979939,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_technical_1",
+      "second": "long_technical_4",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.09420546566585783,
+      "relative_length": 0.2705887775661225,
+      "relative_sustained_radius": 0.1152945396530233,
+      "relative_p95_curvature": 0.04889857242268286,
+      "family_exposure_l1": 0.07090815073422707,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_technical_1",
+      "second": "long_irregular_mixed_1",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.102165180708766,
+      "relative_length": 1.5108033430687896e-06,
+      "relative_sustained_radius": 0.3535771545752047,
+      "relative_p95_curvature": 0.23394137593307615,
+      "family_exposure_l1": 0.1893346397420739,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_technical_1",
+      "second": "long_irregular_mixed_2",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.15162777682273737,
+      "relative_length": 0.10145126261262648,
+      "relative_sustained_radius": 0.45523518963337706,
+      "relative_p95_curvature": 0.40143932747978883,
+      "family_exposure_l1": 0.1969580055067014,
+      "corner_count_difference": 2
+    },
+    {
+      "first": "long_technical_1",
+      "second": "long_irregular_mixed_3",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.15511434363462315,
+      "relative_length": 0.19480665344492112,
+      "relative_sustained_radius": 0.2153898022588505,
+      "relative_p95_curvature": 0.39127405826350015,
+      "family_exposure_l1": 0.1955402599374117,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_technical_1",
+      "second": "long_irregular_mixed_4",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.33105215828806617,
+      "relative_length": 0.27058998866267325,
+      "relative_sustained_radius": 0.23614022073582047,
+      "relative_p95_curvature": 0.40725449755229,
+      "family_exposure_l1": 0.09023825190112053,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_technical_1",
+      "second": "width_pair_1_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.058754225834846456,
+      "relative_length": 0.16129065448764182,
+      "relative_sustained_radius": 0.17932831699148397,
+      "relative_p95_curvature": 0.0565250954166431,
+      "family_exposure_l1": 0.1969020862861541,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "long_technical_1",
+      "second": "width_pair_1_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.058754225834846456,
+      "relative_length": 0.16129065448764182,
+      "relative_sustained_radius": 0.17932831699148397,
+      "relative_p95_curvature": 0.0565250954166431,
+      "family_exposure_l1": 0.1969020862861541,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "long_technical_1",
+      "second": "width_pair_2_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.07535728510378219,
+      "relative_length": 0.09677462592607053,
+      "relative_sustained_radius": 0.09618812002641934,
+      "relative_p95_curvature": 0.00831984257397298,
+      "family_exposure_l1": 0.18532045855379098,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "long_technical_1",
+      "second": "width_pair_2_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.07535728510378219,
+      "relative_length": 0.09677462592607053,
+      "relative_sustained_radius": 0.09618812002641934,
+      "relative_p95_curvature": 0.00831984257397298,
+      "family_exposure_l1": 0.18532045855379098,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "long_technical_2",
+      "second": "long_technical_3",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.08995959586436132,
+      "relative_length": 0.10389592879282401,
+      "relative_sustained_radius": 0.09149485074562805,
+      "relative_p95_curvature": 0.05775132412212901,
+      "family_exposure_l1": 0.0378903772011423,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_technical_2",
+      "second": "long_technical_4",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.10038233429109979,
+      "relative_length": 0.18823553481863184,
+      "relative_sustained_radius": 0.07170288182186148,
+      "relative_p95_curvature": 0.04302870873867824,
+      "family_exposure_l1": 0.03380570538128331,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_technical_2",
+      "second": "long_irregular_mixed_1",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.1236940354223936,
+      "relative_length": 0.10144831940939043,
+      "relative_sustained_radius": 0.21289805309809212,
+      "relative_p95_curvature": 0.1583408227224669,
+      "family_exposure_l1": 0.19085049656674982,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_technical_2",
+      "second": "long_irregular_mixed_2",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.16311546440252442,
+      "relative_length": 1.7646962138898851e-06,
+      "relative_sustained_radius": 0.3366796271542009,
+      "relative_p95_curvature": 0.3423687595741542,
+      "family_exposure_l1": 0.16908209704105606,
+      "corner_count_difference": 2
+    },
+    {
+      "first": "long_technical_2",
+      "second": "long_irregular_mixed_3",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.12028064296835966,
+      "relative_length": 0.10389732673309371,
+      "relative_sustained_radius": 0.044637393971872746,
+      "relative_p95_curvature": 0.3312003034578782,
+      "family_exposure_l1": 0.19172521294730305,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_technical_2",
+      "second": "long_irregular_mixed_4",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.30970046679961244,
+      "relative_length": 0.1882368826524923,
+      "relative_sustained_radius": 0.06990366495510106,
+      "relative_p95_curvature": 0.34875781532678896,
+      "family_exposure_l1": 0.05637043185725288,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_technical_2",
+      "second": "width_pair_1_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.10089839441656523,
+      "relative_length": 0.24637744664001354,
+      "relative_sustained_radius": 0.0007279537919451136,
+      "relative_p95_curvature": 0.03529308850976788,
+      "family_exposure_l1": 0.16910648878225626,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "long_technical_2",
+      "second": "width_pair_1_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.10089839441656523,
+      "relative_length": 0.24637744664001354,
+      "relative_sustained_radius": 0.0007279537919451136,
+      "relative_p95_curvature": 0.03529308850976788,
+      "family_exposure_l1": 0.16910648878225626,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "long_technical_2",
+      "second": "width_pair_2_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.11770466156714798,
+      "relative_length": 0.18840654833374115,
+      "relative_sustained_radius": 0.09132691495428405,
+      "relative_p95_curvature": 0.09739576609909625,
+      "family_exposure_l1": 0.1998419798723094,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "long_technical_2",
+      "second": "width_pair_2_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.11770466156714798,
+      "relative_length": 0.18840654833374115,
+      "relative_sustained_radius": 0.09132691495428405,
+      "relative_p95_curvature": 0.09739576609909625,
+      "family_exposure_l1": 0.1998419798723094,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "long_technical_3",
+      "second": "long_technical_4",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.08059878121679717,
+      "relative_length": 0.09411809268112209,
+      "relative_sustained_radius": 0.021320726452980894,
+      "relative_p95_curvature": 0.015384594624616006,
+      "family_exposure_l1": 0.031090081683277475,
+      "corner_count_difference": 2
+    },
+    {
+      "first": "long_technical_3",
+      "second": "long_irregular_mixed_1",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.11665621620507609,
+      "relative_length": 0.19480418083270476,
+      "relative_sustained_radius": 0.28491382825147543,
+      "relative_p95_curvature": 0.20694775466978618,
+      "family_exposure_l1": 0.16184649826809822,
+      "corner_count_difference": 4
+    },
+    {
+      "first": "long_technical_3",
+      "second": "long_irregular_mixed_2",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.15819115872522282,
+      "relative_length": 0.10389434743857169,
+      "relative_sustained_radius": 0.39737002566426166,
+      "relative_p95_curvature": 0.38034783449282494,
+      "family_exposure_l1": 0.18098464874455103,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_technical_3",
+      "second": "long_irregular_mixed_3",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.13386020717160688,
+      "relative_length": 1.5600199961330644e-06,
+      "relative_sustained_radius": 0.1320481530183705,
+      "relative_p95_curvature": 0.36982437150566383,
+      "family_exposure_l1": 0.168052118463436,
+      "corner_count_difference": 2
+    },
+    {
+      "first": "long_technical_3",
+      "second": "long_irregular_mixed_4",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.3202372161235838,
+      "relative_length": 0.09411959678528117,
+      "relative_sustained_radius": 0.15500269030908975,
+      "relative_p95_curvature": 0.38636791381585495,
+      "family_exposure_l1": 0.06638187089477751,
+      "corner_count_difference": 2
+    },
+    {
+      "first": "long_technical_3",
+      "second": "width_pair_1_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.10128523575692944,
+      "relative_length": 0.3246757617805689,
+      "relative_sustained_radius": 0.09215620051402942,
+      "relative_p95_curvature": 0.023279853543983372,
+      "family_exposure_l1": 0.18100904048575123,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_technical_3",
+      "second": "width_pair_1_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.10128523575692944,
+      "relative_length": 0.3246757617805689,
+      "relative_sustained_radius": 0.09215620051402942,
+      "relative_p95_curvature": 0.023279853543983372,
+      "family_exposure_l1": 0.18100904048575123,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_technical_3",
+      "second": "width_pair_2_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.12137363289519461,
+      "relative_length": 0.272727803796781,
+      "relative_sustained_radius": 0.00018481431232833916,
+      "relative_p95_curvature": 0.04207428780945905,
+      "family_exposure_l1": 0.1694274127533881,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_technical_3",
+      "second": "width_pair_2_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.12137363289519461,
+      "relative_length": 0.272727803796781,
+      "relative_sustained_radius": 0.00018481431232833916,
+      "relative_p95_curvature": 0.04207428780945905,
+      "family_exposure_l1": 0.1694274127533881,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_technical_4",
+      "second": "long_irregular_mixed_1",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.10821648182486744,
+      "relative_length": 0.27058767556754426,
+      "relative_sustained_radius": 0.2693355309785567,
+      "relative_p95_curvature": 0.19455633031877745,
+      "family_exposure_l1": 0.19272127750423557,
+      "corner_count_difference": 6
+    },
+    {
+      "first": "long_technical_4",
+      "second": "long_irregular_mixed_2",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.16487174852727451,
+      "relative_length": 0.1882341022984256,
+      "relative_sustained_radius": 0.38424160945839636,
+      "relative_p95_curvature": 0.37066578267589356,
+      "family_exposure_l1": 0.19636163223442518,
+      "corner_count_difference": 5
+    },
+    {
+      "first": "long_technical_4",
+      "second": "long_irregular_mixed_3",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.1469127544527262,
+      "relative_length": 0.09411667948502793,
+      "relative_sustained_radius": 0.11313964600893316,
+      "relative_p95_curvature": 0.35997789080490555,
+      "family_exposure_l1": 0.19892689769957336,
+      "corner_count_difference": 4
+    },
+    {
+      "first": "long_technical_4",
+      "second": "long_irregular_mixed_4",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.33960171090618935,
+      "relative_length": 1.6603755378320895e-06,
+      "relative_sustained_radius": 0.13659425254977192,
+      "relative_p95_curvature": 0.3767799256094331,
+      "family_exposure_l1": 0.08175885438465168,
+      "corner_count_difference": 4
+    },
+    {
+      "first": "long_technical_4",
+      "second": "width_pair_1_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.09630641160399209,
+      "relative_length": 0.3882359910231135,
+      "relative_sustained_radius": 0.07237863922909098,
+      "relative_p95_curvature": 0.008018622170914848,
+      "family_exposure_l1": 0.19638602397562538,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_technical_4",
+      "second": "width_pair_1_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.09630641160399209,
+      "relative_length": 0.3882359910231135,
+      "relative_sustained_radius": 0.07237863922909098,
+      "relative_p95_curvature": 0.008018622170914848,
+      "family_exposure_l1": 0.19638602397562538,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_technical_4",
+      "second": "width_pair_2_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.08799887955443168,
+      "relative_length": 0.3411772757634388,
+      "relative_sustained_radius": 0.0211398190817789,
+      "relative_p95_curvature": 0.056811586572007106,
+      "family_exposure_l1": 0.20051749443666556,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_technical_4",
+      "second": "width_pair_2_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.08799887955443168,
+      "relative_length": 0.3411772757634388,
+      "relative_sustained_radius": 0.0211398190817789,
+      "relative_p95_curvature": 0.056811586572007106,
+      "family_exposure_l1": 0.20051749443666556,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_irregular_mixed_1",
+      "second": "long_irregular_mixed_2",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.15282108273752704,
+      "relative_length": 0.10144990508013917,
+      "relative_sustained_radius": 0.157262441724763,
+      "relative_p95_curvature": 0.21864899928609097,
+      "family_exposure_l1": 0.054712490716011405,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_irregular_mixed_1",
+      "second": "long_irregular_mixed_3",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.15835954530327548,
+      "relative_length": 0.19480543695428346,
+      "relative_sustained_radius": 0.17612229960072934,
+      "relative_p95_curvature": 0.20537942839826212,
+      "family_exposure_l1": 0.032281114842639604,
+      "corner_count_difference": 2
+    },
+    {
+      "first": "long_irregular_mixed_1",
+      "second": "long_irregular_mixed_4",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.33407161380370354,
+      "relative_length": 0.2705888866659248,
+      "relative_sustained_radius": 0.1537414811295738,
+      "relative_p95_curvature": 0.2262400241630502,
+      "family_exposure_l1": 0.14903974963707967,
+      "corner_count_difference": 2
+    },
+    {
+      "first": "long_irregular_mixed_1",
+      "second": "width_pair_1_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.11752738996601775,
+      "relative_length": 0.16129192161252487,
+      "relative_sustained_radius": 0.21232466184886337,
+      "relative_p95_curvature": 0.18804557456118132,
+      "family_exposure_l1": 0.12972814441646097,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_irregular_mixed_1",
+      "second": "width_pair_1_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.11752738996601775,
+      "relative_length": 0.16129192161252487,
+      "relative_sustained_radius": 0.21232466184886337,
+      "relative_p95_curvature": 0.18804557456118132,
+      "family_exposure_l1": 0.12972814441646097,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_irregular_mixed_1",
+      "second": "width_pair_2_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.11895179735865645,
+      "relative_length": 0.09677599052198521,
+      "relative_sustained_radius": 0.28478164566315406,
+      "relative_p95_curvature": 0.24031486308774733,
+      "family_exposure_l1": 0.10985494392697351,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_irregular_mixed_1",
+      "second": "width_pair_2_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.11895179735865645,
+      "relative_length": 0.09677599052198521,
+      "relative_sustained_radius": 0.28478164566315406,
+      "relative_p95_curvature": 0.24031486308774733,
+      "family_exposure_l1": 0.10985494392697351,
+      "corner_count_difference": 3
+    },
+    {
+      "first": "long_irregular_mixed_2",
+      "second": "long_irregular_mixed_3",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.1284342883193825,
+      "relative_length": 0.10389574538130834,
+      "relative_sustained_radius": 0.3056873184481014,
+      "relative_p95_curvature": 0.016699254162374673,
+      "family_exposure_l1": 0.06091811091134921,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_irregular_mixed_2",
+      "second": "long_irregular_mixed_4",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.28383886013294723,
+      "relative_length": 0.18823545013466458,
+      "relative_sustained_radius": 0.28682616213751844,
+      "relative_p95_curvature": 0.009715255845354268,
+      "family_exposure_l1": 0.11623710924526119,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_irregular_mixed_2",
+      "second": "width_pair_1_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.16061913710986664,
+      "relative_length": 0.24637877655488014,
+      "relative_sustained_radius": 0.3361964088128895,
+      "relative_p95_curvature": 0.365578597149292,
+      "family_exposure_l1": 0.08610956537222383,
+      "corner_count_difference": 2
+    },
+    {
+      "first": "long_irregular_mixed_2",
+      "second": "width_pair_1_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.16061913710986664,
+      "relative_length": 0.24637877655488014,
+      "relative_sustained_radius": 0.3361964088128895,
+      "relative_p95_curvature": 0.365578597149292,
+      "family_exposure_l1": 0.08610956537222383,
+      "corner_count_difference": 2
+    },
+    {
+      "first": "long_irregular_mixed_2",
+      "second": "width_pair_2_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.1599625011566133,
+      "relative_length": 0.18840798054963254,
+      "relative_sustained_radius": 0.3972586304325332,
+      "relative_p95_curvature": 0.4064192580461284,
+      "family_exposure_l1": 0.12238797909589194,
+      "corner_count_difference": 2
+    },
+    {
+      "first": "long_irregular_mixed_2",
+      "second": "width_pair_2_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.1599625011566133,
+      "relative_length": 0.18840798054963254,
+      "relative_sustained_radius": 0.3972586304325332,
+      "relative_p95_curvature": 0.4064192580461284,
+      "family_exposure_l1": 0.12238797909589194,
+      "corner_count_difference": 2
+    },
+    {
+      "first": "long_irregular_mixed_3",
+      "second": "long_irregular_mixed_4",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.25641696804821756,
+      "relative_length": 0.09411818359153344,
+      "relative_sustained_radius": 0.026446786616729306,
+      "relative_p95_curvature": 0.026252272481114874,
+      "family_exposure_l1": 0.15524536983241746,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "long_irregular_mixed_3",
+      "second": "width_pair_1_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.1511456984899611,
+      "relative_length": 0.3246768152998844,
+      "relative_sustained_radius": 0.043941427508706075,
+      "relative_p95_curvature": 0.3548043103432452,
+      "family_exposure_l1": 0.10743801345314156,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_irregular_mixed_3",
+      "second": "width_pair_1_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.1511456984899611,
+      "relative_length": 0.3246768152998844,
+      "relative_sustained_radius": 0.043941427508706075,
+      "relative_p95_curvature": 0.3548043103432452,
+      "family_exposure_l1": 0.10743801345314156,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_irregular_mixed_3",
+      "second": "width_pair_2_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.16633795929380363,
+      "relative_length": 0.27272893835594975,
+      "relative_sustained_radius": 0.1318877134431067,
+      "relative_p95_curvature": 0.39633856226944125,
+      "family_exposure_l1": 0.0875648129636541,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_irregular_mixed_3",
+      "second": "width_pair_2_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.16633795929380363,
+      "relative_length": 0.27272893835594975,
+      "relative_sustained_radius": 0.1318877134431067,
+      "relative_p95_curvature": 0.39633856226944125,
+      "family_exposure_l1": 0.0875648129636541,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_irregular_mixed_4",
+      "second": "width_pair_1_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.3276565596882728,
+      "relative_length": 0.38823700678110895,
+      "relative_sustained_radius": 0.06922610456847815,
+      "relative_p95_curvature": 0.3717421633917552,
+      "family_exposure_l1": 0.1146271695909737,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_irregular_mixed_4",
+      "second": "width_pair_1_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.3276565596882728,
+      "relative_length": 0.38823700678110895,
+      "relative_sustained_radius": 0.06922610456847815,
+      "relative_p95_curvature": 0.3717421633917552,
+      "family_exposure_l1": 0.1146271695909737,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_irregular_mixed_4",
+      "second": "width_pair_2_uniform",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.35552680123374353,
+      "relative_length": 0.3411783696565739,
+      "relative_sustained_radius": 0.15484649384503782,
+      "relative_p95_curvature": 0.41218604681908544,
+      "family_exposure_l1": 0.14347154801505654,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "long_irregular_mixed_4",
+      "second": "width_pair_2_variable",
+      "status": "independent_under_policy",
+      "normalized_shape_distance": 0.35552680123374353,
+      "relative_length": 0.3411783696565739,
+      "relative_sustained_radius": 0.15484649384503782,
+      "relative_p95_curvature": 0.41218604681908544,
+      "family_exposure_l1": 0.14347154801505654,
+      "corner_count_difference": 1
+    },
+    {
+      "first": "width_pair_1_uniform",
+      "second": "width_pair_1_variable",
+      "status": "near_duplicate",
+      "normalized_shape_distance": 0.0,
+      "relative_length": 0.0,
+      "relative_sustained_radius": 0.0,
+      "relative_p95_curvature": 0.0,
+      "family_exposure_l1": 0.0,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "width_pair_1_uniform",
+      "second": "width_pair_2_uniform",
+      "status": "ambiguous",
+      "normalized_shape_distance": 0.060325364169965735,
+      "relative_length": 0.07142849438626447,
+      "relative_sustained_radius": 0.09198838697218155,
+      "relative_p95_curvature": 0.0643746580952708,
+      "family_exposure_l1": 0.045148162774748514,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "width_pair_1_uniform",
+      "second": "width_pair_2_variable",
+      "status": "ambiguous",
+      "normalized_shape_distance": 0.060325364169965735,
+      "relative_length": 0.07142849438626447,
+      "relative_sustained_radius": 0.09198838697218155,
+      "relative_p95_curvature": 0.0643746580952708,
+      "family_exposure_l1": 0.045148162774748514,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "width_pair_1_variable",
+      "second": "width_pair_2_uniform",
+      "status": "ambiguous",
+      "normalized_shape_distance": 0.060325364169965735,
+      "relative_length": 0.07142849438626447,
+      "relative_sustained_radius": 0.09198838697218155,
+      "relative_p95_curvature": 0.0643746580952708,
+      "family_exposure_l1": 0.045148162774748514,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "width_pair_1_variable",
+      "second": "width_pair_2_variable",
+      "status": "ambiguous",
+      "normalized_shape_distance": 0.060325364169965735,
+      "relative_length": 0.07142849438626447,
+      "relative_sustained_radius": 0.09198838697218155,
+      "relative_p95_curvature": 0.0643746580952708,
+      "family_exposure_l1": 0.045148162774748514,
+      "corner_count_difference": 0
+    },
+    {
+      "first": "width_pair_2_uniform",
+      "second": "width_pair_2_variable",
+      "status": "near_duplicate",
+      "normalized_shape_distance": 0.0,
+      "relative_length": 0.0,
+      "relative_sustained_radius": 0.0,
+      "relative_p95_curvature": 0.0,
+      "family_exposure_l1": 0.0,
+      "corner_count_difference": 0
+    }
+  ],
+  "forbidden_transform_checks": [
+    {
+      "transform": "translation",
+      "normalized_distance": 0.0,
+      "accepted_as_independent": false
+    },
+    {
+      "transform": "rotation",
+      "normalized_distance": 1.4901161193847656e-08,
+      "accepted_as_independent": false
+    },
+    {
+      "transform": "reflection",
+      "normalized_distance": 0.0,
+      "accepted_as_independent": false
+    },
+    {
+      "transform": "reversal",
+      "normalized_distance": 0.0008257078335479969,
+      "accepted_as_independent": false
+    },
+    {
+      "transform": "seam_shift",
+      "normalized_distance": 0.002033034078084444,
+      "accepted_as_independent": false
+    },
+    {
+      "transform": "width_only",
+      "normalized_distance": 0.0,
+      "accepted_as_independent": false
+    }
+  ]
+}

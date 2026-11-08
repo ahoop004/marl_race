@@ -1,0 +1,205 @@
+schema_version: 1
+generator: map_editor.research_tracks.v1
+inventory:
+- name: sweeper_1
+  family: sweeper
+  parameters:
+    radius_m: 7.268348666454282
+    turn_angle_rad: 1.3962634015954636
+    direction: left
+    entry_transition_m: 0.65
+    exit_transition_m: 0.65
+  straight_after_m: 0.0
+- name: sweeper_2
+  family: sweeper
+  parameters:
+    radius_m: 13.4843141033659
+    turn_angle_rad: 2.007128639793479
+    direction: left
+    entry_transition_m: 0.65
+    exit_transition_m: 0.65
+    end_radius_m: 13.069903968091792
+  straight_after_m: 0.0
+- name: sweeper_3
+  family: sweeper
+  parameters:
+    radius_m: 14.062349760326798
+    turn_angle_rad: 1.2217304763960306
+    direction: right
+    entry_transition_m: 0.65
+    exit_transition_m: 0.65
+  straight_after_m: 0.0
+- name: sweeper_4
+  family: sweeper
+  parameters:
+    radius_m: 6.60296947648475
+    turn_angle_rad: 2.0943951023931953
+    direction: left
+    entry_transition_m: 0.65
+    exit_transition_m: 0.65
+    end_radius_m: 7.437716404697071
+  straight_after_m: 0.0
+- name: sweeper_5
+  family: sweeper
+  parameters:
+    radius_m: 10.427401195097906
+    turn_angle_rad: 2.007128639793479
+    direction: left
+    entry_transition_m: 0.65
+    exit_transition_m: 0.65
+  straight_after_m: 0.0
+- name: sweeper_6
+  family: sweeper
+  parameters:
+    radius_m: 9.588309954974118
+    turn_angle_rad: 0.8726646259971648
+    direction: right
+    entry_transition_m: 0.65
+    exit_transition_m: 0.65
+    end_radius_m: 12.658235565309191
+  straight_after_m: 0.0
+- name: sweeper_7
+  family: sweeper
+  parameters:
+    radius_m: 8.820483641944339
+    turn_angle_rad: 1.3089969389957472
+    direction: left
+    entry_transition_m: 0.65
+    exit_transition_m: 0.65
+  straight_after_m: 0.0
+- name: sweeper_8
+  family: sweeper
+  parameters:
+    radius_m: 10.05107610955678
+    turn_angle_rad: 1.2217304763960306
+    direction: right
+    entry_transition_m: 0.65
+    exit_transition_m: 0.65
+    end_radius_m: 11.609549073793993
+  straight_after_m: 0.0
+- name: sweeper_9
+  family: sweeper
+  parameters:
+    radius_m: 11.947494286861254
+    turn_angle_rad: 0.7853981633974483
+    direction: left
+    entry_transition_m: 0.65
+    exit_transition_m: 0.65
+  straight_after_m: 0.0
+- name: sweeper_10
+  family: sweeper
+  parameters:
+    radius_m: 12.39527463255915
+    turn_angle_rad: 1.242879386370066
+    direction: right
+    entry_transition_m: 0.65
+    exit_transition_m: 0.65
+    end_radius_m: 12.51843810936245
+  straight_after_m: 0.0
+- name: sweeper_11
+  family: sweeper
+  parameters:
+    radius_m: 9.78847580555044
+    turn_angle_rad: 1.242879386370066
+    direction: left
+    entry_transition_m: 0.65
+    exit_transition_m: 0.65
+    end_radius_m: 13.786578667702987
+  straight_after_m: 0.0
+vehicle:
+  length_m: 0.5
+  width_m: 0.27
+  lf_m: 0.15875
+  lr_m: 0.17145
+  steering_min_rad: -0.523599
+  steering_max_rad: 0.523599
+  steering_rate_min_rad_s: -3.2
+  steering_rate_max_rad_s: 3.2
+  source: combined_slip.yaml
+  source_sha256: fb8bab7a7c49cb913c6adafbec84d4560e02d927087ff61956be0145f6288016
+  calibration_status: uncalibrated
+topologies:
+- name: variable_radius_sweeper_chain
+  order:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  turns: []
+target_lap_length_m: 285.0
+lap_length_range_m:
+- 260.0
+- 450.0
+split: train
+slot_id: train_specialist_sweeper_01
+parent_lineage: research_design.v2:lineage_94f06bdb3bc3e902bc4e8edf
+topology_family: variable_radius_sweeper_chain
+generation_mode: specialist
+target_family: sweeper
+minimum_target_exposure: 0.5
+expected_primary_families: 1
+minimum_family_exposure: 0.025
+maximum_family_exposure: 0.78
+connector_length_bounds_m:
+- 1.2
+- 114.0
+width:
+  left:
+  - - 0.0
+    - 0.75
+  - - 1.0
+    - 0.75
+  right:
+  - - 0.0
+    - 0.75
+  - - 1.0
+    - 0.75
+  maximum_gradient: 0.12
+candidate_budget: 1
+optimization_iterations: 80
+spacing_m: 0.12
+resolution_m_per_pixel: 0.06
+padding_m: 1.0
+seam_offset_m: 1.7
+maximum_supporting_fraction: 0.5
+minimum_primary_coverage: 0.5
+minimum_useful_corner_m: 0.6
+maximum_offset_curvature: 0.95
+objectives: {}
+limits:
+  minimum_radius_m: 0.5
+  minimum_usable_width_m: 0.7
+  maximum_curvature_rate_inv_m2: 2.0
+  footprint_margin_m: 0.02
+  minimum_nonlocal_boundary_gap_m: 0.1
+seed: 823073546676359849
+attempt: 1
+dataset_id: phase5_v2
+template_version: scaled_maneuver_inventory.v1
+layout_version: bounded_supporting_turns.v1
+assembly_method: bounded_supporting_turns.v1
+support_gap_m: 0.3
+minimum_target_active_fraction: 0.5
+design_version: research_design.v2
+achieved:
+  length_m: 284.99910087694013
+  minimum_radius_m: 6.601607522603158
+  minimum_width_m: 1.499998706033491
+  maximum_width_m: 1.5000012454660676
+  mean_width_m: 1.4999998933488368
+  sample_count: 2398
+files:
+  map: research_6c3bd68fccdee0ef8cadb1ee.yaml
+  image: research_6c3bd68fccdee0ef8cadb1ee.png
+  pgm: research_6c3bd68fccdee0ef8cadb1ee.pgm
+  centerline: research_6c3bd68fccdee0ef8cadb1ee_centerline.csv
+  walls: research_6c3bd68fccdee0ef8cadb1ee_walls.csv
+  track_profile: research_6c3bd68fccdee0ef8cadb1ee_track_profile.csv
+  metadata: research_6c3bd68fccdee0ef8cadb1ee_metadata.json

@@ -1,0 +1,233 @@
+schema_version: 1
+generator: map_editor.research_tracks.v1
+inventory:
+- name: chicane_1
+  family: chicane
+  parameters:
+    radius_m: 2.4992722129985587
+    lateral_displacement_m: 2.5601217558741745
+    separation_m: 0.25
+    transition_length_m: 0.65
+    direction: left_right
+  straight_after_m: 0.0
+- name: chicane_2
+  family: chicane
+  parameters:
+    radius_m: 2.478517040651884
+    lateral_displacement_m: 2.595001132780085
+    separation_m: 0.25
+    transition_length_m: 0.65
+    direction: left_right
+  straight_after_m: 0.0
+- name: chicane_3
+  family: chicane
+  parameters:
+    radius_m: 2.524917763306381
+    lateral_displacement_m: 2.436163639171758
+    separation_m: 0.25
+    transition_length_m: 0.65
+    direction: right_left
+  straight_after_m: 0.0
+- name: chicane_4
+  family: chicane
+  parameters:
+    radius_m: 2.485880299123965
+    lateral_displacement_m: 2.472820952022002
+    separation_m: 0.25
+    transition_length_m: 0.65
+    direction: left_right
+  straight_after_m: 0.0
+- name: chicane_5
+  family: chicane
+  parameters:
+    radius_m: 2.515654137683847
+    lateral_displacement_m: 2.588993234727824
+    separation_m: 0.25
+    transition_length_m: 0.65
+    direction: right_left
+  straight_after_m: 0.0
+- name: chicane_6
+  family: chicane
+  parameters:
+    radius_m: 2.497935292495859
+    lateral_displacement_m: 2.622090782030784
+    separation_m: 0.25
+    transition_length_m: 0.65
+    direction: left_right
+  straight_after_m: 0.0
+- name: chicane_7
+  family: chicane
+  parameters:
+    radius_m: 2.4586908412942363
+    lateral_displacement_m: 2.4456079061577656
+    separation_m: 0.25
+    transition_length_m: 0.65
+    direction: right_left
+  straight_after_m: 0.0
+- name: chicane_8
+  family: chicane
+  parameters:
+    radius_m: 2.5660139553052
+    lateral_displacement_m: 2.4768079773255165
+    separation_m: 0.25
+    transition_length_m: 0.65
+    direction: left_right
+  straight_after_m: 0.0
+- name: chicane_9
+  family: chicane
+  parameters:
+    radius_m: 2.4302974971034224
+    lateral_displacement_m: 2.5297159195015766
+    separation_m: 0.25
+    transition_length_m: 0.65
+    direction: right_left
+  straight_after_m: 0.0
+vehicle:
+  length_m: 0.5
+  width_m: 0.27
+  lf_m: 0.15875
+  lr_m: 0.17145
+  steering_min_rad: -0.523599
+  steering_max_rad: 0.523599
+  steering_rate_min_rad_s: -3.2
+  steering_rate_max_rad_s: 3.2
+  source: combined_slip.yaml
+  source_sha256: fb8bab7a7c49cb913c6adafbec84d4560e02d927087ff61956be0145f6288016
+  calibration_status: uncalibrated
+topologies:
+- name: count_budgeted_opposing_ring
+  order:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  turns:
+  - after_index: 0
+    angle_bounds_deg:
+    - 40.0
+    - 40.0
+    radius_m: 2.8
+    transition_m: 0.4
+  - after_index: 1
+    angle_bounds_deg:
+    - 40.0
+    - 40.0
+    radius_m: 2.8
+    transition_m: 0.4
+  - after_index: 2
+    angle_bounds_deg:
+    - 40.0
+    - 40.0
+    radius_m: 2.8
+    transition_m: 0.4
+  - after_index: 3
+    angle_bounds_deg:
+    - 40.0
+    - 40.0
+    radius_m: 2.8
+    transition_m: 0.4
+  - after_index: 4
+    angle_bounds_deg:
+    - 40.0
+    - 40.0
+    radius_m: 2.8
+    transition_m: 0.4
+  - after_index: 5
+    angle_bounds_deg:
+    - 40.0
+    - 40.0
+    radius_m: 2.8
+    transition_m: 0.4
+  - after_index: 6
+    angle_bounds_deg:
+    - 40.0
+    - 40.0
+    radius_m: 2.8
+    transition_m: 0.4
+  - after_index: 7
+    angle_bounds_deg:
+    - 40.0
+    - 40.0
+    radius_m: 2.8
+    transition_m: 0.4
+  - after_index: 8
+    angle_bounds_deg:
+    - 40.0
+    - 40.0
+    radius_m: 2.8
+    transition_m: 0.4
+target_lap_length_m: 90.0
+lap_length_range_m:
+- 70.0
+- 140.0
+split: train
+slot_id: train_specialist_chicane_02
+parent_lineage: research_design.v2:lineage_f9a30877e9ad79fad459d4f2
+topology_family: count_budgeted_opposing_ring
+generation_mode: specialist
+target_family: chicane
+minimum_target_exposure: 0.5
+expected_primary_families: 1
+minimum_family_exposure: 0.025
+maximum_family_exposure: 0.78
+connector_length_bounds_m:
+- 0.3
+- 36.0
+width:
+  left:
+  - - 0.0
+    - 0.75
+  - - 1.0
+    - 0.75
+  right:
+  - - 0.0
+    - 0.75
+  - - 1.0
+    - 0.75
+  maximum_gradient: 0.12
+candidate_budget: 1
+optimization_iterations: 80
+spacing_m: 0.12
+resolution_m_per_pixel: 0.06
+padding_m: 1.0
+seam_offset_m: 1.7
+maximum_supporting_fraction: 0.5
+minimum_primary_coverage: 0.5
+minimum_useful_corner_m: 0.6
+maximum_offset_curvature: 0.95
+objectives: {}
+limits:
+  minimum_radius_m: 0.5
+  minimum_usable_width_m: 0.7
+  maximum_curvature_rate_inv_m2: 2.0
+  footprint_margin_m: 0.02
+  minimum_nonlocal_boundary_gap_m: 0.1
+seed: 90236247394135080
+attempt: 1
+dataset_id: phase5_v2
+template_version: scaled_maneuver_inventory.v1
+layout_version: bounded_supporting_turns.v1
+assembly_method: bounded_supporting_turns.v1
+support_gap_m: 0.45
+minimum_target_active_fraction: 0.5
+design_version: research_design.v2
+achieved:
+  length_m: 89.99564160687368
+  minimum_radius_m: 2.429765497281905
+  minimum_width_m: 1.499998621329553
+  maximum_width_m: 1.5000012996220102
+  mean_width_m: 1.499999997163762
+  sample_count: 807
+files:
+  map: research_084202726c8201309f411987.yaml
+  image: research_084202726c8201309f411987.png
+  pgm: research_084202726c8201309f411987.pgm
+  centerline: research_084202726c8201309f411987_centerline.csv
+  walls: research_084202726c8201309f411987_walls.csv
+  track_profile: research_084202726c8201309f411987_track_profile.csv
+  metadata: research_084202726c8201309f411987_metadata.json

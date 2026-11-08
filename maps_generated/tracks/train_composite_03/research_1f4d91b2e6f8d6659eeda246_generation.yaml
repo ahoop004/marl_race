@@ -1,0 +1,126 @@
+schema_version: 1
+generator: map_editor.research_tracks.v1
+inventory:
+- name: chicane_1
+  family: chicane
+  parameters:
+    radius_m: 2.5536141838537874
+    lateral_displacement_m: 2.507412479861451
+    separation_m: 0.25
+    transition_length_m: 0.65
+    direction: left_right
+  straight_after_m: 0.0
+- name: s_curve_2
+  family: s_curve
+  parameters:
+    radii_m:
+    - 3.4939026390878443
+    - 3.773414850214872
+    turn_angle_rad: 0.8233650463991052
+    transition_length_m: 0.65
+    direction: left_right
+  straight_after_m: 0.0
+- name: straight_3
+  family: straight
+  parameters:
+    length_m: 28.503578469711748
+  straight_after_m: 0.0
+- name: hairpin_4
+  family: hairpin
+  parameters:
+    radius_m: 4.700273421019473
+    turn_angle_rad: 3.141592653589793
+    direction: left
+    entry_transition_m: 0.65
+    exit_transition_m: 0.65
+  straight_after_m: 0.0
+vehicle:
+  length_m: 0.5
+  width_m: 0.27
+  lf_m: 0.15875
+  lr_m: 0.17145
+  steering_min_rad: -0.523599
+  steering_max_rad: 0.523599
+  steering_rate_min_rad_s: -3.2
+  steering_rate_max_rad_s: 3.2
+  source: combined_slip.yaml
+  source_sha256: fb8bab7a7c49cb913c6adafbec84d4560e02d927087ff61956be0145f6288016
+  calibration_status: uncalibrated
+topologies:
+- name: controlled_halfturn_folded_4
+  order:
+  - 0
+  - 1
+  - 2
+  - 3
+  turns: []
+target_lap_length_m: 118.0
+lap_length_range_m:
+- 70.0
+- 140.0
+split: train
+slot_id: train_composite_03
+parent_lineage: research_design.v2:lineage_730a2b828cbd8b82c50974db
+topology_family: controlled_halfturn_folded_4
+generation_mode: composite
+target_family: null
+minimum_target_exposure: 0.6
+expected_primary_families: 4
+minimum_family_exposure: 0.025
+maximum_family_exposure: 0.78
+connector_length_bounds_m:
+- 0.3
+- 47.2
+width:
+  left:
+  - - 0.0
+    - 0.75
+  - - 1.0
+    - 0.75
+  right:
+  - - 0.0
+    - 0.75
+  - - 1.0
+    - 0.75
+  maximum_gradient: 0.12
+candidate_budget: 1
+optimization_iterations: 80
+spacing_m: 0.12
+resolution_m_per_pixel: 0.06
+padding_m: 1.0
+seam_offset_m: 1.7
+maximum_supporting_fraction: 0.4
+minimum_primary_coverage: 0.6
+minimum_useful_corner_m: 0.6
+maximum_offset_curvature: 0.95
+objectives: {}
+limits:
+  minimum_radius_m: 0.5
+  minimum_usable_width_m: 0.7
+  maximum_curvature_rate_inv_m2: 2.0
+  footprint_margin_m: 0.02
+  minimum_nonlocal_boundary_gap_m: 0.1
+seed: 1062587823046686745
+attempt: 3
+dataset_id: phase5_v2
+template_version: scaled_maneuver_inventory.v1
+layout_version: bounded_supporting_turns.v1
+assembly_method: controlled_halfturn.v1
+support_gap_m: 0.45
+minimum_target_active_fraction: 0.5
+design_version: research_design.v2
+achieved:
+  length_m: 117.99808731448313
+  minimum_radius_m: 2.5528944682636245
+  minimum_width_m: 1.4999989847855049
+  maximum_width_m: 1.5000013169087278
+  mean_width_m: 1.5000000164685336
+  sample_count: 1006
+files:
+  map: research_1f4d91b2e6f8d6659eeda246.yaml
+  image: research_1f4d91b2e6f8d6659eeda246.png
+  pgm: research_1f4d91b2e6f8d6659eeda246.pgm
+  centerline: research_1f4d91b2e6f8d6659eeda246_centerline.csv
+  walls: research_1f4d91b2e6f8d6659eeda246_walls.csv
+  track_profile: research_1f4d91b2e6f8d6659eeda246_track_profile.csv
+  metadata: research_1f4d91b2e6f8d6659eeda246_metadata.json
