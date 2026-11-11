@@ -4,14 +4,18 @@
 #SBATCH --account=q1wang
 #SBATCH --qos=normal
 #SBATCH --nodes=2
-#SBATCH --ntasks=2
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=64
+#SBATCH --ntasks=5
+#SBATCH --ntasks-per-node=4
+#SBATCH --cpus-per-task=8
 #SBATCH --gpus-per-task=1
-#SBATCH --mem=256G
+#SBATCH --mem=0
 #SBATCH --time=04:00:00
 #SBATCH --output=ppo-lora-20k-%j.out
 #SBATCH --error=ppo-lora-20k-%j.err
+# GPU nodes: 32 CPUs and four V100 GPUs each.
+# mem=0 requests each node's configured memory; no RAM capacity was supplied.
+# Five independent GPU tasks across two nodes, at most four per node.
+# Eight CPUs per task keep four concurrent tasks within a node's 32 CPUs.
 set -Eeuo pipefail
 
 REPO_DIR=${REPO_DIR:-"$HOME/marl_race"}
@@ -44,8 +48,8 @@ fi
 RUN_ROOT=$(cd "$RUN_ROOT" && pwd)
 exec 9>"$RUN_ROOT/.allocation.lock"
 flock -n 9 || { echo 'This experiment already has an active allocation' >&2; exit 3; }
-printf 'Root=%s; tasks=%s; nodes=%s; one independent learner per GPU\n' \
-  "$RUN_ROOT" "$SLURM_NTASKS" "$SLURM_JOB_NUM_NODES"
+printf 'Root=%s; tasks=%s; nodes=%s; CPUs/task=%s; one independent learner per GPU\n' \
+  "$RUN_ROOT" "$SLURM_NTASKS" "$SLURM_JOB_NUM_NODES" "$SLURM_CPUS_PER_TASK"
 printf 'Source=%s/source.pt; each family trains for 20000 episodes\n' "$RUN_ROOT"
 # No preflight, pilot, or evaluation jobs. Normal checkpoint compatibility
 # checks remain part of training initialization.
