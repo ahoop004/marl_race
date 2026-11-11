@@ -117,6 +117,7 @@ class TorchRLPPOAgent(PPOPolicy):
 
     @torch.no_grad()
     def sample_batch(self, observations, deterministic=False):
+        self._require_lora_source()
         observation = torch.as_tensor(observations, dtype=torch.float32, device=self.device)
         data = TensorDict({"observation": observation}, [len(observation)])
         with set_exploration_type(ExplorationType.MODE if deterministic else ExplorationType.RANDOM):
@@ -127,6 +128,7 @@ class TorchRLPPOAgent(PPOPolicy):
                             outputs[:, self.action_dim:2 * self.action_dim].copy(), outputs[:, -1])
 
     def update_rollouts(self, rollouts):
+        self._require_lora_source()
         # GAE must see each race's time axis independently, before flattening.
         self._append_rollouts(rollouts)
         if self._pending_steps < self.min_rollout_steps and not getattr(self, "distributed", None):

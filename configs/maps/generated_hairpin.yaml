@@ -1,0 +1,19 @@
+available:
+- tracks/train_specialist_hairpin_01/research_3322b6cdcf1cf78c0fdd6e48.yaml
+- tracks/train_specialist_hairpin_02/research_c1897ecc908ee72a08bccd25.yaml
+- tracks/train_specialist_hairpin_03/research_ee0efe728ea0c888544d5211.yaml
+- tracks/train_specialist_hairpin_04/research_05eadfe2f34912eed5a46a61.yaml
+- tracks/validation_specialist_hairpin_01/research_212c18f124aea89d32188039.yaml
+- tracks/test_specialist_hairpin_01/research_757314e0afd1ca87002d90d7.yaml
+train:
+- tracks/train_specialist_hairpin_01/research_3322b6cdcf1cf78c0fdd6e48.yaml
+- tracks/train_specialist_hairpin_02/research_c1897ecc908ee72a08bccd25.yaml
+- tracks/train_specialist_hairpin_03/research_ee0efe728ea0c888544d5211.yaml
+- tracks/train_specialist_hairpin_04/research_05eadfe2f34912eed5a46a61.yaml
+selection:
+- tracks/validation_specialist_hairpin_01/research_212c18f124aea89d32188039.yaml
+final_test:
+- tracks/test_specialist_hairpin_01/research_757314e0afd1ca87002d90d7.yaml
+cycle: per_episode
+pick: round_robin
+root: ${paths.project_root}/maps_generated

@@ -128,10 +128,9 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
         raise ValueError("This comparison requires --pretrained-actor or pretrained_actor_checkpoint for both training arms")
 
     if params.get("lora") is not None:
-        if algorithm != "mappo":
-            raise ValueError("LoRA is supported for MAPPO actor transfer only")
-        if pretrained_actor_path is None and not resume_path:
-            raise ValueError("LoRA training requires --pretrained-actor or pretrained_actor_checkpoint")
+        source = initial_checkpoint if algorithm == "ppo" else pretrained_actor_path
+        if source is None and not resume_path:
+            raise ValueError("LoRA training requires a source checkpoint or --resume")
 
     # --- Startup banner ---
     maps_raw = env_cfg.get(
@@ -187,7 +186,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
     if getattr(learner, "lora_config", None) is not None:
         trainable, total = counts["actor_trainable"], counts["actor_total"]
         console.print_info(f"LoRA mode={learner.lora_config['mode']} rank={learner.lora_config['rank']} "
-                           f"actor_trainable={trainable}/{total}; centralized critic fully trainable")
+                           f"actor_trainable={trainable}/{total}; critic fully trainable")
 
     if distributed:
         distributed.attach(learner)

@@ -1,0 +1,41 @@
+# @package _global_
+defaults:
+- /config
+- /training: historical_ppo
+- override /algorithm: ppo
+- override /scenario: solo_lap_completion
+- override /adaptation: scratch
+- override /maps: solo_pretrain
+- override /evaluation: solo_pretrain
+- override /execution: ppo_pretrain
+- _self_
+experiment:
+  name: ppo_circle_pretrain_20k
+  total_steps: null
+  episodes: 20000
+wandb:
+  logging:
+    profile: auto
+    groups:
+      train: true
+      eval: true
+      performance: true
+  enabled: true
+  project: marl-f110-complete
+  entity: ahoop004-old-dominion-university
+  name: null
+  group: ppo-lap-completion-pretrain
+  job_type: actor-pretraining
+  tags:
+  - ppo
+  - torchrl
+  - single-agent
+  - time-trial
+  - actor-pretraining
+  - mf61-planar
+  - f1tenth-gym-reference
+  - uncalibrated
+  notes: Fresh circle-track PPO under current physics; 20,000 completed training episodes,
+    seed 42, standard historical PPO optimization, 108-beam observations, one-lap episodes,
+    and the unchanged historical PPO collection setup (64 workers x 8 environments).
+  mode: online

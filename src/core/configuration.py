@@ -72,12 +72,12 @@ def materialize_configuration(config):
             require_pretrained_actor=adaptation["mode"] != "scratch",
             pretrained_actor_observation_extension=adaptation["observation_extension"],
         )
-        if adaptation["lora"] is not None:
-            config["training_defaults"]["lora"] = adaptation["lora"]
     elif adaptation["checkpoint"] is not None:
         config["experiment"].setdefault("checkpoint", adaptation["checkpoint"])
         if adaptation["observation_extension"] is not None:
             config["training_defaults"]["pretrained_observation_extension"] = adaptation["observation_extension"]
+    if adaptation["lora"] is not None:
+        config["training_defaults"]["lora"] = adaptation["lora"]
     config["training_defaults"] = OmegaConf.to_container(OmegaConf.merge(
         config["training_defaults"], explicit_params), resolve=True)
     checkpoint = config["experiment"].get("checkpoint")
@@ -167,9 +167,11 @@ def validate_configuration(config):
         raise ScenarioError("Fine-tuning requires adaptation.checkpoint")
     if adaptation["mode"] == "scratch" and (adaptation["checkpoint"] or adaptation["lora"]):
         raise ScenarioError("Scratch adaptation cannot specify a checkpoint or LoRA")
-    if adaptation["mode"] == "lora" and (algorithm["name"] != "mappo"
-            or actor.get("parameter_sharing") != "shared" or not adaptation["lora"]):
-        raise ScenarioError("LoRA requires MAPPO with a shared actor and per-agent adapters")
+    if adaptation["mode"] == "lora" and not adaptation["lora"]:
+        raise ScenarioError("LoRA requires adapter settings")
+    if (adaptation["mode"] == "lora" and algorithm["name"] == "mappo"
+            and actor.get("parameter_sharing") != "shared"):
+        raise ScenarioError("MAPPO LoRA requires a shared actor and per-agent adapters")
     if adaptation["mode"] != "lora" and adaptation["lora"] is not None:
         raise ScenarioError("LoRA settings require adaptation=lora")
     if adaptation["lora"] is not None:
@@ -178,8 +180,9 @@ def validate_configuration(config):
             lora = resolve_lora_config(adaptation["lora"])
         except ValueError as exc:
             raise ScenarioError(str(exc)) from exc
-        if lora["mode"] != "per_agent":
-            raise ScenarioError("LoRA requires per_agent adapters")
+        expected_mode = "shared" if algorithm["name"] == "ppo" else "per_agent"
+        if lora["mode"] != expected_mode:
+            raise ScenarioError(f"{algorithm['name'].upper()} LoRA requires {expected_mode} adapters")
     for key in ("train", "selection", "final_test"):
         value = config["maps"].get(key)
         if not isinstance(value, list) or not value or any(not isinstance(v, str) or not v for v in value):

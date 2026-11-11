@@ -248,7 +248,7 @@ def test_adaptation_choices_do_not_change_the_task(adaptation):
 @pytest.mark.parametrize("path,override,message", [
     (TEAM, "algorithm=ppo", "PPO completion experiments require one vehicle"),
     (PRETRAIN, "algorithm=mappo", "Unsupported evaluation selection strategy"),
-    (PRETRAIN, "adaptation=lora", "LoRA requires MAPPO"),
+    (PRETRAIN, "adaptation=lora", "PPO LoRA requires shared adapters"),
     (PRETRAIN, "network.architecture=cnn", "Unsupported network architecture"),
     (PRETRAIN, "network.encoder=cnn", "Unsupported observation encoder"),
     (PRETRAIN, "network.actor.distribution=normal", "tanh_normal"),

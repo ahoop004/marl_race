@@ -1,0 +1,19 @@
+available:
+- tracks/train_specialist_chicane_01/research_8da11d3a4c5a97fc9e3bcd94.yaml
+- tracks/train_specialist_chicane_02/research_084202726c8201309f411987.yaml
+- tracks/train_specialist_chicane_03/research_f68b51331397a9fed1b1d110.yaml
+- tracks/train_specialist_chicane_04/research_a932e93f3826af391dac052e.yaml
+- tracks/validation_specialist_chicane_01/research_bd1cf4b51835233501660f4f.yaml
+- tracks/test_specialist_chicane_01/research_908a4bf7413dff6f283a7221.yaml
+train:
+- tracks/train_specialist_chicane_01/research_8da11d3a4c5a97fc9e3bcd94.yaml
+- tracks/train_specialist_chicane_02/research_084202726c8201309f411987.yaml
+- tracks/train_specialist_chicane_03/research_f68b51331397a9fed1b1d110.yaml
+- tracks/train_specialist_chicane_04/research_a932e93f3826af391dac052e.yaml
+selection:
+- tracks/validation_specialist_chicane_01/research_bd1cf4b51835233501660f4f.yaml
+final_test:
+- tracks/test_specialist_chicane_01/research_908a4bf7413dff6f283a7221.yaml
+cycle: per_episode
+pick: round_robin
+root: ${paths.project_root}/maps_generated

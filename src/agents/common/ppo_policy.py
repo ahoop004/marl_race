@@ -30,6 +30,11 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         *, training: bool = False,
     ) -> None:
         self.agent_ids = list(params.get("_agent_ids", ["policy"]))
+        from agents.common.lora import resolve_lora_config
+        self.lora_config = resolve_lora_config(params.get("lora"))
+        if self.lora_config and (self.lora_config["mode"] != "shared" or len(self.agent_ids) != 1):
+            raise ValueError("PPO LoRA requires one policy agent and mode=shared")
+        self._lora_ready = self.lora_config is None
         self.source_checkpoint = None
         self.obs_dim = obs_dim
         self.action_low = np.asarray(action_low, dtype=np.float32)
@@ -68,9 +73,23 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         ).to(self.device)
         self.critic = build_critic(obs_dim, self.network_config,
                                    observation_contract=self.observation_contract).to(self.device)
+        # Initialize the critic before adapters to preserve seeded controls.
+        self.lora_contract = None
+        if self.lora_config is not None:
+            from agents.common.networks import route_actor
+            self.actor = route_actor(self.actor, self.agent_ids, lora_config=self.lora_config).to(self.device)
+            self.lora_contract = {
+                "version": 1, **self.lora_config, **self.actor.adaptation_contract(),
+                "target_layers": self.actor.target_layers,
+                "agent_to_adapter": {aid: 0 for aid in self.agent_ids},
+            }
         from agents.common.compilation import configure_compilation
         configure_compilation(self, params.get("compile_networks", False))
         self.build_optimizer((*self.actor.parameters(), *self.critic.parameters()), training=training)
+
+    def _require_lora_source(self):
+        if not self._lora_ready:
+            raise ValueError("LoRA requires a pretrained PPO source or matching PPO LoRA checkpoint before use")
 
     @torch.no_grad()
     def value_batch(self, observations: np.ndarray) -> np.ndarray:
@@ -83,6 +102,7 @@ class PPOPolicy(OnPolicyOptimizationSettings):
     @torch.no_grad()
     def predict(self, obs: np.ndarray) -> np.ndarray:
         """Return a deterministic evaluation action without evaluating the critic."""
+        self._require_lora_source()
         obs_t = torch.as_tensor(np.asarray(obs)[None], dtype=torch.float32, device=self.device)
         actions, _ = self.actor.get_action(obs_t, deterministic=True)
         return actions[0].cpu().numpy()
@@ -102,6 +122,7 @@ class PPOPolicy(OnPolicyOptimizationSettings):
 
     @torch.no_grad()
     def sample_batch(self, observations: np.ndarray, deterministic: bool = False):
+        self._require_lora_source()
         obs_t = torch.as_tensor(observations, dtype=torch.float32, device=self.device)
         actions, log_probs, raw_actions = self.actor.get_action(
             obs_t, deterministic=deterministic, return_raw=True

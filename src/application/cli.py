@@ -89,7 +89,9 @@ def apply_cli_overrides(scenario: dict, args: argparse.Namespace) -> dict:
     if checkpoint:
         scenario["experiment"]["checkpoint"] = str(source_path(checkpoint))
         if not getattr(args, "eval", False) and scenario.get("algorithm", {}).get("name") == "ppo":
-            scenario["adaptation"].update(mode="full_finetune", checkpoint=str(source_path(checkpoint)))
+            scenario["adaptation"]["checkpoint"] = str(source_path(checkpoint))
+            if scenario["adaptation"]["mode"] == "scratch":
+                scenario["adaptation"]["mode"] = "full_finetune"
     if pretrained_actor and scenario.get("algorithm", {}).get("name") == "mappo":
         checkpoint = str(source_path(pretrained_actor))
         scenario["training_defaults"]["pretrained_actor_checkpoint"] = checkpoint

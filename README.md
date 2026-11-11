@@ -43,6 +43,88 @@ python run.py --scenario scenarios/mappo_2v2_completion_lora.yaml \
   --pretrained-actor outputs/pretrain/best.pt \
   --output-dir outputs/mappo_lora
 
+## Circle PPO pretraining for 20,000 episodes on HPC
+
+`scenarios/ppo_circle_pretrain_20k.yaml` keeps the usual circle-track task,
+network, PPO settings, 64 workers × 8 environments, CUDA learning, CPU collection,
+and W&B logging. Its budget is 20,000 completed training episodes instead of
+120M decisions. The linear learning-rate schedule follows the episode budget.
+Parallel collection can finish a few additional episodes in its final batch.
+
+Submit from the repository on the HPC login node:
+
+```bash
+sbatch --chdir="$PWD" scripts/hpc/ppo_circle_pretrain_20k.sbatch
+```
+
+The job uses the existing reserved partition, QoS, node, and container environment
+from the other PPO launchers. Override Slurm resources at submission if required
+by the cluster. Checkpoints and logs are saved in
+`pretrained_models/circle_ppo_seed42_20k/`. On successful completion, the selected
+`best.pt` is atomically copied to `pretrained_models/mlp_base_ppo_seed42_best.pt`.
+The run's `final.pt` and resumable `latest.pt` remain in its directory.
+
+To recover the same run after a walltime limit or interruption:
+
+```bash
+RESUME=1 sbatch --export=ALL --chdir="$PWD" scripts/hpc/ppo_circle_pretrain_20k.sbatch
+```
+
+`REPO_DIR`, `ENV_PATH`, `CRUN`, and `RUN_DIR` may be overridden in the submission
+environment. A fresh submission refuses to overwrite an existing run directory.
+
+## Solo PPO adaptation on generated maps
+
+`scenarios/ppo_generated_lora.yaml` trains one shared actor-head adapter against
+an immutable PPO base. Hidden linear layers receive low-rank residuals; the
+base head and driving encoder stay frozen. The local critic is initialized from
+the source and fully trained. Exploration (`log_std`) is trainable by default;
+set `adaptation.lora.train_log_std=false` to freeze it. Rank and alpha default to 4.
+The existing MAPPO per-agent LoRA preset remains separate.
+
+```bash
+# One independent adapter run for each map family, using the same base checkpoint.
+for family in straight sweeper hairpin chicane s_curve; do
+  python run.py --scenario scenarios/ppo_generated_lora.yaml \
+    --checkpoint /absolute/path/to/pretrained/best.pt \
+    --set maps=generated_${family} \
+    --output-dir outputs/ppo_lora_${family}
+done
+
+# Full fine-tuning control across all generated training maps.
+python run.py --scenario scenarios/ppo_generated_finetune.yaml \
+  --checkpoint /absolute/path/to/pretrained/best.pt \
+  --output-dir outputs/ppo_generated_finetune
+```
+
+`maps=generated` retains the frozen 40/8/12 train/validation/test split.
+Each family preset uses four training maps, one validation map, and one test
+map. Training cycles round-robin through training maps; checkpoint selection
+uses validation maps. Match the map preset, seeds, budget, and task settings
+between adaptation methods. Scenarios default to 4,096,000 decisions, constant
+learning rate 0.0001, five target laps, and W&B disabled. These are starting
+settings, not tuned budgets.
+
+Saved LoRA checkpoints include the base actor, adapters, critic, and source
+identity. Evaluation reconstructs the adapter from checkpoint metadata; the
+original source file is not needed to evaluate or resume. Automatic switching
+between family adapters and adapter-only exports are not implemented.
+
+```bash
+python run.py --scenario scenarios/ppo_generated_lora.yaml \
+  --set maps=generated_straight --resume outputs/ppo_lora_straight
+
+python run.py --scenario scenarios/ppo_generated_lora.yaml \
+  --set maps=generated_straight --eval --eval-protocol final \
+  --checkpoint outputs/ppo_lora_straight \
+  --output-dir outputs/ppo_lora_straight_test
+```
+
+Before a research run, validate the actual pretrained checkpoint against the
+current network, physics, action, and observation contracts, and assess generated
+track drivability. Geometric validation alone does not establish drivability.
+A short run with a synthetic source checks integration, not learned performance.
+
 PPO pretraining and all four MAPPO completion scenarios share the historical PPO
 training setup in `configs/training/historical_ppo.yaml`: 64 workers with 8
 environments each, 4,096 collector frames per batch, 409,600 learner samples per

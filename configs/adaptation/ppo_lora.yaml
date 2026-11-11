@@ -1,0 +1,12 @@
+mode: lora
+checkpoint: ${paths.pretrained_checkpoint}
+load_scope: ${algorithm.transfer_scope}
+actor_sharing: independent
+observation_extension: ${algorithm.observation_extension}
+lora:
+  target: actor_head
+  mode: shared
+  rank: 4
+  alpha: 4.0
+  train_log_std: true
+  per_agent_log_std: false

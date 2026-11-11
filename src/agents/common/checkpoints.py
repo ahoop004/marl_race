@@ -138,7 +138,8 @@ def _validate_models(policy, checkpoint, *, critic=False):
     validate_checkpoint_compatibility(stored["adaptation"], {"lora": expected["adaptation"]["lora"]})
     if getattr(policy, "lora_config", None):
         source = stored["adaptation"]["source_checkpoint"]
-        if (not isinstance(source, dict) or source.get("algorithm") != "ppo" or source.get("scope") != "actor_only"
+        source_scope = "actor_and_critic" if policy.algorithm == "ppo" else "actor_only"
+        if (not isinstance(source, dict) or source.get("algorithm") != "ppo" or source.get("scope") != source_scope
                 or not isinstance(source.get("path"), str) or not source["path"]
                 or not isinstance(source.get("sha256"), str) or len(source["sha256"]) != 64
                 or any(c not in "0123456789abcdef" for c in source["sha256"])):
@@ -219,15 +220,15 @@ def solo_evaluation_actor(checkpoint, spec, params, agent_id):
             for aid in ids}})
     routing = evaluation_routing(checkpoint)
     lora = routing["lora"]
-    if algorithm == "ppo" and lora:
-        raise ValueError("PPO solo evaluation cannot load MAPPO adapters")
+    if algorithm == "ppo" and lora and lora["mode"] != "shared":
+        raise ValueError("PPO LoRA requires mode=shared")
     dims = [contracts["observations"][aid]["dim"] for aid in ids]
     with torch.device("meta"):
         template = build_actor(max(dims), contracts["actions"]["dim"], network,
                                observation_contracts={aid: contracts["observations"][aid]["contract"] for aid in ids})
-        if algorithm == "mappo":
-            template = route_actor(template, ids, actor_mode=mode, lora_config=lora,
-                                   input_dims=dims if lora and lora["mode"] == "per_agent" else None)
+        if algorithm == "mappo" or lora:
+            template = route_actor(template, ids, actor_mode="shared" if algorithm == "ppo" else mode,
+                                   lora_config=lora, input_dims=dims if lora and lora["mode"] == "per_agent" else None)
     validate_checkpoint_compatibility(checkpoint, {}, states=[("actor", checkpoint["models"]["actor"], template.state_dict())])
     if lora:
         expected_lora = {"version": 1, **template.config, **template.adaptation_contract(),
@@ -237,7 +238,9 @@ def solo_evaluation_actor(checkpoint, spec, params, agent_id):
             expected_lora["observation_dims"] = dict(zip(ids, dims))
         validate_checkpoint_compatibility(stored["adaptation"], {"lora": expected_lora})
         source = stored["adaptation"]["source_checkpoint"]
-        if (not isinstance(source, dict) or source.get("algorithm") != "ppo" or source.get("scope") != "actor_only"
+        source_scope = "actor_and_critic" if algorithm == "ppo" else "actor_only"
+        if (not isinstance(source, dict) or source.get("algorithm") != "ppo" or source.get("scope") != source_scope
+                or not isinstance(source.get("path"), str) or not source["path"]
                 or not isinstance(source.get("sha256"), str) or len(source["sha256"]) != 64
                 or any(c not in "0123456789abcdef" for c in source["sha256"])):
             raise ValueError("LoRA solo evaluation requires a valid PPO source identity")
@@ -376,6 +379,8 @@ def initialize_from_checkpoint(policy, path, *, scope, observation_extension=Non
     """Validate and prepare all model states before applying a fresh transfer."""
     if scope not in {"actor_only", "actor_and_critic"}:
         raise ValueError("Transfer scope must be actor_only or actor_and_critic")
+    if policy.algorithm == "ppo" and getattr(policy, "lora_config", None) and scope != "actor_and_critic":
+        raise ValueError("PPO LoRA transfer requires actor_and_critic loading")
     if policy.optimizer is not None and policy.optimizer.state:
         raise ValueError("Transfer requires a fresh learner; use resume_training to continue an existing experiment")
     checkpoint = read_checkpoint(path)

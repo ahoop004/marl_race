@@ -133,10 +133,10 @@ def test_independent_heads_activations_and_centralized_critic_inputs(actor, crit
 
 
 @pytest.mark.parametrize("actor,critic", [("resmlp", "mlp"), ("mlp", "resmlp"), ("resmlp", "resmlp")])
-@pytest.mark.parametrize("algorithm", ["ppo", "mappo_shared", "mappo_independent", "mappo_lora"])
+@pytest.mark.parametrize("algorithm", ["ppo", "ppo_lora", "mappo_shared", "mappo_independent", "mappo_lora"])
 def test_native_cpu_updates_checkpoint_evaluation_and_resume(actor, critic, algorithm, tmp_path):
     raw = network(actor, critic)
-    if algorithm == "mappo_lora":
+    if algorithm in {"ppo_lora", "mappo_lora"}:
         PPOPolicy(1, *BOUNDS, {"network": raw}).save_checkpoint(tmp_path / "source.pt")
 
     class Stop(Capture):
@@ -146,8 +146,12 @@ def test_native_cpu_updates_checkpoint_evaluation_and_resume(actor, critic, algo
 
     def construct(stop=False):
         hook = Stop(False) if stop else Capture(False)
-        if algorithm == "ppo":
-            return ppo_trainer(hook, network=raw, n_epochs=1)
+        if algorithm in {"ppo", "ppo_lora"}:
+            options = {"lora": {"mode": "shared", "rank": 1}} if algorithm == "ppo_lora" else {}
+            result = ppo_trainer(hook, network=raw, n_epochs=1, **options)
+            if stop and algorithm == "ppo_lora":
+                result[0].agent.initialize_from_checkpoint(tmp_path / "source.pt", scope="actor_and_critic")
+            return result
         task = team_task({3: ((), True, (), (*IDS, "car_2", "car_3"))})
         options = mappo_params(network=raw, n_steps=8, actor_mode=algorithm.removeprefix("mappo_"))
         if algorithm == "mappo_lora":

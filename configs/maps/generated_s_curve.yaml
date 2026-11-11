@@ -1,0 +1,19 @@
+available:
+- tracks/train_specialist_s_curve_01/research_838e0417b1e79c93c0c5e719.yaml
+- tracks/train_specialist_s_curve_02/research_e9f7cd3350b19cf7637e05a3.yaml
+- tracks/train_specialist_s_curve_03/research_50e899d4e537dedae4927389.yaml
+- tracks/train_specialist_s_curve_04/research_3d9b74389afa42f92095c9d8.yaml
+- tracks/validation_specialist_s_curve_01/research_1558b2e2ebdf3718f3583313.yaml
+- tracks/test_specialist_s_curve_01/research_1b21ea56967cf03a26b71275.yaml
+train:
+- tracks/train_specialist_s_curve_01/research_838e0417b1e79c93c0c5e719.yaml
+- tracks/train_specialist_s_curve_02/research_e9f7cd3350b19cf7637e05a3.yaml
+- tracks/train_specialist_s_curve_03/research_50e899d4e537dedae4927389.yaml
+- tracks/train_specialist_s_curve_04/research_3d9b74389afa42f92095c9d8.yaml
+selection:
+- tracks/validation_specialist_s_curve_01/research_1558b2e2ebdf3718f3583313.yaml
+final_test:
+- tracks/test_specialist_s_curve_01/research_1b21ea56967cf03a26b71275.yaml
+cycle: per_episode
+pick: round_robin
+root: ${paths.project_root}/maps_generated

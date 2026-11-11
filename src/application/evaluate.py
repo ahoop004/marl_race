@@ -136,8 +136,7 @@ def _run_evaluation(
     metadata = checkpoint_payload["metadata"]
     checkpoint_steps = metadata["progress"].get("environment_steps")
     stored_provenance = metadata["provenance"]
-    if algorithm == "mappo":
-        params.update(evaluation_routing(checkpoint_payload))
+    params.update(evaluation_routing(checkpoint_payload))
     if solo_actor:
         from agents.common.checkpoints import solo_evaluation_actor
         agent = solo_evaluation_actor(checkpoint_payload, spec, params, solo_actor)

@@ -1,0 +1,19 @@
+available:
+- tracks/train_specialist_straight_01/research_e7462d68942ebaadb6e1893a.yaml
+- tracks/train_specialist_straight_02/research_b22affaf48642f49b60dbf1e.yaml
+- tracks/train_specialist_straight_03/research_7a7b659973c3db7b3b878633.yaml
+- tracks/train_specialist_straight_04/research_ff8352ebdd2aaded559cfce0.yaml
+- tracks/validation_specialist_straight_01/research_e2ccd7b7b4b697e56bd54d33.yaml
+- tracks/test_specialist_straight_01/research_dbd46a8f7ef1effd0431f9f0.yaml
+train:
+- tracks/train_specialist_straight_01/research_e7462d68942ebaadb6e1893a.yaml
+- tracks/train_specialist_straight_02/research_b22affaf48642f49b60dbf1e.yaml
+- tracks/train_specialist_straight_03/research_7a7b659973c3db7b3b878633.yaml
+- tracks/train_specialist_straight_04/research_ff8352ebdd2aaded559cfce0.yaml
+selection:
+- tracks/validation_specialist_straight_01/research_e2ccd7b7b4b697e56bd54d33.yaml
+final_test:
+- tracks/test_specialist_straight_01/research_dbd46a8f7ef1effd0431f9f0.yaml
+cycle: per_episode
+pick: round_robin
+root: ${paths.project_root}/maps_generated

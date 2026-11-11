@@ -1,0 +1,19 @@
+available:
+- tracks/train_specialist_sweeper_01/research_6c3bd68fccdee0ef8cadb1ee.yaml
+- tracks/train_specialist_sweeper_02/research_9295682fb24231e375f73b1f.yaml
+- tracks/train_specialist_sweeper_03/research_c70337cc54b291a78d4e9b8f.yaml
+- tracks/train_specialist_sweeper_04/research_7fd754abf4c994b1c837a053.yaml
+- tracks/validation_specialist_sweeper_01/research_7127722e7215f8eb0988778e.yaml
+- tracks/test_specialist_sweeper_01/research_7a92b73a3a90aa9cb823d6d0.yaml
+train:
+- tracks/train_specialist_sweeper_01/research_6c3bd68fccdee0ef8cadb1ee.yaml
+- tracks/train_specialist_sweeper_02/research_9295682fb24231e375f73b1f.yaml
+- tracks/train_specialist_sweeper_03/research_c70337cc54b291a78d4e9b8f.yaml
+- tracks/train_specialist_sweeper_04/research_7fd754abf4c994b1c837a053.yaml
+selection:
+- tracks/validation_specialist_sweeper_01/research_7127722e7215f8eb0988778e.yaml
+final_test:
+- tracks/test_specialist_sweeper_01/research_7a92b73a3a90aa9cb823d6d0.yaml
+cycle: per_episode
+pick: round_robin
+root: ${paths.project_root}/maps_generated
