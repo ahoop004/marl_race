@@ -73,6 +73,70 @@ RESUME=1 sbatch --export=ALL --chdir="$PWD" scripts/hpc/ppo_circle_pretrain_20k.
 `REPO_DIR`, `ENV_PATH`, `CRUN`, and `RUN_DIR` may be overridden in the submission
 environment. A fresh submission refuses to overwrite an existing run directory.
 
+## Concurrent HPC LoRA family training: 20,000 episodes each
+
+`scenarios/ppo_generated_lora_20k.yaml` uses one independent adapter for each of
+straight, sweeper, hairpin, chicane, and S-curve tracks. Every family trains for
+20,000 completed episodes from the same frozen circle PPO checkpoint. Each run
+keeps 64 CPU collector workers × 8 environments, CUDA learning, CPU collection,
+the historical PPO rollout/update settings, rank/alpha 4, and the adaptation
+learning rate of 0.0001. W&B logging is enabled. Training-time evaluation is
+disabled; no preflight or pilot runs are submitted. Normal compatibility checks
+still run when the trainer loads its checkpoint.
+
+From the HPC repository, submit:
+
+```bash
+sbatch --chdir="$PWD" scripts/hpc/ppo_lora_families_20k.sbatch
+```
+
+Default resources are two nodes, one GPU and 64 CPUs per node, with a four-hour
+walltime on the existing public GPU partition/account/QoS. Two families run
+concurrently; remaining families are assigned to those GPU tasks in sequence.
+These are separate policies and optimizers, without cross-GPU gradient sharing.
+Override Slurm resources to increase concurrency, subject to cluster capacity.
+For example, run all five families concurrently on five nodes:
+
+```bash
+sbatch --chdir="$PWD" --nodes=5 --ntasks=5 --ntasks-per-node=1 \
+  scripts/hpc/ppo_lora_families_20k.sbatch
+```
+
+To use multiple GPUs on each node, allocate one task per GPU and 64 CPUs per task:
+
+```bash
+sbatch --chdir="$PWD" --nodes=2 --ntasks=4 --ntasks-per-node=2 \
+  scripts/hpc/ppo_lora_families_20k.sbatch
+```
+
+That allocation requires 128 CPUs and two GPUs per node; the default 256 GB
+memory request is per node. Change `--time` only to a limit supported by the
+selected partition/QoS. The standard task and algorithm settings are preserved:
+five target laps, up to 80,000 steps per episode, with track-limit termination.
+Parallel collection may overshoot the episode target in its final batch.
+
+The source defaults to `pretrained_models/mlp_base_ppo_seed42_best.pt` and is
+copied once to `outputs/ppo_lora_20k_JOBID/source.pt`. Override
+`SOURCE_CHECKPOINT` and/or `RUN_ROOT` in the submission environment if needed.
+Each family directory contains `train.log`, native CSV/physics logs, W&B
+provenance, `latest.pt`, and `final.pt` (base + adapter + critic). Evaluation is
+disabled, so there is no selected `best.pt`. Checkpoints stay separate from the
+original pretrained model.
+
+Recover unfinished families after interruption or walltime expiry:
+
+```bash
+RUN_ROOT="$PWD/outputs/ppo_lora_20k_JOBID" RESUME=1 \
+  sbatch --export=ALL --chdir="$PWD" scripts/hpc/ppo_lora_families_20k.sbatch
+```
+
+Resume retains the frozen source snapshot and skips completed families. Families
+with `latest.pt` recover from that checkpoint; any family with no recovery
+checkpoint restarts from the base. Keep code, training settings, seeds, dataset,
+and output location unchanged when resuming. Concurrency can be changed because
+the family jobs are independent. `REPO_DIR`, `ENV_PATH`, and `CRUN` use the same
+override conventions as the other HPC launchers.
+
 ## Solo PPO adaptation on generated maps
 
 `scenarios/ppo_generated_lora.yaml` trains one shared actor-head adapter against

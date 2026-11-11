@@ -1,0 +1,52 @@
+# @package _global_
+defaults:
+- /config
+- /training: historical_ppo
+- override /algorithm: ppo
+- override /scenario: solo_lap_completion
+- override /adaptation: ppo_lora
+- override /maps: generated
+- override /evaluation: solo_transfer
+- override /execution: ppo_transfer
+- override /reward: solo_transfer
+- _self_
+experiment:
+  name: ppo_generated_lora_20k
+  total_steps: null
+  episodes: 20000
+wandb:
+  logging:
+    profile: auto
+    groups:
+      train: true
+      eval: true
+      performance: true
+  enabled: true
+  project: marl-f110-complete
+  entity: ahoop004-old-dominion-university
+  name: null
+  group: ppo-generated-adaptation
+  job_type: lora
+  tags:
+  - ppo
+  - torchrl
+  - single-agent
+  - lap-completion
+  - generated-maps
+  - lora
+  notes: Independent family adapter; frozen PPO base, trainable local critic, 20000 training episodes, no evaluation runs.
+  mode: online
+environment:
+  target_laps: 5
+  track_limits:
+    enabled: true
+    terminate: true
+  terminate_on_collision: false
+algorithm:
+  params:
+    learning_rate: 0.0001
+    lr_schedule: constant
+    learning_rate_end: null
+
+evaluation:
+  enabled: false
