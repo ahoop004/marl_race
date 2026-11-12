@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=ppo-lora-20k
-#SBATCH --partition=gpu
+#SBATCH --partition=reserved-q1wang
 #SBATCH --account=q1wang
-#SBATCH --qos=normal
-#SBATCH --nodes=2
-#SBATCH --ntasks=5
+#SBATCH --qos=q1wang
+#SBATCH --nodes=1
+#SBATCH --ntasks=4
 #SBATCH --ntasks-per-node=4
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=16
 #SBATCH --gpus-per-task=1
 #SBATCH --mem=0
 #SBATCH --time=04:00:00
 #SBATCH --output=ppo-lora-20k-%j.out
 #SBATCH --error=ppo-lora-20k-%j.err
-# GPU nodes: 32 CPUs and four V100 GPUs each.
-# mem=0 requests each node's configured memory; no RAM capacity was supplied.
-# Five independent GPU tasks across two nodes, at most four per node.
-# Eight CPUs per task keep four concurrent tasks within a node's 32 CPUs.
+# One reserved node: 64 CPUs shared by four independent single-GPU tasks.
+# Each task receives 16 CPUs and one GPU; the fifth family follows on task 0.
+# mem=0 requests the node's configured memory.
 set -Eeuo pipefail
 
 REPO_DIR=${REPO_DIR:-"$HOME/marl_race"}

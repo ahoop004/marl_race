@@ -90,24 +90,22 @@ From the HPC repository, submit:
 sbatch --chdir="$PWD" scripts/hpc/ppo_lora_families_20k.sbatch
 ```
 
-Default resources are two nodes and five GPU tasks, with at most four tasks per
-node. Each node has 32 CPUs and four V100 GPUs; each task receives one GPU and
-eight CPUs. All five map-family adapters run concurrently, using five GPUs total
-across the two nodes. The remaining three GPUs are not requested. These are
-separate policies and optimizers, without cross-GPU gradient sharing.
+Default resources are one node on `reserved-q1wang`, using account and QoS
+`q1wang`, with 64 CPUs and four GPUs total. Four independent adapter tasks each
+receive one GPU and 16 CPUs. Straight, sweeper, hairpin, and chicane run
+concurrently; the straight task runs the S-curve family after straight finishes.
+These are separate policies and optimizers, without cross-GPU gradient sharing.
 
-`--ntasks-per-node=4` is the per-node maximum with the explicit five-task budget.
-The launcher uses `--mem=0` to request each allocated node's configured memory
-rather than assume a 256 GB capacity. The historical collector layout remains
-64 workers × 8 environments per adapter; these workers share the adapter's eight
-allocated CPUs, so CPU collection is oversubscribed. The collector layout has not
-been retuned. PPO settings and episode budgets are unchanged.
+The launcher uses `--mem=0` to request the node's configured memory. The
+historical collector layout remains 64 workers × 8 environments per adapter;
+these workers share the adapter's 16 allocated CPUs, so CPU collection remains
+oversubscribed. The collector layout has not been retuned. PPO settings and
+episode budgets are unchanged.
 
-The default walltime is four hours on the existing public GPU
-partition/account/QoS. Change `--time` only to a limit supported by the selected
-partition/QoS. The standard task settings are five target laps, up to 80,000 steps
-per episode, with track-limit termination. Parallel collection may overshoot the
-episode target in its final batch.
+The default walltime is four hours. Change `--time` only to a limit supported by
+the reserved partition/QoS. The standard task settings are five target laps, up
+to 80,000 steps per episode, with track-limit termination. Parallel collection
+may overshoot the episode target in its final batch.
 
 The source defaults to `pretrained_models/mlp_base_ppo_seed42_best.pt` and is
 copied once to `outputs/ppo_lora_20k_JOBID/source.pt`. Override
