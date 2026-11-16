@@ -29,6 +29,23 @@ def _historical_event_predicates(config: dict) -> bool:
     return semantics == "f110_71a3e0f"
 
 
+def _episode_failure(step_info: dict) -> Optional[str]:
+    """Failure precedence for the opt-in generated-track reward protocol."""
+    info = step_info.get("info") or {}
+    reason = info.get("terminal_reason")
+    if info.get("collision_event") or info.get("collision") or reason == "collision":
+        return "collision"
+    if (info.get("boundary_event") or (info.get("track_limits") or {}).get("exceeded")
+            or reason == "track_boundary"):
+        return "boundary"
+    if reason in {"time_limit", "no_progress"}:
+        return reason
+    if (step_info.get("truncated") or ((step_info.get("done") or step_info.get("terminated"))
+            and not (info.get("race_completed") and reason in (None, "race_complete")))):
+        return "failure"
+    return None
+
+
 class ProgressDeltaBonusComponent(RewardComponent):
     """Signed progress with optional exclusive boundary/collision costs."""
 
@@ -41,6 +58,13 @@ class ProgressDeltaBonusComponent(RewardComponent):
             raise ValueError("Progress units must be lap_fraction or metres")
         self.boundary_penalty = config.get("boundary_penalty")
         self.collision_penalty = config.get("collision_penalty")
+        self.failure_penalty = config.get("failure_penalty")
+        if self.failure_penalty is not None:
+            self.failure_penalty = float(self.failure_penalty)
+            if not math.isfinite(self.failure_penalty) or self.failure_penalty >= 0:
+                raise ValueError("failure_penalty must be finite and negative")
+            if self._historical_events or self.boundary_penalty is not None or self.collision_penalty is not None:
+                raise ValueError("failure_penalty replaces current boundary/collision penalties")
         self.collision_penalty_once_per_contact = config.get("collision_penalty_once_per_contact", False)
         if not isinstance(self.collision_penalty_once_per_contact, bool):
             raise ValueError("collision_penalty_once_per_contact must be boolean")
@@ -50,9 +74,17 @@ class ProgressDeltaBonusComponent(RewardComponent):
 
     def reset(self) -> None:
         self._collision_active = False
+        self._failure_paid = False
 
     def compute(self, step_info: dict) -> Dict[str, float]:
         info = step_info.get("info") or {}
+        if self.failure_penalty is not None:
+            failure = _episode_failure(step_info)
+            if failure is not None:
+                if self._failure_paid:
+                    return {}
+                self._failure_paid = True
+                return {f"progress_delta/{failure}": self.failure_penalty}
         if self.collision_penalty is not None:
             if self._historical_events:
                 collided = info.get("terminal_reason") == "collision"
@@ -131,9 +163,22 @@ class LapCompletionComponent(RewardComponent):
         self._historical_events = _historical_event_predicates(config)
         self.bonus = float(config.get("bonus", 150.0))
         self.require_clean = bool(config.get("require_clean", True))
+        self.require_clean_episode = config.get("require_clean_episode", False)
+        if not isinstance(self.require_clean_episode, bool):
+            raise ValueError("require_clean_episode must be boolean")
+        if self.require_clean_episode and (self._historical_events or not self.require_clean):
+            raise ValueError("require_clean_episode requires current clean-completion semantics")
+        self.reset()
+
+    def reset(self) -> None:
+        self._episode_failed = self._paid = False
 
     def compute(self, step_info: dict) -> Dict[str, float]:
         info = step_info.get("info") or {}
+        if self.require_clean_episode:
+            self._episode_failed |= _episode_failure(step_info) is not None
+            if self._episode_failed or self._paid:
+                return {}
         if not bool(info.get("lap_crossed", False)):
             return {}
         if not bool(info.get("race_completed", False)):
@@ -153,6 +198,7 @@ class LapCompletionComponent(RewardComponent):
             ):
                 return {}
 
+        self._paid = True
         return {"lap_completion/bonus": self.bonus}
 
 

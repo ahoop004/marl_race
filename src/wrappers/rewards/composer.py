@@ -59,6 +59,11 @@ class RewardComposer:
         unknown = sorted(set(cfg) - set(COMPONENT_REGISTRY))
         if unknown:
             raise ValueError(f"RewardComposer: unknown reward component(s): {unknown}")
+        progress, timeout = cfg.get("progress_delta_bonus", {}), cfg.get("timeout_penalty", {})
+        if (isinstance(progress, dict) and progress.get("enabled")
+                and progress.get("failure_penalty") is not None
+                and isinstance(timeout, dict) and timeout.get("enabled")):
+            raise ValueError("failure_penalty includes truncations; disable timeout_penalty to avoid double charges")
         components: List[RewardComponent] = []
 
         for key, component_cls in COMPONENT_REGISTRY.items():

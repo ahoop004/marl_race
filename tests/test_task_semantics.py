@@ -313,3 +313,67 @@ def test_frenet_velocity_rotation_is_consistent_with_body_frame_observations():
         assert facts["vs"] == pytest.approx(2*np.cos(.3) - .5*np.sin(.3), abs=1e-6)
         assert facts["vd"] == pytest.approx(2*np.sin(.3) + .5*np.cos(.3), abs=1e-6)
         assert facts["d"] == pytest.approx(.4, abs=1e-6)
+
+
+def generated_reward_context(*, distance=0., length=100., reason=None, **events):
+    return dict(timestep=.05, track_length=length,
+        done=reason is not None, terminated=reason in {'collision', 'track_boundary', 'race_complete'},
+        truncated=reason in {'time_limit', 'no_progress'}, info={
+            'centerline': {'progress_delta': distance / length}, 'terminal_reason': reason,
+            'track_limits': {'exceeded': False}, **events})
+
+
+def generated_rewards():
+    from core.scenario import load_yaml_config
+    return RewardComposer.from_config(load_yaml_config('configs/reward/generated_one_lap.yaml'))
+
+
+@pytest.mark.parametrize('length', [100., 425.])
+@pytest.mark.parametrize('distance,expected', [(.4, .002), (-.4, -.002), (2., .005), (-2., -.005)])
+def test_generated_progress_uses_signed_clipped_metres(length, distance, expected):
+    reward, parts = generated_rewards().compute(generated_reward_context(distance=distance, length=length))
+    assert parts['progress_delta/bonus'] == pytest.approx(expected)
+    assert parts['step_time/penalty'] == pytest.approx(-.00025 * .05)
+    assert reward == pytest.approx(expected - .00025 * .05)
+
+
+@pytest.mark.parametrize('reason,events,key', [
+    ('collision', {}, 'collision'),
+    ('track_boundary', {}, 'boundary'),
+    ('time_limit', {}, 'time_limit'),
+    ('no_progress', {}, 'no_progress'),
+    ('no_progress', {'collision_event': True, 'boundary_event': True}, 'collision'),
+    ('time_limit', {'boundary_event': True}, 'boundary'),
+])
+def test_generated_terminal_failure_is_exclusive_once_and_blocks_finish(reason, events, key):
+    composer = generated_rewards()
+    context = generated_reward_context(reason=reason, lap_crossed=True, race_completed=True, **events)
+    _, parts = composer.compute(context)
+    assert parts == pytest.approx({f'progress_delta/{key}': -2., 'step_time/penalty': -.00025 * .05})
+    assert composer.compute(context)[1] == pytest.approx({'step_time/penalty': -.00025 * .05})
+    finish = generated_reward_context(reason='race_complete', lap_crossed=True, race_completed=True)
+    assert 'lap_completion/bonus' not in composer.compute(finish)[1]
+    composer.reset()
+    assert composer.compute(finish)[1]['lap_completion/bonus'] == 2.
+    assert 'lap_completion/bonus' not in composer.compute(finish)[1]
+
+
+def test_generated_contact_then_stall_or_finish_never_double_charges_or_pays_completion():
+    composer = generated_rewards()
+    _, hit = composer.compute(generated_reward_context(collision_event=True))
+    assert hit['progress_delta/collision'] == -2.
+    for context in (generated_reward_context(collision_event=True), generated_reward_context(),
+                    generated_reward_context(reason='no_progress'),
+                    generated_reward_context(reason='race_complete', lap_crossed=True, race_completed=True)):
+        _, parts = composer.compute(context)
+        assert not any(value == -2. or key == 'lap_completion/bonus' for key, value in parts.items())
+    composer.reset()
+    assert composer.compute(generated_reward_context(reason='no_progress'))[1]['progress_delta/no_progress'] == -2.
+
+
+def test_generated_failure_protocol_rejects_a_second_timeout_penalty():
+    from core.scenario import load_yaml_config
+    config = load_yaml_config('configs/reward/generated_one_lap.yaml')
+    config['reward']['timeout_penalty'] = {'enabled': True, 'penalty': -2.}
+    with pytest.raises(ValueError, match='double charges'):
+        RewardComposer.from_config(config)

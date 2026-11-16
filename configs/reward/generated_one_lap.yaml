@@ -1,0 +1,20 @@
+task:
+  name: generated_one_lap_distance_v1
+  description: Signed metre progress, clean one-lap completion, and one failure cost per episode.
+reward:
+  progress_delta_bonus:
+    enabled: true
+    units: metres
+    weight: 0.005
+    positive_only: false
+    max_delta: 1.0
+    failure_penalty: -2.0
+  lap_completion:
+    enabled: true
+    bonus: 2.0
+    require_clean: true
+    require_clean_episode: true
+  step_time_penalty:
+    enabled: true
+    per_second: -0.00025
+    apply_on_terminal: true

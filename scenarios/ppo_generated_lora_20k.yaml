@@ -8,10 +8,10 @@ defaults:
 - override /maps: generated
 - override /evaluation: solo_transfer
 - override /execution: ppo_transfer
-- override /reward: solo_transfer
+- override /reward: generated_one_lap
 - _self_
 experiment:
-  name: ppo_generated_lora_20k
+  name: ppo_generated_lora_1lap_20k
   total_steps: null
   episodes: 20000
   parallel_envs: 24
@@ -23,11 +23,12 @@ wandb:
       train: true
       eval: true
       performance: true
+      reward_components: true
   enabled: true
   project: marl-f110-complete
   entity: ahoop004-old-dominion-university
   name: null
-  group: ppo-generated-adaptation
+  group: ppo-generated-one-lap
   job_type: lora
   tags:
   - ppo
@@ -36,13 +37,13 @@ wandb:
   - lap-completion
   - generated-maps
   - lora
-  notes: Independent family adapter; frozen PPO base, trainable local critic, 20000 training episodes, no evaluation runs.
+  notes: Independent family adapter; frozen PPO base, trainable local critic, 20000 one-lap training episodes, distance rewards, one failure penalty, no evaluation runs.
   mode: online
+paths:
+  pretrained_checkpoint: ${paths.project_root}/pretrained_models/mlp_base_ppo_seed42_best.pt
 environment:
-  # 1500 simulated seconds: five laps plus the initial partial lap of the
-  # longest (425 m) track require at most 1.70 m/s average (8 m/s ceiling).
-  max_steps: 30000
-  target_laps: 5
+  max_steps: 20000
+  target_laps: 1
   no_progress:
     timeout_s: 60.0
     min_progress_m: 1.0
@@ -50,10 +51,6 @@ environment:
     enabled: true
     terminate: true
   terminate_on_collision: false
-reward:
-  reward:
-    progress_delta_bonus:
-      collision_penalty_once_per_contact: true
 algorithm:
   params:
     # Exact multiples of 96 slots and 1024-sample minibatches: no rounding.

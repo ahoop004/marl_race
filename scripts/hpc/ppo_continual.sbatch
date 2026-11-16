@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=ppo-continual
+#SBATCH --job-name=ppo-continual-1lap
 #SBATCH --partition=reserved-q1wang
 #SBATCH --account=q1wang
 #SBATCH --qos=q1wang
@@ -31,7 +31,7 @@ EXTRA=()
 if [[ "$RESUME" == 1 ]]; then
   : "${RUN_ROOT:?Set RUN_ROOT to the original continual experiment directory}"
 elif [[ "$RESUME" == 0 ]]; then
-  RUN_ROOT=${RUN_ROOT:-"$REPO_DIR/outputs/ppo_continual_${PROFILE}_${SLURM_JOB_ID}"}
+  RUN_ROOT=${RUN_ROOT:-"$REPO_DIR/outputs/ppo_continual_1lap_${PROFILE}_${SLURM_JOB_ID}"}
   SOURCE_CHECKPOINT=${SOURCE_CHECKPOINT:-"$REPO_DIR/pretrained_models/mlp_base_ppo_seed42_best.pt"}
   mkdir -p "$(dirname "$RUN_ROOT")"
   mkdir "$RUN_ROOT"

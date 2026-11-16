@@ -8,10 +8,10 @@ defaults:
 - override /maps: generated
 - override /evaluation: solo_transfer
 - override /execution: ppo_transfer
-- override /reward: solo_transfer
+- override /reward: generated_one_lap
 - _self_
 experiment:
-  name: ppo_continual_${adaptation.mode}
+  name: ppo_continual_1lap_${adaptation.mode}
   total_steps: null # Resolved to five times continual.steps_per_task during composition.
   parallel_envs: 8
   envs_per_worker: 4
@@ -23,8 +23,8 @@ experiment:
 paths:
   pretrained_checkpoint: ${paths.project_root}/pretrained_models/mlp_base_ppo_seed42_best.pt
 environment:
-  max_steps: 30000
-  target_laps: 5
+  max_steps: 20000
+  target_laps: 1
   no_progress:
     timeout_s: 60.0
     min_progress_m: 1.0
@@ -32,10 +32,6 @@ environment:
     enabled: true
     terminate: true
   terminate_on_collision: false
-reward:
-  reward:
-    progress_delta_bonus:
-      collision_penalty_once_per_contact: true
 algorithm:
   params:
     frames_per_batch: 4096
@@ -58,7 +54,7 @@ wandb:
   project: marl-f110-complete
   entity: ahoop004-old-dominion-university
   name: null
-  group: ppo-continual-phase1
+  group: ppo-continual-one-lap-phase1
   job_type: ${adaptation.mode}
   tags: [ppo, continual, phase1]
   mode: online
@@ -68,3 +64,4 @@ wandb:
       train: true
       eval: true
       performance: true
+      reward_components: true
