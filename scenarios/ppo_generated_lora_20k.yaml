@@ -14,6 +14,8 @@ experiment:
   name: ppo_generated_lora_20k
   total_steps: null
   episodes: 20000
+  parallel_envs: 24
+  envs_per_worker: 4
 wandb:
   logging:
     profile: auto
@@ -37,16 +39,31 @@ wandb:
   notes: Independent family adapter; frozen PPO base, trainable local critic, 20000 training episodes, no evaluation runs.
   mode: online
 environment:
+  # 1500 simulated seconds: five laps plus the initial partial lap of the
+  # longest (425 m) track require at most 1.70 m/s average (8 m/s ceiling).
+  max_steps: 30000
   target_laps: 5
+  no_progress:
+    timeout_s: 60.0
+    min_progress_m: 1.0
   track_limits:
     enabled: true
     terminate: true
   terminate_on_collision: false
 algorithm:
   params:
+    # Exact multiples of 96 slots and 1024-sample minibatches: no rounding.
+    frames_per_batch: 6144
+    n_steps: 67584
+    n_epochs: 5
+    batch_size: 1024
     learning_rate: 0.0001
     lr_schedule: constant
     learning_rate_end: null
+
+checkpoint:
+  every_steps: null
+  every_updates: 1
 
 evaluation:
   enabled: false
