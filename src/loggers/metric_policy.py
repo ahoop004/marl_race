@@ -9,6 +9,7 @@ AXES = {
     "train": "train/environment_steps",
     "perf": "train/environment_steps",
     "eval": "eval/environment_steps",
+    "cl": "cl/global_steps",
 }
 
 CORE = (
@@ -61,7 +62,8 @@ class MetricPolicy:
         # dashboard selection. Explicit user allowlists still take precedence.
         profiling = (("perf/boundaries/*", "perf/workload/*", "perf/profiling/*")
                      if scenario.get("experiment", {}).get("measure_stages", False) else ())
-        patterns = (*CORE, *profiling, *(LAP_COMPLETION if self.lap_completion else RACING))
+        continual = ("cl/*", "eval/cl/*", "perf/cl_*") if scenario.get("continual") else ()
+        patterns = (*CORE, *profiling, *continual, *(LAP_COMPLETION if self.lap_completion else RACING))
         self._names = set(patterns)
         self._patterns = tuple(pattern for pattern in patterns if "*" in pattern)
 

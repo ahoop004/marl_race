@@ -32,7 +32,7 @@ class _CollectionBoundary:
 
     def collection_stopped(self):
         t = self.trainer
-        return (t.budget_reached() or t._should_stop()
+        return (t.collection_budget_reached() or t._should_stop()
                 or t._pending_learning_steps >= t.agent.n_steps
                 or t.env.last_step is None)  # Collector has just auto-reset a race.
 
@@ -180,6 +180,8 @@ class OnPolicyTrainer:
         self._optimizer_steps = 0
         self._resume_state = None
         self.checkpoint_ready = False
+        self.continual = None
+        self._collection_rng = None
         for hook in self.hooks:
             bind = getattr(hook, "bind_trainer", None)
             if bind:
@@ -855,6 +857,8 @@ class OnPolicyTrainer:
         metrics = {"train/" + key: progress[key] for key in (
             "environment_steps", "physics_steps", "agent_steps", "completed_episodes", "updates")}
         metrics["train/optimizer_steps_total"] = self._optimizer_steps
+        if self.continual is not None:
+            metrics.update(self.continual.progress_metrics())
         if self.process_collection:
             metrics.update({
                 "train/budget_step_overshoot": max(0, progress["environment_steps"] - self.total_steps) if self.total_steps is not None else 0,
@@ -925,9 +929,15 @@ class OnPolicyTrainer:
             getattr(hook, "should_stop", False) for hook in self.hooks)
 
     def budget_reached(self):
+        if self.continual is not None:
+            return self.continual.complete
         if self.total_steps is not None:
             return self.checkpoint_progress()["environment_steps"] >= self.total_steps
         return self.n_episodes is not None and self.checkpoint_progress()["completed_episodes"] >= self.n_episodes
+
+    def collection_budget_reached(self):
+        return (self.continual.stage_reached() if self.continual is not None
+                else self.budget_reached())
 
     def _diagnostic_stop_reached(self):
         # This limit is execution-only: it never shortens collection rollouts,
@@ -1125,7 +1135,7 @@ class OnPolicyTrainer:
             profile.record_workload("trajectory_rows", sum(len(rollout) for rollout in rollouts))
         return rollouts
 
-    def train(self, n_episodes=0, *, total_steps=None):
+    def train(self, n_episodes=0, *, total_steps=None, finalize=True):
         self._run_started, self._run_finished = time.perf_counter(), None
         self._process_placement = cpu_placement()
         self._process_placement.pop("cpu_topology")
@@ -1285,7 +1295,7 @@ class OnPolicyTrainer:
             require_source = getattr(self.agent, "_require_lora_source", None)
             if require_source:
                 require_source()
-            if not self.budget_reached() and not self._diagnostic_stop_reached():
+            if not self.collection_budget_reached() and not self._diagnostic_stop_reached():
                 # Serial interrupts at an exact decision boundary. Processes
                 # consume whole synchronous batches and report their overshoot.
                 # Neither path introduces artificial trajectory truncations.
@@ -1407,6 +1417,10 @@ class OnPolicyTrainer:
                 if self._resume_state is not None:
                     from agents.common.checkpoints import restore_rng
                     restore_rng(self._resume_state["rng"])
+                elif self._collection_rng is not None:
+                    from agents.common.checkpoints import restore_rng
+                    restore_rng(self._collection_rng)
+                self._collection_rng = None
                 iterator = iter(collector)
                 while True:
                     try:
@@ -1461,7 +1475,7 @@ class OnPolicyTrainer:
                     self._record_boundary("aggregation", aggregation_started)
                     self._synchronize_progress()
                     ready = ((self._global_pending_steps if self.distributed else self._pending_learning_steps)
-                             >= self.agent.n_steps or self.budget_reached())
+                             >= self.agent.n_steps or self.collection_budget_reached())
                     if ready and (pending or self.distributed):
                         prepare_started = time.perf_counter()
                         with self.measure_boundary("trajectory_reconstruction"):
@@ -1483,7 +1497,7 @@ class OnPolicyTrainer:
                             self._set_timing_phase("steady")
                             self._steady_started, self._steady_baseline = time.perf_counter(), self._rate_counters()
                     self._synchronize_progress()
-                    if (self.budget_reached() or self._should_stop()
+                    if (self.collection_budget_reached() or self._should_stop()
                             or (updated and self._diagnostic_stop_reached())):
                         break
                 if not self._should_stop() and pending:
@@ -1500,8 +1514,9 @@ class OnPolicyTrainer:
                     if metrics:
                         checkpoint_boundary()
             self._steady_finished = time.perf_counter()
-            for hook in self.hooks:
-                self.call_hook(hook, "on_training_end")
+            if finalize:
+                for hook in self.hooks:
+                    self.call_hook(hook, "on_training_end")
             if self.distributed:
                 self.distributed.broadcast(True)
         finally:

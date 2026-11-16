@@ -1,0 +1,70 @@
+# @package _global_
+defaults:
+- /config
+- /continual: pilot
+- override /algorithm: ppo
+- override /scenario: solo_lap_completion
+- override /adaptation: full_finetune
+- override /maps: generated
+- override /evaluation: solo_transfer
+- override /execution: ppo_transfer
+- override /reward: solo_transfer
+- _self_
+experiment:
+  name: ppo_continual_${adaptation.mode}
+  total_steps: null # Resolved to five times continual.steps_per_task during composition.
+  parallel_envs: 8
+  envs_per_worker: 4
+  collection_backend: process
+  measure_services: true
+  measure_stages: true
+  measure_collector_startup: true
+  torch_threads: 1
+paths:
+  pretrained_checkpoint: ${paths.project_root}/pretrained_models/mlp_base_ppo_seed42_best.pt
+environment:
+  max_steps: 30000
+  target_laps: 5
+  no_progress:
+    timeout_s: 60.0
+    min_progress_m: 1.0
+  track_limits:
+    enabled: true
+    terminate: true
+  terminate_on_collision: false
+reward:
+  reward:
+    progress_delta_bonus:
+      collision_penalty_once_per_contact: true
+algorithm:
+  params:
+    frames_per_batch: 4096
+    n_steps: 65536
+    n_epochs: 5
+    batch_size: 1024
+    learning_rate: 0.0001
+    lr_schedule: constant
+    learning_rate_end: null
+checkpoint:
+  every_steps: null
+  every_updates: 1
+evaluation:
+  enabled: false # Continual orchestration owns baseline, curves and boundary evaluation.
+  episodes: 20 # Per map, with the same seed set for both conditions and all stages.
+  seed: 10042
+  selection_strategy: completion_progress
+wandb:
+  enabled: true
+  project: marl-f110-complete
+  entity: ahoop004-old-dominion-university
+  name: null
+  group: ppo-continual-phase1
+  job_type: ${adaptation.mode}
+  tags: [ppo, continual, phase1]
+  mode: online
+  logging:
+    profile: auto
+    groups:
+      train: true
+      eval: true
+      performance: true

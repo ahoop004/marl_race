@@ -43,9 +43,15 @@ def validate_resume_experiment(metadata, scenario):
         if stored["algorithm"]["name"] == "mappo":
             stored["algorithm"]["params"].setdefault("lr_schedule", "constant")
             stored["algorithm"]["params"].setdefault("learning_rate_end", None)
-    fields = ("algorithm", "network", "environment", "agents", "controllers", "maps", "evaluation", "mappo")
+    if bool(stored.get("continual")) != bool(scenario.get("continual")):
+        raise ValueError("Recovery must retain continual-learning mode; use transfer for a new experiment")
+    fields = ("algorithm", "network", "environment", "agents", "controllers", "maps", "evaluation", "mappo", "continual")
     validate_checkpoint_compatibility(stored, {key: scenario[key] for key in fields if key in scenario})
     validate_checkpoint_compatibility(stored["experiment"], {"seed": scenario["experiment"].get("seed")})
+    if scenario.get("continual"):
+        validate_checkpoint_compatibility(stored["experiment"], {
+            key: scenario["experiment"].get(key) for key in
+            ("total_steps", "parallel_envs", "envs_per_worker", "collection_backend")})
     current_maps = collect_map_protocols(scenario["environment"])
     stored_provenance = metadata["provenance"]
     # Older provenance only recorded YAML. Retain those checks without making

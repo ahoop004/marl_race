@@ -39,6 +39,8 @@ def run_evaluation_episode(task, actions_fn, *, episode, seed,
                                 trainable_ids=task.possible_agents,
                                 opponent_ids=task.fixed_policy_agents)
     clean = dict.fromkeys(task.possible_agents, True)
+    contacts = dict.fromkeys(task.possible_agents, False)
+    boundary_violations = dict.fromkeys(task.possible_agents, False)
     team_return, team_components = 0.0, {}
 
     def observe(substep):
@@ -48,8 +50,9 @@ def run_evaluation_episode(task, actions_fn, *, episode, seed,
                                 agent_states=raw.agent_states)
         for aid in clean:
             info = raw.info.get(aid, {})
-            clean[aid] &= not (info.get("collision", False)
-                               or (info.get("track_limits") or {}).get("exceeded", False))
+            contacts[aid] |= bool(info.get("collision", False))
+            boundary_violations[aid] |= bool((info.get("track_limits") or {}).get("exceeded", False))
+            clean[aid] &= not (contacts[aid] or boundary_violations[aid])
         if render:
             task.render()
 
@@ -81,6 +84,8 @@ def run_evaluation_episode(task, actions_fn, *, episode, seed,
         "seed": seed, "map_id": map_id, "spawn_configuration": spawn,
         "strict_clean_finish": all(clean[aid] and facts.agents[aid].clean_finish
                                    for aid in task.possible_agents),
+        "collision_observed": any(contacts.values()),
+        "boundary_violation_observed": any(boundary_violations.values()),
     }
     if include_rewards:
         record.update(reward_mode=reward_mapping.mode,

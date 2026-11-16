@@ -55,6 +55,9 @@ def materialize_configuration(config):
         adaptation["checkpoint"] = str(source_path(adaptation["checkpoint"]))
     config["experiment"] = OmegaConf.to_container(OmegaConf.merge(
         execution["experiment"], config.get("experiment", {})), resolve=True)
+    if config.get("continual") and config["experiment"].get("total_steps") is None:
+        config["experiment"]["total_steps"] = (len(config["continual"]["families"])
+                                                * config["continual"]["steps_per_task"])
     name = algorithm["name"]
     config["experiment"][f"{name}_backend"] = algorithm["backend"]
     explicit_params = config.get("training_defaults", {})

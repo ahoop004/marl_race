@@ -60,6 +60,9 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
 
     rl_agent_id = trainable_ids[0]
     algorithm = select_algorithm(scenario, trainable_ids)
+    continual_enabled = bool(scenario.get("continual"))
+    if continual_enabled and (algorithm != "ppo" or distributed):
+        raise ValueError("Phase 1 continual learning requires non-distributed PPO")
 
     run_id = args.run_id or (resume_payload["metadata"]["provenance"].get("run_id") if resume_payload else None) or resolve_run_id(
         scenario_name=exp_cfg.get("name"),
@@ -332,6 +335,10 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
             ))
             console.print_info(f"Selection evaluation: {evaluator.episodes} fixed-seed races; "
                                f"completion={evaluator.completion}")
+        if continual_enabled:
+            from training.continual import ContinualHook
+            hooks.insert(0, ContinualHook(scenario, scenario_dir, spec, params, output_dir,
+                                         wandb=wandb_logger))
     trainer = create_trainer(algorithm, task, learner, hooks=hooks, render=render, run_id=run_id,
                              collection_device=str(collection_device),
                              parallel_envs=workers, envs_per_worker=envs_per_worker,
@@ -352,7 +359,10 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
     budget = f"{total_steps} joint environment decisions" if total_steps is not None else f"{episodes} episodes"
     console.print_info(f"Starting {algorithm.upper()} training for {budget}")
     options = {"total_steps": total_steps} if total_steps is not None else {}
-    trainer.train(episodes, **options)
+    if continual_enabled:
+        trainer.continual.run(trainer)
+    else:
+        trainer.train(episodes, **options)
     if primary and (trainer.measure_services or trainer.measure_stages or trainer.measure_mpc or trainer.measure_hybrid
                     or trainer.measure_collector_startup):
         # Include end-of-run service work, especially latest/final checkpoint saves.
