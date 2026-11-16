@@ -35,6 +35,7 @@ class EpisodeOutcome(Enum):
     TARGET_FINISH = "target_finish"
     FINISHED = "finished"
     TRACK_BOUNDARY = "track_boundary"
+    NO_PROGRESS = "no_progress"
 
     def is_success(self) -> bool:
         """Check if outcome represents attacker success."""
@@ -85,6 +86,8 @@ def determine_outcome(info: Dict[str, Any], truncated: bool = False) -> EpisodeO
         return EpisodeOutcome.SELF_CRASH
     if terminal_reason == "time_limit":
         return EpisodeOutcome.TIMEOUT
+    if terminal_reason == "no_progress":
+        return EpisodeOutcome.NO_PROGRESS
 
     # Backward-compatible adversarial outcome classification.
     if info.get('target_finished', False):

@@ -41,7 +41,7 @@ if [[ "$RESUME" == 1 ]]; then
   [[ -s "$RUN_ROOT/source.pt" ]] || { echo 'Missing frozen source snapshot' >&2; exit 3; }
   EXTRA=(--resume)
 elif [[ "$RESUME" == 0 ]]; then
-  RUN_ROOT=${RUN_ROOT:-"$REPO_DIR/outputs/ppo_lora_20k_v2_${SLURM_JOB_ID}"}
+  RUN_ROOT=${RUN_ROOT:-"$REPO_DIR/outputs/ppo_lora_20k_v3_${SLURM_JOB_ID}"}
   SOURCE_CHECKPOINT=${SOURCE_CHECKPOINT:-"$REPO_DIR/pretrained_models/mlp_base_ppo_seed42_best.pt"}
   mkdir -p "$(dirname "$RUN_ROOT")"
   mkdir "$RUN_ROOT" # Refuse accidental reuse of an existing experiment.

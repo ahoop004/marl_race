@@ -66,6 +66,9 @@ def main():
                 temporary.replace(frozen)
             config = yaml.safe_load(frozen.read_text())
             seed = config['experiment']['seed']
+            if config['agents']['car_0']['reward']['reward']['progress_delta_bonus'].get(
+                    'collision_penalty_once_per_contact') is not True:
+                raise RuntimeError(f'{out}: old collision reward semantics; start a new RUN_ROOT')
             if (config['experiment'].get('total_steps') is not None
                     or config['experiment'].get('episodes') != 20000):
                 raise RuntimeError(f'{out}: expected the original 20000-episode budget')

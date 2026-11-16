@@ -41,8 +41,15 @@ class ProgressDeltaBonusComponent(RewardComponent):
             raise ValueError("Progress units must be lap_fraction or metres")
         self.boundary_penalty = config.get("boundary_penalty")
         self.collision_penalty = config.get("collision_penalty")
+        self.collision_penalty_once_per_contact = config.get("collision_penalty_once_per_contact", False)
+        if not isinstance(self.collision_penalty_once_per_contact, bool):
+            raise ValueError("collision_penalty_once_per_contact must be boolean")
         max_delta = config.get("max_delta")
         self.max_delta = _float_or_none(max_delta) if max_delta is not None else None
+        self.reset()
+
+    def reset(self) -> None:
+        self._collision_active = False
 
     def compute(self, step_info: dict) -> Dict[str, float]:
         info = step_info.get("info") or {}
@@ -52,8 +59,14 @@ class ProgressDeltaBonusComponent(RewardComponent):
             else:
                 collided = (info.get("collision_event", info.get("collision", False))
                             or info.get("terminal_reason") == "collision")
+            previous_contact = self._collision_active
+            self._collision_active = bool(collided)
             if collided:
-                return {"progress_delta/collision": float(self.collision_penalty)}
+                if not self.collision_penalty_once_per_contact or not previous_contact:
+                    return {"progress_delta/collision": float(self.collision_penalty)}
+                # Keep collision costs exclusive of progress/boundary rewards,
+                # without charging a stationary contact on every physics step.
+                return {}
         if self.boundary_penalty is not None:
             boundary = (step_info.get("info") or {}).get("track_limits")
             if boundary is None:

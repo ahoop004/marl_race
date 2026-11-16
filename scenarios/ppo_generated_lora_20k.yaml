@@ -50,6 +50,10 @@ environment:
     enabled: true
     terminate: true
   terminate_on_collision: false
+reward:
+  reward:
+    progress_delta_bonus:
+      collision_penalty_once_per_contact: true
 algorithm:
   params:
     # Exact multiples of 96 slots and 1024-sample minibatches: no rounding.
