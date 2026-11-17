@@ -120,6 +120,36 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def source_code_sha256():
+    """Identify training code, including dirty edits; configs are frozen separately."""
+    digest = hashlib.sha256()
+    for path in sorted([REPO / "run.py", *(REPO / "src").rglob("*.py")]):
+        digest.update(path.relative_to(REPO).as_posix().encode() + b"\0")
+        digest.update(path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def validate_revision(data, *, allow_code_change=False):
+    """Retired wrappers and renamed scenarios do not change frozen training code."""
+    expected = data.get("source_code_sha256")
+    if expected and expected == source_code_sha256():
+        return
+    # Older clean manifests can still prove equivalence against their Git revision.
+    if not expected and data.get("git_commit") and data.get("git_dirty") is False and not data.get("legacy_import"):
+        diff = subprocess.run(["git", "diff", "--quiet", data["git_commit"], "--", "src", "run.py"], cwd=REPO)
+        untracked = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "--", "src", "run.py"],
+                                   cwd=REPO, check=True, capture_output=True, text=True).stdout
+        if diff.returncode == 0 and not untracked.strip():
+            return
+    message = ("Training source changed or revision compatibility cannot be proven "
+               f"(original commit={data.get('git_commit')}, dirty={data.get('git_dirty')}). "
+               "Restore the original training code, or audit compatibility and explicitly use --allow-code-change. "
+               "Frozen configurations and W&B identities will be retained.")
+    if not allow_code_change:
+        raise ValueError(message)
+    print("WARNING: " + message + " Proceeding with explicit code-change override.", file=sys.stderr, flush=True)
+
+
 def atomic_yaml(path, value):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(yaml.safe_dump(value, sort_keys=False))
@@ -187,9 +217,14 @@ def prepare_manifest(args, cpu_count):
             if args.resume:
                 # Import old launch roots only if every item has an original snapshot.
                 # Never reconstruct missing historical settings from today's scenario.
+                validate_revision({}, allow_code_change=getattr(args, "allow_code_change", False))
                 if args.scenario is None:
                     raise ValueError("Legacy root has no manifest; specify its original --scenario to identify work items")
-                template = compose_configuration(args.scenario)
+                scenario = args.scenario
+                if (Path(scenario).name == "ppo_generated_lora_20k.yaml"
+                        and not (REPO / scenario).exists()):
+                    scenario = "scenarios/ppo_lora_families.yaml"
+                template = compose_configuration(scenario)
                 configs = {}
                 for name in work_items(template):
                     frozen = root / name / "launch_config.yaml"
@@ -222,9 +257,11 @@ def prepare_manifest(args, cpu_count):
             dirty = bool(subprocess.run(["git", "status", "--porcelain"], cwd=REPO, check=True,
                                         capture_output=True, text=True).stdout.strip())
             data = dict(version=1, allocation=os.environ.get("SLURM_JOB_ID"), root=str(root),
-                        git_commit=git, git_dirty=dirty, legacy_import=legacy,
+                        git_commit=None if legacy else git, git_dirty=None if legacy else dirty,
+                        source_code_sha256=None if legacy else source_code_sha256(), legacy_import=legacy,
                         source=source_record, items=configs)
             atomic_yaml(manifest, data)
+        validate_revision(data, allow_code_change=getattr(args, "allow_code_change", False))
         if data["root"] != str(root):
             raise ValueError("Recovery root moved; frozen checkpoint and output paths require the original location")
         if data["source"] and sha256(Path(data["source"]["path"])) != data["source"]["sha256"]:
@@ -316,7 +353,9 @@ def run_item(args, name, config, identity):
         attempt = f"{os.environ.get('SLURM_JOB_ID', 'local')}_{uuid.uuid4().hex[:8]}"
         record = dict(work_item=name, task=rank, tasks=size, cpu_affinity=affinity,
                       gpu=os.environ.get("CUDA_VISIBLE_DEVICES"), node=os.environ.get("SLURMD_NODENAME"),
-                      configuration=str(frozen), command=command)
+                      configuration=str(frozen), command=command,
+                      source_code_sha256=source_code_sha256(),
+                      allow_code_change=getattr(args, "allow_code_change", False))
         (out / f"command_{attempt}.json").write_text(json.dumps(record, indent=2) + "\n")
         print(f"Task {rank}/{size}: training {name}; output={out}", flush=True)
         with (out / "train.log").open("a") as log:
@@ -330,12 +369,14 @@ def run_item(args, name, config, identity):
         (out / "completed.json").write_text(json.dumps(dict(checkpoint=str(out / "final.pt"), run_id=run_id)) + "\n")
 
 
-def main(argv=None, *, default_scenario=None):
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", default=default_scenario, help="Required for new runs; recovery reads the root manifest")
+    parser.add_argument("--scenario", help="Required for new runs; recovery reads the root manifest")
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--source", type=Path, help="Source to freeze; defaults to the scenario checkpoint")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--allow-code-change", action="store_true",
+                        help="Explicitly accept unproven training-code compatibility on recovery; preserves frozen settings")
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     parser.add_argument("--seed", type=int)
     parser.add_argument("--profile", choices=("pilot", "full"))
@@ -349,16 +390,21 @@ def main(argv=None, *, default_scenario=None):
     args.root = args.root.expanduser().resolve()
     if not args.scenario and not args.resume:
         parser.error("New experiments require --scenario")
+    if args.allow_code_change and not args.resume:
+        parser.error("--allow-code-change requires --resume")
     if args.resume and (cli_overrides(args) or args.source):
         parser.error("Recovery uses frozen settings; omit source, profile, seed and configuration overrides")
     identity = task_identity()
     rank, size, affinity = identity
     if args.plan:
-        configs = (yaml.safe_load((args.root / "launch_manifest.yaml").read_text())["items"] if args.resume
-                   else prepare_configs(args, len(affinity))[0])
         if args.resume:
+            data = yaml.safe_load((args.root / "launch_manifest.yaml").read_text())
+            validate_revision(data, allow_code_change=args.allow_code_change)
+            configs = data["items"]
             for config in configs.values():
                 resolve_collectors(deepcopy(config), len(affinity), frozen=True)
+        else:
+            configs = prepare_configs(args, len(affinity))[0]
         print(yaml.safe_dump({"assignment": {r: list(configs)[r::size] for r in range(size)},
                              "collectors": {n: {k: c["experiment"][k] for k in ("parallel_envs", "envs_per_worker")}
                                             for n, c in configs.items()}}, sort_keys=False))

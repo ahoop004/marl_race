@@ -1,4 +1,4 @@
-"""Configuration migration parity and Hydra composition contracts."""
+"""Hydra composition, frozen configurations, and current experiment contracts."""
 from copy import deepcopy
 import hashlib
 import json
@@ -150,66 +150,31 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def parity_fingerprints(config, source, params=None):
-    """Compare task values and effective learner inputs across schema changes."""
-    from agents.common.networks import resolve_network_config
-
-    def canonical_path(path):
-        return "$PROJECT_ROOT/" + Path(path).resolve().relative_to(PROJECT_ROOT).as_posix()
-
-    task = {k: deepcopy(config[k]) for k in ("experiment", "environment", "agents", "evaluation", "wandb")
-            if k in config}
-    # Disabled execution options do not change the task or learner contract.
-    for name in ("measure_mpc", "measure_hybrid", "measure_collector_startup", "measure_stages", "measure_services", "distributed"):
-        if task["experiment"].get(name) is False:
-            task["experiment"].pop(name)
-    if task["experiment"].get("envs_per_worker") == 1:
-        task["experiment"].pop("envs_per_worker")
-    if "mappo" in config:
-        task["mappo"] = deepcopy(config["mappo"])
-    env = task["environment"]
-    env["map_dir"] = canonical_path(source_path(env.get("map_dir", "maps")))
-    if env.get("max_speed") is None:
-        env.pop("max_speed", None)
-    if task["experiment"].get("checkpoint"):
-        task["experiment"]["checkpoint"] = canonical_path(source.parent / task["experiment"]["checkpoint"])
-    observation_order = {}
-    learners = {}
-    for aid, agent in task["agents"].items():
-        if not agent.get("trainable"):
-            continue
-        agent.pop("params", None)
-        observation_order[aid] = list(agent["observation"]["observation"])
-        values = deepcopy(params[aid] if params is not None
-                          else resolve_training_params(config["agents"][aid], config))
-        values["network"] = resolve_network_config(values, default_hidden_dims=[64, 64])
-        # Additive optimization selection fields express the same historical
-        # Adam/L2 defaults; retain the original numerical parity fingerprints.
-        for key, default in (("optimizer", "adam"), ("optimizer_kwargs", {}),
-                             ("loss", "clip_ppo" if agent["algorithm"] == "ppo" else "mappo"),
-                             ("critic_loss", "l2"), ("lr_scheduler_kwargs", {})):
-            if values.get(key) == default:
-                values.pop(key)
-        if agent["algorithm"] == "mappo":
-            for key, default in (("lr_schedule", "constant"), ("learning_rate_end", None)):
-                if values.get(key) == default:
-                    values.pop(key, None)
-        for k in ("pi_hidden_dims", "vf_hidden_dims", "hidden_dims", "activation"):
-            values.pop(k, None)
-        if values.get("pretrained_actor_checkpoint"):
-            values["pretrained_actor_checkpoint"] = canonical_path(source.parent / values["pretrained_actor_checkpoint"])
-        learners[aid] = values
-    return {"task": digest(task), "learner": digest(learners), "observation_order": observation_order}
+# The retired migration fingerprints belong to 8e325d0 (available through Git).
+# Current configurations intentionally include subsequent vehicle and LoRA changes.
+COMPLETION_PRESETS = [
+    "scenarios/mappo_2v2_completion_lora.yaml",
+    "scenarios/mappo_2v2_completion_pretrained.yaml",
+    "scenarios/mappo_2v2_completion_pretrained_shared.yaml",
+    TEAM, PRETRAIN,
+    "scenarios/ppo_lap_completion_transfer.yaml",
+    "scenarios/ppo_lap_completion_transfer_3lap.yaml",
+]
 
 
-GOLDEN = json.loads((Path(__file__).parent / "fixtures/configuration_parity.json").read_text())
-
-
-@pytest.mark.parametrize("path", GOLDEN)
-def test_all_existing_presets_preserve_effective_configuration(path):
+@pytest.mark.parametrize("path", [*COMPLETION_PRESETS, "scenarios/render/racing_mpc.yaml"])
+def test_current_presets_preserve_effective_configuration_when_frozen(path, tmp_path):
     config = load_and_expand_scenario(path)
     validate_experiment_scenario(config)
-    assert parity_fingerprints(config, source_path(path)) == GOLDEN[path]
+    frozen = tmp_path / "resolved.yaml"
+    frozen.write_text(yaml.safe_dump(config))
+    restored = load_and_expand_scenario(frozen)
+    validate_experiment_scenario(restored)
+    for key in ("experiment", "environment", "agents", "evaluation", "wandb", "training_defaults"):
+        assert restored.get(key) == config.get(key)
+    for aid, agent in config["agents"].items():
+        if agent.get("trainable"):
+            assert resolve_training_params(restored["agents"][aid], restored) == resolve_training_params(agent, config)
     assert "includes" not in config
     assert config["_configuration"]["source"] == str(source_path(path))
 
@@ -309,7 +274,8 @@ def test_overrides_apply_once_and_dedicated_cli_flags_take_precedence(monkeypatc
     config = yaml.safe_load(capsys.readouterr().out)
     assert config["experiment"]["seed"] == 71 and config["experiment"]["total_steps"] == 9
     assert config["environment"]["max_speed"] == 5
-    assert config["environment"]["vehicle_params"]["wheel_actuators"]["wheel_speed_max"] == 100
+    actuators = config["environment"]["vehicle_params"]["wheel_actuators"]
+    assert actuators["wheel_speed_max"] * actuators["wheel_radius"] == pytest.approx(5.0)
     assert "optional" not in config["experiment"]
 
 
@@ -456,7 +422,8 @@ def test_serial_profiling_presets_keep_production_settings_separate(algorithm, t
     assert config["maps"]["train"] == config["maps"]["selection"] == config["maps"]["final_test"] == ["circle_map"]
     assert config["experiment"]["seed"] == 42
     assert environment["vehicle_params"] == production["environment"]["vehicle_params"]
-    assert environment["vehicle_params"]["wheel_actuators"]["wheel_speed_max"] == 160.
+    actuators = environment["vehicle_params"]["wheel_actuators"]
+    assert actuators["wheel_speed_max"] * actuators["wheel_radius"] == pytest.approx(environment["max_speed"])
     for agent in config["agents"].values():
         if not agent["trainable"]:
             assert agent["params"]["max_speed"] == 8.
@@ -480,7 +447,7 @@ def test_map_provenance_uses_explicit_geometry_paths(tmp_path):
     assert "walls" not in assets
 
 
-@pytest.mark.parametrize("path", [path for path in GOLDEN if "completion" in path])
+@pytest.mark.parametrize("path", COMPLETION_PRESETS)
 def test_completion_training_and_evaluation_share_horizons_and_termination(path):
     from core.environment_config import resolve_environment_config
     config = load_and_expand_scenario(path)
@@ -488,8 +455,9 @@ def test_completion_training_and_evaluation_share_horizons_and_termination(path)
     evaluated = resolve_environment_config(config, mode="eval")
     assert training["max_steps"] == (8000 if "transfer" in path else 80000)
     assert training["max_speed"] == evaluated["max_speed"] == 8.0
-    assert training["vehicle_params"]["wheel_actuators"]["wheel_speed_max"] == 160.0
-    assert evaluated["vehicle_params"]["wheel_actuators"]["wheel_speed_max"] == 160.0
+    for environment in (training, evaluated):
+        actuators = environment["vehicle_params"]["wheel_actuators"]
+        assert actuators["wheel_speed_max"] * actuators["wheel_radius"] == pytest.approx(environment["max_speed"])
     for key in ("target_laps", "max_steps", "episode_termination", "terminate_on_collision", "track_limits"):
         assert evaluated[key] == training[key]
     for protocol in ("selection", "final"):

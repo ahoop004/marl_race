@@ -78,13 +78,13 @@ environment. A fresh submission refuses to overwrite an existing run directory.
 Scenarios own budgets, task choices, and ordered `launch.work_items` (output names
 mapped to Hydra override lists). `configs/` owns reusable algorithm, adaptation,
 reward, checkpoint, and execution profiles. Slurm alone owns hardware allocation.
-The legacy LoRA/continual Python and sbatch commands use the shared
-`scripts/launch_experiment.py` and `scripts/hpc/launch_single_node_gpu.sh` runtime.
+Use `scripts/hpc/experiment.sbatch` with the shared `scripts/launch_experiment.py`
+and `scripts/hpc/launch_single_node_gpu.sh` runtime for single-node experiments.
 Ray, multi-node, distributed PPO, and the circle checkpoint-export job remain
 separate. No training algorithms or physics are changed.
 
-The LoRA scenario retains its authoritative **30,000 episodes** per family; its
-`_20k` filename is retained for command compatibility. Continual learning defaults
+`scenarios/ppo_lora_families.yaml` retains **30,000 episodes** per family,
+with no-progress termination disabled. Continual learning defaults
 to the pilot profile with independent full-fine-tuning and LoRA conditions;
 `PROFILE=full` selects the full scenario budget. Stage transitions, evaluations,
 and metrics remain owned by `src/training/continual.py`.
@@ -104,19 +104,19 @@ Examples from the repository on Wahab (submission examples only):
 ```bash
 # Four GPUs, 64 CPUs: straight then s_curve on rank 0; one family on each other rank.
 REPO_DIR="$PWD" sbatch --ntasks=4 --cpus-per-task=16 --gpus-per-task=1 \
-  scripts/hpc/ppo_lora_families_20k.sbatch
+  scripts/hpc/experiment.sbatch
 
 # Five GPUs, 160 CPUs: one concurrent independent family per task.
 REPO_DIR="$PWD" sbatch --ntasks=5 --cpus-per-task=32 --gpus-per-task=1 \
-  scripts/hpc/ppo_lora_families_20k.sbatch
+  scripts/hpc/experiment.sbatch
 
 # Two independent continual pilot conditions, each with one GPU and 16 CPUs.
-REPO_DIR="$PWD" PROFILE=pilot sbatch --ntasks=2 --cpus-per-task=16 \
-  scripts/hpc/ppo_continual.sbatch
+REPO_DIR="$PWD" SCENARIO=scenarios/ppo_continual.yaml PROFILE=pilot sbatch --ntasks=2 --cpus-per-task=16 \
+  scripts/hpc/experiment.sbatch
 
 # Resume with fewer GPU tasks; keep enough CPUs/task for each frozen collector.
 REPO_DIR="$PWD" RUN_ROOT="$PWD/outputs/ORIGINAL_RUN" RESUME=1 \
-  sbatch --ntasks=2 --cpus-per-task=32 scripts/hpc/ppo_lora_families_20k.sbatch
+  sbatch --ntasks=2 --cpus-per-task=32 scripts/hpc/experiment.sbatch
 
 # Generic launcher, including scratch PPO pretraining without checkpoint export.
 REPO_DIR="$PWD" SCENARIO=scenarios/ppo_circle_pretrain_20k.yaml \
@@ -129,7 +129,8 @@ Tasks use deterministic rank-strided assignment of the frozen work-item order;
 Every item retains separate checkpoints, logs, W&B IDs, and recovery state.
 Slurm supplies task CPU affinity and GPU visibility; `srun` inherits allocation
 counts instead of repeating them. Partition/account/QoS, memory, walltime, and
-other resources may also be overridden with sbatch options. `REPO_DIR`,
+other resources may also be overridden with sbatch options. Memory uses Slurm’s
+configured default unless supplied with `sbatch --mem`. `REPO_DIR`,
 `ENV_PATH`, `CRUN`, `SOURCE_CHECKPOINT`, `RUN_ROOT`, and `SEED` preserve the usual
 submission-environment conventions. Python flags, including repeatable `--set`,
 may be passed after the sbatch filename. The default walltime is four days,
@@ -154,11 +155,20 @@ and settings, retaining `train.log` and archiving earlier artifacts under
 imported only when every configured item has its original `launch_config.yaml`;
 missing historical configurations cannot safely be reconstructed. Legacy source
 hashes are recorded at import time, so earlier changes cannot be detected.
+Recovery verifies a SHA-256 of `run.py` and `src/**/*.py` (or the original clean Git revision
+for older manifests). Unproven compatibility, including old dirty runs and legacy
+imports, requires an explicit `--allow-code-change` after review; it never rewrites
+frozen manifests or W&B IDs. Removed wrappers are unnecessary for manifest recovery.
 
-For a local configuration-only inspection, use the Python wrapper with
-`--root /tmp/example --plan`; this performs no writes or training. `--prepare-only`
+For a local configuration-only inspection, use
+`python3 scripts/launch_experiment.py --scenario scenarios/ppo_lora_families.yaml
+--root /tmp/example --plan`; this performs no writes or training. `--prepare-only`
 freezes a real root without invoking training. Standard `run.py` entry points
 remain available; automatic affinity selection belongs to the shared launcher.
+
+Retired launchers and migration fixtures remain available at Git tag
+`pre-infrastructure-cleanup-2026-11-17` (`0e38e17`); use the original experiment
+commit and saved configurations/checkpoints for historical reproduction.
 
 ## Solo PPO adaptation on generated maps
 

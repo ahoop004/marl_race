@@ -1,5 +1,6 @@
 """Matched P2 replay and detailed instrumentation preserve the physics contract."""
 import importlib.util
+from math import ceil
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +30,9 @@ def test_matched_replay_and_detail_preserve_full_outputs(map_id):
             row = p2.replay(task, reset, frames, layer, profile=profile, capture=True)
             assert row["exact_physics_parity"]
             assert sum(profile.seconds.values()) <= row["wall_seconds"]
-            assert profile.finish_counts[1] == 12 * 4 * 50
+            sim = task.env.sim
+            substeps = ceil(sim.time_step / sim.params["max_integration_step"])
+            assert profile.finish_counts[1] == len(frames) * sim.num_agents * substeps
             assert profile.finish_counts[2] == 2 * profile.finish_counts[1]
             assert profile.finish_counts[3] <= profile.finish_counts[2]
             assert "profile_counts" not in vars(task.env._lap_tracker)

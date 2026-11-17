@@ -1,5 +1,6 @@
 """P1 instrumentation must preserve the committed simulation contract exactly."""
 from pathlib import Path
+from math import ceil
 
 import numpy as np
 import pytest
@@ -34,10 +35,13 @@ def test_profiling_rollout_is_bit_identical_and_restores_instances(tmp_path, nam
         assert sim.profile_region is None and sim.profile_counters is None
         assert "advance" not in vars(sim.agents[0]._physics)
         counts = measured["profile"]["counters"]
-        assert counts["integration_substeps"] == measured["vehicle_steps"] * 50
+        substeps = ceil(sim.time_step / sim.params["max_integration_step"])
+        assert counts["integration_substeps"] == measured["vehicle_steps"] * substeps
         stops = counts["physical_contact_resolutions"] + counts["predictive_stops"]
-        assert counts["load_solves"] == measured["vehicle_steps"] * 201 + stops
-        assert counts["actuator_pair_samples"] == measured["vehicle_steps"] * 151 + stops
+        # RK4 evaluates four RHS and three actuator samples per substep, plus
+        # one final sample/solve per vehicle step and one per resolved stop.
+        assert counts["load_solves"] == measured["vehicle_steps"] * (4 * substeps + 1) + stops
+        assert counts["actuator_pair_samples"] == measured["vehicle_steps"] * (3 * substeps + 1) + stops
         assert counts["mf61_evaluations"] == 2 * (counts["load_iterations"] + 2 * counts["load_solves"])
         assert sum(measured["profile"]["exclusive_seconds"].values()) <= measured["wall_seconds"]
         if name in {"B4", "B5"}:

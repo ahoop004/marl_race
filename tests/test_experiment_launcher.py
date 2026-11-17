@@ -16,7 +16,7 @@ spec.loader.exec_module(launch)
 
 
 def arguments(root, **kwargs):
-    values = dict(root=root, scenario="scenarios/ppo_generated_lora_20k.yaml", source=None,
+    values = dict(root=root, scenario="scenarios/ppo_lora_families.yaml", source=None,
                   overrides=[], seed=None, profile=None, steps_per_task=None, workers=None,
                   envs_per_worker=None, reserved_cpus=None, resume=False, prepare_only=False)
     values.update(kwargs)
@@ -69,6 +69,7 @@ def test_affinity_workers_alignment_and_explicit_overrides(family_configs):
 def test_scenario_budget_and_continual_conditions(tmp_path):
     configs, _ = launch.prepare_configs(arguments(tmp_path, overrides=["experiment.episodes=19"]), 16)
     assert all(c["experiment"]["episodes"] == 19 for c in configs.values())
+    assert all(not c["environment"].get("no_progress") for c in configs.values())
     for profile, steps in (("pilot", 2000000), ("full", 10000000)):
         configs, _ = launch.prepare_configs(arguments(tmp_path, scenario="scenarios/ppo_continual.yaml", profile=profile), 16)
         assert list(configs) == ["full_finetune", "ppo_lora"]
@@ -95,6 +96,16 @@ def test_freezing_recovery_completion_and_source_identity(tmp_path, monkeypatch)
     args.resume, args.source, args.scenario = True, None, "no-longer-present.yaml"
     # No composition on recovery; larger CPU and different GPU counts retain settings.
     assert launch.prepare_manifest(args, 32) == data
+    manifest = args.root / "launch_manifest.yaml"
+    original_manifest = manifest.read_bytes()
+    with monkeypatch.context() as changed_code:
+        changed_code.setattr(launch, "source_code_sha256", lambda: "different training code")
+        with pytest.raises(ValueError, match="revision compatibility cannot be proven"):
+            launch.prepare_manifest(args, 32)
+        args.allow_code_change = True
+        assert launch.prepare_manifest(args, 32) == data
+        args.allow_code_change = False
+    assert manifest.read_bytes() == original_manifest
     monkeypatch.setattr(launch, "task_identity", lambda: (0, 1, list(range(32))))
     launch.main(["--root", str(args.root), "--resume", "--prepare-only"])
     queued = yaml.safe_load((args.root / "s_curve/launch_config.yaml").read_text())
@@ -127,6 +138,49 @@ def test_freezing_recovery_completion_and_source_identity(tmp_path, monkeypatch)
     snapshot.write_bytes(b"changed source")
     with pytest.raises(ValueError, match="content changed"):
         launch.prepare_manifest(args, 32)
+
+
+def test_older_manifest_revision_guard_and_legacy_import(tmp_path, monkeypatch):
+    # Clean older manifests can verify training code even after wrapper retirement.
+    commit = launch.subprocess.run(["git", "rev-parse", "HEAD"], cwd=launch.REPO,
+                                  check=True, capture_output=True, text=True).stdout.strip()
+    launch.validate_revision(dict(git_commit=commit, git_dirty=False))
+    for record in ({}, dict(git_commit=commit, git_dirty=True),
+                   dict(git_commit=commit, git_dirty=False, legacy_import=True)):
+        with pytest.raises(ValueError, match="allow-code-change"):
+            launch.validate_revision(record)
+    # Importing snapshots must not label today's source as the original revision.
+    args = arguments(tmp_path, resume=True, scenario="scenarios/ppo_generated_lora_20k.yaml")
+    with pytest.raises(ValueError, match="revision compatibility cannot be proven"):
+        launch.prepare_manifest(args, 16)
+    assert not (tmp_path / "launch_manifest.yaml").exists()
+    config = {"adaptation": {"checkpoint": None}, "wandb": {"id": "original-id"}}
+    out = tmp_path / "train"
+    out.mkdir()
+    (out / "launch_config.yaml").write_text(yaml.safe_dump(config))
+    def legacy_template(path):
+        assert path == "scenarios/ppo_lora_families.yaml"
+        return {}
+    monkeypatch.setattr(launch, "compose_configuration", legacy_template)
+    args.allow_code_change = True
+    data = launch.prepare_manifest(args, 16)
+    assert data["git_commit"] is data["git_dirty"] is data["source_code_sha256"] is None
+    assert data["items"]["train"] == config
+
+
+def test_training_source_identity_includes_uncommitted_files(tmp_path, monkeypatch):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "run.py").write_text("# entry point\n")
+    source = tmp_path / "src/model.py"
+    source.write_text("# original\n")
+    monkeypatch.setattr(launch, "REPO", tmp_path)
+    original = launch.source_code_sha256()
+    source.write_text("# changed\n")
+    assert launch.source_code_sha256() != original
+    source.write_text("# original\n")
+    assert launch.source_code_sha256() == original
+    (tmp_path / "src/new.py").write_text("# untracked training code\n")
+    assert launch.source_code_sha256() != original
 
 
 def test_task_gpu_visibility_is_relative_and_preserved(family_configs, monkeypatch):
@@ -175,7 +229,8 @@ def test_slurm_runtime_inherits_allocation_and_propagates_failure(tmp_path):
     env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", CRUN="/bin/true",
                REPO_DIR=str(launch.REPO), RUN_ROOT=str(tmp_path / "run"), SLURM_JOB_ID="test",
                SLURM_NTASKS="5", SLURM_CPUS_PER_TASK="32", LAUNCH_ARGUMENTS=str(tmp_path / "args.json"))
-    script = launch.REPO / "scripts/hpc/ppo_lora_families_20k.sbatch"
+    script = launch.REPO / "scripts/hpc/experiment.sbatch"
+    assert "#SBATCH --mem=" not in script.read_text()
     result = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     command = json.loads((tmp_path / "args.json").read_text())
