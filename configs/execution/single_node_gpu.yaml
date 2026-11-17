@@ -1,0 +1,9 @@
+# Reusable independent-GPU execution policy; Slurm owns hardware allocation.
+defaults:
+- ppo_transfer
+- _self_
+collector:
+  # null selects the largest batch-compatible count within CPU affinity.
+  workers: null
+  reserved_cpus: 4
+  envs_per_worker: 4

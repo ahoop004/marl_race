@@ -73,61 +73,92 @@ RESUME=1 sbatch --export=ALL --chdir="$PWD" scripts/hpc/ppo_circle_pretrain_20k.
 `REPO_DIR`, `ENV_PATH`, `CRUN`, and `RUN_DIR` may be overridden in the submission
 environment. A fresh submission refuses to overwrite an existing run directory.
 
-## Concurrent HPC LoRA family training: 20,000 episodes each
+## Single-node experiment launch infrastructure
 
-`scenarios/ppo_generated_lora_20k.yaml` uses one independent adapter for each of
-straight, sweeper, hairpin, chicane, and S-curve tracks. Every family trains for
-20,000 completed episodes from the same frozen circle PPO checkpoint. Each run
-keeps 64 CPU collector workers × 8 environments, CUDA learning, CPU collection,
-the historical PPO rollout/update settings, rank/alpha 4, and the adaptation
-learning rate of 0.0001. W&B logging is enabled. Training-time evaluation is
-disabled; no preflight or pilot runs are submitted. Normal compatibility checks
-still run when the trainer loads its checkpoint.
+Scenarios own budgets, task choices, and ordered `launch.work_items` (output names
+mapped to Hydra override lists). `configs/` owns reusable algorithm, adaptation,
+reward, checkpoint, and execution profiles. Slurm alone owns hardware allocation.
+The legacy LoRA/continual Python and sbatch commands use the shared
+`scripts/launch_experiment.py` and `scripts/hpc/launch_single_node_gpu.sh` runtime.
+Ray, multi-node, distributed PPO, and the circle checkpoint-export job remain
+separate. No training algorithms or physics are changed.
 
-From the HPC repository, submit:
+The LoRA scenario retains its authoritative **30,000 episodes** per family; its
+`_20k` filename is retained for command compatibility. Continual learning defaults
+to the pilot profile with independent full-fine-tuning and LoRA conditions;
+`PROFILE=full` selects the full scenario budget. Stage transitions, evaluations,
+and metrics remain owned by `src/training/continual.py`.
 
-```bash
-sbatch --chdir="$PWD" scripts/hpc/ppo_lora_families_20k.sbatch
-```
+The `single_node_gpu` execution profile reserves four affinity CPUs per learner
+and defaults to four environments per worker. Automatic selection uses the
+largest worker count within the remaining CPU affinity that exactly divides PPO
+collection batches. It preserves `frames_per_batch`, `n_steps`, minibatch size,
+epochs, and learning rates. For the current LoRA preset, 16/24/32 affinity CPUs
+select 12/16/24 workers respectively; arbitrary batches can use all 12/20/28
+available workers. Continual pilot batches select eight workers on 16 CPUs.
+Set `WORKERS`, `ENVS_PER_WORKER`, or `RESERVED_CPUS` for explicit execution
+experiments. Incompatible explicit layouts fail with a diagnostic.
 
-Default resources are one node on `reserved-q1wang`, using account and QoS
-`q1wang`, with 64 CPUs and four GPUs total. Four independent adapter tasks each
-receive one GPU and 16 CPUs. Straight, sweeper, hairpin, and chicane run
-concurrently; the straight task runs the S-curve family after straight finishes.
-These are separate policies and optimizers, without cross-GPU gradient sharing.
-
-The launcher uses `--mem=0` to request the node's configured memory. The
-historical collector layout remains 64 workers × 8 environments per adapter;
-these workers share the adapter's 16 allocated CPUs, so CPU collection remains
-oversubscribed. The collector layout has not been retuned. PPO settings and
-episode budgets are unchanged.
-
-The default walltime is four hours. Change `--time` only to a limit supported by
-the reserved partition/QoS. The standard task settings are five target laps, up
-to 80,000 steps per episode, with track-limit termination. Parallel collection
-may overshoot the episode target in its final batch.
-
-The source defaults to `pretrained_models/mlp_base_ppo_seed42_best.pt` and is
-copied once to `outputs/ppo_lora_20k_JOBID/source.pt`. Override
-`SOURCE_CHECKPOINT` and/or `RUN_ROOT` in the submission environment if needed.
-Each family directory contains `train.log`, native CSV/physics logs, W&B
-provenance, `latest.pt`, and `final.pt` (base + adapter + critic). Evaluation is
-disabled, so there is no selected `best.pt`. Checkpoints stay separate from the
-original pretrained model.
-
-Recover unfinished families after interruption or walltime expiry:
+Examples from the repository on Wahab (submission examples only):
 
 ```bash
-RUN_ROOT="$PWD/outputs/ppo_lora_20k_JOBID" RESUME=1 \
-  sbatch --export=ALL --chdir="$PWD" scripts/hpc/ppo_lora_families_20k.sbatch
+# Four GPUs, 64 CPUs: straight then s_curve on rank 0; one family on each other rank.
+REPO_DIR="$PWD" sbatch --ntasks=4 --cpus-per-task=16 --gpus-per-task=1 \
+  scripts/hpc/ppo_lora_families_20k.sbatch
+
+# Five GPUs, 160 CPUs: one concurrent independent family per task.
+REPO_DIR="$PWD" sbatch --ntasks=5 --cpus-per-task=32 --gpus-per-task=1 \
+  scripts/hpc/ppo_lora_families_20k.sbatch
+
+# Two independent continual pilot conditions, each with one GPU and 16 CPUs.
+REPO_DIR="$PWD" PROFILE=pilot sbatch --ntasks=2 --cpus-per-task=16 \
+  scripts/hpc/ppo_continual.sbatch
+
+# Resume with fewer GPU tasks; keep enough CPUs/task for each frozen collector.
+REPO_DIR="$PWD" RUN_ROOT="$PWD/outputs/ORIGINAL_RUN" RESUME=1 \
+  sbatch --ntasks=2 --cpus-per-task=32 scripts/hpc/ppo_lora_families_20k.sbatch
+
+# Generic launcher, including scratch PPO pretraining without checkpoint export.
+REPO_DIR="$PWD" SCENARIO=scenarios/ppo_circle_pretrain_20k.yaml \
+  sbatch --ntasks=1 --cpus-per-task=16 scripts/hpc/experiment.sbatch \
+  --set execution=single_node_gpu
 ```
 
-Resume retains the frozen source snapshot and skips completed families. Families
-with `latest.pt` recover from that checkpoint; any family with no recovery
-checkpoint restarts from the base. Keep code, training settings, seeds, dataset,
-and output location unchanged when resuming. Concurrency can be changed because
-the family jobs are independent. `REPO_DIR`, `ENV_PATH`, and `CRUN` use the same
-override conventions as the other HPC launchers.
+Tasks use deterministic rank-strided assignment of the frozen work-item order;
+1, 2, 4, 5, and larger task counts execute each item once, with excess tasks idle.
+Every item retains separate checkpoints, logs, W&B IDs, and recovery state.
+Slurm supplies task CPU affinity and GPU visibility; `srun` inherits allocation
+counts instead of repeating them. Partition/account/QoS, memory, walltime, and
+other resources may also be overridden with sbatch options. `REPO_DIR`,
+`ENV_PATH`, `CRUN`, `SOURCE_CHECKPOINT`, `RUN_ROOT`, and `SEED` preserve the usual
+submission-environment conventions. Python flags, including repeatable `--set`,
+may be passed after the sbatch filename. The default walltime is four days,
+subject to Wahab partition/QoS policy.
+
+Before training, the launcher freezes the source checkpoint as `source.pt` and
+records its SHA-256, original identity, Git commit/dirty flag, and **all** resolved
+work-item configurations in `launch_manifest.yaml`. Each item also receives its
+original `launch_config.yaml`. Allocation and item locks prevent concurrent
+writers. The default root is `outputs/SCENARIO_JOBID`; existing experiment data
+is refused on fresh runs.
+
+Recovery reads the manifest without recomposing today's scenario. It reuses the
+original budgets, collector layouts, source hash, and W&B IDs, restores
+`latest.pt` through the existing training code, and skips verified completed
+items. Queued items use the settings frozen at initial launch. Smaller CPU
+allocations fail when they cannot fit the frozen workers plus CPU reservation.
+A run root must stay at its original absolute path. If initialization failed
+before the first recovery checkpoint, training restarts from its frozen source
+and settings, retaining `train.log` and archiving earlier artifacts under
+`uncheckpointed_*` instead of overwriting them. Old roots without a manifest can be
+imported only when every configured item has its original `launch_config.yaml`;
+missing historical configurations cannot safely be reconstructed. Legacy source
+hashes are recorded at import time, so earlier changes cannot be detected.
+
+For a local configuration-only inspection, use the Python wrapper with
+`--root /tmp/example --plan`; this performs no writes or training. `--prepare-only`
+freezes a real root without invoking training. Standard `run.py` entry points
+remain available; automatic affinity selection belongs to the shared launcher.
 
 ## Solo PPO adaptation on generated maps
 

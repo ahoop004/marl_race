@@ -7,19 +7,22 @@ defaults:
 - override /adaptation: full_finetune
 - override /maps: generated
 - override /evaluation: solo_transfer
-- override /execution: ppo_transfer
+- override /execution: single_node_gpu
 - override /reward: generated_one_lap
 - _self_
 experiment:
   name: ppo_continual_1lap_${adaptation.mode}
   total_steps: null # Resolved to five times continual.steps_per_task during composition.
-  parallel_envs: 8
-  envs_per_worker: 4
   collection_backend: process
   measure_services: true
   measure_stages: true
   measure_collector_startup: true
   torch_threads: 1
+launch:
+  type: continual
+  work_items:
+    full_finetune: [adaptation=full_finetune]
+    ppo_lora: [adaptation=ppo_lora]
 paths:
   pretrained_checkpoint: ${paths.project_root}/pretrained_models/mlp_base_ppo_seed42_best.pt
 environment:

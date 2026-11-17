@@ -7,15 +7,21 @@ defaults:
 - override /adaptation: ppo_lora
 - override /maps: generated
 - override /evaluation: solo_transfer
-- override /execution: ppo_transfer
+- override /execution: single_node_gpu
 - override /reward: generated_one_lap
 - _self_
 experiment:
-  name: ppo_generated_lora_1lap_20k
+  name: ppo_generated_lora_1lap
   total_steps: null
   episodes: 30000
-  parallel_envs: 12
-  envs_per_worker: 4
+launch:
+  type: independent
+  work_items:
+    straight: [maps=generated_straight]
+    sweeper: [maps=generated_sweeper]
+    hairpin: [maps=generated_hairpin]
+    chicane: [maps=generated_chicane]
+    s_curve: [maps=generated_s_curve]
 wandb:
   logging:
     profile: auto
@@ -37,7 +43,7 @@ wandb:
   - lap-completion
   - generated-maps
   - lora
-  notes: Independent family adapter; frozen PPO base, trainable local critic, 20000 one-lap training episodes, distance rewards, one failure penalty, no evaluation runs.
+  notes: Independent family adapter; frozen PPO base, trainable local critic, scenario episode budget, distance rewards, one failure penalty, no evaluation runs.
   mode: online
 paths:
   pretrained_checkpoint: ${paths.project_root}/pretrained_models/mlp_base_ppo_seed42_best.pt
@@ -53,7 +59,7 @@ environment:
   terminate_on_collision: false
 algorithm:
   params:
-    # Exact multiples of 96 slots and 1024-sample minibatches: no rounding.
+    # The launcher selects a CPU-appropriate collector that divides these batches.
     frames_per_batch: 6144
     n_steps: 67584
     n_epochs: 5
