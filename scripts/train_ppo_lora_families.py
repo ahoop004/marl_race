@@ -23,10 +23,10 @@ def main():
     root = args.root.expanduser().resolve()
     rank = int(os.environ.get('SLURM_PROCID', '0'))
     size = int(os.environ.get('SLURM_NTASKS', '1'))
-    if size != len(FAMILIES) or not 0 <= rank < size:
+    if size != 4 or not 0 <= rank < size:
         parser.error('Exactly five Slurm tasks are required, one per family')
     affinity = sorted(os.sched_getaffinity(0))
-    if len(affinity) < 32:
+    if len(affinity) < 16:
         parser.error(f'Task {rank}: expected at least 32 allocated CPUs; affinity={affinity}')
     # Slurm binds each task to one GPU. Families have separate learners and
     # optimizers; no torchrun process group or gradient synchronization is used.
@@ -34,7 +34,7 @@ def main():
     for key in ('RANK', 'LOCAL_RANK', 'WORLD_SIZE', 'LOCAL_WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT'):
         environment.pop(key, None)
     failures = []
-    for family in (FAMILIES[rank],):
+    for family in (FAMILIES[rank::size],):
         out = root / family
         out.mkdir(exist_ok=True)
         with (out / '.training.lock').open('w') as lock:
@@ -77,7 +77,7 @@ def main():
             if (config['experiment'].get('total_steps') is not None
                     or config['experiment'].get('episodes') != 20000):
                 raise RuntimeError(f'{out}: expected the original 20000-episode budget')
-            if (config['experiment']['parallel_envs'], config['experiment']['envs_per_worker']) != (24, 4):
+            if (config['experiment']['parallel_envs'], config['experiment']['envs_per_worker']) != (12, 4):
                 raise RuntimeError(f'{out}: incompatible collector layout; start a new RUN_ROOT')
             if config['adaptation']['checkpoint'] != str(root / 'source.pt'):
                 raise RuntimeError(f'{out}: source snapshot path changed')

@@ -5,9 +5,9 @@
 #SBATCH --qos=q1wang
 #SBATCH --nodes=1
 #SBATCH --nodelist=e7-w4125-01
-#SBATCH --ntasks=5
-#SBATCH --ntasks-per-node=5
-#SBATCH --cpus-per-task=32
+#SBATCH --ntasks=4
+#SBATCH --ntasks-per-node=4
+#SBATCH --cpus-per-task=16
 #SBATCH --gpus-per-task=1
 #SBATCH --mem=0
 #SBATCH --time=4-00:00:00
@@ -58,12 +58,12 @@ flock -n 9 || { echo 'This experiment already has an active allocation' >&2; exi
 printf 'Root=%s; tasks=%s; nodes=%s; CPUs/task=%s; one independent learner per GPU\n' \
   "$RUN_ROOT" "$SLURM_NTASKS" "$SLURM_JOB_NUM_NODES" "$SLURM_CPUS_PER_TASK"
 printf 'Source=%s/source.pt; each family trains for 20000 episodes\n' "$RUN_ROOT"
-[[ "$SLURM_NTASKS" == 5 && "$SLURM_JOB_NUM_NODES" == 1 && "$SLURM_CPUS_PER_TASK" == 32 ]] || {
+[[ "$SLURM_NTASKS" == 4 && "$SLURM_JOB_NUM_NODES" == 1 && "$SLURM_CPUS_PER_TASK" == 16 ]] || {
   echo 'This launcher requires one node, five tasks and 32 CPUs/task' >&2; exit 2;
 }
 # No preflight, pilot, or evaluation jobs. Normal checkpoint compatibility
 # checks remain part of training initialization.
-srun --nodes=1 --ntasks=5 --ntasks-per-node=5 --exact --cpus-per-task="$SLURM_CPUS_PER_TASK" \
+srun --nodes=1 --ntasks=4 --ntasks-per-node=4 --exact --cpus-per-task="$SLURM_CPUS_PER_TASK" \
   --gpus-per-task=1 --gpu-bind=single:1 --cpu-bind=cores --kill-on-bad-exit=0 \
   "$CRUN" -p "$ENV_PATH" python3 scripts/train_ppo_lora_families.py \
   --root "$RUN_ROOT" --seed 42 "${EXTRA[@]}"

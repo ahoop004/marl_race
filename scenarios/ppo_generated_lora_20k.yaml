@@ -13,8 +13,8 @@ defaults:
 experiment:
   name: ppo_generated_lora_1lap_20k
   total_steps: null
-  episodes: 20000
-  parallel_envs: 24
+  episodes: 30000
+  parallel_envs: 12
   envs_per_worker: 4
 wandb:
   logging:
@@ -42,7 +42,7 @@ wandb:
 paths:
   pretrained_checkpoint: ${paths.project_root}/pretrained_models/mlp_base_ppo_seed42_best.pt
 environment:
-  max_steps: 20000
+  max_steps: 8000
   target_laps: 1
   # no_progress:
   #   timeout_s: 60.0
