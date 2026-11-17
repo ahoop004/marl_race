@@ -25,7 +25,6 @@ PROFILE_GPU_MONITOR="${PROFILE_GPU_MONITOR:-1}"
 [[ "$RESTORE" =~ ^[01]$ && "$GPUS_PER_NODE" =~ ^[1-4]$ && "$ENABLE_DASHBOARD" =~ ^[01]$ && "$PROFILE_GPU_MONITOR" =~ ^[01]$ ]] || exit 2
 [[ -d "$VENV" ]] || { echo "Missing project environment" >&2; exit 2; }
 cd "$REPO"
-[[ "$(git branch --show-current)" == multiNode ]] || { echo "Expected multiNode branch" >&2; exit 2; }
 # Reuse the same source integrity contract as the current T5 launcher.
 git diff --quiet -- HEAD -- src configs scenarios scripts run.py || { echo "Uncommitted source files" >&2; exit 2; }
 [[ -z "$(git ls-files --others --exclude-standard -- src configs scenarios scripts run.py)" ]] || { echo "Untracked source files" >&2; exit 2; }

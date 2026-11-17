@@ -38,9 +38,7 @@ if spec.stem==os.environ.get('FAIL_PROFILE'):
  sys.exit(1)
 print('Validation entrypoint exercised: '+spec.stem)
 ''',
-        "git": '''#!/usr/bin/env bash
-if [[ "$1" == branch ]]; then echo multiNode; fi
-''',
+        "git": '#!/usr/bin/env bash\nif [[ "$1" == branch ]]; then exit 1; fi\n',
         "sbatch": '''#!/usr/bin/env python3
 import os,sys
 p=os.environ['MATRIX_TEST_EVENTS']
@@ -126,7 +124,7 @@ def test_pipeline_pretimeout_requeues_same_job_with_explicit_limit(tmp_path, res
     bindir.mkdir()
     events = tmp_path / "events"
     commands = {
-        "git": '#!/usr/bin/env bash\nif [[ "$1" == branch ]]; then echo multiNode; fi\n',
+        "git": '#!/usr/bin/env bash\nif [[ "$1" == branch ]]; then exit 1; fi\n',
         "scontrol": '#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "$TEST_EVENTS"\n',
         "crun": '''#!/usr/bin/env python3
 import os,sys,time

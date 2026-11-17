@@ -47,7 +47,6 @@ HOLD_SECONDS="${HOLD_SECONDS:-0}"
 [[ "$HOLD_SECONDS" =~ ^[0-9]+$ ]] && (( HOLD_SECONDS <= 1800 )) || exit 2
 [[ -d "$VENV" ]] || { echo "Missing environment $VENV" >&2; exit 2; }
 cd "$REPO"
-[[ "$(git branch --show-current)" == multiNode ]] || { echo "Expected multiNode branch" >&2; exit 2; }
 [[ -f scripts/ray_tune_trials.py ]] || { echo "Missing scripts/ray_tune_trials.py" >&2; exit 2; }
 # Do not train from changing source code; new, untracked scripts are okay.
 git diff --quiet -- src configs scenarios run.py || { echo "Uncommitted training source changes" >&2; exit 2; }

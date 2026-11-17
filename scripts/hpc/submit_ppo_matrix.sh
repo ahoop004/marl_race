@@ -31,7 +31,6 @@ done
 [[ -f scripts/hpc/ray_tune_matrix.sbatch ]] || { echo "Missing generalized matrix launcher" >&2; exit 2; }
 if [[ "$MODE" == submit ]]; then
   command -v sbatch >/dev/null || { echo "sbatch unavailable" >&2; exit 2; }
-  [[ "$(git branch --show-current)" == multiNode ]] || { echo "Expected multiNode" >&2; exit 2; }
   [[ -z "$(git status --porcelain -- src configs scenarios scripts run.py)" ]] || {
     echo "Commit/review source changes before launching (T5 revision guard)" >&2; exit 2;
   }

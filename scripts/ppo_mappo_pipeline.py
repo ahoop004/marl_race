@@ -556,8 +556,6 @@ def main():
     if any(character in str(root) for character in ",\n"):
         parser.error("Pipeline paths cannot contain commas or newlines (Slurm export syntax)")
     if args.submit:
-        if subprocess.check_output(["git", "branch", "--show-current"], cwd=REPO, text=True).strip() != "multiNode":
-            raise ValueError("Expected multiNode branch")
         revision = current_revision()
         value = write_plan(root, args.pipeline_id, args.ppo_steps, args.walltime, args.max_restarts, revision)
         preflight_stage(value, "ppo")
