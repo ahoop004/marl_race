@@ -1,5 +1,5 @@
 # Four native CPU trials; 8 decisions each. Restore with the same spec and --restore.
-# For local Ray use RAY_EXPECTED_NODES=1 RAY_EXPECTED_GPUS=0 and RAY_ADDRESS.
+# Run locally with scripts/ray_tune_trials.py --sweep-spec scripts/sweeps/architectures_cpu_smoke.yaml.
 name: Architecture CPU functional smoke
 experiment_id: phase6-architecture-cpu-smoke
 algorithm: ppo

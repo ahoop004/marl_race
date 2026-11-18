@@ -101,6 +101,7 @@ def test_pipeline_plan_separates_budgets_and_submits_held_dependency_chain(tmp_p
     monkeypatch.setattr(pipeline.subprocess, "run", lambda command, **kwargs: releases.append(command))
     pipeline.queue_pipeline(value)
     assert len(submissions) == 4
+    assert all(c[-1].endswith("/scripts/hpc/ray_tune.sbatch") for c in submissions)
     assert all("--hold" in c and "--signal=B:USR1@240" in c for c in submissions)
     assert "--nodes=1" in submissions[0] and "--gres=gpu:1" in submissions[0]
     assert "--nodes=2" in submissions[1] and "--ntasks=2" in submissions[1] and "--gres=gpu:2" in submissions[1]
@@ -145,7 +146,7 @@ else:
         "CRUN": str(bindir / "crun"), "VENV": str(tmp_path), "RAY_TUNE_REPO": str(adapter.REPO),
         "PIPELINE_ROOT": str(tmp_path), "PIPELINE_STAGE": "team", "SLURM_JOB_ID": "9001",
         "SLURM_RESTART_COUNT": str(restart), "TEST_EVENTS": str(events)}
-    process = subprocess.Popen(["bash", str(adapter.REPO / "scripts/hpc/ray_tune_matrix.sbatch")],
+    process = subprocess.Popen(["bash", str(adapter.REPO / "scripts/hpc/ray_tune.sbatch")],
         env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + 5
@@ -160,6 +161,112 @@ else:
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+@pytest.mark.parametrize("capacities,expected", [
+    ({"n1": [5, 0]}, 0),
+    ({"n1": [12, 5], "n2": [12, 5]}, 143),
+    ({"n1": [12, 5], "n2": [12, 1]}, 2),
+    ({"n1": [12, 5], "n2": [12, 5]}, 2),  # fixed workload expects six GPUs/node
+])
+def test_ray_slurm_steps_probe_capacity_and_cleanup(tmp_path, capacities, expected):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    events = tmp_path / "events"
+    scripts = {
+        "git": '#!/usr/bin/env bash\nif [[ "$1" == rev-parse ]]; then echo revision; fi\n',
+        "scontrol": '#!/usr/bin/env bash\nprintf "%s\\n" ${TEST_NODES}\n',
+        "getent": '#!/usr/bin/env bash\nprintf "127.0.0.%s STREAM\\n" "${2#n}"\n',
+        "crun": '#!/usr/bin/env bash\nshift 3\nexec "$TEST_PYTHON" "$@"\n',
+        "srun": '''#!/usr/bin/env python3
+import json, os, signal, socket, sys, time
+args = sys.argv[1:]
+node = next(a.split('=')[1] for a in args if a.startswith('--nodelist='))
+cpus, gpus = json.loads(os.environ['TEST_CAPACITIES'])[node]
+def log(event):
+    with open(os.environ['TEST_EVENTS'], 'a') as stream:
+        stream.write(event + '\\n')
+def hold(role):
+    def stop(*_):
+        log('stop:' + role)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    log('start:' + role)
+    time.sleep(60)
+assert '--cpus-per-task=12' in args and not any(a.startswith('--gres=') for a in args)
+if '--slurm-node-resources' in args:
+    print(cpus, gpus, '0,1', '', '', sep='\\t')
+elif '--preflight-only' in args:
+    assert args[-6:] == ['--cluster-nodes', os.environ['RAY_EXPECTED_NODES'],
+                         '--cpus-per-node', str(cpus), '--gpus-per-node', str(gpus)]
+    log('preflight')
+elif 'start' in args:
+    assert f'--num-cpus={cpus}' in args and f'--num-gpus={gpus}' in args
+    with open(os.environ['RAY_AUTH_TOKEN_PATH']) as stream:
+        assert stream.read().strip()
+    if '--head' in args:
+        host, port = os.environ['RAY_ADDRESS'].split(':')
+        listener = socket.create_server((host, int(port)))
+    hold(node)
+elif 'nvidia-smi' in args:
+    assert gpus > 0
+    hold('gpu-' + node)
+else:
+    assert os.environ['RAY_EXPECTED_GPUS'] == str(gpus * int(os.environ['RAY_EXPECTED_NODES']))
+    if gpus:
+        hold('driver')
+    else:
+        log('driver-completed')
+''',
+    }
+    for name, source in scripts.items():
+        path = bindir / name
+        path.write_text(source)
+        path.chmod(0o755)
+    env = {**os.environ, "PATH": str(bindir) + os.pathsep + os.environ["PATH"], "RAY_TUNE_REPO": str(adapter.REPO),
+           "CRUN": str(bindir / "crun"), "VENV": str(tmp_path), "SLURM_JOB_ID": "9144",
+           "SLURM_JOB_NODELIST": "mock", "SLURM_CPUS_PER_TASK": "12", "RESTORE": "0", "PROFILE_GPU_MONITOR": "1",
+           "TEST_CAPACITIES": json.dumps(capacities), "TEST_NODES": " ".join(capacities), "TEST_EVENTS": str(events),
+           "TEST_PYTHON": sys.executable}
+    if expected == 2 and len(set(gpu for _, gpu in capacities.values())) == 1:
+        env["RAY_TUNE_FIXED_GPUS_PER_NODE"] = "6"
+    if expected == 0:
+        python_exec = bindir / "python"
+        python_exec.write_text('#!/usr/bin/env bash\nexec "$TEST_PYTHON" "$@"\n')
+        python_exec.chmod(0o755)
+        del env["CRUN"]
+    root = tmp_path / "output with spaces"
+    command = ["bash", "scripts/hpc/ray_tune.sbatch", "--root", str(root),
+               "--sweep-spec", "scripts/sweeps/architectures_cpu_smoke.yaml"]
+    with subprocess.Popen(command, cwd=adapter.REPO, env=env, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        started = {"start:n1", "start:n2", "start:gpu-n1", "start:gpu-n2", "start:driver"}
+        try:
+            if expected == 143:
+                deadline = time.monotonic() + 10
+                while process.poll() is None and time.monotonic() < deadline:
+                    if events.exists() and started <= set(events.read_text().splitlines()):
+                        break
+                    time.sleep(.05)
+                process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=15)
+            assert process.returncode == expected, stdout + stderr
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=15)
+    attempt = root / "attempts/9144"
+    rows = (attempt / "allocation.tsv").read_text().splitlines()
+    assert [row.split("\t")[:3] for row in rows[1:]] == [[node, str(cpu), str(gpu)] for node, (cpu, gpu) in capacities.items()]
+    assert not (attempt / ".ray_auth_token").exists()
+    if expected == 2:
+        assert "Heterogeneous Slurm" in stderr or "fixed workload layout" in stderr
+        assert not events.exists()
+    elif expected == 143:
+        logged = set(events.read_text().splitlines())
+        assert {event.replace("start:", "stop:") for event in started} <= logged
+    else:
+        assert events.read_text().splitlines() == ["preflight", "start:n1", "driver-completed", "stop:n1"]
 
 
 def test_all_seven_profiles_pass_native_preflight_without_cluster_or_manifest(tmp_path, matrix_env, tune, monkeypatch):

@@ -1,6 +1,7 @@
 # Production PPO pretraining sweep: N3-G2 (3 nodes x 2 GPUs, 24 CPUs/node).
 # Six independent single-GPU PPO trials, 8 collector processes x 8 envs/trial.
-# Use with scripts/hpc/ray_tune_matrix.sbatch on the public gpu partition.
+# Use with scripts/hpc/ray_tune.sbatch on the public gpu partition.
+# Pass --checkpoint-every-steps 65536 --trial-timeout 0 for the production run.
 name: PPO lap-completion pretraining N3-G2 24M
 experiment_id: ppo-pretrain-n3g2-24m-v1
 algorithm: ppo

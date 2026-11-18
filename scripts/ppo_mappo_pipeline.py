@@ -31,7 +31,7 @@ from ray_tune_trials import (atomic_json, checkpoint_payload, current_revision, 
                              prepare_settings, validate_restoration)
 from prepare_mappo_pilot_sources import prepare as prepare_sources
 
-LAUNCHER = REPO / "scripts/hpc/ray_tune_matrix.sbatch"
+LAUNCHER = REPO / "scripts/hpc/ray_tune.sbatch"
 TEMPLATES = {stage: REPO / f"scripts/sweeps/ppo_to_mappo_{stage}.yaml" for stage in ("ppo", "mappo")}
 STAGES = ("ppo", "mappo", "team", "solo")
 
@@ -437,8 +437,8 @@ def stage_environment(root, stage):
         verify_complete(value, stage)
     env = {"SWEEP_SPEC": info["spec"], "EXPERIMENT_ID": info["experiment_id"], "RAY_TUNE_JOB_ROOT": info["root"],
            "RESTORE": int((Path(info["root"]) / "experiment.json").exists()),
-           "PROFILE_GPUS_PER_NODE": info["gpus_per_node"], "PIPELINE_EXPECTED_NODES": info["nodes"],
-           "PIPELINE_CPUS_PER_NODE": info["cpus_per_node"], "PIPELINE_MAX_RESTARTS": value["max_restarts"],
+           "RAY_TUNE_FIXED_GPUS_PER_NODE": info["gpus_per_node"], "RAY_TUNE_FIXED_NODES": info["nodes"],
+           "RAY_TUNE_FIXED_CPUS_PER_NODE": info["cpus_per_node"], "PIPELINE_MAX_RESTARTS": value["max_restarts"],
            "PIPELINE_STAGE_COMPLETE": int(complete), "RAY_TUNE_CHECKPOINT_STEPS": value["checkpoint_every_steps"],
            "RAY_TUNE_TRIAL_TIMEOUT": 0}
     record_status(root, stage, "running")

@@ -151,8 +151,9 @@ def test_preflight_freezes_native_config_and_rejects_bad_paths_types_and_values(
             sweeps.preflight(bad, adapter.trainer_command, adapter.REPO)
 
 
-def test_fifo_plan_concurrency_and_restore_without_resampling(tmp_path, tune, monkeypatch):
-    captured, restores = [], []
+@pytest.mark.parametrize("address,gpus", [(None, 0), (None, 2), ("test", 1)])
+def test_fifo_plan_concurrency_and_restore_without_resampling(tmp_path, tune, monkeypatch, address, gpus):
+    captured, restores, initializations = [], [], []
     result_configs = []
 
     class Tuner:
@@ -175,17 +176,28 @@ def test_fifo_plan_concurrency_and_restore_without_resampling(tmp_path, tune, mo
     tune.with_resources = lambda fn, resources: (fn, resources)
     for name in ("TuneConfig", "RunConfig", "FailureConfig", "CheckpointConfig", "CLIReporter"):
         setattr(tune, name, lambda **kwargs: kwargs)
-    ray = SimpleNamespace(tune=tune, init=lambda **kw: None, shutdown=lambda: None,
-                          cluster_resources=lambda: {"GPU": 2}, nodes=lambda: [{"Alive": True, "Resources": {"CPU": 8, "GPU": 1}}] * 2)
+    nodes = [{"Alive": True, "Resources": {"CPU": 12, "GPU": gpus}}] * (2 if address else 1)
+    ray = SimpleNamespace(tune=tune, init=lambda **kw: initializations.append(kw), shutdown=lambda: None,
+                          nodes=lambda: nodes)
     monkeypatch.setitem(sys.modules, "ray", ray)
-    monkeypatch.setenv("RAY_ADDRESS", "test")
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    if address:
+        monkeypatch.setenv("RAY_ADDRESS", address)
+        monkeypatch.setattr(adapter, "visible_resources", lambda: pytest.fail("External cluster used local resources"))
+    else:
+        monkeypatch.setattr(adapter, "visible_resources", lambda: ({"cpu": 12, "gpu": gpus}, list(range(12))))
     monkeypatch.setattr(adapter, "current_revision", lambda: "revision")
-    path = spec_file(tmp_path)
+    path = spec_file(tmp_path, resources_per_trial={"cpu": 6, "gpu": int(bool(gpus))})
     root = tmp_path / "experiment"
     command = ["adapter", "--sweep-spec", str(path), "--root", str(root)]
     monkeypatch.setattr(sys, "argv", command)
     adapter.main()
-    assert len(result_configs) == 3  # two GPUs, third trial remains in the plan
+    if address:
+        assert initializations == [{"address": address, "logging_level": "ERROR"}]
+    else:
+        assert initializations == [{"address": "local", "num_cpus": 12, "num_gpus": gpus,
+                                    "include_dashboard": False, "logging_level": "ERROR"}]
+    assert len(result_configs) == 3  # third trial remains in the plan when capacity is two
     assert captured[0]["tune_config"]["max_concurrent_trials"] == 2
     assert "scheduler" not in captured[0]["tune_config"]  # FIFO, no early stopping
     saved = json.loads((root / "experiment.json").read_text())

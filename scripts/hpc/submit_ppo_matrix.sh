@@ -28,7 +28,7 @@ done
 [[ "$TAG" =~ ^[A-Za-z0-9_-]+$ && "$STEPS" =~ ^[0-9]+$ ]] || exit 2
 (( STEPS >= 131072 && STEPS % 32768 == 0 )) || { echo "--steps must be >=131072 and divisible by 32768" >&2; exit 2; }
 [[ "$WALLTIME" =~ ^[0-9]{2}:[0-5][0-9]:[0-5][0-9]$ ]] || { echo "--walltime must be HH:MM:SS" >&2; exit 2; }
-[[ -f scripts/hpc/ray_tune_matrix.sbatch ]] || { echo "Missing generalized matrix launcher" >&2; exit 2; }
+[[ -f scripts/hpc/ray_tune.sbatch ]] || { echo "Missing Ray Tune launcher" >&2; exit 2; }
 if [[ "$MODE" == submit ]]; then
   command -v sbatch >/dev/null || { echo "sbatch unavailable" >&2; exit 2; }
   [[ -z "$(git status --porcelain -- src configs scenarios scripts run.py)" ]] || {
@@ -40,6 +40,7 @@ CRUN="${CRUN:-$(command -v crun || true)}"
 [[ -n "$CRUN" ]] || CRUN=/cm/shared/containers/python3/2025.1-py312/crun.python3
 VENV="${VENV:-$HOME/envs/marl-race}"
 [[ -x "$CRUN" && -d "$VENV" ]] || { echo "Missing project container/environment: $CRUN -p $VENV" >&2; exit 2; }
+CHECKPOINT_STEPS="${RAY_TUNE_CHECKPOINT_STEPS:-65536}"
 
 OUT="${PROFILE_MATRIX_ROOT:-$REPO/outputs/hpc_profile_matrix}/$TAG"
 mkdir -p "$(dirname "$OUT")"
@@ -116,6 +117,7 @@ for record in "${selected[@]}"; do
   echo "Validating $key: nodes=$nodes GPUs/node=$gpus CPUs/node=$cpus workers/trial=$workers envs/worker=$envs"
   if ! RESTORE=0 "$CRUN" -p "$VENV" python3 scripts/ray_tune_trials.py \
       --preflight-only --sweep-spec "$SPEC_DIR/$key.yaml" --experiment-id "profile_${TAG}_${key}" \
+      --checkpoint-every-steps "$CHECKPOINT_STEPS" \
       --cluster-nodes "$nodes" --cpus-per-node "$cpus" --gpus-per-node "$gpus" \
       > "$OUT/validation/$key.log" 2>&1; then
     echo "PREFLIGHT FAILED: $key; zero jobs submitted" >&2
@@ -138,8 +140,8 @@ for record in "${selected[@]}"; do
     dependency="afterok:$previous"
     command+=("--dependency=$dependency" --kill-on-invalid-dep=no)
   fi
-  command+=("--export=ALL,RESTORE=0,EXPERIMENT_ID=${experiment_id},SWEEP_SPEC=${spec},PROFILE_GPUS_PER_NODE=${gpus},RAY_TUNE_JOB_ROOT=${REPO}/outputs/ray_tune_${experiment_id}"
-            scripts/hpc/ray_tune_matrix.sbatch)
+  command+=("--export=ALL,RESTORE=0,EXPERIMENT_ID=${experiment_id},SWEEP_SPEC=${spec},RAY_TUNE_FIXED_NODES=${nodes},RAY_TUNE_FIXED_CPUS_PER_NODE=${cpus},RAY_TUNE_FIXED_GPUS_PER_NODE=${gpus},RAY_TUNE_JOB_ROOT=${REPO}/outputs/ray_tune_${experiment_id}"
+            scripts/hpc/ray_tune.sbatch --checkpoint-every-steps "$CHECKPOINT_STEPS" --trial-timeout 0)
   if [[ "$MODE" == submit ]]; then
     if ! job="$("${command[@]}")"; then
       echo "Submission failed for $key; submitted IDs are preserved in $JOBS" >&2

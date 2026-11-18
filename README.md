@@ -73,15 +73,64 @@ RESUME=1 sbatch --export=ALL --chdir="$PWD" scripts/hpc/ppo_circle_pretrain_20k.
 `REPO_DIR`, `ENV_PATH`, `CRUN`, and `RUN_DIR` may be overridden in the submission
 environment. A fresh submission refuses to overwrite an existing run directory.
 
+## Ray Tune sweeps
+
+Run from a clean, reviewed checkout with Ray 2.59 (`ray[tune,default]`) in the
+project’s Python environment. A local cluster starts automatically. Set
+`RAY_ADDRESS` to connect to an existing cluster with the same checkout,
+environment, and shared output paths on its workers.
+
+```bash
+# Local CPU-only smoke sweep
+CUDA_VISIBLE_DEVICES='' python scripts/ray_tune_trials.py \
+  --sweep-spec scripts/sweeps/architectures_cpu_smoke.yaml
+
+# Local GPU sweep (use 0 for one GPU, or 0,1 for two)
+CUDA_VISIBLE_DEVICES=0,1 python scripts/ray_tune_trials.py \
+  --sweep-spec scripts/sweeps/ppo_lr_smoke.yaml
+```
+
+Submit one Slurm task per node and set the CPUs available to each Ray node
+with `--cpus-per-task`. Use a per-node GPU request such as `--gres=gpu:2`, or
+omit the GPU request for a CPU-only sweep. These Wahab examples use the same
+sweep as the local GPU example. Choose the partition, account and matching QoS
+at submission. Set `VENV` for a shared Python environment and `CRUN` when using a
+container wrapper. The launcher detects the existing Wahab wrapper when present.
+
+```bash
+# One node, two GPUs on the public partition
+sbatch --partition=gpu --account=q1wang --qos=normal --time=01:00:00 \
+  --nodes=1 --ntasks-per-node=1 --cpus-per-task=16 --gres=gpu:2 \
+  scripts/hpc/ray_tune.sbatch --sweep-spec scripts/sweeps/ppo_lr_smoke.yaml
+
+# Two nodes, one GPU per node on the reserved partition
+sbatch --partition=reserved-q1wang --account=q1wang --qos=q1wang --time=01:00:00 \
+  --nodes=2 --ntasks-per-node=1 --cpus-per-task=8 --gres=gpu:1 \
+  scripts/hpc/ray_tune.sbatch --sweep-spec scripts/sweeps/ppo_lr_smoke.yaml
+```
+
+Tune schedules each trial on one node, up to the sweep’s `max_concurrent_trials`.
+For the GPU example, one GPU runs trials sequentially and two GPUs can run two
+trials at once when each has six CPUs available. Use `--trial-timeout 0` for
+long runs that need to disable the per-attempt timeout. Slurm nodes must have
+matching usable CPU and GPU counts. `attempts/<job-id>/allocation.tsv` records the
+discovered layout and `gpu_*.csv` captures GPU utilization where available.
+The profiling matrix and PPO → MAPPO pipeline require their specified layouts.
+
+To recover an interrupted sweep, repeat the command with `--restore`, the same
+sweep and experiment ID, the original checkout revision, and the original
+absolute output root (`--root` if customized). For Slurm, the `sbatch` resource
+options can change as long as one node can fit a trial and any fixed layout is
+satisfied. Resume uses the frozen trial configurations, checkpoints, and W&B IDs.
+
 ## Single-node experiment launch infrastructure
 
 Scenarios own budgets, task choices, and ordered `launch.work_items` (output names
 mapped to Hydra override lists). `configs/` owns reusable algorithm, adaptation,
 reward, checkpoint, and execution profiles. Slurm alone owns hardware allocation.
 Use `scripts/hpc/experiment.sbatch` with the shared `scripts/launch_experiment.py`
-and `scripts/hpc/launch_single_node_gpu.sh` runtime for single-node experiments.
-Ray, multi-node, distributed PPO, and the circle checkpoint-export job remain
-separate. No training algorithms or physics are changed.
+and `scripts/hpc/launch_single_node_gpu.sh` runtime for independent single-node
+experiments.
 
 `scenarios/ppo_lora_families.yaml` retains **30,000 episodes** per family,
 with no-progress termination disabled. Continual learning defaults

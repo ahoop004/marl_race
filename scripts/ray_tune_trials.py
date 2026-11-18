@@ -13,6 +13,7 @@ import io
 import json
 import math
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -32,6 +33,7 @@ SCENARIOS = {
     "ppo": "scenarios/ppo_lap_completion_pretrain.yaml",
     "mappo": "scenarios/mappo_2v2_completion_scratch.yaml",
 }
+DEFAULT_TRIAL_RESOURCES = {"cpu": 6, "gpu": 1}
 
 
 def atomic_json(path, value):
@@ -561,8 +563,58 @@ def _attempts(out):
     return path
 
 
+def visible_resources(*, slurm=False):
+    from ray._private.utils import get_num_cpus
+
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None
+    cpus = int(get_num_cpus(override_docker_cpu_warning=True))
+    if affinity is not None:
+        cpus = min(cpus, len(affinity))
+    visible = os.getenv("CUDA_VISIBLE_DEVICES")
+    step_gpus = os.getenv("SLURM_STEP_GPUS", "") if slurm else None
+    if slurm and not step_gpus and int(os.getenv("SLURM_GPUS_ON_NODE", "0")):
+        raise ValueError("Slurm reports GPUs without step device IDs in SLURM_STEP_GPUS")
+    gpus = 0
+    if not slurm or step_gpus:
+        from torch import cuda
+
+        gpus = cuda.device_count() if cuda.is_available() else 0
+    if slurm:
+        cpus = min(cpus, int(os.environ["SLURM_CPUS_PER_TASK"]))
+        if step_gpus and (not visible or gpus != len(step_gpus.split(","))):
+            raise ValueError(f"Slurm GPUs {step_gpus} disagree with CUDA visibility {visible!r} ({gpus} usable GPUs)")
+    return {"cpu": cpus, "gpu": gpus}, affinity
+
+
+def validate_capacity(resources, nodes):
+    if not any(all(node.get(key, 0) >= amount for key, amount in resources.items()) for node in nodes):
+        raise ValueError(f"Trial resources {resources} do not fit on any single Ray node. Node capacities: {nodes}")
+
+
+def cluster_nodes(ray):
+    expected_nodes = int(os.getenv("RAY_EXPECTED_NODES", "0"))
+    expected_gpus = int(os.getenv("RAY_EXPECTED_GPUS", "0"))
+    # The Slurm launcher sets these from the per-node probes. An external cluster
+    # normally needs no readiness contract, but can still opt into a startup wait.
+    capacity_env = {"cpu": "RAY_EXPECTED_CPUS_PER_NODE", "gpu": "RAY_EXPECTED_GPUS_PER_NODE"}
+    exact_capacity = {key: int(os.environ[name]) for key, name in capacity_env.items() if name in os.environ}
+    deadline = time.monotonic() + 180
+    while True:
+        nodes = [{"host": n.get("NodeManagerHostname"), "cpu": n.get("Resources", {}).get("CPU", 0),
+                  "gpu": n.get("Resources", {}).get("GPU", 0)} for n in ray.nodes() if n["Alive"]]
+        if not expected_nodes or len(nodes) == expected_nodes:
+            if any(any(node[key] != amount for key, amount in exact_capacity.items()) for node in nodes):
+                raise RuntimeError(f"Ray nodes differ from the allocation ({exact_capacity} per node): {nodes}")
+            if sum(n["gpu"] for n in nodes) >= expected_gpus:
+                return nodes
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Ray cluster not ready for {expected_nodes} nodes, {expected_gpus} GPUs: {nodes}")
+        time.sleep(2)
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--slurm-environment", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--experiment-id", default=os.getenv("EXPERIMENT_ID"))
     parser.add_argument("--sweep-spec", default=os.getenv("SWEEP_SPEC"), help="YAML sweep specification; paths relative to the repository")
     parser.add_argument("--preflight-only", action="store_true", help="Validate a sweep in temporary storage without Ray cluster startup or training")
@@ -645,6 +697,13 @@ def main():
     spec = read_spec(args.sweep_spec, REPO) if args.sweep_spec else None
     args.experiment_id = args.experiment_id or (spec["experiment_id"] if spec else f"slurm_{os.getenv('SLURM_JOB_ID', 'local')}")
     identifier(args.experiment_id)
+    root = Path(args.root or REPO / "outputs" / f"ray_tune_{args.experiment_id}").expanduser().resolve()
+    if args.slurm_environment:
+        for key, value in {"SWEEP_SPEC": args.sweep_spec or "", "EXPERIMENT_ID": args.experiment_id,
+                           "RAY_TUNE_JOB_ROOT": str(root), "RESTORE": str(int(args.restore)),
+                           "PREFLIGHT_ONLY": str(int(args.preflight_only))}.items():
+            print(f"export {key}={shlex.quote(value)}")
+        return
     if spec and args.overrides:
         raise ValueError("Use fixed_overrides inside the sweep specification, rather than --set")
     controlled = {"--mode", "--total-steps", "--seed", "--evaluation", "--ppo-scenario", "--mappo-scenario",
@@ -665,20 +724,15 @@ def main():
             raise ValueError("--preflight-only requires --sweep-spec and cannot restore an experiment")
         allocation = (args.cluster_nodes, args.cpus_per_node, args.gpus_per_node)
         if any(value is not None for value in allocation):
-            if any(type(value) is not int or value < 1 for value in allocation):
-                raise ValueError("Supply positive --cluster-nodes, --cpus-per-node and --gpus-per-node together")
-            if args.cluster_nodes > 8 or args.gpus_per_node > 4:
-                raise ValueError("Matrix launcher supports 1..8 nodes and 1..4 GPUs per node")
-            resources = spec["resources_per_trial"]
-            if resources["cpu"] > args.cpus_per_node or resources["gpu"] > args.gpus_per_node:
-                raise ValueError(f"Trial resources {resources} do not fit a node with {args.cpus_per_node} CPUs/{args.gpus_per_node} GPUs")
+            if (None in allocation or args.cluster_nodes < 1 or args.cpus_per_node < 1 or args.gpus_per_node < 0):
+                raise ValueError("Supply --cluster-nodes and --cpus-per-node >= 1 and --gpus-per-node >= 0 together")
+            validate_capacity(spec["resources_per_trial"], [{"cpu": args.cpus_per_node, "gpu": args.gpus_per_node}])
         with tempfile.TemporaryDirectory(prefix="ray-tune-preflight-") as directory:
             checked = prepare_settings(args, spec, Path(directory), tune, "preflight-only")
             print(f"PREFLIGHT PASSED: {args.experiment_id}; {len(checked['trial_plan'])} trials; "
                   f"resources/trial={spec['resources_per_trial']}; frozen configurations reconstructed", flush=True)
         return
 
-    root = Path(args.root or REPO / "outputs" / f"ray_tune_{args.experiment_id}").expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     with exclusive(root / ".experiment.lock"):
         manifest = root / "experiment.json"
@@ -690,31 +744,32 @@ def main():
             validate_restoration(settings, spec, args.experiment_id, root)
             if not tune.Tuner.can_restore(str(experiment_path)):
                 raise RuntimeError(f"No restorable Tune experiment at {experiment_path}")
+            resources = settings.get("resources_per_trial", DEFAULT_TRIAL_RESOURCES)
         else:
             if manifest.exists() or experiment_path.exists() or (root / "trial_runs").exists():
                 raise FileExistsError(f"Experiment already exists; use --restore: {root}")
-            settings = prepare_settings(args, spec, root, tune, current_revision())
-            settings["manifest_digest"] = digest(settings)
-            atomic_json(manifest, settings)
-        algorithms = ["ppo", "mappo"] if settings["mode"] == "both" else [settings["mode"]]
-        expected_trials = len(settings["trial_plan"]) if "trial_plan" in settings else len(algorithms)
-        resources = settings.get("resources_per_trial", {"cpu": 6, "gpu": 1})
-        concurrency = settings.get("max_concurrent_trials", len(algorithms))
-        ray.init(address=os.environ["RAY_ADDRESS"], logging_level="ERROR")
+            revision = current_revision()
+            resources = spec["resources_per_trial"] if spec else DEFAULT_TRIAL_RESOURCES
+        address = os.getenv("RAY_ADDRESS")
+        if address and address != "local":
+            ray.init(address=address, logging_level="ERROR")
+        else:
+            local, _ = visible_resources()
+            validate_capacity(resources, [local])
+            os.environ.setdefault("RAY_DISABLE_USAGE_STATS", "1")
+            ray.init(address="local", num_cpus=local["cpu"], num_gpus=local["gpu"],
+                     include_dashboard=False, logging_level="ERROR")
         try:
-            deadline = time.monotonic() + 180
-            expected_nodes = int(os.environ.get("RAY_EXPECTED_NODES", "2"))
-            expected_gpus = int(os.environ.get("RAY_EXPECTED_GPUS", "2"))
-            while time.monotonic() < deadline:
-                nodes = [n for n in ray.nodes() if n["Alive"]]
-                if ray.cluster_resources().get("GPU", 0) >= expected_gpus and len(nodes) == expected_nodes:
-                    break
-                time.sleep(2)
-            else:
-                raise RuntimeError(f"Ray cluster not ready for {expected_nodes} nodes, {expected_gpus} GPUs: {ray.cluster_resources()}")
-            if settings.get("sweep") and not any(all(n.get("Resources", {}).get(k.upper() if k == "gpu" else "CPU", 0) >= v
-                                         for k, v in resources.items()) for n in nodes):
-                raise ValueError(f"Trial resources cannot fit on any Ray node: {resources}")
+            nodes = cluster_nodes(ray)
+            validate_capacity(resources, nodes)
+            print(f"Ray allocation: {nodes}; resources/trial={resources}", flush=True)
+            if not args.restore:
+                settings = prepare_settings(args, spec, root, tune, revision)
+                settings["manifest_digest"] = digest(settings)
+                atomic_json(manifest, settings)
+            algorithms = ["ppo", "mappo"] if settings["mode"] == "both" else [settings["mode"]]
+            expected_trials = len(settings["trial_plan"]) if "trial_plan" in settings else len(algorithms)
+            concurrency = settings.get("max_concurrent_trials", len(algorithms))
             trainable = tune.with_resources(trial, resources=resources)
             if args.restore:
                 tuner = tune.Tuner.restore(str(experiment_path), trainable=trainable,
@@ -759,4 +814,9 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--supervise":
         sys.exit(supervise(int(sys.argv[2]), sys.argv[3:]))
+    if sys.argv[1:] == ["--slurm-node-resources"]:
+        resources, affinity = visible_resources(slurm=True)
+        print(resources["cpu"], resources["gpu"], ",".join(map(str, affinity or [])),
+              os.getenv("SLURM_STEP_GPUS", ""), os.getenv("CUDA_VISIBLE_DEVICES", ""), sep="\t")
+        sys.exit(0)
     main()

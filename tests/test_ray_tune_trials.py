@@ -255,7 +255,7 @@ def test_restore_uses_saved_settings_and_resume_flags(tmp_path, monkeypatch):
 
     tune = SimpleNamespace(Tuner=Tuner, with_resources=lambda fn, resources: fn)
     ray = SimpleNamespace(tune=tune, init=lambda **kw: None, shutdown=lambda: None,
-                          cluster_resources=lambda: {"GPU": 2}, nodes=lambda: [{"Alive": True}] * 2)
+                          nodes=lambda: [{"Alive": True, "Resources": {"CPU": 8, "GPU": 1}}])
     monkeypatch.setitem(sys.modules, "ray", ray)
     monkeypatch.setenv("RAY_ADDRESS", "test")
     monkeypatch.setattr(sys, "argv", ["adapter", "--root", str(tmp_path), "--experiment-id", "recovery", "--restore", "--total-steps", "999"])
@@ -264,6 +264,42 @@ def test_restore_uses_saved_settings_and_resume_flags(tmp_path, monkeypatch):
     assert not restored[0]["restart_errored"]
     assert "param_space" not in restored[0]
     assert json.loads((tmp_path / "experiment.json").read_text())["total_steps"] == 9
+
+
+def test_capacity_must_fit_cpus_and_gpus_on_the_same_node(monkeypatch):
+    nodes = [{"cpu": 8, "gpu": 0}, {"cpu": 4, "gpu": 2}]
+    adapter.validate_capacity({"cpu": 8, "gpu": 0}, nodes)
+    adapter.validate_capacity({"cpu": 4, "gpu": 1}, nodes)
+    with pytest.raises(ValueError, match="do not fit on any single Ray node"):
+        adapter.validate_capacity({"cpu": 6, "gpu": 1}, nodes)
+    for key, value in {"NODES": "2", "GPUS": "2", "CPUS_PER_NODE": "8", "GPUS_PER_NODE": "1"}.items():
+        monkeypatch.setenv(f"RAY_EXPECTED_{key}", value)
+    ray = SimpleNamespace(nodes=lambda: [{"Alive": True, "Resources": {"CPU": n["cpu"], "GPU": n["gpu"]}} for n in nodes])
+    with pytest.raises(RuntimeError, match="Ray nodes differ from the allocation"):
+        adapter.cluster_nodes(ray)
+
+
+def test_visible_resources_respect_cpu_affinity_and_slurm_gpu_visibility(monkeypatch):
+    from torch import cuda
+
+    monkeypatch.setitem(sys.modules, "ray._private.utils", SimpleNamespace(get_num_cpus=lambda **_: 32))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {7, 8, 9, 10})
+    monkeypatch.setattr(cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cuda, "device_count", lambda: 2)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,3")
+    assert adapter.visible_resources() == ({"cpu": 4, "gpu": 2}, [7, 8, 9, 10])
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "3")
+    monkeypatch.delenv("SLURM_STEP_GPUS", raising=False)
+    monkeypatch.delenv("SLURM_GPUS_ON_NODE", raising=False)
+    assert adapter.visible_resources(slurm=True)[0] == {"cpu": 3, "gpu": 0}
+    monkeypatch.setenv("SLURM_GPUS_ON_NODE", "2")
+    with pytest.raises(ValueError, match="without step device IDs"):
+        adapter.visible_resources(slurm=True)
+    monkeypatch.setenv("SLURM_STEP_GPUS", "5,7")
+    assert adapter.visible_resources(slurm=True)[0] == {"cpu": 3, "gpu": 2}
+    monkeypatch.setenv("SLURM_STEP_GPUS", "7")
+    with pytest.raises(ValueError, match="disagree with CUDA visibility"):
+        adapter.visible_resources(slurm=True)
 
 
 @pytest.mark.parametrize("failure", ["signal", "worker_exit"])
