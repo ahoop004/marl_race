@@ -123,6 +123,8 @@ def _run_evaluation(
     env = task.env
     spec = task.spec
     params = learner_params(scenario, spec, algorithm)
+    if getattr(args, "eval_device", None):
+        params["device"] = args.eval_device
     action_dim = len(spec.action_lows[focal_agent_id])
     has_team_rewards = validate_team_reward_composers(
         task.reward_composers, trainable_ids=trainable_ids,

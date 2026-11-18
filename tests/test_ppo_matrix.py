@@ -1,5 +1,6 @@
 """Focused profiling preflight and submission safeguards; no Slurm jobs or GPUs."""
 import csv
+from copy import deepcopy
 import importlib.util
 import json
 import os
@@ -64,7 +65,9 @@ def test_pipeline_plan_separates_budgets_and_submits_held_dependency_chain(tmp_p
     import ppo_mappo_pipeline as pipeline
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(tune=tune))
     root = tmp_path / "pipeline"
-    value = pipeline.write_plan(root, "pipeline-test", 120000000, "24:00:00", 3, "revision")
+    value = pipeline.write_plan(root, "pipeline-test", 120000000, "revision")
+    assert value["schema_version"] == 2 and "walltime" not in value
+    assert all("nodes" not in stage for stage in value["stages"].values())
     ppo = yaml.safe_load(Path(value["stages"]["ppo"]["spec"]).read_text())
     mappo = yaml.safe_load(Path(value["stages"]["mappo"]["spec"]).read_text())
     assert ppo["total_steps"] == 120000000 and mappo["total_steps"] == 24576000
@@ -99,23 +102,139 @@ def test_pipeline_plan_separates_budgets_and_submits_held_dependency_chain(tmp_p
         return str(8000 + len(submissions)) + "\n"
     monkeypatch.setattr(pipeline.subprocess, "check_output", submit)
     monkeypatch.setattr(pipeline.subprocess, "run", lambda command, **kwargs: releases.append(command))
-    pipeline.queue_pipeline(value)
+    options = {"ppo": {"--partition": "reserved-q1wang", "--account": "q1wang", "--qos": "q1wang"},
+               "mappo": {"--partition": "gpu", "--nodes": "2", "--gres": "gpu:2", "--cpus-per-task": "24",
+                         "--time": "10:00:00"}}
+    frozen = (root / "pipeline.json").read_bytes()
+    pipeline.queue_pipeline(value, options=options, device="cpu")
     assert len(submissions) == 4
     assert all(c[-1].endswith("/scripts/hpc/ray_tune.sbatch") for c in submissions)
     assert all("--hold" in c and "--signal=B:USR1@240" in c for c in submissions)
     assert "--nodes=1" in submissions[0] and "--gres=gpu:1" in submissions[0]
-    assert "--nodes=2" in submissions[1] and "--ntasks=2" in submissions[1] and "--gres=gpu:2" in submissions[1]
+    assert {"--partition=reserved-q1wang", "--qos=q1wang", "--cpus-per-task=20"} <= set(submissions[0])
+    assert {"--partition=gpu", "--nodes=2", "--ntasks-per-node=1", "--gres=gpu:2", "--time=10:00:00"} <= set(submissions[1])
+    assert not any(arg.startswith("--gres=") for arg in submissions[2])
+    assert "PIPELINE_EVAL_DEVICE=cpu" in next(arg for arg in submissions[2] if arg.startswith("--export="))
     assert [next((a for a in c if a.startswith("--dependency")), None) for c in submissions] == [
         None, "--dependency=afterok:8001", "--dependency=afterok:8002", "--dependency=afterok:8003"]
     assert releases == [["scontrol", "release", str(job)] for job in range(8001, 8005)]
     assert json.loads((root / "jobs.json").read_text())["status"] == "released"
     with pytest.raises(ValueError, match="already submitted"):
         pipeline.queue_pipeline(value)
+    # Resubmission from a mixed pipeline skips verified PPO and adapts the MAPPO allocation.
+    monkeypatch.setattr(pipeline, "stage_complete", lambda plan, stage: stage == "ppo")
+    original_submit = pipeline.subprocess.check_output
+    monkeypatch.setattr(pipeline.subprocess, "check_output",
+                        lambda command, **kwargs: "" if command[0] == "squeue" else original_submit(command, **kwargs))
+    pipeline.queue_pipeline(value, stage="mappo", resume=True, walltime="04:00:00",
+                            options={"mappo": {"--nodes": "1", "--gres": "gpu:1"}})
+    assert {"--nodes=1", "--cpus-per-task=10", "--gres=gpu:1", "--time=04:00:00"} <= set(submissions[-1])
+    assert (root / "pipeline.json").read_bytes() == frozen
     Path(value["stages"]["ppo"]["spec"]).chmod(0o644)
     Path(value["stages"]["ppo"]["spec"]).write_text("modified: true")
     monkeypatch.setattr(pipeline, "current_revision", lambda: "revision")
     with pytest.raises(ValueError, match="modified"):
         pipeline.load_pipeline(root)
+
+
+def test_local_pipeline_stage_requires_handoff_and_reuses_driver_state(tmp_path, monkeypatch, capsys):
+    import ppo_mappo_pipeline as pipeline
+
+    root = tmp_path / "experiment"
+    value = pipeline.write_plan(root, "local-stage", 120000000, "revision")
+    with pytest.raises(ValueError, match="Complete the ppo"):
+        pipeline.run_local(value, ["mappo"], "cpu")
+    captured = []
+
+    class Driver:
+        returncode = 0
+
+        def __init__(self, command, **kwargs):
+            assert command[-1].endswith("scripts/ray_tune_trials.py")
+            captured.append(kwargs["env"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        wait = poll = lambda self: 0
+
+    monkeypatch.setattr(pipeline.subprocess, "Popen", Driver)
+    monkeypatch.setattr(pipeline, "current_revision", lambda: "revision")
+    monkeypatch.setattr(pipeline, "finish_stage", lambda *_: None)
+    monkeypatch.setattr(pipeline, "stage_complete", lambda plan, stage: stage == "ppo")
+    stage_root = root / "mappo"
+    stage_root.mkdir()
+    (stage_root / "experiment.json").write_text("saved Tune manifest")
+    pipeline.run_local(value, ["mappo"], "cpu")
+    assert captured[0]["RESTORE"] == "1" and captured[0]["RAY_TUNE_JOB_ROOT"] == str(stage_root)
+    assert captured[0]["RAY_TUNE_CHECKPOINT_STEPS"] == "1024000" and captured[0]["EXPERIMENT_ID"] == "local-stage-mappo"
+    with pipeline.exclusive(root / ".mappo_allocation.lock"), pytest.raises(RuntimeError, match="Already in use"):
+        pipeline.run_local(value, ["mappo"], "cpu")
+    monkeypatch.setattr(pipeline, "stage_complete", lambda *_: True)
+    pipeline.run_local(value, ["mappo"], "cpu")
+    assert len(captured) == 1
+
+    legacy = deepcopy(value)
+    legacy.update(schema_version=1, walltime="24:00:00", max_restarts=3)
+    legacy["stages"]["mappo"].update(nodes=2, cpus_per_node=24, gpus_per_node=2)
+    with pytest.raises(ValueError, match="original fixed Slurm layout"):
+        pipeline.run_local(legacy, ["mappo"], "cpu")
+    with pytest.raises(ValueError, match="original fixed Slurm layout"):
+        pipeline.submission_command(legacy, "mappo", options={"--nodes": "1"})
+    pipeline.stage_environment(legacy, "mappo")
+    legacy_exports = capsys.readouterr().out
+    assert "RAY_TUNE_FIXED_NODES=2" in legacy_exports and "RAY_TUNE_FIXED_GPUS_PER_NODE=2" in legacy_exports
+    pipeline.stage_environment(value, "mappo")
+    assert "RAY_TUNE_FIXED_NODES=''" in capsys.readouterr().out
+
+
+def test_local_final_evaluation_keeps_receipts_across_execution_devices(tmp_path, monkeypatch):
+    import ppo_mappo_pipeline as pipeline
+    from application import evaluate
+
+    value = pipeline.write_plan(tmp_path / "pipeline", "eval-test", 120000000, "revision")
+    root = Path(value["root"])
+    checkpoint = root / "checkpoint.pt"
+    checkpoint.write_bytes(b"fixed checkpoint")
+    calls, summaries = [], []
+
+    def units(_, stage):
+        actor = "car_1" if stage == "solo" else None
+        unit = {"stage": stage, "name": "scratch_seed42", "actor": actor, "adaptation": "scratch",
+                "checkpoint": str(checkpoint), "checkpoint_sha256": pipeline.sha256(checkpoint),
+                "config": {"execution": {"params": {"device": "cuda"}}}}
+        return [{**unit, "digest": pipeline.digest(unit)}]
+
+    def evaluate_fixture(config, args, *_):
+        calls.append((args.eval_device, config["execution"]["params"]["device"]))
+        seeds = list(range(30042, 30142))
+        pipeline.atomic_json(Path(args.output_dir) / "evaluation_report.json", {
+            "checkpoint_sha256": pipeline.sha256(checkpoint), "protocol": "final", "seeds": seeds,
+            "episode_results": [{"seed": seed, "map_bundle": "map", "race_record": {"spawn_configuration": {}}}
+                                for seed in seeds],
+            "summary": {"episodes": 100}, "target_laps": 3 if args.eval_actor else 1,
+            "max_steps": 16000 if args.eval_actor else 8000,
+            "actor_identity": {"source_actor": args.eval_actor, "critic_loaded": False, "adapter_active": False}})
+
+    monkeypatch.setattr(pipeline, "evaluation_units", units)
+    monkeypatch.setattr(pipeline, "visible_resources", lambda **_: ({"cpu": 8, "gpu": 0}, list(range(8))))
+    monkeypatch.setattr(evaluate, "run_evaluation", evaluate_fixture)
+    monkeypatch.setattr(pipeline, "combine_results", lambda plan: summaries.append(plan["digest"]))
+    pipeline.evaluate_stage(value, "team", "auto")
+    pipeline.evaluate_stage(value, "solo", "cpu")
+    receipt = root / "evaluations/solo/scratch_seed42/complete.json"
+    frozen = receipt.read_bytes()
+    monkeypatch.setattr(pipeline, "visible_resources", lambda **_: ({"cpu": 8, "gpu": 1}, list(range(8))))
+    pipeline.evaluate_stage(value, "solo", "cuda")
+    assert calls == [("cpu", "cuda"), ("cpu", "cuda")]
+    assert receipt.read_bytes() == frozen and summaries == [value["digest"]] * 2
+    assert pipeline.stage_complete(value, "solo")
+    attempts = pipeline.stage_allocations(root, "solo")
+    assert {attempt["evaluation_device"] for attempt in attempts} == {"cpu", "cuda"}
+    assert all(attempt["ray_node_count"] == 0 for attempt in attempts)
 
 
 @pytest.mark.parametrize("restart,expected", [(0, ["evaluating", "interrupted", "requeue"]),
@@ -126,7 +245,7 @@ def test_pipeline_pretimeout_requeues_same_job_with_explicit_limit(tmp_path, res
     events = tmp_path / "events"
     commands = {
         "git": '#!/usr/bin/env bash\nif [[ "$1" == branch ]]; then exit 1; fi\n',
-        "scontrol": '#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "$TEST_EVENTS"\n',
+        "scontrol": '#!/usr/bin/env bash\nif [[ "$1" == requeue ]]; then echo requeue >> "$TEST_EVENTS"; fi\n',
         "crun": '''#!/usr/bin/env python3
 import os,sys,time
 from pathlib import Path
@@ -166,6 +285,7 @@ else:
 @pytest.mark.parametrize("capacities,expected", [
     ({"n1": [5, 0]}, 0),
     ({"n1": [12, 5], "n2": [12, 5]}, 143),
+    ({"n1": [12, 2], "n2": [12, 2]}, 75),
     ({"n1": [12, 5], "n2": [12, 1]}, 2),
     ({"n1": [12, 5], "n2": [12, 5]}, 2),  # fixed workload expects six GPUs/node
 ])
@@ -175,9 +295,22 @@ def test_ray_slurm_steps_probe_capacity_and_cleanup(tmp_path, capacities, expect
     events = tmp_path / "events"
     scripts = {
         "git": '#!/usr/bin/env bash\nif [[ "$1" == rev-parse ]]; then echo revision; fi\n',
-        "scontrol": '#!/usr/bin/env bash\nprintf "%s\\n" ${TEST_NODES}\n',
+        "scontrol": '#!/usr/bin/env bash\nif [[ "$2" == hostnames ]]; then printf "%s\\n" ${TEST_NODES}; fi\n'
+                    'if [[ "$2" == job ]]; then echo "SubmitTime=2026-01-01T00:00:00 StartTime=2026-01-01T00:00:10"; fi\n'
+                    'if [[ "$1" == requeue ]]; then echo requeue >> "$TEST_EVENTS"; fi\n',
         "getent": '#!/usr/bin/env bash\nprintf "127.0.0.%s STREAM\\n" "${2#n}"\n',
-        "crun": '#!/usr/bin/env bash\nshift 3\nexec "$TEST_PYTHON" "$@"\n',
+        "crun": '''#!/usr/bin/env bash
+shift 3
+if [[ "$1" == scripts/ppo_mappo_pipeline.py ]]; then
+  if [[ "${@: -1}" == environment ]]; then
+    printf 'export SWEEP_SPEC=scripts/sweeps/architectures_cpu_smoke.yaml PIPELINE_MAX_RESTARTS=1 RAY_TUNE_JOB_ROOT=%q\\n' "$PIPELINE_ROOT/ppo"
+  else
+    printf '%s\\n' "${@: -1}" >> "$TEST_EVENTS"
+  fi
+else
+  exec "$TEST_PYTHON" "$@"
+fi
+''',
         "srun": '''#!/usr/bin/env python3
 import json, os, signal, socket, sys, time
 args = sys.argv[1:]
@@ -191,6 +324,11 @@ def hold(role):
         log('stop:' + role)
         sys.exit(0)
     signal.signal(signal.SIGTERM, stop)
+    if role == 'driver':
+        def checkpoint(*_):
+            log('checkpoint:driver')
+            sys.exit(0)
+        signal.signal(signal.SIGUSR1, checkpoint)
     log('start:' + role)
     time.sleep(60)
 assert '--cpus-per-task=12' in args and not any(a.startswith('--gres=') for a in args)
@@ -236,26 +374,31 @@ else:
         python_exec.chmod(0o755)
         del env["CRUN"]
     root = tmp_path / "output with spaces"
-    command = ["bash", "scripts/hpc/ray_tune.sbatch", "--root", str(root),
-               "--sweep-spec", "scripts/sweeps/architectures_cpu_smoke.yaml"]
+    command = ["bash", "scripts/hpc/ray_tune.sbatch"]
+    if expected == 75:
+        root.mkdir()
+        env.update(PIPELINE_ROOT=str(root), PIPELINE_STAGE="ppo", SLURM_RESTART_COUNT="0")
+        root = root / "ppo"
+    else:
+        command.extend(["--root", str(root), "--sweep-spec", "scripts/sweeps/architectures_cpu_smoke.yaml"])
     with subprocess.Popen(command, cwd=adapter.REPO, env=env, text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
         started = {"start:n1", "start:n2", "start:gpu-n1", "start:gpu-n2", "start:driver"}
         try:
-            if expected == 143:
+            if expected in (75, 143):
                 deadline = time.monotonic() + 10
                 while process.poll() is None and time.monotonic() < deadline:
                     if events.exists() and started <= set(events.read_text().splitlines()):
                         break
                     time.sleep(.05)
-                process.send_signal(signal.SIGTERM)
+                process.send_signal(signal.SIGUSR1 if expected == 75 else signal.SIGTERM)
             stdout, stderr = process.communicate(timeout=15)
             assert process.returncode == expected, stdout + stderr
         finally:
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=15)
-    attempt = root / "attempts/9144"
+    attempt = root / ("attempts/9144_r0" if expected == 75 else "attempts/9144")
     rows = (attempt / "allocation.tsv").read_text().splitlines()
     assert [row.split("\t")[:3] for row in rows[1:]] == [[node, str(cpu), str(gpu)] for node, (cpu, gpu) in capacities.items()]
     assert not (attempt / ".ray_auth_token").exists()
@@ -265,6 +408,10 @@ else:
     elif expected == 143:
         logged = set(events.read_text().splitlines())
         assert {event.replace("start:", "stop:") for event in started} <= logged
+    elif expected == 75:
+        logged = events.read_text().splitlines()
+        assert "checkpoint:driver" in logged and "stop:driver" not in logged
+        assert logged[-2:] == ["interrupted", "requeue"]
     else:
         assert events.read_text().splitlines() == ["preflight", "start:n1", "driver-completed", "stop:n1"]
 

@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Submit/finalize the existing native Ray sweeps as a dependent PPO -> MAPPO run.
-
-Default is a CPU-only dry run; --submit releases held PPO, MAPPO, team-final and
-solo-final jobs after their afterok dependencies are recorded. Native Ray owns
-training; the shared evaluator owns all final races.
-"""
+"""Freeze and run the native PPO -> MAPPO pipeline locally or through Slurm."""
 import argparse
 import csv
 from copy import deepcopy
+from datetime import datetime
 import json
 import hashlib
 import math
@@ -15,6 +11,8 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -25,21 +23,27 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
-from ray_tune_sources import configuration_digest, read_sources, verify_source
-from ray_tune_sweeps import digest, identifier, read_spec, ranking
-from ray_tune_trials import (atomic_json, checkpoint_payload, current_revision, exclusive,
-                             prepare_settings, validate_restoration)
+from ray_tune_sources import read_sources, verify_source
+from ray_tune_sweeps import digest, identifier, read_spec, ranking, trial_settings
+from ray_tune_trials import (atomic_json, current_revision, exclusive,
+                             execution_attempt, prepare_settings, stop_group, validate_restoration,
+                             verify_native_completion, visible_resources)
 from prepare_mappo_pilot_sources import prepare as prepare_sources
 
 LAUNCHER = REPO / "scripts/hpc/ray_tune.sbatch"
 TEMPLATES = {stage: REPO / f"scripts/sweeps/ppo_to_mappo_{stage}.yaml" for stage in ("ppo", "mappo")}
 STAGES = ("ppo", "mappo", "team", "solo")
+SBATCH_OPTIONS = {"--partition", "--account", "--qos", "--nodes", "--cpus-per-task", "--time",
+                  "--gres", "--gpus", "--gpus-per-node", "--gpus-per-task", "--mem", "--mem-per-cpu",
+                  "--mem-per-gpu", "--constraint", "--reservation", "--nodelist", "--exclude"}
 
 
 def load_pipeline(root):
     value = json.loads((root / "pipeline.json").read_text())
     if value["digest"] != digest({k: v for k, v in value.items() if k != "digest"}):
         raise ValueError("Frozen pipeline manifest was modified")
+    if value["schema_version"] not in {1, 2}:
+        raise ValueError("Unsupported pipeline manifest version")
     if value["root"] != str(root) or value["git_sha"] != current_revision():
         raise ValueError("Pipeline path/Git revision differs; use the original clean checkout")
     for stage in value["stages"].values():
@@ -48,7 +52,7 @@ def load_pipeline(root):
     return value
 
 
-def write_plan(root, pipeline_id, ppo_steps, walltime, max_restarts, revision):
+def write_plan(root, pipeline_id, ppo_steps, revision):
     root.mkdir(parents=True, exist_ok=False)
     (root / "specs").mkdir()
     stages = {}
@@ -64,12 +68,9 @@ def write_plan(root, pipeline_id, ppo_steps, walltime, max_restarts, revision):
         path.write_text(yaml.safe_dump(spec, sort_keys=False))
         path.chmod(0o444)
         stages[stage] = {"spec": str(path), "spec_digest": digest(spec), "root": str(root / stage),
-                         "experiment_id": spec["experiment_id"], "trials": 1 if stage == "ppo" else 6,
-                         "nodes": 1 if stage == "ppo" else 2, "gpus_per_node": 1 if stage == "ppo" else 2,
-                         "cpus_per_node": 24}
-    value = {"schema_version": 1, "root": str(root), "pipeline_id": pipeline_id, "git_sha": revision,
-             "checkpoint_every_steps": 1024000, "walltime": walltime, "max_restarts": max_restarts,
-             "stages": stages,
+                         "experiment_id": spec["experiment_id"], "trials": 1 if stage == "ppo" else 6}
+    value = {"schema_version": 2, "root": str(root), "pipeline_id": pipeline_id, "git_sha": revision,
+             "checkpoint_every_steps": 1024000, "stages": stages,
              "evaluation": {"seed": 30042, "episodes": 100, "team_target_laps": 1,
                             "team_max_steps": 8000, "solo_target_laps": 3, "solo_max_steps": 16000}}
     value["digest"] = digest(value)
@@ -95,7 +96,6 @@ def preflight_stage(value, stage):
 
 def verify_complete(value, stage):
     """A successful allocation needs actual native budgets, recovery and selection."""
-    from agents.common.checkpoints import read_checkpoint
     info = value["stages"][stage]
     root = Path(info["root"])
     settings = json.loads((root / "experiment.json").read_text())
@@ -105,28 +105,22 @@ def verify_complete(value, stage):
     checked = ranking(results)
     if len(results) != info["trials"] or len(checked["ranked_trials"]) != info["trials"] or checked["diagnostics"]:
         raise ValueError(f"{stage}: missing/failed/incomplete or unrankable trials: {checked['diagnostics']}")
-    directories = set()
+    directories, trial_keys = set(), set()
     for row in checked["ranked_trials"]:
         out = Path(row["training_output_dir"])
         if out.parent != root / "trial_runs" or out in directories:
             raise ValueError("Trial output directories differ or collide")
         directories.add(out)
         identity = json.loads((out / "ray_trial.json").read_text())
-        if identity["settings"]["sweep_trial"] not in settings["trial_plan"]:
+        entry = identity["settings"]["sweep_trial"]
+        if (entry not in settings["trial_plan"] or identity["settings"] != trial_settings(settings, entry)
+                or entry["trial_key"] in trial_keys):
             raise ValueError("Completed trial does not belong to the frozen experiment matrix")
-        summary = json.loads((out / "run_summary.json").read_text())
-        latest = checkpoint_payload(out / "latest.pt", identity)
-        final = read_checkpoint(out / "final.pt")
-        budget = spec["total_steps"]
-        if (row.get("environment_steps", 0) < budget or summary["environment_steps"] < budget
-                or latest["training"]["progress"]["environment_steps"] < budget
-                or final["metadata"]["progress"]["environment_steps"] < budget):
-            raise ValueError(f"{stage}: actual native budget not reached: {out}")
-        if (final["metadata"]["provenance"].get("run_id") != identity["run_id"]
-                or configuration_digest(final["metadata"]["configuration"]) != identity["settings"]["sweep_trial"]["config_digest"]
-                or final["metadata"]["adaptation"] != latest["metadata"]["adaptation"]):
-            raise ValueError(f"{stage}: final checkpoint identity/configuration/source differs")
-        adaptation = final["metadata"]["adaptation"]
+        trial_keys.add(entry["trial_key"])
+        summary, final = verify_native_completion(out, identity)
+        if row.get("environment_steps", 0) < spec["total_steps"]:
+            raise ValueError(f"{stage}: Tune did not report the completed budget: {out}")
+        adaptation = final["adaptation"]
         arm = row["adaptation"]
         if adaptation["method"] != arm or (arm == "scratch" and adaptation["source_checkpoint"] is not None):
             raise ValueError("Checkpoint adaptation/source differs from its planned arm")
@@ -139,8 +133,22 @@ def verify_complete(value, stage):
     return checked
 
 
-def finish_stage(root, stage):
-    value = load_pipeline(root)
+def completion_sources(value, stage):
+    root = Path(value["root"])
+    path = root / f"{stage}_complete.json"
+    if not path.is_file():
+        raise ValueError(f"Complete the {stage} stage before using its artifacts")
+    receipt = json.loads(path.read_text())
+    sources = list(read_sources(root / "sources/manifest.yaml").values())
+    if receipt["pipeline_digest"] != value["digest"] or receipt["sources"] != sources:
+        raise ValueError(f"{stage.upper()} completion/source handoff differs from the frozen pipeline")
+    for record in sources:
+        verify_source(record)
+    return sources
+
+
+def finish_stage(value, stage):
+    root = Path(value["root"])
     checked = verify_complete(value, stage)
     if stage == "ppo":
         records = prepare_sources(Path(value["stages"]["ppo"]["root"]), root / "sources",
@@ -149,9 +157,7 @@ def finish_stage(root, stage):
         preflight_stage(value, "mappo")
         payload = {"pipeline_digest": value["digest"], "sources": records}
     else:
-        sources = list(read_sources(root / "sources/manifest.yaml").values())
-        for record in sources:
-            verify_source(record)
+        sources = completion_sources(value, "ppo")
         payload = {"pipeline_digest": value["digest"], "sources": sources,
                    "result_identity": "checkpoint_selection_not_final_test", **checked}
         atomic_json(root / "selection_summary.json", payload)
@@ -176,13 +182,8 @@ def evaluation_units(value, stage):
     """Derive only from verified native selections; final tests cannot rank models."""
     from agents.common.checkpoints import read_checkpoint
     root = Path(value["root"])
-    completed = json.loads((root / "mappo_complete.json").read_text())
-    if completed["pipeline_digest"] != value["digest"]:
-        raise ValueError("MAPPO completion manifest differs")
+    sources = completion_sources(value, "mappo")
     rows = verify_complete(value, "mappo")["ranked_trials"]
-    sources = list(read_sources(root / "sources/manifest.yaml").values())
-    for record in sources:
-        verify_source(record)
     models = [(f"{r['adaptation']}_seed{r['seed']}", r["best_checkpoint"], r) for r in rows]
     if stage == "solo":
         models.insert(0, ("ppo_seed42", sources[0]["checkpoint"], {"adaptation": "ppo", "seed": 42}))
@@ -234,10 +235,14 @@ def checked_report(root, unit):
     return report
 
 
-def evaluate_stage(root, stage):
+def evaluate_stage(value, stage, device):
     from application.evaluate import run_evaluation
     from loggers.console import ConsoleLogger
-    value = load_pipeline(root)
+    root = Path(value["root"])
+    if value["schema_version"] == 1:
+        if device != "auto":
+            raise ValueError("Historical pipeline manifests require their original CUDA evaluation layout")
+        device = "cuda"
     if stage == "solo":
         # Revalidate team receipts before allowing the next dependent stage.
         verify_evaluations(value, "team")
@@ -245,27 +250,37 @@ def evaluate_stage(root, stage):
     target = root / "evaluations" / stage
     target.mkdir(parents=True, exist_ok=True)
     with exclusive(target / ".lock"):
-        manifest = {"pipeline_digest": value["digest"], "units": units}
-        path = target / "manifest.json"
-        if path.exists() and json.loads(path.read_text()) != manifest:
-            raise ValueError("Frozen evaluation plan was modified")
-        atomic_json(path, manifest)
-        for unit in units:
-            if checked_report(root, unit) is not None:
-                continue
-            folder = target / unit["name"]
-            folder.mkdir(parents=True, exist_ok=True)
-            atomic_json(folder / "request.json", unit)
-            input_path = folder / "evaluation_input.yaml"
-            input_path.write_text(yaml.safe_dump(unit["config"], sort_keys=False))
-            args = argparse.Namespace(checkpoint=unit["checkpoint"], eval_protocol="final", eval_episodes=None,
-                eval_actor=unit["actor"], scenario=str(input_path),
-                run_id=f"{value['pipeline_id']}_{stage}_{unit['name']}", output_dir=str(folder))
-            run_evaluation(unit["config"], args, ConsoleLogger(verbose=True), REPO / "scenarios")
-            atomic_json(folder / "complete.json", {"unit_digest": unit["digest"],
-                "report_sha256": sha256(folder / "evaluation_report.json")})
-            checked_report(root, unit)
-        reports = verify_evaluations(value, stage)
+        with execution_attempt(target, "evaluation") as (allocation_path, allocation):
+            slurm = bool(os.getenv("SLURM_JOB_ID"))
+            resources, affinity = visible_resources(slurm=slurm, batch=slurm)
+            if device == "auto":
+                device = "cuda" if resources["gpu"] else "cpu"
+            allocation.update(nodes=[{"host": socket.gethostname(), **resources, "cpu_affinity": affinity}],
+                              ray_node_count=0, allocation_trial_capacity=1, evaluation_device=device)
+            atomic_json(allocation_path, allocation)
+            if device == "cuda" and not resources["gpu"]:
+                raise ValueError("CUDA evaluation requires a visible GPU; select --eval-device cpu")
+            manifest = {"pipeline_digest": value["digest"], "units": units}
+            path = target / "manifest.json"
+            if path.exists() and json.loads(path.read_text()) != manifest:
+                raise ValueError("Frozen evaluation plan was modified")
+            atomic_json(path, manifest)
+            for unit in units:
+                if checked_report(root, unit) is not None:
+                    continue
+                folder = target / unit["name"]
+                folder.mkdir(parents=True, exist_ok=True)
+                atomic_json(folder / "request.json", unit)
+                input_path = folder / "evaluation_input.yaml"
+                input_path.write_text(yaml.safe_dump(unit["config"], sort_keys=False))
+                args = argparse.Namespace(checkpoint=unit["checkpoint"], eval_protocol="final", eval_episodes=None,
+                    eval_actor=unit["actor"], eval_device=device, scenario=str(input_path),
+                    run_id=f"{value['pipeline_id']}_{stage}_{unit['name']}", output_dir=str(folder))
+                run_evaluation(unit["config"], args, ConsoleLogger(verbose=True), REPO / "scenarios")
+                atomic_json(folder / "complete.json", {"unit_digest": unit["digest"],
+                    "report_sha256": sha256(folder / "evaluation_report.json")})
+                checked_report(root, unit)
+            reports = verify_evaluations(value, stage)
         if stage == "solo":
             combine_results(value)
         atomic_json(root / f"{stage}_complete.json", {"pipeline_digest": value["digest"], "reports": reports})
@@ -315,7 +330,13 @@ def variation(values):
 def computational_metrics(out, metadata):
     attempts = []
     for path in sorted((out / "attempts").glob("*/execution.json")):
-        attempts.append({"path": str(path.parent), **json.loads(path.read_text())})
+        attempt = {"path": str(path.parent), **json.loads(path.read_text())}
+        placement = path.with_name("attempt.json")
+        if placement.exists():
+            facts = json.loads(placement.read_text())
+            attempt["placement"] = {key: facts.get(key) for key in ("hostname", "slurm_job_id", "slurm_partition",
+                "slurm_restart_count", "resources_per_trial", "ray_gpu_ids")}
+        attempts.append(attempt)
     wall = sum(a["wall_seconds"] for a in attempts)
     closed = bool(attempts) and all(a["closed"] for a in attempts)
     with (out / "update_metrics.csv").open() as stream:
@@ -354,6 +375,33 @@ def learning_curve(out, attempts):
         "at_common_budget": next((r for r in reversed(curve) if r["joint_environment_decisions"] <= 24576000), None),
         "checkpoint_variation": variation([r["both_finish_rate"] for r in curve]),
         "history": str(out / "evaluation_history.jsonl")}
+
+
+def stage_allocations(root, stage):
+    parent = root / stage if stage in TEMPLATES else root / "evaluations" / stage
+    records = []
+    for attempt in sorted((parent / "attempts").glob("*/")):
+        execution, timing, layout = (attempt / name for name in ("execution.json", "allocation_timing.tsv", "allocation.tsv"))
+        record = json.loads(execution.read_text()) if execution.is_file() else {}
+        record["path"] = str(attempt)
+        if layout.is_file():
+            record["allocation_tsv"] = str(layout)
+        if timing.is_file():
+            record["allocation_timing_tsv"] = str(timing)
+            with timing.open() as stream:
+                timestamps = dict(csv.reader(stream, delimiter="\t"))
+            record.update(mode="slurm", **{key: timestamps[key] for key in ("slurm_job_id", "slurm_partition", "slurm_nodelist")
+                                          if key in timestamps})
+            for key in ("batch_wall_seconds", "allocation_wall_seconds"):
+                if key in timestamps:
+                    record[key] = int(timestamps[key])
+            try:
+                record["queue_seconds"] = (datetime.fromisoformat(timestamps["slurm_start_time"])
+                                           - datetime.fromisoformat(timestamps["slurm_submit_time"])).total_seconds()
+            except (KeyError, ValueError):
+                record["queue_seconds"] = None
+        records.append(record)
+    return records
 
 
 def combine_results(value):
@@ -396,6 +444,7 @@ def combine_results(value):
     ppo_row = verify_complete(value, "ppo")["ranked_trials"][0]
     ppo_metadata = read_checkpoint(baseline_unit["checkpoint"])["metadata"]
     atomic_json(root / "summary.json", {"pipeline_digest": value["digest"], "ppo_source": baseline_unit["checkpoint"],
+        "stage_allocations": {stage: stage_allocations(root, stage) for stage in STAGES},
         "ppo_training": {"actual_environment_decisions": ppo_row["actual_environment_decisions"],
                          "computation": computational_metrics(Path(ppo_row["training_output_dir"]), ppo_metadata)},
         "ppo_solo_baseline": {"checkpoint_sha256": baseline["checkpoint_sha256"], "summary": baseline["summary"],
@@ -415,87 +464,169 @@ def record_status(root, stage, status):
         "slurm_job_id": os.getenv("SLURM_JOB_ID"), "restart_count": os.getenv("SLURM_RESTART_COUNT", "0")})
 
 
-def stage_environment(root, stage):
-    value = load_pipeline(root)
-    if stage in {"team", "solo"}:
-        if stage == "team":
-            verify_complete(value, "mappo")
-        else:
-            verify_evaluations(value, "team")
-        record_status(root, stage, "running")
-        print(f"export PIPELINE_MAX_RESTARTS={value['max_restarts']}")
-        return
-    info = value["stages"][stage]
-    if stage == "mappo":
-        completed = json.loads((root / "ppo_complete.json").read_text())
-        if completed["pipeline_digest"] != value["digest"] or list(read_sources(root / "sources/manifest.yaml").values()) != completed["sources"]:
-            raise ValueError("PPO completion/source handoff differs from the frozen pipeline")
-        for record in completed["sources"]:
-            verify_source(record)
-    complete = (root / f"{stage}_complete.json").exists()
-    if complete:
+def stage_complete(value, stage):
+    path = Path(value["root"]) / f"{stage}_complete.json"
+    if not path.is_file():
+        return False
+    if stage in TEMPLATES:
+        completion_sources(value, stage)
         verify_complete(value, stage)
-    env = {"SWEEP_SPEC": info["spec"], "EXPERIMENT_ID": info["experiment_id"], "RAY_TUNE_JOB_ROOT": info["root"],
-           "RESTORE": int((Path(info["root"]) / "experiment.json").exists()),
-           "RAY_TUNE_FIXED_GPUS_PER_NODE": info["gpus_per_node"], "RAY_TUNE_FIXED_NODES": info["nodes"],
-           "RAY_TUNE_FIXED_CPUS_PER_NODE": info["cpus_per_node"], "PIPELINE_MAX_RESTARTS": value["max_restarts"],
-           "PIPELINE_STAGE_COMPLETE": int(complete), "RAY_TUNE_CHECKPOINT_STEPS": value["checkpoint_every_steps"],
-           "RAY_TUNE_TRIAL_TIMEOUT": 0}
-    record_status(root, stage, "running")
+    else:
+        receipt = json.loads(path.read_text())
+        if receipt != {"pipeline_digest": value["digest"], "reports": verify_evaluations(value, stage)}:
+            raise ValueError(f"{stage} evaluation completion manifest differs")
+    return True
+
+
+def require_previous_stage(value, stage):
+    index = STAGES.index(stage)
+    if index and not stage_complete(value, STAGES[index - 1]):
+        raise ValueError(f"Complete the {STAGES[index - 1]} stage before running {stage}")
+
+
+def stage_details(value, stage):
+    require_previous_stage(value, stage)
+    complete = stage_complete(value, stage)
+    env = {"PIPELINE_STAGE_COMPLETE": int(complete)}
+    if stage not in TEMPLATES:
+        return complete, env
+    info = value["stages"][stage]
+    env.update(SWEEP_SPEC=info["spec"], EXPERIMENT_ID=info["experiment_id"], RAY_TUNE_JOB_ROOT=info["root"],
+               RESTORE=int((Path(info["root"]) / "experiment.json").exists()),
+               RAY_TUNE_CHECKPOINT_STEPS=value["checkpoint_every_steps"], RAY_TUNE_TRIAL_TIMEOUT=0)
+    return complete, env
+
+
+def stage_environment(value, stage):
+    complete, env = stage_details(value, stage)
+    legacy = value["schema_version"] == 1
+    restarts = value["max_restarts"] if legacy else int(os.getenv("PIPELINE_MAX_RESTARTS", "20"))
+    if restarts < 0:
+        raise ValueError("PIPELINE_MAX_RESTARTS must be nonnegative")
+    env["PIPELINE_MAX_RESTARTS"] = restarts
+    if stage in TEMPLATES:
+        info = value["stages"][stage]
+        for key in ("nodes", "cpus_per_node", "gpus_per_node"):
+            env[f"RAY_TUNE_FIXED_{key.upper()}"] = info[key] if legacy else ""
+        env["PIPELINE_LEGACY_LAYOUT"] = int(legacy)
+    record_status(Path(value["root"]), stage, "completed" if complete else "running")
     for key, item in env.items():
         print(f"export {key}={shlex.quote(str(item))}")
 
 
-def submission_command(value, stage, dependency=None):
-    info = value["stages"].get(stage, {"nodes": 1, "gpus_per_node": 1, "cpus_per_node": 4})
-    exports = f"ALL,PIPELINE_ROOT={value['root']},PIPELINE_STAGE={stage}"
-    command = ["sbatch", "--parsable", "--hold", "--partition=gpu", "--account=q1wang", "--qos=normal",
-        f"--job-name={value['pipeline_id']}-{stage}", f"--nodes={info['nodes']}", f"--ntasks={info['nodes']}",
-        "--ntasks-per-node=1", f"--cpus-per-task={info['cpus_per_node']}", f"--gres=gpu:{info['gpus_per_node']}",
-        f"--time={value['walltime']}", "--signal=B:USR1@240", "--requeue", "--open-mode=append",
+def run_local(value, stages, device):
+    if value["schema_version"] == 1:
+        raise ValueError("Historical pipeline manifests require their original fixed Slurm layout")
+    root = Path(value["root"])
+    for stage in stages:
+        with exclusive(root / f".{stage}_allocation.lock") as lease:
+            complete, settings = stage_details(value, stage)
+            if complete:
+                print(f"{stage} already verified")
+                continue
+            record_status(root, stage, "running")
+            try:
+                if stage in TEMPLATES:
+                    env = {**os.environ, **{key: str(value) for key, value in settings.items()}}
+                    with subprocess.Popen([sys.executable, str(REPO / "scripts/ray_tune_trials.py")],
+                                          cwd=REPO, env=env, start_new_session=True, pass_fds=(lease.fileno(),)) as process:
+                        try:
+                            if process.wait():
+                                raise RuntimeError(f"{stage} Ray Tune driver exited {process.returncode}")
+                        except (KeyboardInterrupt, SystemExit):
+                            if process.poll() is None:
+                                process.send_signal(signal.SIGINT)
+                                try:
+                                    process.wait(timeout=30)
+                                except subprocess.TimeoutExpired:
+                                    pass
+                            raise
+                        finally:
+                            if process.poll() is None:
+                                stop_group(process)
+                    finish_stage(load_pipeline(root), stage)
+                else:
+                    evaluate_stage(value, stage, device)
+            except (KeyboardInterrupt, SystemExit):
+                record_status(root, stage, "interrupted")
+                raise
+            except Exception:
+                record_status(root, stage, "failed")
+                raise
+
+
+def submission_command(value, stage, dependency=None, *, options=(), walltime=None, max_restarts=None, device="auto"):
+    if value["schema_version"] == 1:
+        if options or walltime is not None or max_restarts is not None:
+            raise ValueError("Historical pipeline manifests require their original fixed Slurm layout")
+        info = value["stages"].get(stage, {"nodes": 1, "gpus_per_node": 1, "cpus_per_node": 4})
+        defaults = {"--partition": "gpu", "--account": "q1wang", "--qos": "normal", "--nodes": info["nodes"],
+                    "--cpus-per-task": info["cpus_per_node"], "--gres": f"gpu:{info['gpus_per_node']}",
+                    "--time": value["walltime"]}
+        max_restarts = value["max_restarts"]
+    else:
+        resources = (read_spec(value["stages"][stage]["spec"], REPO)["resources_per_trial"]
+                     if stage in TEMPLATES else {"cpu": 4, "gpu": 0})
+        defaults = {"--nodes": 1, "--cpus-per-task": resources["cpu"], "--time": walltime or "24:00:00"}
+        if resources["gpu"] and not any(key in options for key in ("--gres", "--gpus", "--gpus-per-node", "--gpus-per-task")):
+            defaults["--gres"] = f"gpu:{resources['gpu']}"
+        defaults.update(options)
+    exports = (f"ALL,PIPELINE_ROOT={value['root']},PIPELINE_STAGE={stage},"
+               f"PIPELINE_MAX_RESTARTS={20 if max_restarts is None else max_restarts},PIPELINE_EVAL_DEVICE={device}")
+    command = ["sbatch", "--parsable", "--hold", "--ntasks-per-node=1",
+        *(f"{key}={item}" for key, item in defaults.items()),
+        f"--job-name={value['pipeline_id']}-{stage}", "--signal=B:USR1@240", "--requeue", "--open-mode=append",
         f"--output={value['root']}/{stage}-%j.log", f"--export={exports}"]
     if dependency:
         command.extend([f"--dependency=afterok:{dependency}", "--kill-on-invalid-dep=yes"])
     return [*command, str(LAUNCHER)]
 
 
-def queue_pipeline(value, *, resume=False):
+def queue_pipeline(value, *, resume=False, stage=None, options=None, walltime=None, max_restarts=None, device="auto"):
     root = Path(value["root"])
+    options = options or {}
+    stages = [stage] if stage else list(STAGES)
     with exclusive(root / ".submission.lock"):
-        if (root / "jobs.json").exists() and not resume:
-            raise ValueError("Pipeline already submitted; use --resume after a terminal failure")
-        if resume and (root / "jobs.json").exists():
+        if stage:
+            require_previous_stage(value, stage)
+        while stages and stage_complete(value, stages[0]):
+            stages.pop(0)
+        if not stages:
+            if stage in (None, "solo"):
+                combine_results(value)
+            return
+        commands = {item: submission_command(value, item, options=options.get(item, {}),
+                                              walltime=walltime, max_restarts=max_restarts, device=device) for item in stages}
+        if (root / "jobs.json").exists():
             previous = json.loads((root / "jobs.json").read_text())
-            ids = [str(job) for job in previous["jobs"].values()]
-            live = subprocess.check_output(["squeue", "--noheader", "--jobs", ",".join(ids), "--format=%i %T %r"], text=True).splitlines() if ids else []
-            states = [line.split(maxsplit=2) for line in live]
-            for job, state, reason in states:
+            if not resume and (not stage or stage in previous["jobs"]):
+                raise ValueError("Pipeline already submitted; use --resume after a terminal failure")
+            if previous["pipeline_digest"] != value["digest"]:
+                raise ValueError("Slurm job record belongs to a different pipeline")
+            ids = set(previous["jobs"].values())
+            live = subprocess.check_output(["squeue", "--all", "--me", "--noheader", "--format=%i %T %r"],
+                                           text=True) if ids else ""
+            states = [row for row in (line.split(maxsplit=2) for line in live.splitlines()) if row and row[0] in ids]
+            for _, state, reason in states:
                 if state != "PENDING" or reason not in {"DependencyNeverSatisfied", "Dependency"}:
                     raise ValueError("Pipeline jobs are still active; automatic requeue owns recovery")
             if states and not any(reason == "DependencyNeverSatisfied" for _, _, reason in states):
                 raise ValueError("Pipeline has live dependencies; refusing to replace active work")
             # A dependency that has already failed cannot be repaired by merely
             # requeuing its parent. Replace only the old pending dependent job.
-            for line in live:
-                subprocess.run(["scancel", line.split()[0]], check=True)
-        stages = list(STAGES)
-        if resume:
-            for stage in STAGES:
-                if not (root / f"{stage}_complete.json").exists():
-                    break
-                if stage in {"ppo", "mappo"}:
-                    finish_stage(root, stage)
-                else:
-                    verify_evaluations(value, stage)
-                stages.remove(stage)
-            if not stages:
-                combine_results(value)
-                return
+            for job, _, _ in states:
+                subprocess.run(["scancel", job], check=True)
+        # Slurm's ALL export gives existing values priority over explicit ones.
+        env = os.environ.copy()
+        for key in ("PIPELINE_ROOT", "PIPELINE_STAGE", "PIPELINE_MAX_RESTARTS", "PIPELINE_EVAL_DEVICE"):
+            env.pop(key, None)
         jobs = {}
         try:
             dependency = None
-            for stage in stages:
-                output = subprocess.check_output(submission_command(value, stage, dependency), text=True).strip()
+            for stage, command in commands.items():
+                if dependency:
+                    command[-1:-1] = [f"--dependency=afterok:{dependency}", "--kill-on-invalid-dep=yes"]
+                output = subprocess.check_output(command, text=True, env=env).strip()
                 job = output.split(";", 1)[0]
                 if not job.isdigit():
                     raise ValueError(f"Unexpected sbatch job identity: {output!r}")
@@ -515,60 +646,111 @@ def queue_pipeline(value, *, resume=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--submit", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--create", action="store_true", help="Freeze and preflight a new pipeline without running it")
+    mode.add_argument("--run", action="store_true", help="Run a local stage or all remaining stages")
+    mode.add_argument("--submit", action="store_true", help="Submit one stage or a dependent Slurm chain")
+    mode.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", type=Path, help="Existing pipeline root after terminal failure; retains frozen settings")
-    parser.add_argument("--pipeline-id", default="ppo-mappo-mlp108-v1")
-    parser.add_argument("--ppo-steps", type=int, default=120000000)
-    parser.add_argument("--walltime", default="24:00:00")
-    parser.add_argument("--max-restarts", type=int, default=20)
-    parser.add_argument("--stage-action", choices=("environment", "finish", "evaluate", "interrupted", "failed"))
+    parser.add_argument("--pipeline-id")
+    parser.add_argument("--ppo-steps", type=int)
+    parser.add_argument("--walltime", help="Default Slurm walltime for this submission")
+    parser.add_argument("--max-restarts", type=int, help="Maximum automatic Slurm requeues per job")
+    parser.add_argument("--sbatch-option", action="append", default=[], metavar="STAGE=--OPTION=VALUE",
+                        help="Set a standard Slurm resource option for one stage (repeatable)")
+    parser.add_argument("--eval-device", choices=("auto", "cpu", "cuda"), default=os.getenv("PIPELINE_EVAL_DEVICE", "auto"))
+    parser.add_argument("--stage-action", choices=("environment", "finish", "evaluate", "interrupted", "failed"),
+                        help=argparse.SUPPRESS)
     parser.add_argument("--root", type=Path)
     parser.add_argument("--stage", choices=STAGES)
     args = parser.parse_args()
+    for name in ("root", "resume"):
+        path = getattr(args, name)
+        if path is not None:
+            setattr(args, name, path.expanduser().resolve())
+    os.chdir(REPO)
+    if args.eval_device not in {"auto", "cpu", "cuda"}:
+        parser.error("PIPELINE_EVAL_DEVICE must be auto, cpu, or cuda")
     if args.stage_action:
         if args.root is None or args.stage is None:
             parser.error("Stage actions require --root and --stage")
-        root = args.root.resolve()
+        value = load_pipeline(args.root)
         if args.stage_action == "environment":
-            stage_environment(root, args.stage)
-        elif args.stage_action == "finish":
-            finish_stage(root, args.stage)
+            stage_environment(value, args.stage)
+        elif args.stage_action == "finish" and args.stage in TEMPLATES:
+            finish_stage(value, args.stage)
         elif args.stage_action == "evaluate" and args.stage in {"team", "solo"}:
-            evaluate_stage(root, args.stage)
+            evaluate_stage(value, args.stage, args.eval_device)
+        elif args.stage_action in {"failed", "interrupted"}:
+            record_status(args.root, args.stage, args.stage_action)
         else:
-            load_pipeline(root)
-            record_status(root, args.stage, args.stage_action)
+            parser.error("Invalid action for this stage")
         return
-    if args.submit and args.dry_run:
-        parser.error("Choose --submit or --dry-run")
-    if args.resume:
-        if not args.submit:
-            parser.error("--resume requires --submit")
-        if any(flag.split("=", 1)[0] in {"--ppo-steps", "--pipeline-id", "--walltime", "--max-restarts", "--root"} for flag in sys.argv[1:]):
-            parser.error("--resume uses frozen settings; omit configuration overrides")
-        queue_pipeline(load_pipeline(args.resume.resolve()), resume=True)
-        return
-    identifier(args.pipeline_id)
-    if args.ppo_steps < 1 or args.max_restarts < 0 or not re.fullmatch(r"\d{2,3}:[0-5]\d:[0-5]\d", args.walltime) or args.walltime == "00:00:00":
-        parser.error("Positive PPO budget/walltime and nonnegative max-restarts are required")
-    root = (args.root or REPO / "outputs/ppo_mappo_pipeline" / args.pipeline_id).expanduser().resolve()
-    if any(character in str(root) for character in ",\n"):
+    if args.resume and (not args.submit or args.root is not None or args.pipeline_id is not None):
+        parser.error("--resume ROOT requires --submit and selects the original pipeline")
+    if (args.ppo_steps is not None and args.ppo_steps < 1
+            or args.max_restarts is not None and args.max_restarts < 0):
+        parser.error("Positive PPO budget and nonnegative max-restarts are required")
+    if args.walltime is not None and (not re.fullmatch(r"\d{2,3}:[0-5]\d:[0-5]\d", args.walltime)
+                                     or args.walltime == "00:00:00"):
+        parser.error("Use a positive --walltime in HH:MM:SS format")
+    options = {}
+    for raw in args.sbatch_option:
+        stage, _, option = raw.partition("=")
+        key, _, item = option.partition("=")
+        if stage not in STAGES or key not in SBATCH_OPTIONS or not item:
+            parser.error(f"Expected STAGE=--OPTION=VALUE for a Slurm resource option: {raw!r}")
+        options.setdefault(stage, {})[key] = item
+    if (args.create or args.run) and (options or args.walltime is not None or args.max_restarts is not None):
+        parser.error("Slurm options apply to submissions and previews")
+    pipeline_id = identifier(args.pipeline_id or "ppo-mappo-mlp108-v1")
+    root = (args.resume or args.root or REPO / "outputs/ppo_mappo_pipeline" / pipeline_id).resolve()
+    stages = [args.stage] if args.stage else STAGES
+    if not (args.create or args.run) and any(character in str(root) for character in ",\n"):
         parser.error("Pipeline paths cannot contain commas or newlines (Slurm export syntax)")
-    if args.submit:
-        revision = current_revision()
-        value = write_plan(root, args.pipeline_id, args.ppo_steps, args.walltime, args.max_restarts, revision)
+    ppo_steps = args.ppo_steps or 120000000
+    if args.create or (args.submit and not (root / "pipeline.json").exists() and not args.resume):
+        if args.stage:
+            parser.error("Create the pipeline before running or submitting an individual stage")
+        value = write_plan(root, pipeline_id, ppo_steps, current_revision())
         preflight_stage(value, "ppo")
-        queue_pipeline(value)
+        if args.create:
+            print(root)
+            return
+    elif args.run or args.submit or (root / "pipeline.json").exists():
+        if args.ppo_steps is not None:
+            parser.error("An existing pipeline retains its frozen PPO budget")
+        value = load_pipeline(root)
     else:
         with tempfile.TemporaryDirectory(prefix="ppo-mappo-preview-") as temporary:
-            value = write_plan(Path(temporary) / "plan", args.pipeline_id, args.ppo_steps, args.walltime, args.max_restarts, "preview")
+            value = write_plan(Path(temporary) / "plan", pipeline_id, ppo_steps, "preview")
             preflight_stage(value, "ppo")
-            # Use the requested persistent path in the printed submission plan.
             value["root"] = str(root)
-            for index, stage in enumerate(STAGES):
-                print(shlex.join(submission_command(value, stage, f"{STAGES[index-1].upper()}_JOB_ID" if index else None)))
-        print("Preview only: no jobs submitted. PPO -> source verification -> MAPPO -> 6 team finals -> 13 solo finals -> summary.json.")
+            preview(value, stages, options, args.walltime, args.max_restarts, args.eval_device)
+        return
+    if args.run:
+        def terminate(signum, _):
+            raise SystemExit(128 + signum)
+
+        previous = signal.signal(signal.SIGTERM, terminate)
+        try:
+            run_local(value, stages, args.eval_device)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+    elif args.submit:
+        queue_pipeline(value, resume=bool(args.resume), stage=args.stage, options=options,
+                       walltime=args.walltime, max_restarts=args.max_restarts, device=args.eval_device)
+    else:
+        preview(value, stages, options, args.walltime, args.max_restarts, args.eval_device)
+
+
+def preview(value, stages, options, walltime, max_restarts, device):
+    dependency = None
+    for stage in stages:
+        print(shlex.join(submission_command(value, stage, dependency, options=options.get(stage, {}),
+                                            walltime=walltime, max_restarts=max_restarts, device=device)))
+        dependency = f"{stage.upper()}_JOB_ID"
+    print("Preview only. PPO -> source verification -> MAPPO -> team finals -> solo finals -> summary.json.")
 
 
 if __name__ == "__main__":

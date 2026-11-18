@@ -202,9 +202,19 @@ def test_fifo_plan_concurrency_and_restore_without_resampling(tmp_path, tune, mo
     assert "scheduler" not in captured[0]["tune_config"]  # FIFO, no early stopping
     saved = json.loads((root / "experiment.json").read_text())
     plan = deepcopy(saved["trial_plan"])
+    first_alloc, = (root / "attempts").glob("*/execution.json")
+    assert json.loads(first_alloc.read_text())["allocation_trial_capacity"] == 2
+    # A smaller allocation changes placement, while Tune restores its original
+    # cap, trial definitions, identities, and state.
+    smaller = {"cpu": 6, "gpu": int(bool(gpus))}
+    nodes[:] = [{"Alive": True, "Resources": {"CPU": smaller["cpu"], "GPU": smaller["gpu"]}}]
+    if not address:
+        monkeypatch.setattr(adapter, "visible_resources", lambda: (smaller, list(range(6))))
     monkeypatch.setattr(adapter, "generate_plan", lambda *a: pytest.fail("Restoration resampled the sweep"))
     monkeypatch.setattr(sys, "argv", [*command, "--restore"])
     adapter.main()
+    assert sorted(json.loads(path.read_text())["allocation_trial_capacity"]
+                  for path in (root / "attempts").glob("*/execution.json")) == [1, 2]
     assert json.loads((root / "experiment.json").read_text())["trial_plan"] == plan
     assert restores[0]["resume_unfinished"] and restores[0]["resume_errored"]
     assert not restores[0]["restart_errored"] and "param_space" not in restores[0]

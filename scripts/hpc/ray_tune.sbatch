@@ -6,6 +6,7 @@
 # Submit with one task per node. Set CPU, GPU, and partition options with sbatch.
 set -Eeuo pipefail
 umask 077
+batch_started="$(date +%s)"
 
 REPO="${RAY_TUNE_REPO:-$PWD}"
 RESTORE="${RESTORE:-0}"
@@ -43,6 +44,28 @@ pipeline_action() {
   "${runtime[@]}" "$python_exec" scripts/ppo_mappo_pipeline.py --root "$PIPELINE_ROOT" \
     --stage "$PIPELINE_STAGE" --stage-action "$1"
 }
+start_allocation() {
+  export RAY_TUNE_ALLOCATION_DIR="$1"
+  mkdir -p "$RAY_TUNE_ALLOCATION_DIR"
+  local job_info submitted="" started=""
+  job_info="$(scontrol show job -o "$SLURM_JOB_ID" 2>/dev/null)" || job_info=""
+  if [[ "$job_info" =~ SubmitTime=([^[:space:]]+) ]]; then submitted="${BASH_REMATCH[1]}"; fi
+  if [[ "$job_info" =~ StartTime=([^[:space:]]+) ]]; then started="${BASH_REMATCH[1]}"; fi
+  printf 'batch_started_unix\t%s\nslurm_submit_time\t%s\nslurm_start_time\t%s\n' \
+    "$batch_started" "$submitted" "$started" > "$RAY_TUNE_ALLOCATION_DIR/allocation_timing.tsv"
+  printf 'slurm_job_id\t%s\nslurm_partition\t%s\nslurm_nodelist\t%s\n' \
+    "$SLURM_JOB_ID" "${SLURM_JOB_PARTITION:-}" "${SLURM_JOB_NODELIST:-}" >> "$RAY_TUNE_ALLOCATION_DIR/allocation_timing.tsv"
+}
+finish_allocation() {
+  local finished
+  finished="$(date +%s)"
+  printf 'batch_finished_unix\t%s\nbatch_wall_seconds\t%s\nexit_code\t%s\n' \
+    "$finished" "$((finished - batch_started))" "$1" >> "$RAY_TUNE_ALLOCATION_DIR/allocation_timing.tsv"
+  if [[ "${SLURM_JOB_START_TIME:-}" =~ ^[0-9]+$ ]]; then
+    printf 'allocation_wall_seconds\t%s\n' "$((finished - SLURM_JOB_START_TIME))" \
+      >> "$RAY_TUNE_ALLOCATION_DIR/allocation_timing.tsv"
+  fi
+}
 pipeline_interrupted=0
 pipeline_outcome() {
   local rc="$1"
@@ -65,12 +88,17 @@ pipeline_outcome() {
   return "$rc"
 }
 if [[ -n "${PIPELINE_ROOT:-}" ]]; then
+  [[ "${PIPELINE_STAGE:-}" =~ ^(ppo|mappo|team|solo)$ && "$#" == 0 ]] || {
+    echo "A pipeline allocation takes its stage configuration from the frozen pipeline" >&2; exit 2;
+  }
+  exec 8>"$PIPELINE_ROOT/.${PIPELINE_STAGE}_allocation.lock"
+  flock -n 8 || { echo "Pipeline stage already active" >&2; exit 2; }
   pipeline_exports="$(pipeline_action environment)"
   eval "$pipeline_exports"
+  if [[ "${PIPELINE_STAGE_COMPLETE:-0}" == 1 && "${PIPELINE_LEGACY_LAYOUT:-0}" == 0 ]]; then exit 0; fi
   if [[ "$PIPELINE_STAGE" == team || "$PIPELINE_STAGE" == solo ]]; then
     export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYGLET_HEADLESS=true
-    exec 9>"$PIPELINE_ROOT/.${PIPELINE_STAGE}_allocation.lock"
-    flock -n 9 || { echo "Evaluation allocation already active" >&2; exit 2; }
+    start_allocation "$PIPELINE_ROOT/evaluations/$PIPELINE_STAGE/attempts/${SLURM_JOB_ID}_r${SLURM_RESTART_COUNT:-0}"
     evaluation_pid=""
     evaluation_cleanup() {
       local rc=$?
@@ -79,6 +107,7 @@ if [[ -n "${PIPELINE_ROOT:-}" ]]; then
         kill -- "-$evaluation_pid" 2>/dev/null || true
         wait "$evaluation_pid" 2>/dev/null || true
       fi
+      finish_allocation "$rc"
       pipeline_outcome "$rc"
       exit "$?"
     }
@@ -113,7 +142,7 @@ exec 9>"$RAY_TUNE_JOB_ROOT/.allocation.lock"
 flock -n 9 || { echo "Another allocation is using this experiment" >&2; exit 2; }
 ATTEMPT_ROOT="$RAY_TUNE_JOB_ROOT/attempts/${SLURM_JOB_ID}"
 if [[ -n "${PIPELINE_ROOT:-}" ]]; then ATTEMPT_ROOT="${ATTEMPT_ROOT}_r${SLURM_RESTART_COUNT:-0}"; fi
-mkdir -p "$ATTEMPT_ROOT"
+start_allocation "$ATTEMPT_ROOT"
 export RAY_AUTH_MODE=token
 unset RAY_AUTH_TOKEN || true
 export RAY_AUTH_TOKEN_PATH="$ATTEMPT_ROOT/.ray_auth_token"
@@ -150,10 +179,17 @@ run_on() {
 
 steps=()
 pending_step=""
+driver_step=""
 token_created=0
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM USR1
+  if (( pipeline_interrupted )) && [[ -n "${PIPELINE_ROOT:-}" && -n "$driver_step" ]]; then
+    # srun forwards USR1 to the driver without converting it to SIGKILL.
+    kill -USR1 "$driver_step" 2>/dev/null || true
+    deadline=$((SECONDS + 30))
+    while (( SECONDS < deadline )) && kill -0 "$driver_step" 2>/dev/null; do sleep 1; done
+  fi
   # The pending step or driver is stopped before the Ray nodes.
   if [[ -n "$pending_step" ]]; then steps+=("$pending_step"); fi
   for ((i=${#steps[@]}-1; i>=0; i--)); do
@@ -171,6 +207,7 @@ cleanup() {
   for p in "${steps[@]}"; do kill -KILL "$p" 2>/dev/null || true; done
   for p in "${steps[@]}"; do wait "$p" 2>/dev/null || true; done
   if (( token_created )); then rm -f -- "$RAY_AUTH_TOKEN_PATH"; fi
+  finish_allocation "$rc"
   if (( rc != 0 )); then
     echo "ERROR: Ray Tune allocation failed, exit $rc" >&2
     for f in "$ATTEMPT_ROOT"/*.log; do [[ -f "$f" ]] && tail -n 25 "$f" >&2; done
@@ -210,7 +247,7 @@ if [[ "$NODE_COUNT" != "${RAY_TUNE_FIXED_NODES:-$NODE_COUNT}" ||
   echo "Discovered allocation differs from the fixed workload layout; see $allocation" >&2
   exit 2
 fi
-if [[ "${PIPELINE_STAGE_COMPLETE:-0}" == 1 ]]; then pipeline_action finish; exit 0; fi
+if [[ "${PIPELINE_STAGE_COMPLETE:-0}" == 1 ]]; then exit 0; fi
 export RAY_EXPECTED_NODES="$NODE_COUNT" RAY_EXPECTED_GPUS="$(( NODE_COUNT * GPUS_PER_NODE ))"
 export RAY_EXPECTED_CPUS_PER_NODE="$CPUS_PER_NODE" RAY_EXPECTED_GPUS_PER_NODE="$GPUS_PER_NODE"
 echo "Git=$(git rev-parse HEAD) job=$SLURM_JOB_ID partition=${SLURM_JOB_PARTITION:-unknown} account=${SLURM_JOB_ACCOUNT:-unknown} qos=${SLURM_JOB_QOS:-${SBATCH_QOS:-unknown}}"
@@ -278,10 +315,12 @@ fi
 
 run_on "$HEAD" "$python_exec" -u scripts/ray_tune_trials.py "$@" \
   > "$ATTEMPT_ROOT/driver.log" 2>&1 &
-pending_step="$!"
+driver_step="$!"
+pending_step="$driver_step"
 echo "Driver log: $ATTEMPT_ROOT/driver.log"
 wait "$pending_step"
 pending_step=""
+driver_step=""
 if [[ -n "${PIPELINE_ROOT:-}" ]]; then pipeline_action finish; fi
 if (( 10#$HOLD_SECONDS > 0 )); then
   sleep "$(( 10#$HOLD_SECONDS ))" &

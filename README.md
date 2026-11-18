@@ -98,13 +98,13 @@ at submission. Set `VENV` for a shared Python environment and `CRUN` when using 
 container wrapper. The launcher detects the existing Wahab wrapper when present.
 
 ```bash
-# One node, two GPUs on the public partition
-sbatch --partition=gpu --account=q1wang --qos=normal --time=01:00:00 \
+# One node, two GPUs on the reserved partition
+sbatch --partition=reserved-q1wang --account=q1wang --qos=q1wang --time=01:00:00 \
   --nodes=1 --ntasks-per-node=1 --cpus-per-task=16 --gres=gpu:2 \
   scripts/hpc/ray_tune.sbatch --sweep-spec scripts/sweeps/ppo_lr_smoke.yaml
 
-# Two nodes, one GPU per node on the reserved partition
-sbatch --partition=reserved-q1wang --account=q1wang --qos=q1wang --time=01:00:00 \
+# Two nodes, one GPU per node on the public partition
+sbatch --partition=gpu --account=q1wang --qos=normal --time=01:00:00 \
   --nodes=2 --ntasks-per-node=1 --cpus-per-task=8 --gres=gpu:1 \
   scripts/hpc/ray_tune.sbatch --sweep-spec scripts/sweeps/ppo_lr_smoke.yaml
 ```
@@ -115,13 +115,72 @@ trials at once when each has six CPUs available. Use `--trial-timeout 0` for
 long runs that need to disable the per-attempt timeout. Slurm nodes must have
 matching usable CPU and GPU counts. `attempts/<job-id>/allocation.tsv` records the
 discovered layout and `gpu_*.csv` captures GPU utilization where available.
-The profiling matrix and PPO → MAPPO pipeline require their specified layouts.
+The profiling matrix requires its specified layouts.
 
 To recover an interrupted sweep, repeat the command with `--restore`, the same
 sweep and experiment ID, the original checkout revision, and the original
 absolute output root (`--root` if customized). For Slurm, the `sbatch` resource
 options can change as long as one node can fit a trial and any fixed layout is
 satisfied. Resume uses the frozen trial configurations, checkpoints, and W&B IDs.
+
+## PPO → MAPPO pipeline
+
+Create the pipeline once from a clean checkout. Creation freezes the PPO and
+MAPPO sweeps and verifies the PPO configuration. These commands use the project’s
+Python environment from the repository.
+
+```bash
+PIPELINE="$PWD/outputs/ppo_mappo_pipeline/matched-run"
+python scripts/ppo_mappo_pipeline.py --create --pipeline-id matched-run --root "$PIPELINE"
+
+# Run locally or against an existing Ray cluster selected with RAY_ADDRESS.
+python scripts/ppo_mappo_pipeline.py --run --root "$PIPELINE" --stage ppo
+python scripts/ppo_mappo_pipeline.py --run --root "$PIPELINE" --stage mappo
+```
+
+Omit `--stage` to run all remaining stages locally. PPO needs 20 CPUs and one
+GPU per trial. MAPPO needs 10 CPUs and one GPU per trial, and can run up to four
+trials concurrently. Four trials on one node need at least 40 usable CPUs and
+four GPUs. On one GPU, MAPPO runs its six trials in sequence. Each stage checks
+its upstream artifacts before running.
+
+For a Slurm dependency chain, set the resource options independently for each
+stage. Use `--dry-run` in place of `--submit` to preview. Add `--stage ppo` or
+`--stage mappo` to submit just that stage after its dependencies are verified.
+
+```bash
+python scripts/ppo_mappo_pipeline.py --submit --root "$PIPELINE" \
+  --sbatch-option ppo=--partition=reserved-q1wang --sbatch-option ppo=--account=q1wang \
+  --sbatch-option ppo=--qos=q1wang --sbatch-option ppo=--cpus-per-task=24 \
+  --sbatch-option mappo=--partition=gpu --sbatch-option mappo=--account=q1wang \
+  --sbatch-option mappo=--qos=normal --sbatch-option mappo=--nodes=2 \
+  --sbatch-option mappo=--cpus-per-task=24 --sbatch-option mappo=--gres=gpu:2
+
+# After terminal failure, resume just MAPPO on one GPU.
+python scripts/ppo_mappo_pipeline.py --submit --resume "$PIPELINE" --stage mappo \
+  --sbatch-option mappo=--partition=gpu --sbatch-option mappo=--account=q1wang \
+  --sbatch-option mappo=--qos=normal --sbatch-option mappo=--time=08:00:00
+
+# After training and any previous evaluation jobs have exited, run finals locally.
+python scripts/ppo_mappo_pipeline.py --run --stage team --root "$PIPELINE" --eval-device cpu
+python scripts/ppo_mappo_pipeline.py --run --stage solo --root "$PIPELINE" --eval-device cpu
+```
+
+For local recovery, repeat the original `--run` command with the same root.
+For a Slurm chain recovery, omit `--stage` and supply options for the remaining
+stages. The existing Wahab submission wrapper accepts the same Python options.
+Final evaluation defaults to a visible CUDA device or CPU and uses the frozen
+checkpoints, seeds, and protocols on either device.
+
+The root, checkout revision, scientific settings, sources, trial identities,
+and W&B IDs stay fixed. Partition, account, QoS, nodes, available CPUs and GPUs,
+walltime, and effective concurrency can change between compatible attempts.
+Keep the frozen absolute paths accessible on every host. Historical version 1
+manifests require their original revision and fixed Slurm layout.
+
+`summary.json` links per-attempt resource records, including Slurm
+`allocation.tsv` and `allocation_timing.tsv`. Cumulative trainer time, Slurm
+allocation and batch wall time, and queue delay are reported separately where available.
 
 ## Single-node experiment launch infrastructure
 

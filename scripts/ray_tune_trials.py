@@ -284,6 +284,24 @@ def restore_native(checkpoint, out, attempt, identity):
     return max(candidates, key=lambda item: item[1]["training"]["progress"]["environment_steps"])[0]
 
 
+def verify_native_completion(out, identity):
+    from agents.common.checkpoints import read_checkpoint
+
+    summary = json.loads((out / "run_summary.json").read_text())
+    latest = checkpoint_payload(out / "latest.pt", identity)
+    final = read_checkpoint(out / "final.pt")["metadata"]
+    entry = identity["settings"]["sweep_trial"]
+    budget = identity["settings"]["total_steps"]
+    if (summary["environment_steps"] < budget or latest["training"]["progress"]["environment_steps"] < budget
+            or final["progress"]["environment_steps"] < budget):
+        raise ValueError(f"Actual native budget not reached: {out}")
+    if (final["provenance"].get("run_id") != identity["run_id"]
+            or configuration_digest(final["configuration"]) != entry["config_digest"]
+            or final["adaptation"] != latest["metadata"]["adaptation"]):
+        raise ValueError(f"Final checkpoint identity/configuration/source differs: {out}")
+    return summary, final
+
+
 def trainer_command(settings, identity, out):
     entry = settings.get("sweep_trial", {})
     scenario = entry.get("input_path", settings["scenarios"][identity["algorithm"]])
@@ -464,6 +482,9 @@ def trial(config):
         if resume:
             command.extend(["--resume", str(resume)])
         metadata = {"hostname": socket.gethostname(), "slurm_job_id": os.getenv("SLURM_JOB_ID"),
+                    "slurm_partition": os.getenv("SLURM_JOB_PARTITION"),
+                    "slurm_restart_count": os.getenv("SLURM_RESTART_COUNT"),
+                    "resources_per_trial": settings.get("resources_per_trial", DEFAULT_TRIAL_RESOURCES),
                     "ray_gpu_ids": [str(x) for x in allocated], "command": command,
                     "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
         atomic_json(attempt / "attempt.json", metadata)
@@ -524,6 +545,12 @@ def trial(config):
             atomic_json(journal, metrics.values)
             tune.report(values, checkpoint=tune.Checkpoint.from_directory(str(directory)) if directory else None)
 
+        # A native run can finish before Tune durably records its terminal state.
+        if resume and entry and all((out / name).is_file() for name in ("run_summary.json", "final.pt", "latest.pt")):
+            verify_native_completion(out, identity)
+            report(completed=True)
+            return
+
         started = time.monotonic()
         timeout = float(os.getenv("RAY_TUNE_TRIAL_TIMEOUT", settings["trial_timeout"]))
         if not math.isfinite(timeout) or timeout < 0:
@@ -563,7 +590,31 @@ def _attempts(out):
     return path
 
 
-def visible_resources(*, slurm=False):
+@contextmanager
+def execution_attempt(root, operation):
+    directory = os.getenv("RAY_TUNE_ALLOCATION_DIR")
+    attempt = Path(directory) if directory else Path(tempfile.mkdtemp(prefix="local_", dir=_attempts(root)))
+    path = attempt / "execution.json"
+    job = os.getenv("SLURM_JOB_ID")
+    record = {"operation": operation, "mode": "slurm" if job else "local", "hostname": socket.gethostname(),
+              "slurm_job_id": job, "slurm_partition": os.getenv("SLURM_JOB_PARTITION"),
+              "slurm_account": os.getenv("SLURM_JOB_ACCOUNT"), "slurm_qos": os.getenv("SLURM_JOB_QOS"),
+              "slurm_restart_count": os.getenv("SLURM_RESTART_COUNT"), "started_unix": time.time(),
+              "status": "running"}
+    started = time.monotonic()
+    atomic_json(path, record)
+    try:
+        yield path, record
+        record["status"] = "completed"
+    except BaseException as exc:
+        record["status"] = "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed"
+        raise
+    finally:
+        record.update(finished_unix=time.time(), execution_wall_seconds=time.monotonic() - started)
+        atomic_json(path, record)
+
+
+def visible_resources(*, slurm=False, batch=False):
     from ray._private.utils import get_num_cpus
 
     affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None
@@ -571,23 +622,29 @@ def visible_resources(*, slurm=False):
     if affinity is not None:
         cpus = min(cpus, len(affinity))
     visible = os.getenv("CUDA_VISIBLE_DEVICES")
-    step_gpus = os.getenv("SLURM_STEP_GPUS", "") if slurm else None
+    gpu_ids = "SLURM_JOB_GPUS" if batch else "SLURM_STEP_GPUS"
+    step_gpus = os.getenv(gpu_ids, "") if slurm else None
     if slurm and not step_gpus and int(os.getenv("SLURM_GPUS_ON_NODE", "0")):
-        raise ValueError("Slurm reports GPUs without step device IDs in SLURM_STEP_GPUS")
+        raise ValueError(f"Slurm reports GPUs without step device IDs in {gpu_ids}")
     gpus = 0
     if not slurm or step_gpus:
         from torch import cuda
 
         gpus = cuda.device_count() if cuda.is_available() else 0
     if slurm:
-        cpus = min(cpus, int(os.environ["SLURM_CPUS_PER_TASK"]))
+        cpus = min(cpus, int(os.getenv("SLURM_CPUS_PER_TASK", "1")))
         if step_gpus and (not visible or gpus != len(step_gpus.split(","))):
             raise ValueError(f"Slurm GPUs {step_gpus} disagree with CUDA visibility {visible!r} ({gpus} usable GPUs)")
     return {"cpu": cpus, "gpu": gpus}, affinity
 
 
+def trial_slots(resources, nodes):
+    return sum(min(int(node.get(key, 0) // amount) for key, amount in resources.items() if amount)
+               for node in nodes)
+
+
 def validate_capacity(resources, nodes):
-    if not any(all(node.get(key, 0) >= amount for key, amount in resources.items()) for node in nodes):
+    if not trial_slots(resources, nodes):
         raise ValueError(f"Trial resources {resources} do not fit on any single Ray node. Node capacities: {nodes}")
 
 
@@ -734,15 +791,20 @@ def main():
         return
 
     root.mkdir(parents=True, exist_ok=True)
-    with exclusive(root / ".experiment.lock"):
+    with exclusive(root / ".experiment.lock"), execution_attempt(root, "ray_tune") as (allocation_path, allocation):
         manifest = root / "experiment.json"
         experiment_path = root / "tune_results" / "independent_trials"
+        restore_tuner = False
         if args.restore:
             settings = json.loads(manifest.read_text())
             if settings.get("sweep") and conflicting_flags:
                 raise ValueError("Restored sweep configuration cannot be overridden")
             validate_restoration(settings, spec, args.experiment_id, root)
-            if not tune.Tuner.can_restore(str(experiment_path)):
+            restore_tuner = tune.Tuner.can_restore(str(experiment_path))
+            # A saved plan can precede Tune initialization. With existing Tune or
+            # trial artifacts, only Ray's original trial identities are acceptable.
+            if not restore_tuner and any(path.exists() for path in
+                                         (experiment_path, root / "trial_runs", root / "results.json")):
                 raise RuntimeError(f"No restorable Tune experiment at {experiment_path}")
             resources = settings.get("resources_per_trial", DEFAULT_TRIAL_RESOURCES)
         else:
@@ -755,12 +817,14 @@ def main():
             ray.init(address=address, logging_level="ERROR")
         else:
             local, _ = visible_resources()
+            allocation.update(nodes=[{"host": socket.gethostname(), **local}], ray_node_count=0)
             validate_capacity(resources, [local])
             os.environ.setdefault("RAY_DISABLE_USAGE_STATS", "1")
             ray.init(address="local", num_cpus=local["cpu"], num_gpus=local["gpu"],
                      include_dashboard=False, logging_level="ERROR")
         try:
             nodes = cluster_nodes(ray)
+            allocation.update(nodes=nodes, ray_node_count=len(nodes), resources_per_trial=resources)
             validate_capacity(resources, nodes)
             print(f"Ray allocation: {nodes}; resources/trial={resources}", flush=True)
             if not args.restore:
@@ -770,8 +834,11 @@ def main():
             algorithms = ["ppo", "mappo"] if settings["mode"] == "both" else [settings["mode"]]
             expected_trials = len(settings["trial_plan"]) if "trial_plan" in settings else len(algorithms)
             concurrency = settings.get("max_concurrent_trials", len(algorithms))
+            allocation.update(sweep_concurrency_limit=concurrency,
+                              allocation_trial_capacity=min(expected_trials, concurrency, trial_slots(resources, nodes)))
+            atomic_json(allocation_path, allocation)
             trainable = tune.with_resources(trial, resources=resources)
-            if args.restore:
+            if restore_tuner:
                 tuner = tune.Tuner.restore(str(experiment_path), trainable=trainable,
                                            resume_unfinished=True, resume_errored=True, restart_errored=False)
             else:
@@ -787,7 +854,16 @@ def main():
                                                             failure_config=tune.FailureConfig(max_failures=args.max_failures),
                                                             checkpoint_config=tune.CheckpointConfig(num_to_keep=2), verbose=1))
             results = []
-            for result in tuner.fit():
+            if os.getenv("PIPELINE_ROOT"):
+                previous_signal = signal.signal(signal.SIGUSR1, lambda *_: os.kill(os.getpid(), signal.SIGINT))
+            else:
+                previous_signal = None
+            try:
+                fitted = tuner.fit()
+            finally:
+                if previous_signal is not None:
+                    signal.signal(signal.SIGUSR1, previous_signal)
+            for result in fitted:
                 metrics = result.metrics or {}
                 row = {key: metrics.get(key) for key in ("algorithm", "hostname", "status", "environment_steps", "training_output_dir")}
                 row.update(tune_result_path=str(result.path), error=str(result.error) if result.error else None)

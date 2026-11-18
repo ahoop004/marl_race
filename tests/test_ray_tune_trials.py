@@ -137,9 +137,12 @@ def test_native_configuration_roundtrip_and_wandb_metadata(tmp_path, algorithm, 
 @pytest.mark.parametrize("sweep", [False, True])
 def test_trial_registers_immutable_native_checkpoint_and_recovers_new_allocation(tmp_path, monkeypatch, sweep):
     cfg = settings(tmp_path)
+    configuration = {"experiment": {"seed": 42, "total_steps": 9},
+                     "algorithm": {"params": {"learning_rate": .0003}}} if sweep else None
     entry = {"configuration_id": "point", "sample_index": 0, "replicate": 0, "seed": 42,
              "parameters": {"algorithm.params.learning_rate": .0003}, "schedule": {"lr_schedule": "constant"}}
     if sweep:
+        entry["config_digest"] = adapter.configuration_digest(configuration)
         cfg["sweep"] = {"name": "sweep", "search": {"method": "grid"}, "sweep_seed": 5, "evaluation": {}}
     trial_config = {"algorithm": "ppo", "settings": cfg, **({"sweep_trial": entry} if sweep else {})}
     reports, resume_checkpoint, calls = [], None, []
@@ -181,8 +184,6 @@ def test_trial_registers_immutable_native_checkpoint_and_recovers_new_allocation
             capture = Capture(False)
             native, _ = trainer(capture, **({"learning_rate": .0003} if sweep else {}))
             logger = CSVLogger(str(out), append="--resume" in command)
-            configuration = {"experiment": {"seed": 42, "total_steps": 9},
-                             "algorithm": {"params": {"learning_rate": .0003}}} if sweep else None
             native.hooks.extend([CSVHook(logger), CheckpointHook(native.agent, out, provenance=provenance,
                                                                configuration=configuration, save_every_steps=4)])
             if "--resume" in command:
@@ -218,6 +219,10 @@ def test_trial_registers_immutable_native_checkpoint_and_recovers_new_allocation
     assert [r["environment_steps"] for r in reports] == sorted(r["environment_steps"] for r in reports)
     assert len(list((out / "attempts").iterdir())) == 2
     assert read_checkpoint(out / "latest.pt")["metadata"]["provenance"]["wandb_run_id"] == json.loads((out / "ray_trial.json").read_text())["wandb_id"]
+    if sweep:
+        # Tune may re-enter a trial whose native completion reached disk first.
+        adapter.trial(trial_config)
+        assert calls == [4, 9] and reports[-1]["status"] == "completed"
     different = deepcopy(cfg)
     different["total_steps"] = 10
     with pytest.raises(ValueError, match="unrelated results"):
@@ -272,6 +277,10 @@ def test_capacity_must_fit_cpus_and_gpus_on_the_same_node(monkeypatch):
     adapter.validate_capacity({"cpu": 4, "gpu": 1}, nodes)
     with pytest.raises(ValueError, match="do not fit on any single Ray node"):
         adapter.validate_capacity({"cpu": 6, "gpu": 1}, nodes)
+    mappo = {"cpu": 10, "gpu": 1}
+    assert adapter.trial_slots(mappo, [{"cpu": 24, "gpu": 2}] * 2) == 4
+    assert adapter.trial_slots(mappo, [{"cpu": 40, "gpu": 4}]) == 4
+    assert adapter.trial_slots(mappo, [{"cpu": 10, "gpu": 1}]) == 1
     for key, value in {"NODES": "2", "GPUS": "2", "CPUS_PER_NODE": "8", "GPUS_PER_NODE": "1"}.items():
         monkeypatch.setenv(f"RAY_EXPECTED_{key}", value)
     ray = SimpleNamespace(nodes=lambda: [{"Alive": True, "Resources": {"CPU": n["cpu"], "GPU": n["gpu"]}} for n in nodes])

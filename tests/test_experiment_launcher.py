@@ -141,12 +141,21 @@ def test_freezing_recovery_completion_and_source_identity(tmp_path, monkeypatch)
 
 
 def test_older_manifest_revision_guard_and_legacy_import(tmp_path, monkeypatch):
-    # Clean older manifests can verify training code even after wrapper retirement.
-    commit = launch.subprocess.run(["git", "rev-parse", "HEAD"], cwd=launch.REPO,
-                                  check=True, capture_output=True, text=True).stdout.strip()
-    launch.validate_revision(dict(git_commit=commit, git_dirty=False))
-    for record in ({}, dict(git_commit=commit, git_dirty=True),
-                   dict(git_commit=commit, git_dirty=False, legacy_import=True)):
+    # Exercise real Git checks against a clean fixture independent of worktree edits.
+    checkout = tmp_path / "checkout"
+    launch.subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(launch.REPO), str(checkout)],
+                          check=True)
+    launch.subprocess.run(["git", "restore", "--source=HEAD", "--staged", "--worktree", "--", "src", "run.py"],
+                          cwd=checkout, check=True)
+    commit = launch.subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+    with monkeypatch.context() as fixture:
+        fixture.setattr(launch, "REPO", checkout)
+        record = dict(git_commit=commit, git_dirty=False)
+        launch.validate_revision(record)
+        for incompatible in ({}, {**record, "git_dirty": True}, {**record, "legacy_import": True}):
+            with pytest.raises(ValueError, match="allow-code-change"):
+                launch.validate_revision(incompatible)
+        (checkout / "run.py").write_text("# different training source\n")
         with pytest.raises(ValueError, match="allow-code-change"):
             launch.validate_revision(record)
     # Importing snapshots must not label today's source as the original revision.
