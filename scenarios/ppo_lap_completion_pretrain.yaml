@@ -1,6 +1,7 @@
 # @package _global_
 defaults:
 - /config
+- /wandb
 - /training: historical_ppo
 - override /algorithm: ppo
 - override /scenario: solo_lap_completion
@@ -12,12 +13,6 @@ defaults:
 experiment:
   name: ppo_lap_completion_pretrain
 wandb:
-  logging:
-    profile: auto
-    groups:
-      train: true
-      eval: true
-      performance: true
   enabled: true
   project: marl-f110-complete
   entity: ahoop004-old-dominion-university

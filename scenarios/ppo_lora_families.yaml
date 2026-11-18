@@ -1,6 +1,7 @@
 # @package _global_
 defaults:
 - /config
+- /wandb
 - /training: historical_ppo
 - override /algorithm: ppo
 - override /scenario: solo_lap_completion
@@ -24,11 +25,7 @@ launch:
     s_curve: [maps=generated_s_curve]
 wandb:
   logging:
-    profile: auto
     groups:
-      train: true
-      eval: true
-      performance: true
       reward_components: true
   enabled: true
   project: marl-f110-complete
@@ -50,9 +47,6 @@ paths:
 environment:
   max_steps: 8000
   target_laps: 1
-  # no_progress:
-  #   timeout_s: 60.0
-  #   min_progress_m: 1.0
   track_limits:
     enabled: true
     terminate: true

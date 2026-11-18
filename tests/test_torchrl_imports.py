@@ -66,10 +66,10 @@ try:
     params.update(device="cpu", hidden_dims=[8], n_steps=2, n_epochs=1, batch_size=2)
     learner = create_learner("ppo", spec, params)
     trainer = TorchRLPPOTrainer(task, learner)
+    trainer.train(total_steps=2)
     assert isinstance(trainer.env, NativeRaceTorchRLEnv)
     assert isinstance(trainer.env, EnvBase)
     assert isinstance(learner.loss_module, ClipPPOLoss)
-    trainer.train(total_steps=2)
     assert trainer.collected_steps == 2
 finally:
     task.close()

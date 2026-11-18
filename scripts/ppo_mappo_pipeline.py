@@ -172,10 +172,7 @@ def finish_stage(value, stage):
 
 def sha256(path):
     with Path(path).open("rb") as handle:
-        h = hashlib.sha256()
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            h.update(chunk)
-        return h.hexdigest()
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def evaluation_units(value, stage):

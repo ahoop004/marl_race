@@ -1,6 +1,7 @@
 # @package _global_
 defaults:
 - /config
+- /wandb
 - /continual: pilot
 - override /algorithm: ppo
 - override /scenario: solo_lap_completion
@@ -62,9 +63,5 @@ wandb:
   tags: [ppo, continual, phase1]
   mode: online
   logging:
-    profile: auto
     groups:
-      train: true
-      eval: true
-      performance: true
       reward_components: true

@@ -1,6 +1,7 @@
 # @package _global_
 defaults:
 - /config
+- /wandb
 - override /algorithm: ppo
 - override /scenario: solo_lap_completion
 - override /adaptation: full_finetune
@@ -12,12 +13,6 @@ defaults:
 experiment:
   name: ppo_lap_completion_transfer_circle
 wandb:
-  logging:
-    profile: auto
-    groups:
-      train: true
-      eval: true
-      performance: true
   enabled: true
   project: marl-f110-complete
   entity: ahoop004-old-dominion-university

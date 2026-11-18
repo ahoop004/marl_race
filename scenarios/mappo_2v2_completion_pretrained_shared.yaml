@@ -1,27 +1,10 @@
 # @package _global_
 defaults:
-- /config
-- /training: historical_ppo
-- override /algorithm: mappo
-- override /scenario: cooperative_2v2_completion
-- override /adaptation: full_finetune
-- override /maps: team_completion
-- override /evaluation: team_completion
-- override /execution: mappo
+- mappo_2v2_completion_pretrained
 - _self_
 experiment:
   name: mappo_2v2_completion_pretrained_shared
 wandb:
-  logging:
-    profile: auto
-    groups:
-      train: true
-      eval: true
-      performance: true
-  enabled: true
-  project: marl-f110-complete
-  group: mappo-2v2-completion
-  job_type: mappo-team
   tags:
   - mappo
   - torchrl
