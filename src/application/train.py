@@ -322,19 +322,36 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
             hooks.append(PhysicsEpisodeHook(output_dir))
 
         if evaluation_selection_enabled:
-            evaluator = create_selection_evaluator(algorithm, scenario, scenario_dir, spec, params)
-            resources.callback(evaluator.close)
-            evaluator.bind_agent(learner)
+            background = None
+            if exp_cfg.get("async_evaluation", False):
+                from tempfile import TemporaryDirectory
+                from training.evaluation_config import resolve_evaluation_protocol
+                from training.selection import BackgroundSelectionEvaluator
+
+                device = exp_cfg.get("async_evaluation_device", "cpu")
+                device = str(resolve_device(["cuda:0" if device == "cuda" else device]))
+                workspace = resources.enter_context(TemporaryDirectory(prefix="marl-race-evaluation-"))
+                background = BackgroundSelectionEvaluator(algorithm, scenario, scenario_dir, spec, params, workspace,
+                                                          device=device)
+                resources.callback(background.close)
+                evaluator = None
+                episodes = resolve_evaluation_protocol(scenario, "selection")["episodes"]
+                console.print_info(f"Selection evaluation: {episodes} fixed-seed races in a background process "
+                                   f"with policy inference on {device}")
+            else:
+                evaluator = create_selection_evaluator(algorithm, scenario, scenario_dir, spec, params)
+                resources.callback(evaluator.close)
+                evaluator.bind_agent(learner)
+                console.print_info(f"Selection evaluation: {evaluator.episodes} fixed-seed races; "
+                                   f"completion={evaluator.completion}")
             hooks.append(EvaluationCheckpointHook(
                 learner, output_dir, evaluator,
                 evaluate_every=int(eval_cfg.get("every_episodes", 100)),
                 selection_strategy=eval_cfg.get("selection_strategy",
                     "team_completion" if algorithm == "mappo" else "completion_progress"),
                 evaluate_every_steps=eval_cfg.get("every_steps"), provenance=provenance,
-                console=console, wandb_logger=wandb_logger, configuration=scenario,
+                console=console, wandb_logger=wandb_logger, configuration=scenario, background=background,
             ))
-            console.print_info(f"Selection evaluation: {evaluator.episodes} fixed-seed races; "
-                               f"completion={evaluator.completion}")
         if continual_enabled:
             from training.continual import ContinualHook
             hooks.insert(0, ContinualHook(scenario, scenario_dir, spec, params, output_dir,

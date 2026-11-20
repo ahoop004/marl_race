@@ -18,6 +18,7 @@ from loggers.wandb_logger import WandbLogger
 if TYPE_CHECKING:
     from env.types import TransitionRecord
     from loggers.csv_logger import CSVLogger
+    from training.selection import BackgroundSelectionEvaluator
 
 
 _log = logging.getLogger(__name__)
@@ -375,6 +376,7 @@ class EvaluationCheckpointHook(CheckpointHook):
         selection_strategy: str = "completion_progress",
         evaluate_every_steps: Optional[int] = None,
         configuration: Optional[Dict[str, Any]] = None,
+        background: Optional[BackgroundSelectionEvaluator] = None,
     ) -> None:
         if selection_strategy not in EVALUATION_STRATEGIES:
             raise ValueError(f"Unknown checkpoint selection strategy: {selection_strategy!r}")
@@ -394,6 +396,8 @@ class EvaluationCheckpointHook(CheckpointHook):
         self._evaluation_count = 0
         self.evaluation_seconds = 0.0
         self._policy_version = 0
+        self._background = background
+        self._pending = None
         if console is not None and selection_strategy == "team_completion":
             console.print_info("Checkpoint priority: " + self.selection_priority(selection_strategy))
 
@@ -401,18 +405,44 @@ class EvaluationCheckpointHook(CheckpointHook):
         pass
 
     def on_training_end(self):
-        pass
+        if self._pending is not None:
+            if self._trainer is None:
+                self._collect_evaluation(wait=True)
+            else:
+                self._trainer.measure_service("evaluation", self._collect_evaluation, wait=True)
 
     def state_dict(self):
         return {"best_score": self._best_score, "evaluation_count": self._evaluation_count,
-                "evaluation_seconds": self.evaluation_seconds}
+                "evaluation_seconds": self.evaluation_seconds,
+                **({"asynchronous": True} if self._background is not None else {})}
 
     def load_state_dict(self, state):
         self._best_score = state["best_score"]
         self._evaluation_count = state["evaluation_count"]
         self.evaluation_seconds = state["evaluation_seconds"]
+        if self._background is not None or state.get("asynchronous"):
+            self._restore_evaluation_outputs()
         if self._evaluate_every_steps is not None:
             self._next_evaluation_step = (self._environment_steps // self._evaluate_every_steps + 1) * self._evaluate_every_steps
+
+    def _restore_evaluation_outputs(self):
+        # Background results can be published after the last recovery checkpoint.
+        if self._history_path.is_file():
+            with self._history_path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    record = json.loads(line)
+                    self._evaluation_count = max(self._evaluation_count, record.get("evaluation_index", 0))
+                    self.evaluation_seconds = max(self.evaluation_seconds, record["evaluation_seconds_total"])
+        best = self._dir / "best.pt"
+        if best.is_file():
+            from agents.common.checkpoints import read_checkpoint
+
+            record = read_checkpoint(best)["metadata"]["selection"]
+            score = self.selection_score(record, self._selection_strategy)
+            if self._best_score is None or score > self._best_score:
+                self._best_score = score
+            self._evaluation_count = max(self._evaluation_count, record.get("evaluation_index", 0))
+            self.evaluation_seconds = max(self.evaluation_seconds, record["evaluation_seconds_total"])
 
     @staticmethod
     def selection_priority(strategy):
@@ -468,31 +498,61 @@ class EvaluationCheckpointHook(CheckpointHook):
     def on_update(self, metrics: Dict[str, float]) -> None:
         self._environment_steps = int(metrics.get("train/environment_steps", self._environment_steps))
         self._policy_version = int(metrics.get("train/updates", self._policy_version + 1))
+        self._collect_evaluation()
         if self._next_evaluation_step is not None and self._environment_steps >= self._next_evaluation_step:
-            self._evaluate_checkpoint(None)
+            if self._background is None:
+                self._evaluate_checkpoint(None)
+            elif self._pending is None:
+                self._save(self._background.snapshot)
+                self._background.start()
+                self._pending = (self._environment_steps, self._policy_version)
             self._next_evaluation_step = (self._environment_steps // self._evaluate_every_steps + 1) * self._evaluate_every_steps
+
+    def _collect_evaluation(self, *, wait=False):
+        if self._pending is None:
+            return
+        environment_steps, policy_version = self._pending
+        try:
+            result = self._background.result(wait=wait)
+        except (RuntimeError, OSError, ValueError) as exc:
+            self._pending = None
+            message = f"Background checkpoint evaluation failed at {environment_steps} steps: {exc}"
+            if self._console is not None:
+                self._console.print_warning(message)
+            else:
+                _log.warning(message)
+            return
+        if result is None:
+            return
+        self._pending = None
+        summary, seconds = result
+        self._record_evaluation(summary, seconds, None, environment_steps, policy_version)
 
     def _evaluate_checkpoint(self, completed_episodes: Optional[int]) -> None:
         started = time.perf_counter()
-        summary = dict(self._trainer.measure_service("evaluation", self._evaluator.evaluate)
-                       if self._trainer is not None else self._evaluator.evaluate())
-        summary["evaluation_seconds"] = time.perf_counter() - started
-        self.evaluation_seconds += summary["evaluation_seconds"]
+        summary = (self._trainer.measure_service("evaluation", self._evaluator.evaluate)
+                   if self._trainer is not None else self._evaluator.evaluate())
+        self._record_evaluation(summary, time.perf_counter() - started, completed_episodes,
+                                self._environment_steps, self._policy_version)
+
+    def _record_evaluation(self, summary, seconds, completed_episodes, environment_steps, policy_version):
+        summary = dict(summary, evaluation_seconds=seconds)
+        self.evaluation_seconds += seconds
         summary["evaluation_seconds_total"] = self.evaluation_seconds
         self._evaluation_count += 1
         run_id = self._provenance.get("run_id", self._dir.name)
         for index, row in enumerate(summary.get("episode_results", [])):
             row.update(run_id=run_id, environment_id="evaluation",
                        episode_id=f"{run_id}_eval{self._evaluation_count:06d}_ep{index:06d}",
-                       policy_version=self._policy_version,
+                       policy_version=policy_version,
                        reported_at_environment_steps=self._environment_steps)
         score = self.selection_score(summary, self._selection_strategy)
         is_best = self._best_score is None or score > self._best_score
         record = {
             "training_episode": completed_episodes,
             "run_id": run_id,
-            "policy_version": self._policy_version,
-            "environment_steps": self._environment_steps,
+            "policy_version": policy_version,
+            "environment_steps": environment_steps,
             "selection_strategy": self._selection_strategy,
             "selection_priority": (self.selection_priority(self._selection_strategy)
                                    if self._selection_strategy == "team_completion" else None),
@@ -506,6 +566,16 @@ class EvaluationCheckpointHook(CheckpointHook):
             import os
             record["recorded_unix"] = time.time()
             record["training_attempt"] = os.environ.get("RAY_TUNE_ATTEMPT_PATH")
+        if self._background is not None:
+            record["evaluation_index"] = self._evaluation_count
+            if is_best:
+                from agents.common.checkpoints import read_checkpoint
+                from utils.torch_io import atomic_save
+
+                checkpoint = read_checkpoint(self._background.snapshot)
+                checkpoint.pop("_identity")
+                checkpoint["metadata"]["selection"] = record
+                atomic_save(checkpoint, self._dir / "best.pt")
         with self._history_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
 
@@ -517,7 +587,7 @@ class EvaluationCheckpointHook(CheckpointHook):
             }
             if completed_episodes is not None:
                 scalar_metrics["eval/training_episode"] = completed_episodes
-            scalar_metrics["eval/environment_steps"] = self._environment_steps
+            scalar_metrics["eval/environment_steps"] = environment_steps
             self._wandb.log_metrics(scalar_metrics)
 
         if self._console is not None and self._selection_strategy in {"team_completion", "lap_time"}:
@@ -527,7 +597,7 @@ class EvaluationCheckpointHook(CheckpointHook):
             lap_time = summary.get("mean_valid_lap_time_s")
             lap_text = "n/a" if lap_time is None else f"{lap_time:.2f}s"
             self._console.print_info(
-                f"checkpoint eval races={summary.get('episodes', 0)} steps={self._environment_steps} "
+                f"checkpoint eval races={summary.get('episodes', 0)} steps={environment_steps} "
                 f"{'both_finished' if self._selection_strategy == 'team_completion' else 'completion'}={summary.get(completion_key, 0):.1%} "
                 f"failed={summary.get('learner_failure_rate', 0):.1%} "
                 f"timeout={summary.get('timeout_rate', 0):.1%} "
@@ -539,7 +609,7 @@ class EvaluationCheckpointHook(CheckpointHook):
             progress_key = "mean_net_progress" if self._selection_strategy == "completion_progress" else "mean_progress"
             self._console.print_info(
                 "checkpoint eval  "
-                f"episode={completed_episodes}  steps={self._environment_steps}  "
+                f"episode={completed_episodes}  steps={environment_steps}  "
                 f"completion={float(summary.get('completion_rate', 0.0)):.1%}  "
                 f"collision={float(summary.get('collision_rate', 0.0)):.1%}  "
                 f"timeout={float(summary.get('timeout_rate', 0.0)):.1%}  "
@@ -549,10 +619,8 @@ class EvaluationCheckpointHook(CheckpointHook):
 
         if is_best:
             self._best_score = score
-            self._save(
-                self._dir / "best.pt",
-                selection=record,
-            )
+            if self._background is None:
+                self._save(self._dir / "best.pt", selection=record)
 
 
 class PhysicsEpisodeHook(TrainingHook):

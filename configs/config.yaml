@@ -23,6 +23,8 @@ experiment:
   name: race
   parallel_envs: 1
   distributed: false  # torchrun: one learner/collector per local GPU; counts stay global.
+  async_evaluation: false
+  async_evaluation_device: cpu
   envs_per_worker: 1
   # Ordinary runs default off; preserve explicit execution-profile settings.
   measure_stages: ${oc.select:execution.experiment.measure_stages,false}

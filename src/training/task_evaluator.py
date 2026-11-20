@@ -38,7 +38,7 @@ class TaskEvaluator:
                     "physics": result.physics} if result.physics is not None else None)
         return result.facts, str(result.map_id or "unknown"), result.record, physics
 
-    def evaluate(self, agent=None):
+    def evaluate(self, agent=None, *, preserve_rng=True):
         if agent is not None:
             self.bind_agent(agent)
         if not hasattr(self, "agent"):
@@ -49,7 +49,7 @@ class TaskEvaluator:
             target_laps=self.task.episode_limits.target_laps, action_repeat=self.action_repeat,
             completion=self.completion)
         by_map, physics, records, results = {}, [], [], []
-        with evaluation_mode(self.agent):
+        with evaluation_mode(self.agent, preserve_rng=preserve_rng):
             for episode in range(self.episodes):
                 result, map_id, record, physics_record = self._evaluate_episode(episode, protocol)
                 results.append(result)

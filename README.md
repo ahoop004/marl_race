@@ -202,6 +202,25 @@ between adaptation methods. Scenarios default to 4,096,000 decisions, constant
 learning rate 0.0001, five target laps, and W&B disabled. These are starting
 settings, not tuned budgets.
 
+For background checkpoint selection in a new PPO family run, add the following
+flags after `scripts/hpc/experiment.sbatch` or to the `run.py` command.
+
+```bash
+--set evaluation.enabled=true --set experiment.async_evaluation=true
+```
+
+Each learner uses one background process to evaluate a fixed checkpoint
+while training continues. It skips scheduled evaluations while that process is
+busy and waits for the in-flight evaluation at normal shutdown. `best.pt` contains
+the weights that earned the score. An interrupted evaluation is discarded on
+recovery. The Slurm launcher's frozen configuration preserves the mode on resume.
+
+Policy inference defaults to CPU. Add `--set experiment.async_evaluation_device=cuda:0`
+to use the GPU assigned to each task by the standard Slurm launcher. With direct
+`run.py` launches that expose multiple GPUs to the process, set
+`execution.params.device=cuda:0` for the learner and `experiment.async_evaluation_device=cuda:1`
+for evaluation on the second visible GPU. The simulator runs on CPU in either case.
+
 Saved LoRA checkpoints include the base actor, adapters, critic, and source
 identity. Evaluation reconstructs the adapter from checkpoint metadata; the
 original source file is not needed to evaluate or resume. Automatic switching

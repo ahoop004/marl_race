@@ -178,7 +178,18 @@ def validate_training_scenario(scenario):
     if experiment.get("mappo_backend") == "torchrl":
         if trainable_algos != {"mappo"}:
             raise ScenarioError("The TorchRL MAPPO backend requires MAPPO learners")
-    evaluation_strategy = scenario.get("evaluation", {}).get("selection_strategy")
+    evaluation = scenario.get("evaluation", {})
+    async_evaluation = experiment.get("async_evaluation", False)
+    if type(async_evaluation) is not bool:
+        raise ScenarioError("experiment.async_evaluation must be boolean")
+    eval_device = experiment.get("async_evaluation_device", "cpu")
+    if not isinstance(eval_device, str) or (eval_device not in {"cpu", "cuda"} and not (
+            eval_device.startswith("cuda:") and eval_device[5:].isascii() and eval_device[5:].isdigit())):
+        raise ScenarioError("experiment.async_evaluation_device must be cpu, cuda or cuda:<index>")
+    if async_evaluation and (trainable_algos != {"ppo"} or not evaluation.get("enabled")
+                             or evaluation.get("every_steps") is None):
+        raise ScenarioError("Asynchronous evaluation requires PPO and enabled step-based checkpoint evaluation")
+    evaluation_strategy = evaluation.get("selection_strategy")
     if evaluation_strategy is not None:
         supported = {"team_completion"} if trainable_algos == {"mappo"} else {"completion_progress", "lap_time"}
         if evaluation_strategy not in supported:

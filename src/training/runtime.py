@@ -1,5 +1,5 @@
 """Process randomness and inference mode belong to execution, not task creation."""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import random
 
 import numpy as np
@@ -71,9 +71,9 @@ def preserve_random_state():
 
 
 @contextmanager
-def evaluation_mode(policy):
+def evaluation_mode(policy, *, preserve_rng=True):
     actor_was_training = policy.actor.training
-    with preserve_random_state():
+    with (preserve_random_state() if preserve_rng else nullcontext()):
         policy.actor.eval()
         try:
             with torch.no_grad():
