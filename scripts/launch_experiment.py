@@ -1,4 +1,4 @@
-"""Launch independent single-node experiments; training remains owned by run.py.
+"""Launch independent experiments; training remains owned by run.py.
 
 Work items are ordered scenario entries mapping output names to Hydra overrides.
 A root manifest freezes every item before any training, including queued items.
@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pickle
 import re
 import shutil
 import subprocess
@@ -32,11 +33,17 @@ def positive(value, name):
     return value
 
 
-def task_identity():
+def task_identity(independent_cpu=False):
     rank = int(os.environ.get("SLURM_PROCID", "0"))
     size = positive(int(os.environ.get("SLURM_NTASKS", "1")), "Slurm task count")
-    if not 0 <= rank < size or int(os.environ.get("SLURM_JOB_NUM_NODES", "1")) != 1:
-        raise ValueError("Independent experiments require a valid task rank on one node")
+    nodes = int(os.environ.get("SLURM_JOB_NUM_NODES", "1"))
+    if not 0 <= rank < size:
+        raise ValueError("Invalid Slurm task rank")
+    if independent_cpu:
+        if nodes != size or int(os.environ.get("SLURM_LOCALID", "0")) != 0:
+            raise ValueError("Independent CPU experiments require exactly one Slurm task per node")
+    elif nodes != 1:
+        raise ValueError("Use the independent CPU entry point for multiple nodes")
     return rank, size, sorted(os.sched_getaffinity(0))
 
 
@@ -77,6 +84,8 @@ def resolve_collectors(config, cpu_count, *, frozen=False):
     # Historical frozen experiments predate the four-CPU policy.
     reserved = policy.get("reserved_cpus", 1)
     positive(reserved, "execution.collector.reserved_cpus")
+    if config["experiment"].get("async_evaluation"):
+        reserved = max(reserved, config["experiment"].get("torch_threads", 1) + 1)
     capacity = cpu_count - reserved
     exp = config["experiment"]
     envs = exp["envs_per_worker"] if frozen else policy.get("envs_per_worker", exp["envs_per_worker"])
@@ -285,7 +294,37 @@ def completed(out, config):
     summary = json.loads(summary.read_text())
     budget = config["experiment"].get("total_steps")
     key = "environment_steps" if budget is not None else "completed_episodes"
-    return int(summary.get(key, 0)) >= (budget or config["experiment"]["episodes"])
+    if int(summary.get(key, 0)) < (budget or config["experiment"]["episodes"]):
+        return False
+    if config["experiment"].get("async_evaluation"):
+        from training.selection import verify_selected_checkpoint
+
+        try:
+            verify_selected_checkpoint(out, config)
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError, pickle.UnpicklingError) as exc:
+            print(f"{out.name}: validation selection incomplete: {exc}", file=sys.stderr, flush=True)
+            return False
+    return True
+
+
+def verify_cpu_item(config, affinity):
+    cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", len(affinity)))
+    if len(affinity) < cpus:
+        raise ValueError(f"Slurm task requested {cpus} CPUs but has only {len(affinity)} in its affinity")
+    resolve_collectors(deepcopy(config), cpus, frozen=True)
+    experiment = config["experiment"]
+    if (not experiment.get("async_evaluation") or experiment.get("async_evaluation_device", "cpu") != "cpu"
+            or experiment.get("torch_threads") != 1 or experiment.get("distributed")):
+        raise ValueError("Independent CPU tasks require asynchronous CPU evaluation and one PyTorch thread")
+    for agent in config["agents"].values():
+        if agent.get("algorithm") == "ppo":
+            params = {**config["training_defaults"], **agent.get("params", {})}
+            if params.get("device") != "cpu" or params.get("collection_device") != "cpu":
+                raise ValueError("Independent CPU tasks require CPU learner and collector devices")
+    import torch
+
+    if torch.cuda.is_available():
+        raise ValueError("The independent CPU allocation exposes a CUDA device")
 
 
 def validate_gpu(config):
@@ -365,7 +404,7 @@ def run_item(args, name, config, identity):
         if result.returncode:
             raise RuntimeError(f"{name}: exit {result.returncode}; see {out / 'train.log'}; use --resume")
         if not completed(out, config):
-            raise RuntimeError(f"{name}: stopped before its configured budget completed; use --resume")
+            raise RuntimeError(f"{name}: training budget or checkpoint selection incomplete; use --resume")
         (out / "completed.json").write_text(json.dumps(dict(checkpoint=str(out / "final.pt"), run_id=run_id)) + "\n")
 
 
@@ -386,6 +425,9 @@ def main(argv=None):
     parser.add_argument("--reserved-cpus", type=int)
     parser.add_argument("--plan", action="store_true", help="Resolve and print assignment; no writes or training")
     parser.add_argument("--prepare-only", action="store_true", help="Freeze configurations without training")
+    parser.add_argument("--independent-cpu", action="store_true", help="Require one CPU-only independent task per node")
+    parser.add_argument("--shared-token", help="Verify the run directory is shared with the batch host")
+    parser.add_argument("--verify-allocation", action="store_true", help="Verify the assigned work item before training")
     args = parser.parse_args(argv)
     args.root = args.root.expanduser().resolve()
     if not args.scenario and not args.resume:
@@ -394,7 +436,7 @@ def main(argv=None):
         parser.error("--allow-code-change requires --resume")
     if args.resume and (cli_overrides(args) or args.source):
         parser.error("Recovery uses frozen settings; omit source, profile, seed and configuration overrides")
-    identity = task_identity()
+    identity = task_identity(independent_cpu=True) if args.independent_cpu else task_identity()
     rank, size, affinity = identity
     if args.plan:
         if args.resume:
@@ -409,7 +451,41 @@ def main(argv=None):
                              "collectors": {n: {k: c["experiment"][k] for k in ("parallel_envs", "envs_per_worker")}
                                             for n, c in configs.items()}}, sort_keys=False))
         return
+    if args.independent_cpu and (not args.shared_token or
+            (args.root / ".allocation.lock").read_text().strip() != args.shared_token):
+        raise ValueError(f"{args.root} is not shared with the batch host")
     data = prepare_manifest(args, len(affinity))
+    if args.independent_cpu:
+        if len(data["items"]) != size:
+            raise ValueError(f"Expected one independent work item per CPU node, got {len(data['items'])} items for {size} tasks")
+        name = list(data["items"])[rank]
+        config = data["items"][name]
+        verify_cpu_item(config, affinity)
+        if args.verify_allocation:
+            from agents.common.checkpoints import read_checkpoint
+            from core.provenance import collect_map_protocols
+
+            maps = config["maps"]
+            if not set(maps["selection"]).isdisjoint(maps["final_test"]):
+                raise ValueError(f"{name}: checkpoint selection and final-test maps overlap")
+            protocols = collect_map_protocols(config["environment"])
+            missing = [bundle for bundle in maps["available"]
+                       if bundle not in protocols or not protocols[bundle]["assets"]["image"]["sha256"]]
+            if missing:
+                raise ValueError(f"{name}: missing map files on this node: {', '.join(missing)}")
+            source_id = data["source"]
+            if config["adaptation"]["mode"] == "lora":
+                source = read_checkpoint(source_id["path"])["metadata"]
+                if source["algorithm"] != "ppo" or source["adaptation"]["lora"] is not None:
+                    raise ValueError(f"{name}: expected a pretrained PPO base checkpoint")
+            print(f"Verified {name}: rank={rank} node={os.environ.get('SLURMD_NODENAME', 'local')} "
+                  f"cpus={os.environ.get('SLURM_CPUS_PER_TASK', len(affinity))} "
+                  f"collectors={config['experiment']['parallel_envs']}x{config['experiment']['envs_per_worker']} "
+                  f"eval_workers=1 cuda=0 source_sha256={source_id['sha256'] if source_id else 'none'} "
+                  f"root={args.root}", flush=True)
+            return
+    elif args.verify_allocation:
+        parser.error("--verify-allocation requires --independent-cpu")
     failures = []
     for name in list(data["items"])[rank::size]:
         try:

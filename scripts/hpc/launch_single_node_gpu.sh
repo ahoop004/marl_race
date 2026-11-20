@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared runtime for single-node independent GPU jobs. Allocation comes from sbatch.
+# Shared runtime for independent experiments. Allocation comes from sbatch.
 set -Eeuo pipefail
 trap 'status=$?; if (( status != 0 )); then echo "Allocation ${SLURM_JOB_ID:-unknown} failed/interrupted (exit $status); recover with RESUME=1 RUN_ROOT=${RUN_ROOT:-unset}" >&2; fi' EXIT
 trap 'echo "Slurm termination received; recover from latest.pt" >&2; exit 143' TERM
@@ -16,7 +16,14 @@ CRUN=${CRUN:-$(command -v crun.python3 || command -v crun || true)}
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 export NUMBA_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYGLET_HEADLESS=true PYTHONUNBUFFERED=1
 export WEIGHT_SYNC_TIMEOUT=${WEIGHT_SYNC_TIMEOUT:-900}
-[[ "${SLURM_JOB_NUM_NODES:-1}" == 1 ]] || { echo 'Requires a single node' >&2; exit 2; }
+CPU_INDEPENDENT=${CPU_INDEPENDENT:-0}
+if [[ "$CPU_INDEPENDENT" == 1 ]]; then
+  [[ "${SLURM_NTASKS:?}" == "${SLURM_JOB_NUM_NODES:?}" ]] || { echo 'Request one task per node' >&2; exit 2; }
+  [[ "${SLURM_GPUS_PER_TASK:-0}" == 0 && -z "${SLURM_JOB_GPUS:-}" ]] || { echo 'Use a CPU-only allocation' >&2; exit 2; }
+  export CUDA_VISIBLE_DEVICES=""
+else
+  [[ "${SLURM_JOB_NUM_NODES:-1}" == 1 ]] || { echo 'Requires a single node' >&2; exit 2; }
+fi
 : "${SCENARIO:?Set SCENARIO to an experiment definition}"
 RESUME=${RESUME:-0}
 EXTRA=()
@@ -27,6 +34,15 @@ if [[ "$RESUME" == 1 ]]; then
 elif [[ "$RESUME" == 0 ]]; then
   RUN_ROOT=${RUN_ROOT:-"$REPO_DIR/outputs/$(basename "$SCENARIO" .yaml)_${SLURM_JOB_ID}"}
   mkdir -p "$RUN_ROOT"
+  if [[ "$CPU_INDEPENDENT" == 1 ]]; then
+    EXTRA+=(--set execution.params.device=cpu --set execution.params.collection_device=cpu
+      --set experiment.torch_threads=1 --set experiment.distributed=false
+      --set evaluation.enabled=true --set experiment.async_evaluation=true
+      --set experiment.async_evaluation_device=cpu --set experiment.measure_services=true)
+    WORKERS=${WORKERS:-24}
+    ENVS_PER_WORKER=${ENVS_PER_WORKER:-4}
+    RESERVED_CPUS=${RESERVED_CPUS:-8}
+  fi
   if [[ -n "${SOURCE_CHECKPOINT:-}" ]]; then EXTRA+=(--source "$SOURCE_CHECKPOINT"); fi
   if [[ -n "${PROFILE:-}" ]]; then EXTRA+=(--profile "$PROFILE"); fi
   if [[ -n "${SEED:-}" ]]; then EXTRA+=(--seed "$SEED"); fi
@@ -38,12 +54,24 @@ else
   echo 'RESUME must be 0 or 1' >&2; exit 2
 fi
 RUN_ROOT=$(cd "$RUN_ROOT" && pwd)
-exec 9>"$RUN_ROOT/.allocation.lock"
+exec 9<>"$RUN_ROOT/.allocation.lock"
 flock -n 9 || { echo 'Experiment already has an active allocation' >&2; exit 3; }
 printf 'Root=%s; scenario=%s; tasks=%s; CPUs/task=%s\n' \
   "$RUN_ROOT" "$SCENARIO" "${SLURM_NTASKS:-1}" "${SLURM_CPUS_PER_TASK:-affinity}"
-# srun inherits task, CPU and GPU requests from the allocation. Never remap CUDA
-# devices: Slurm supplies task-local visibility, and the learner uses cuda:0.
-srun --exact --gpu-bind=single:1 --cpu-bind=cores --kill-on-bad-exit=0 \
-  "$CRUN" -p "$ENV_PATH" python3 scripts/launch_experiment.py \
-  --scenario "$SCENARIO" --root "$RUN_ROOT" "${EXTRA[@]}" "$@"
+COMMAND=("$CRUN" -p "$ENV_PATH" python3 scripts/launch_experiment.py
+  --scenario "$SCENARIO" --root "$RUN_ROOT" "${EXTRA[@]}" "$@")
+if [[ "$CPU_INDEPENDENT" == 1 ]]; then
+  scontrol -o show partition "${SLURM_JOB_PARTITION:?}"
+  scontrol -o show job "$SLURM_JOB_ID"
+  IFS= read -r shared_token < /proc/sys/kernel/random/uuid
+  printf '%s\n' "$shared_token" >&9
+  COMMAND+=(--independent-cpu --shared-token "$shared_token")
+  SRUN=(srun --exact --ntasks="$SLURM_NTASKS" --ntasks-per-node=1 --cpu-bind=cores
+    --cpus-per-task="${SLURM_CPUS_PER_TASK:?}" --kill-on-bad-exit=0 --label)
+  "${SRUN[@]}" "${COMMAND[@]}" --verify-allocation
+  if [[ "${PREFLIGHT_ONLY:-0}" == 1 ]]; then exit 0; fi
+  "${SRUN[@]}" "${COMMAND[@]}"
+else
+  # Slurm sets task-local GPU visibility. The learner uses cuda:0.
+  srun --exact --gpu-bind=single:1 --cpu-bind=cores --kill-on-bad-exit=0 "${COMMAND[@]}"
+fi

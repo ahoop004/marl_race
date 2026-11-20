@@ -63,7 +63,9 @@ class MetricPolicy:
         profiling = (("perf/boundaries/*", "perf/workload/*", "perf/profiling/*")
                      if scenario.get("experiment", {}).get("measure_stages", False) else ())
         continual = ("cl/*", "eval/cl/*", "perf/cl_*") if scenario.get("continual") else ()
-        patterns = (*CORE, *profiling, *continual, *(LAP_COMPLETION if self.lap_completion else RACING))
+        async_eval = (("eval/evaluation_queue_depth", "eval/evaluation_queue_wait_seconds", "eval/evaluation_lag_steps")
+                      if scenario.get("experiment", {}).get("async_evaluation") else ())
+        patterns = (*CORE, *profiling, *continual, *async_eval, *(LAP_COMPLETION if self.lap_completion else RACING))
         self._names = set(patterns)
         self._patterns = tuple(pattern for pattern in patterns if "*" in pattern)
 

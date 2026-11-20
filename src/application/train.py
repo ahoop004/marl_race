@@ -302,6 +302,9 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
         evaluation_selection_enabled = bool(eval_cfg.get("enabled", False)) and algorithm in {"ppo", "mappo"}
         compact_laps = MetricPolicy(scenario.get("wandb", {}).get("logging"), scenario).lap_completion
 
+        recovery_checkpoint = CheckpointHook(learner, output_dir, provenance=provenance, configuration=scenario,
+                                             save_every_steps=scenario["checkpoint"]["every_steps"],
+                                             save_every_updates=scenario["checkpoint"]["every_updates"])
         hooks = [
             ConsoleHook(
                 logger=console,
@@ -309,9 +312,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
                 lap_completion=compact_laps,
             ),
             CSVHook(csv_logger),
-            CheckpointHook(learner, output_dir, provenance=provenance, configuration=scenario,
-                           save_every_steps=scenario["checkpoint"]["every_steps"],
-                           save_every_updates=scenario["checkpoint"]["every_updates"]),
+            recovery_checkpoint,
         ]
         if wandb_logger:
             hooks.append(WandbHook(wandb_logger))
@@ -324,13 +325,12 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
         if evaluation_selection_enabled:
             background = None
             if exp_cfg.get("async_evaluation", False):
-                from tempfile import TemporaryDirectory
                 from training.evaluation_config import resolve_evaluation_protocol
                 from training.selection import BackgroundSelectionEvaluator
 
                 device = exp_cfg.get("async_evaluation_device", "cpu")
                 device = str(resolve_device(["cuda:0" if device == "cuda" else device]))
-                workspace = resources.enter_context(TemporaryDirectory(prefix="marl-race-evaluation-"))
+                workspace = Path(output_dir) / ".evaluation_pending"
                 background = BackgroundSelectionEvaluator(algorithm, scenario, scenario_dir, spec, params, workspace,
                                                           device=device)
                 resources.callback(background.close)
@@ -351,6 +351,7 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
                     "team_completion" if algorithm == "mappo" else "completion_progress"),
                 evaluate_every_steps=eval_cfg.get("every_steps"), provenance=provenance,
                 console=console, wandb_logger=wandb_logger, configuration=scenario, background=background,
+                recovery_checkpoint=recovery_checkpoint,
             ))
         if continual_enabled:
             from training.continual import ContinualHook

@@ -210,16 +210,54 @@ flags after `scripts/hpc/experiment.sbatch` or to the `run.py` command.
 ```
 
 Each learner uses one background process to evaluate a fixed checkpoint
-while training continues. It skips scheduled evaluations while that process is
-busy and waits for the in-flight evaluation at normal shutdown. `best.pt` contains
-the weights that earned the score. An interrupted evaluation is discarded on
-recovery. The Slurm launcher's frozen configuration preserves the mode on resume.
+while training continues. One extra snapshot can wait in the queue. A full queue
+pauses training at the next scheduled evaluation until a slot opens. Results are
+applied in policy order, and normal shutdown drains the queue. Recovery restores
+pending snapshots from `latest.pt`. `best.pt` contains the evaluated weights and
+`final.pt` contains the final learner state. The local evaluation journal and CSV
+record results against the steps of the evaluated policy.
 
 Policy inference defaults to CPU. Add `--set experiment.async_evaluation_device=cuda:0`
 to use the GPU assigned to each task by the standard Slurm launcher. With direct
 `run.py` launches that expose multiple GPUs to the process, set
 `execution.params.device=cuda:0` for the learner and `experiment.async_evaluation_device=cuda:1`
 for evaluation on the second visible GPU. The simulator runs on CPU in either case.
+
+On Wahab, `scripts/hpc/experiment_cpu.sbatch` assigns one PPO family per node in
+`main`. Each task requests 32 CPUs and runs 24 collectors with four environments
+each, one single-threaded learner, and one single-threaded CPU evaluator. Check
+the partition and your account association on the login node before choosing
+any account, QoS, memory or time overrides.
+
+```bash
+scontrol -o show partition main
+sinfo -N -p main -o '%N %c %m %t'
+sacctmgr -n -P show assoc where user="$USER" format=Account,Partition,QOS,DefaultQOS
+sbatch --test-only scripts/hpc/experiment_cpu.sbatch
+REPO_DIR="$PWD" PREFLIGHT_ONLY=1 sbatch scripts/hpc/experiment_cpu.sbatch
+REPO_DIR="$PWD" sbatch scripts/hpc/experiment_cpu.sbatch
+REPO_DIR="$PWD" RESUME=1 RUN_ROOT="$PWD/outputs/ppo_lora_families_JOBID" \
+  sbatch scripts/hpc/experiment_cpu.sbatch
+```
+
+The allocation preflight checks the shared run directory, source SHA-256, map
+assets, CPU affinity and family assignment on every node. Production retains the
+30,000-episode budget and the existing validation interval. A work item completes
+after training reaches its budget and its validation-selected `best.pt` passes
+verification.
+
+To compare 16 and 24 workers on Wahab, run three PPO updates for the straight
+family with each layout. Each submission gets a separate run directory.
+
+```bash
+for workers in 16 24; do
+  REPO_DIR="$PWD" WORKERS="$workers" sbatch --nodes=1 --ntasks=1 scripts/hpc/experiment_cpu.sbatch \
+    --set experiment.total_steps=202752 --set evaluation.every_steps=67584 \
+    --set experiment.measure_stages=true --set wandb.enabled=false \
+    --set '~launch.work_items.sweeper' --set '~launch.work_items.hairpin' \
+    --set '~launch.work_items.chicane' --set '~launch.work_items.s_curve'
+done
+```
 
 Saved LoRA checkpoints include the base actor, adapters, critic, and source
 identity. Evaluation reconstructs the adapter from checkpoint metadata; the

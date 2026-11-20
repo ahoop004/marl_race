@@ -1,8 +1,9 @@
 """Training hooks — called by trainers at step, episode, and update boundaries."""
 from __future__ import annotations
 
-import logging
+import csv
 import json
+import os
 import time
 from collections import deque
 from pathlib import Path
@@ -19,9 +20,6 @@ if TYPE_CHECKING:
     from env.types import TransitionRecord
     from loggers.csv_logger import CSVLogger
     from training.selection import BackgroundSelectionEvaluator
-
-
-_log = logging.getLogger(__name__)
 
 
 class TrainingHook:
@@ -333,6 +331,9 @@ class CheckpointHook(TrainingHook):
             self._save(self._dir / "latest.pt", resumable=True)
             self._due = False
 
+    def request_recovery_checkpoint(self):
+        self._due = True
+
     def on_training_end(self):
         if self._trainer is None:
             return
@@ -377,6 +378,7 @@ class EvaluationCheckpointHook(CheckpointHook):
         evaluate_every_steps: Optional[int] = None,
         configuration: Optional[Dict[str, Any]] = None,
         background: Optional[BackgroundSelectionEvaluator] = None,
+        recovery_checkpoint: Optional[CheckpointHook] = None,
     ) -> None:
         if selection_strategy not in EVALUATION_STRATEGIES:
             raise ValueError(f"Unknown checkpoint selection strategy: {selection_strategy!r}")
@@ -393,56 +395,85 @@ class EvaluationCheckpointHook(CheckpointHook):
         self._wandb = wandb_logger
         self._best_score: Optional[tuple[float, ...]] = None
         self._history_path = self._dir / "evaluation_history.jsonl"
+        self._evaluation_csv = self._dir / "evaluation_metrics.csv"
         self._evaluation_count = 0
         self.evaluation_seconds = 0.0
         self._policy_version = 0
         self._background = background
-        self._pending = None
+        self._recovery_checkpoint = recovery_checkpoint
+        self._pending = deque()
+        self._active = False
         if console is not None and selection_strategy == "team_completion":
             console.print_info("Checkpoint priority: " + self.selection_priority(selection_strategy))
 
     def on_checkpoint_boundary(self):
-        pass
+        self._start_evaluation()
 
     def on_training_end(self):
-        if self._pending is not None:
-            if self._trainer is None:
-                self._collect_evaluation(wait=True)
-            else:
-                self._trainer.measure_service("evaluation", self._collect_evaluation, wait=True)
+        self._start_evaluation()
+        while self._pending:
+            self._collect_evaluation(wait=True)
+        if self._background is not None and self._trainer is not None and self._trainer.budget_reached():
+            if self._best_score is None or not (self._dir / "best.pt").is_file():
+                raise RuntimeError("Training reached its budget without a validation-selected best.pt")
 
     def state_dict(self):
         return {"best_score": self._best_score, "evaluation_count": self._evaluation_count,
                 "evaluation_seconds": self.evaluation_seconds,
-                **({"asynchronous": True} if self._background is not None else {})}
+                **({"pending_evaluations": list(self._pending)} if self._background is not None else {})}
 
     def load_state_dict(self, state):
         self._best_score = state["best_score"]
         self._evaluation_count = state["evaluation_count"]
         self.evaluation_seconds = state["evaluation_seconds"]
-        if self._background is not None or state.get("asynchronous"):
+        if self._background is not None:
+            self._pending = deque(state.get("pending_evaluations", ()))
             self._restore_evaluation_outputs()
+            self._start_evaluation()
+        elif state.get("pending_evaluations"):
+            raise ValueError("Resume with asynchronous evaluation enabled to finish pending checkpoints")
         if self._evaluate_every_steps is not None:
             self._next_evaluation_step = (self._environment_steps // self._evaluate_every_steps + 1) * self._evaluate_every_steps
 
     def _restore_evaluation_outputs(self):
-        # Background results can be published after the last recovery checkpoint.
+        # The journal commits results before best.pt or CSV can be published.
+        records = []
         if self._history_path.is_file():
-            with self._history_path.open(encoding="utf-8") as stream:
+            with self._history_path.open("r+b") as stream:
+                offset = 0
                 for line in stream:
-                    record = json.loads(line)
-                    self._evaluation_count = max(self._evaluation_count, record.get("evaluation_index", 0))
-                    self.evaluation_seconds = max(self.evaluation_seconds, record["evaluation_seconds_total"])
+                    if not line.endswith(b"\n"):
+                        stream.truncate(offset)
+                        break
+                    offset += len(line)
+                    records.append(json.loads(line))
+        if records:
+            self._evaluation_count = max(self._evaluation_count, records[-1].get("evaluation_index", len(records)))
+            self.evaluation_seconds = max(self.evaluation_seconds, records[-1]["evaluation_seconds_total"])
         best = self._dir / "best.pt"
-        if best.is_file():
-            from agents.common.checkpoints import read_checkpoint
+        from agents.common.checkpoints import read_checkpoint
 
-            record = read_checkpoint(best)["metadata"]["selection"]
-            score = self.selection_score(record, self._selection_strategy)
-            if self._best_score is None or score > self._best_score:
-                self._best_score = score
-            self._evaluation_count = max(self._evaluation_count, record.get("evaluation_index", 0))
-            self.evaluation_seconds = max(self.evaluation_seconds, record["evaluation_seconds_total"])
+        saved = read_checkpoint(best)["metadata"]["selection"] if best.is_file() else None
+        winner = next((row for row in reversed(records) if row["is_best"]), None)
+        if winner and winner.get("snapshot_sha256") and (saved is None or
+                saved.get("evaluation_index", 0) < winner["evaluation_index"]):
+            self._publish_best(winner)
+            saved = winner
+        if saved:
+            self._best_score = self.selection_score(saved, self._selection_strategy)
+            self._evaluation_count = max(self._evaluation_count, saved.get("evaluation_index", 0))
+            self.evaluation_seconds = max(self.evaluation_seconds, saved["evaluation_seconds_total"])
+        finished = {row["policy_version"]: row["snapshot_sha256"] for row in records if row.get("snapshot_sha256")}
+        for job in self._pending:
+            version = job["policy_version"]
+            if version in finished and job["snapshot_sha256"] != finished[version]:
+                raise ValueError(f"Evaluation journal disagrees with recovery snapshot for PPO update {version}")
+            if version not in finished and not self._background.snapshot(version).is_file():
+                raise ValueError(f"Missing recovery snapshot for PPO update {version}")
+        self._pending = deque(job for job in self._pending if job["policy_version"] not in finished)
+        self._background.prune(job["policy_version"] for job in self._pending)
+        if records:
+            self._write_evaluation_csv(records, rebuild=True)
 
     @staticmethod
     def selection_priority(strategy):
@@ -499,34 +530,82 @@ class EvaluationCheckpointHook(CheckpointHook):
         self._environment_steps = int(metrics.get("train/environment_steps", self._environment_steps))
         self._policy_version = int(metrics.get("train/updates", self._policy_version + 1))
         self._collect_evaluation()
-        if self._next_evaluation_step is not None and self._environment_steps >= self._next_evaluation_step:
+        due = self._next_evaluation_step is not None and self._environment_steps >= self._next_evaluation_step
+        final_fallback = (self._background is not None and not self._evaluation_count and not self._pending
+                          and self._trainer is not None and self._trainer.budget_reached())
+        if due or final_fallback:
             if self._background is None:
                 self._evaluate_checkpoint(None)
-            elif self._pending is None:
-                self._save(self._background.snapshot)
-                self._background.start()
-                self._pending = (self._environment_steps, self._policy_version)
+            else:
+                if len(self._pending) >= 2:
+                    if self._console is not None:
+                        self._console.print_info("Evaluation queue full. Waiting for the oldest checkpoint result.")
+                    self._collect_evaluation(wait=True)
+                path = self._background.snapshot(self._policy_version)
+                self._save(path)
+                from agents.common.checkpoints import checkpoint_sha256
+
+                self._pending.append(dict(environment_steps=self._environment_steps,
+                                          policy_version=self._policy_version, snapshot_sha256=checkpoint_sha256(path),
+                                          evaluation_queued_unix=time.time(), evaluation_queue_depth=len(self._pending) + 1))
+                if self._recovery_checkpoint is not None:
+                    self._recovery_checkpoint.request_recovery_checkpoint()
             self._next_evaluation_step = (self._environment_steps // self._evaluate_every_steps + 1) * self._evaluate_every_steps
 
+    def _start_evaluation(self):
+        if self._pending and not self._active:
+            self._background.start(self._pending[0]["policy_version"])
+            self._active = True
+
     def _collect_evaluation(self, *, wait=False):
-        if self._pending is None:
+        if not self._active:
             return
-        environment_steps, policy_version = self._pending
-        try:
-            result = self._background.result(wait=wait)
-        except (RuntimeError, OSError, ValueError) as exc:
-            self._pending = None
-            message = f"Background checkpoint evaluation failed at {environment_steps} steps: {exc}"
-            if self._console is not None:
-                self._console.print_warning(message)
-            else:
-                _log.warning(message)
-            return
+        job = self._pending[0]
+        version = job["policy_version"]
+        result = (self._trainer.measure_service("evaluation", self._background.result, version, wait=True)
+                  if wait and self._trainer is not None else self._background.result(version, wait=wait))
         if result is None:
             return
-        self._pending = None
         summary, seconds = result
-        self._record_evaluation(summary, seconds, None, environment_steps, policy_version)
+        if summary["snapshot_sha256"] != job["snapshot_sha256"]:
+            raise ValueError(f"Evaluation result for PPO update {version} does not match its frozen snapshot")
+        summary.update(evaluation_queue_depth=job["evaluation_queue_depth"],
+                       evaluation_queue_wait_seconds=max(0., summary["evaluation_started_unix"] - job["evaluation_queued_unix"]),
+                       evaluation_lag_steps=self._environment_steps - job["environment_steps"])
+        self._record_evaluation(summary, seconds, None, job["environment_steps"], version)
+        self._pending.popleft()
+        self._active = False
+        self._background.prune(item["policy_version"] for item in self._pending)
+        self._start_evaluation()
+
+    def _publish_best(self, record):
+        from agents.common.checkpoints import read_checkpoint
+        from utils.torch_io import atomic_save
+
+        checkpoint = read_checkpoint(self._background.snapshot(record["policy_version"]))
+        if (checkpoint.pop("_identity")["sha256"] != record["snapshot_sha256"]
+                or checkpoint["metadata"]["progress"]["environment_steps"] != record["environment_steps"]
+                or checkpoint["metadata"]["progress"]["updates"] != record["policy_version"]):
+            raise ValueError("Best evaluation does not match its policy snapshot")
+        checkpoint["metadata"]["selection"] = record
+        if self._trainer is not None:
+            self._trainer.measure_service("checkpoint", atomic_save, checkpoint, self._dir / "best.pt")
+        else:
+            atomic_save(checkpoint, self._dir / "best.pt")
+
+    def _write_evaluation_csv(self, records, *, rebuild=False):
+        fields = ("run_id", "environment_steps", "policy_version", "snapshot_sha256", "evaluation_index", "is_best",
+                  "completion_rate", "timeout_rate", "valid_laps", "fastest_valid_lap_s", "evaluation_seconds",
+                  "evaluation_queue_depth", "evaluation_queue_wait_seconds", "evaluation_lag_steps")
+        path = self._evaluation_csv.with_suffix(".tmp") if rebuild else self._evaluation_csv
+        header = rebuild or not path.exists()
+        with path.open("w" if rebuild else "a", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+            if header:
+                writer.writeheader()
+            writer.writerows(records)
+        if rebuild:
+            path.replace(self._evaluation_csv)
 
     def _evaluate_checkpoint(self, completed_episodes: Optional[int]) -> None:
         started = time.perf_counter()
@@ -563,21 +642,19 @@ class EvaluationCheckpointHook(CheckpointHook):
             **summary,
         }
         if self._trainer is not None:
-            import os
             record["recorded_unix"] = time.time()
             record["training_attempt"] = os.environ.get("RAY_TUNE_ATTEMPT_PATH")
         if self._background is not None:
             record["evaluation_index"] = self._evaluation_count
-            if is_best:
-                from agents.common.checkpoints import read_checkpoint
-                from utils.torch_io import atomic_save
-
-                checkpoint = read_checkpoint(self._background.snapshot)
-                checkpoint.pop("_identity")
-                checkpoint["metadata"]["selection"] = record
-                atomic_save(checkpoint, self._dir / "best.pt")
         with self._history_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
+            if self._background is not None:
+                stream.flush()
+                os.fsync(stream.fileno())
+        if self._background is not None:
+            if is_best:
+                self._publish_best(record)
+            self._write_evaluation_csv([record])
 
         if self._wandb is not None:
             scalar_metrics = {
