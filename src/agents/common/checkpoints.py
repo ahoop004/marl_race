@@ -94,12 +94,14 @@ def save_checkpoint(policy, path, *, provenance=None, configuration=None, traini
     atomic_save(_plain(payload), path)
 
 
+def checkpoint_sha256(path):
+    with Path(path).open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
 def read_checkpoint(path):
     with Path(path).open("rb") as handle:
-        hasher = hashlib.sha256()
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            hasher.update(chunk)
-        digest = hasher.hexdigest()
+        digest = hashlib.file_digest(handle, "sha256").hexdigest()
         handle.seek(0)
         checkpoint = safe_load(handle, map_location="cpu")
     _validate_schema(checkpoint)

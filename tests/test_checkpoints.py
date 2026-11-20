@@ -1,5 +1,6 @@
 """Versioned checkpoint safety, compatibility and update-boundary recovery."""
 from copy import deepcopy
+import json
 import random
 
 import numpy as np
@@ -72,6 +73,69 @@ def test_atomic_failure_preserves_valid_file_and_cleans_temporary(tmp_path, monk
         atomic_save({"value": torch.tensor(2)}, path)
     assert path.read_bytes() == previous
     assert [item.name for item in tmp_path.iterdir()] == ["latest.pt"]
+
+
+def test_background_selection_bounds_work_and_publishes_in_policy_order(tmp_path):
+    from agents.common.checkpoints import checkpoint_sha256
+
+    class Background:
+        def __init__(self):
+            self.starts = []
+            self.ready = {2}  # A later result is available, but the earlier policy wins score ties.
+
+        def snapshot(self, version):
+            return tmp_path / f"{version}.pt"
+
+        def start(self, version):
+            self.starts.append(version)
+
+        def result(self, version, *, wait=False):
+            if wait or version in self.ready:
+                return {"completion_rate": 0., "episode_results": [{}], "evaluation_started_unix": 0.,
+                        "snapshot_sha256": checkpoint_sha256(self.snapshot(version))}, 3.
+
+        def prune(self, versions):
+            pass
+
+    learner, background = agent(), Background()
+    hook = EvaluationCheckpointHook(learner, tmp_path, None, evaluate_every=100,
+                                    evaluate_every_steps=4, background=background, selection_strategy="lap_time")
+    hook.on_update({"train/environment_steps": 4, "train/updates": 1})
+    assert background.starts == []  # Work starts after the recovery checkpoint boundary.
+    hook.on_checkpoint_boundary()
+    snapshot = read_checkpoint(background.snapshot(1))
+    with torch.no_grad():
+        for parameter in learner.actor.parameters():
+            parameter.add_(1)
+    hook.on_update({"train/environment_steps": 8, "train/updates": 2})
+    hook.on_checkpoint_boundary()
+    assert background.starts == [1] and not (tmp_path / "best.pt").exists()
+    recovery_state = hook.state_dict()
+    assert [job["policy_version"] for job in recovery_state["pending_evaluations"]] == [1, 2]
+
+    hook.on_update({"train/environment_steps": 12, "train/updates": 3})
+    hook.on_checkpoint_boundary()
+    assert background.starts == [1, 2]
+
+    hook.on_training_end()
+    best = read_checkpoint(tmp_path / "best.pt")
+    history = [json.loads(line) for line in (tmp_path / "evaluation_history.jsonl").read_text().splitlines()]
+    assert [row["environment_steps"] for row in history] == [4, 8, 12]
+    assert [row["is_best"] for row in history] == [True, False, False]
+    assert best["metadata"]["selection"] == history[0]
+    assert best["metadata"]["progress"] == {"environment_steps": 4, "updates": 1}
+    assert history[0]["policy_version"] == 1
+    assert history[0]["episode_results"][0]["reported_at_environment_steps"] == 12
+    for role, model in best["models"].items():
+        for name, value in model.items():
+            torch.testing.assert_close(value, snapshot["models"][role][name], rtol=0, atol=0)
+
+    (tmp_path / "best.pt").unlink()  # Simulate interruption just after the journal commit.
+    resumed = EvaluationCheckpointHook(learner, tmp_path, None, evaluate_every=100, selection_strategy="lap_time",
+                                       evaluate_every_steps=4, background=Background())
+    resumed.load_state_dict(recovery_state)
+    assert resumed.state_dict() == hook.state_dict()
+    assert read_checkpoint(tmp_path / "best.pt")["metadata"]["selection"] == history[0]
 
 
 def test_historical_and_arbitrary_object_checkpoints_have_no_loading_fallback(tmp_path):

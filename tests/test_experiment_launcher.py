@@ -204,6 +204,40 @@ def test_task_gpu_visibility_is_relative_and_preserved(family_configs, monkeypat
         launch.validate_gpu(family_configs["straight"])
 
 
+def test_cpu_preflight_assigns_one_family_per_node(tmp_path, monkeypatch, capsys):
+    import torch
+    from test_torchrl_ppo import agent
+
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / ".allocation.lock").write_text("shared\n")
+    source = tmp_path / "original.pt"
+    agent().save_checkpoint(source)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(launch.os, "sched_getaffinity", lambda pid: set(range(32)))
+    for key, value in {"SLURM_NTASKS": "5", "SLURM_JOB_NUM_NODES": "5", "SLURM_LOCALID": "0",
+                       "SLURM_CPUS_PER_TASK": "32", "SLURM_JOB_ID": "local-preflight"}.items():
+        monkeypatch.setenv(key, value)
+    command = ["--scenario", "scenarios/ppo_lora_families.yaml", "--root", str(root), "--source", str(source),
+               "--workers", "24", "--reserved-cpus", "8", "--independent-cpu", "--verify-allocation",
+               "--shared-token", "shared", "--set", "execution.params.device=cpu",
+               "--set", "execution.params.collection_device=cpu", "--set", "evaluation.enabled=true",
+               "--set", "experiment.async_evaluation=true"]
+    for rank, family in enumerate(("straight", "sweeper", "hairpin", "chicane", "s_curve")):
+        monkeypatch.setenv("SLURM_PROCID", str(rank))
+        monkeypatch.setenv("SLURMD_NODENAME", f"simulated-{rank}")
+        launch.main(command)
+        output = capsys.readouterr().out
+        assert f"Verified {family}: rank={rank} node=simulated-{rank} cpus=32 collectors=24x4" in output
+        assert "eval_workers=1 cuda=0" in output
+    manifest = yaml.safe_load((root / "launch_manifest.yaml").read_text())
+    assert manifest["source"]["sha256"] == launch.sha256(source)
+    assert all(config["experiment"]["episodes"] == 30000 for config in manifest["items"].values())
+    assert len({config["_launch"]["run_id"] for config in manifest["items"].values()}) == 5
+    assert all(set(config["maps"]["selection"]).isdisjoint(config["maps"]["final_test"])
+               for config in manifest["items"].values())
+
+
 def test_recovery_before_first_checkpoint_preserves_attempt_artifacts(tmp_path, family_configs, monkeypatch):
     args = arguments(tmp_path, prepare_only=True)
     config = deepcopy(family_configs["straight"])
@@ -247,3 +281,16 @@ def test_slurm_runtime_inherits_allocation_and_propagates_failure(tmp_path):
     assert not any(arg.startswith(("--ntasks", "--cpus-per-task", "--gpus-per-task", "--nodes")) for arg in command)
     result = subprocess.run(["bash", str(script)], env=dict(env, LAUNCH_EXIT="7"), capture_output=True, text=True)
     assert result.returncode == 7 and "RESUME=1" in result.stderr
+
+    scontrol = bindir / "scontrol"
+    scontrol.symlink_to("/bin/true")
+    cpu_script = launch.REPO / "scripts/hpc/experiment_cpu.sbatch"
+    assert "#SBATCH --partition=main" in cpu_script.read_text()
+    assert "--gpus" not in cpu_script.read_text()
+    result = subprocess.run(["bash", str(cpu_script)], env=dict(env, SLURM_JOB_NUM_NODES="5",
+                            SLURM_JOB_PARTITION="main", PREFLIGHT_ONLY="1"), capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    command = json.loads((tmp_path / "args.json").read_text())
+    assert "--independent-cpu" in command and "--verify-allocation" in command
+    assert "--ntasks=5" in command and "--ntasks-per-node=1" in command and "--cpus-per-task=32" in command
+    assert not any(arg.startswith(("--gpu-bind", "--gpus", "--gres")) for arg in command)
