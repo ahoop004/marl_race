@@ -40,3 +40,28 @@ def test_changed_base_rejected(bank, monkeypatch):
     monkeypatch.setattr('hierarchical.bank.read_checkpoint', changed)
     with pytest.raises(ValueError, match='source hash'):
         AdapterBank({'skills': [{k: v for k, v in e.items() if k != 'sha256'} for e in bank.manifest]})
+
+
+def test_selectors_and_independent_execution(bank):
+    from hierarchical.selectors import SkillExecutor, FixedSelector, RandomSelector, GeometrySelector
+    a, b = SkillExecutor(bank), SkillExecutor(bank)
+    obs = torch.zeros(bank.obs_dim).numpy()
+    assert (a.action(obs, 1) == bank.actors[1].get_action(torch.from_numpy(obs[None]), deterministic=True)[0][0].numpy(force=True)).all()
+    b.action(obs, 4)
+    assert (a.state.active, b.state.active) == (1, 4)
+    a.action(obs, 1)
+    assert a.state.switches == 0 and a.state.since_change == 2
+    a.action(obs, 2)
+    assert a.state.switches == 1 and a.state.since_change == 1
+    a.reset()
+    assert a.state.active == -1 and b.state.active == 4
+    assert FixedSelector(2).select() == 2
+    r = RandomSelector(6, seed=4)
+    assert set(r.select() for _ in range(100)) == set(range(6))
+    g = GeometrySelector(bank.manifest, anticipation=1)
+    metadata = {'schema_version': '2.0.0', 'measured': {'length_m': 10}, 'maneuvers': [
+        {'type': 'hairpin', 's_start_m': 8, 's_end_m': 2, 'wraps_seam': True,
+         'requested': {'composition_role': 'primary'}}]}
+    assert g.select(metadata=metadata, s=9.5) == 3
+    metadata['maneuvers'][0]['type'] = 'corner'
+    assert g.select(metadata=metadata, s=9.5) == 0
