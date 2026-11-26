@@ -1,0 +1,1503 @@
+{
+  "timestamp": "2026-11-11T10:50:02.645438",
+  "provenance": {
+    "version": "1.1",
+    "physics_contract": {
+      "version": 1,
+      "vehicle_params": {
+        "model": "combined_slip_st",
+        "model_version": 2,
+        "tire_model": "mf61_planar",
+        "tire_id": "synthetic-mf61-planar-v2",
+        "drivetrain": "shared_speed_awd",
+        "calibration": {
+          "id": "f1tenth-gym-chassis-mf61-v1",
+          "status": "uncalibrated",
+          "source": "Chassis, footprint and nominal mu from F1TENTH Gym defaults: https://github.com/f1tenth/f1tenth_gym/blob/4fdb9c7e6fb7c701290f4dc18377d07c1681724f/gym/f110_gym/envs/f110_env.py MF6.1 effective-axle tire coefficients remain synthetic, not hardware fitted."
+        },
+        "m": 3.47,
+        "I": 0.04712,
+        "lf": 0.15875,
+        "lr": 0.17145,
+        "h": 0.074,
+        "mu": 1.0489,
+        "slip_speed_floor": 0.5,
+        "max_integration_step": 0.0025,
+        "front_tire": {
+          "FNOMIN": 19.050265385,
+          "PCX1": 1.65,
+          "PDX1": 1.0,
+          "PDX2": -0.08,
+          "PEX1": 0.5,
+          "PEX2": 0.0,
+          "PEX3": 0.0,
+          "PEX4": 0.0,
+          "PKX1": 12.0,
+          "PKX2": 0.0,
+          "PKX3": 0.0,
+          "PHX1": 0.0,
+          "PHX2": 0.0,
+          "PVX1": 0.0,
+          "PVX2": 0.0,
+          "PCY1": 1.3,
+          "PDY1": 1.0,
+          "PDY2": -0.08,
+          "PEY1": -0.5,
+          "PEY2": 0.0,
+          "PEY3": 0.0,
+          "PKY1": -10.0,
+          "PKY2": 1.5,
+          "PKY4": 2.0,
+          "PHY1": 0.0,
+          "PHY2": 0.0,
+          "PVY1": 0.0,
+          "PVY2": 0.0,
+          "RBX1": 10.0,
+          "RBX2": 0.0,
+          "RCX1": 1.0,
+          "REX1": 0.0,
+          "REX2": 0.0,
+          "RHX1": 0.0,
+          "RBY1": 10.0,
+          "RBY2": 0.0,
+          "RBY3": 0.0,
+          "RCY1": 1.0,
+          "REY1": 0.0,
+          "REY2": 0.0,
+          "RHY1": 0.0,
+          "RHY2": 0.0,
+          "RVY1": 0.0,
+          "RVY2": 0.0,
+          "RVY4": 0.0,
+          "RVY5": 0.0,
+          "RVY6": 0.0
+        },
+        "rear_tire": {
+          "FNOMIN": 17.639134615,
+          "PCX1": 1.65,
+          "PDX1": 1.0,
+          "PDX2": -0.08,
+          "PEX1": 0.5,
+          "PEX2": 0.0,
+          "PEX3": 0.0,
+          "PEX4": 0.0,
+          "PKX1": 12.0,
+          "PKX2": 0.0,
+          "PKX3": 0.0,
+          "PHX1": 0.0,
+          "PHX2": 0.0,
+          "PVX1": 0.0,
+          "PVX2": 0.0,
+          "PCY1": 1.3,
+          "PDY1": 1.0,
+          "PDY2": -0.08,
+          "PEY1": -0.5,
+          "PEY2": 0.0,
+          "PEY3": 0.0,
+          "PKY1": -10.0,
+          "PKY2": 1.5,
+          "PKY4": 2.0,
+          "PHY1": 0.0,
+          "PHY2": 0.0,
+          "PVY1": 0.0,
+          "PVY2": 0.0,
+          "RBX1": 10.0,
+          "RBX2": 0.0,
+          "RCX1": 1.0,
+          "REX1": 0.0,
+          "REX2": 0.0,
+          "RHX1": 0.0,
+          "RBY1": 10.0,
+          "RBY2": 0.0,
+          "RBY3": 0.0,
+          "RCY1": 1.0,
+          "REY1": 0.0,
+          "REY2": 0.0,
+          "RHY1": 0.0,
+          "RHY2": 0.0,
+          "RVY1": 0.0,
+          "RVY2": 0.0,
+          "RVY4": 0.0,
+          "RVY5": 0.0,
+          "RVY6": 0.0
+        },
+        "length": 0.5,
+        "width": 0.27,
+        "wheel_actuators": {
+          "wheel_radius": 0.058,
+          "steering_min": -0.523599,
+          "wheel_rate_max": 10000.0,
+          "wheel_rate_min": -10000.0,
+          "wheel_speed_min": -400.0,
+          "steering_rate_min": -3.2,
+          "steering_time_constant": 0.5,
+          "steering_rate_max": 3.2,
+          "wheel_speed_time_constant": 0.15,
+          "steering_max": 0.523599,
+          "wheel_speed_max": 137.9310344827586,
+          "version": 1,
+          "calibration": {
+            "id": "f1tenth-gym-steering-wheel-v1",
+            "status": "uncalibrated",
+            "source": "Steering angle/rate bounds from F1TENTH Gym defaults: https://github.com/f1tenth/f1tenth_gym/blob/4fdb9c7e6fb7c701290f4dc18377d07c1681724f/gym/f110_gym/envs/f110_env.py Radius, time constants and wheel speed/rate bounds remain provisional."
+          }
+        }
+      },
+      "state_layout": [
+        "x",
+        "y",
+        "psi",
+        "vx",
+        "vy",
+        "r",
+        "delta",
+        "omega"
+      ],
+      "action_units": [
+        "rad",
+        "rad/s"
+      ],
+      "timestep": 0.05,
+      "action_repeat": 1,
+      "friction_protocol": {
+        "version": 1,
+        "scope": "shared",
+        "train": {
+          "mode": "gaussian",
+          "relative_std": 0.02
+        },
+        "eval": {
+          "mode": "fixed",
+          "mu": 1.0489
+        }
+      }
+    },
+    "observation_contracts": {
+      "car_0": {
+        "version": 1,
+        "observation": {
+          "lidar": {
+            "enabled": true,
+            "normalize": true
+          },
+          "frenet_vehicle_track": {
+            "enabled": true,
+            "points": 20,
+            "wheel_radius": 0.058,
+            "clip": false,
+            "maxima": {
+              "vx": 20.0,
+              "vy": 20.0,
+              "u": 3.141592653589793,
+              "n": 5.0,
+              "r": 10.0,
+              "delta": 0.5,
+              "delta_ref": 0.5,
+              "omega_ref_dot": 100.0,
+              "omega_ref": 400.0,
+              "omega": 400.0
+            },
+            "wheel_speed_source": "simulated_v1",
+            "track_maxima": {
+              "curvature": 1.0,
+              "width": 1.0
+            }
+          }
+        },
+        "lidar_beams": 108,
+        "lidar_range": 10.0,
+        "track_preview": {
+          "points": 20,
+          "spacing": 0.3
+        }
+      }
+    },
+    "runtime": {
+      "python": "3.12.8",
+      "platform": "Linux-4.18.0-553.182.1.el8_10.x86_64-x86_64-with-glibc2.34",
+      "machine": "x86_64",
+      "processor": "x86_64",
+      "cpu_count": 192,
+      "resources": {
+        "pid": 1893044,
+        "cpu_affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          96,
+          97,
+          98,
+          99,
+          100,
+          101,
+          102,
+          103,
+          104,
+          105,
+          106,
+          107,
+          108,
+          109,
+          110,
+          111,
+          112,
+          113,
+          114,
+          115,
+          116,
+          117,
+          118,
+          119,
+          120,
+          121,
+          122,
+          123,
+          124,
+          125,
+          126,
+          127
+        ],
+        "cpu_affinity_count": 64,
+        "cpu_sockets": [
+          0,
+          1
+        ],
+        "numa_nodes": [
+          0,
+          1
+        ],
+        "cpu_topology": [
+          {
+            "cpu": 0,
+            "socket": 0,
+            "core": 0,
+            "numa_node": 0
+          },
+          {
+            "cpu": 1,
+            "socket": 0,
+            "core": 1,
+            "numa_node": 0
+          },
+          {
+            "cpu": 2,
+            "socket": 0,
+            "core": 2,
+            "numa_node": 0
+          },
+          {
+            "cpu": 3,
+            "socket": 0,
+            "core": 3,
+            "numa_node": 0
+          },
+          {
+            "cpu": 4,
+            "socket": 0,
+            "core": 4,
+            "numa_node": 0
+          },
+          {
+            "cpu": 5,
+            "socket": 0,
+            "core": 5,
+            "numa_node": 0
+          },
+          {
+            "cpu": 6,
+            "socket": 0,
+            "core": 6,
+            "numa_node": 0
+          },
+          {
+            "cpu": 7,
+            "socket": 0,
+            "core": 7,
+            "numa_node": 0
+          },
+          {
+            "cpu": 8,
+            "socket": 0,
+            "core": 64,
+            "numa_node": 0
+          },
+          {
+            "cpu": 9,
+            "socket": 0,
+            "core": 65,
+            "numa_node": 0
+          },
+          {
+            "cpu": 10,
+            "socket": 0,
+            "core": 66,
+            "numa_node": 0
+          },
+          {
+            "cpu": 11,
+            "socket": 0,
+            "core": 67,
+            "numa_node": 0
+          },
+          {
+            "cpu": 12,
+            "socket": 0,
+            "core": 68,
+            "numa_node": 0
+          },
+          {
+            "cpu": 13,
+            "socket": 0,
+            "core": 69,
+            "numa_node": 0
+          },
+          {
+            "cpu": 14,
+            "socket": 0,
+            "core": 70,
+            "numa_node": 0
+          },
+          {
+            "cpu": 15,
+            "socket": 0,
+            "core": 71,
+            "numa_node": 0
+          },
+          {
+            "cpu": 16,
+            "socket": 0,
+            "core": 128,
+            "numa_node": 0
+          },
+          {
+            "cpu": 17,
+            "socket": 0,
+            "core": 129,
+            "numa_node": 0
+          },
+          {
+            "cpu": 18,
+            "socket": 0,
+            "core": 130,
+            "numa_node": 0
+          },
+          {
+            "cpu": 19,
+            "socket": 0,
+            "core": 131,
+            "numa_node": 0
+          },
+          {
+            "cpu": 20,
+            "socket": 0,
+            "core": 132,
+            "numa_node": 0
+          },
+          {
+            "cpu": 21,
+            "socket": 0,
+            "core": 133,
+            "numa_node": 0
+          },
+          {
+            "cpu": 22,
+            "socket": 0,
+            "core": 134,
+            "numa_node": 0
+          },
+          {
+            "cpu": 23,
+            "socket": 0,
+            "core": 135,
+            "numa_node": 0
+          },
+          {
+            "cpu": 24,
+            "socket": 0,
+            "core": 32,
+            "numa_node": 0
+          },
+          {
+            "cpu": 25,
+            "socket": 0,
+            "core": 33,
+            "numa_node": 0
+          },
+          {
+            "cpu": 26,
+            "socket": 0,
+            "core": 34,
+            "numa_node": 0
+          },
+          {
+            "cpu": 27,
+            "socket": 0,
+            "core": 35,
+            "numa_node": 0
+          },
+          {
+            "cpu": 28,
+            "socket": 0,
+            "core": 36,
+            "numa_node": 0
+          },
+          {
+            "cpu": 29,
+            "socket": 0,
+            "core": 37,
+            "numa_node": 0
+          },
+          {
+            "cpu": 30,
+            "socket": 0,
+            "core": 38,
+            "numa_node": 0
+          },
+          {
+            "cpu": 31,
+            "socket": 0,
+            "core": 39,
+            "numa_node": 0
+          },
+          {
+            "cpu": 96,
+            "socket": 1,
+            "core": 0,
+            "numa_node": 1
+          },
+          {
+            "cpu": 97,
+            "socket": 1,
+            "core": 1,
+            "numa_node": 1
+          },
+          {
+            "cpu": 98,
+            "socket": 1,
+            "core": 2,
+            "numa_node": 1
+          },
+          {
+            "cpu": 99,
+            "socket": 1,
+            "core": 3,
+            "numa_node": 1
+          },
+          {
+            "cpu": 100,
+            "socket": 1,
+            "core": 4,
+            "numa_node": 1
+          },
+          {
+            "cpu": 101,
+            "socket": 1,
+            "core": 5,
+            "numa_node": 1
+          },
+          {
+            "cpu": 102,
+            "socket": 1,
+            "core": 6,
+            "numa_node": 1
+          },
+          {
+            "cpu": 103,
+            "socket": 1,
+            "core": 7,
+            "numa_node": 1
+          },
+          {
+            "cpu": 104,
+            "socket": 1,
+            "core": 64,
+            "numa_node": 1
+          },
+          {
+            "cpu": 105,
+            "socket": 1,
+            "core": 65,
+            "numa_node": 1
+          },
+          {
+            "cpu": 106,
+            "socket": 1,
+            "core": 66,
+            "numa_node": 1
+          },
+          {
+            "cpu": 107,
+            "socket": 1,
+            "core": 67,
+            "numa_node": 1
+          },
+          {
+            "cpu": 108,
+            "socket": 1,
+            "core": 68,
+            "numa_node": 1
+          },
+          {
+            "cpu": 109,
+            "socket": 1,
+            "core": 69,
+            "numa_node": 1
+          },
+          {
+            "cpu": 110,
+            "socket": 1,
+            "core": 70,
+            "numa_node": 1
+          },
+          {
+            "cpu": 111,
+            "socket": 1,
+            "core": 71,
+            "numa_node": 1
+          },
+          {
+            "cpu": 112,
+            "socket": 1,
+            "core": 128,
+            "numa_node": 1
+          },
+          {
+            "cpu": 113,
+            "socket": 1,
+            "core": 129,
+            "numa_node": 1
+          },
+          {
+            "cpu": 114,
+            "socket": 1,
+            "core": 130,
+            "numa_node": 1
+          },
+          {
+            "cpu": 115,
+            "socket": 1,
+            "core": 131,
+            "numa_node": 1
+          },
+          {
+            "cpu": 116,
+            "socket": 1,
+            "core": 132,
+            "numa_node": 1
+          },
+          {
+            "cpu": 117,
+            "socket": 1,
+            "core": 133,
+            "numa_node": 1
+          },
+          {
+            "cpu": 118,
+            "socket": 1,
+            "core": 134,
+            "numa_node": 1
+          },
+          {
+            "cpu": 119,
+            "socket": 1,
+            "core": 135,
+            "numa_node": 1
+          },
+          {
+            "cpu": 120,
+            "socket": 1,
+            "core": 32,
+            "numa_node": 1
+          },
+          {
+            "cpu": 121,
+            "socket": 1,
+            "core": 33,
+            "numa_node": 1
+          },
+          {
+            "cpu": 122,
+            "socket": 1,
+            "core": 34,
+            "numa_node": 1
+          },
+          {
+            "cpu": 123,
+            "socket": 1,
+            "core": 35,
+            "numa_node": 1
+          },
+          {
+            "cpu": 124,
+            "socket": 1,
+            "core": 36,
+            "numa_node": 1
+          },
+          {
+            "cpu": 125,
+            "socket": 1,
+            "core": 37,
+            "numa_node": 1
+          },
+          {
+            "cpu": 126,
+            "socket": 1,
+            "core": 38,
+            "numa_node": 1
+          },
+          {
+            "cpu": 127,
+            "socket": 1,
+            "core": 39,
+            "numa_node": 1
+          }
+        ],
+        "slurm": {
+          "SLURM_JOB_ID": "7730290",
+          "SLURM_STEP_ID": "0",
+          "SLURM_CPUS_PER_TASK": "64",
+          "SLURM_CPUS_ON_NODE": "64",
+          "SLURM_JOB_CPUS_PER_NODE": "64",
+          "SLURM_CPU_BIND_TYPE": "mask_cpu:",
+          "SLURM_CPU_BIND_LIST": "0x0000000000000000FFFFFFFF0000000000000000FFFFFFFF"
+        },
+        "MemTotal_bytes": 811253764096,
+        "MemAvailable_bytes": 799001284608
+      },
+      "packages": {
+        "torch": "2.14.1+cu126",
+        "torchrl": "0.14.1",
+        "tensordict": "0.14.3",
+        "numba": "0.68.0"
+      },
+      "torch_threads": 1,
+      "torch_interop_threads": 64,
+      "cuda": {
+        "inspected": true,
+        "available": true,
+        "runtime": "12.6",
+        "cudnn": 91002,
+        "devices": [
+          {
+            "index": 0,
+            "name": "NVIDIA L40S",
+            "capability": [
+              8,
+              9
+            ],
+            "total_memory": 47665709056
+          }
+        ]
+      }
+    },
+    "behavior_contracts": {
+      "vehicle_geometry_collision": 2,
+      "swept_collision": 1,
+      "map_lidar": 2,
+      "fixed_opponent_episode_reset": "1.0",
+      "seeded_map_schedule": "1.0",
+      "evaluation_action_repeat_boundary": "1.0",
+      "net_finish_line_crossings": "2.0",
+      "resolved_simulation_state": "2.0",
+      "completion_progress_finish_time_selection": "1.0",
+      "policy_likelihood": "stored_pre_tanh_v1",
+      "policy_entropy": "squashed_gaussian_quadrature32_v1",
+      "ppo_fragment_pooling": "1.0"
+    },
+    "created_at_utc": "2026-11-11T15:49:48.746992+00:00",
+    "run_id": "ppo_circle_pretrain_20k_ppo_s42_1794412169_f898",
+    "algorithm": "ppo",
+    "scenario_name": "ppo_circle_pretrain_20k",
+    "scenario_path": "/home/ahoop004/marl_race/scenarios/ppo_circle_pretrain_20k.yaml",
+    "scenario_source_sha256": "29a0c3a0eb490bc42c12e2fdc188f24a2b2aad5649c24d50f2a56ebe9e2e8ae7",
+    "resolved_config_sha256": "16ee0090e6268699caae55921041a481aa06da93d80c871081f6ec472ed7f744",
+    "seed": 42,
+    "trainable_agents": [
+      "car_0"
+    ],
+    "target_laps": 1,
+    "max_steps": 80000,
+    "training_total_steps": null,
+    "track_limits": {
+      "enabled": true,
+      "terminate": false
+    },
+    "episode_termination": {
+      "mode": "any_agent",
+      "lap_completion": true
+    },
+    "map_split": {
+      "train": [
+        "circle_map"
+      ],
+      "eval": [
+        "circle_map"
+      ]
+    },
+    "map_protocols": {
+      "circle_map": {
+        "yaml_path": "/home/ahoop004/marl_race/maps/circle_map/circle_map.yaml",
+        "yaml_sha256": "9626f2cb2c614c1df756fa06d2b70b3c2001c61e583a8887689f45b5a775de3a",
+        "finish_line_version": 1,
+        "assets": {
+          "image": {
+            "path": "/home/ahoop004/marl_race/maps/circle_map/circle_map.png",
+            "sha256": "f86bdf6e5bee5112575a1395ed79663b525a7d4b912e0c0b29caf8eb551f3e7c"
+          },
+          "centerline": {
+            "path": "/home/ahoop004/marl_race/maps/circle_map/circle_map_centerline.csv",
+            "sha256": "6ad921eb24e2cd95c7824c5b3380079768695453e07f8068ba024420942fa04c"
+          },
+          "walls": {
+            "path": "/home/ahoop004/marl_race/maps/circle_map/circle_map_walls.csv",
+            "sha256": "8f1b7cc2e015a470d2320d2ded5d7206136063cce3e3e723cc8656f728076e8c"
+          }
+        }
+      }
+    },
+    "git": {
+      "commit": "b172dcd0f819f548cbdb40d89aa314aa70897a86",
+      "dirty": true
+    },
+    "wandb_run_id": "jqsjl1mt",
+    "network": {
+      "architecture": "mlp",
+      "actor_hidden_dims": [
+        256,
+        256
+      ],
+      "critic_hidden_dims": [
+        512,
+        512
+      ],
+      "activation": "leaky_relu"
+    },
+    "parameter_counts": {
+      "actor_total": 107012,
+      "actor_frozen": 0,
+      "actor_trainable": 107012,
+      "lora_trainable": 0,
+      "neighbor_encoder_trainable": 0,
+      "exploration_trainable": 2,
+      "critic_trainable": 344577,
+      "learner_trainable": 451589
+    },
+    "execution": {
+      "requested_device": "cuda",
+      "requested_collection_device": "cpu",
+      "collection_device": "cpu",
+      "learner_device": "cuda",
+      "policy_device": "cpu",
+      "environment_device": "cpu",
+      "rollout_storage_device": "cpu",
+      "update_device": "cuda",
+      "torch_threads": 1,
+      "parallel_envs": 64,
+      "envs_per_worker": 8,
+      "collection_backend": "process",
+      "total_envs": 512,
+      "measure_services": false,
+      "measure_stages": false,
+      "measure_cuda_sync": false,
+      "profiling_detail_samples": 0,
+      "measure_mpc": false,
+      "measure_hybrid": false,
+      "profiling_warmup_updates": 1,
+      "compile_networks": {
+        "actor": false,
+        "critic": false,
+        "backend": "inductor",
+        "mode": "default"
+      },
+      "compilation_cuda_graphs": false
+    },
+    "algorithm_implementation": {
+      "backend": "torchrl",
+      "loss": "torchrl.ClipPPOLoss",
+      "advantage_estimator": "torchrl.GAE",
+      "update_version": "torchrl-ppo-v1"
+    },
+    "collector": {
+      "implementation": "torchrl.collectors.Collector",
+      "backend": "process",
+      "task_adapter": "native_envbase",
+      "mode": "synchronous",
+      "num_collectors": 64,
+      "envs_per_worker": 8,
+      "num_envs": 512,
+      "environment_batch": "SerialEnv",
+      "inference": "worker",
+      "frames_per_batch": 4096,
+      "learning_sample_target": 409600,
+      "learning_sample_unit": "active_learner_samples",
+      "effective_frames_per_batch": 4096,
+      "worker_seed_scheme": "(experiment.seed + environment_id) modulo 2**32",
+      "environment_id_scheme": "worker_id * envs_per_worker + local_env_id",
+      "sync": true,
+      "reset_at_each_iter": false,
+      "set_truncated": false,
+      "use_buffers": false,
+      "environment_use_buffers": false,
+      "track_policy_version": true,
+      "no_cuda_sync": true,
+      "num_sub_threads": 1,
+      "initial_weight_sync_timeout_seconds": 900.0,
+      "measure_startup": true
+    }
+  },
+  "config": {
+    "algorithm": {
+      "name": "ppo",
+      "backend": "torchrl",
+      "loss": "clip_ppo",
+      "optimizer": "adam",
+      "optimizer_kwargs": {},
+      "advantage_estimator": "gae",
+      "critic_loss": "l2",
+      "observation_extension": null,
+      "critic_input": "local_observation",
+      "critic_sharing": "independent",
+      "transfer_scope": "actor_and_critic",
+      "params": {
+        "progress_unit": "environment_steps",
+        "update_version": "torchrl-ppo-v1",
+        "n_steps": 409600,
+        "n_epochs": 10,
+        "gae_lambda": 0.95,
+        "clip_range": 0.2,
+        "ent_coef": 0.01,
+        "vf_coef": 0.5,
+        "max_grad_norm": 0.5,
+        "batch_size": 1024,
+        "learning_rate": 0.001,
+        "gamma": 0.99,
+        "lr_schedule": "linear",
+        "lr_scheduler_kwargs": {},
+        "learning_rate_end": 0.0001,
+        "log_std_init": 0.0,
+        "target_kl": null,
+        "frames_per_batch": 4096
+      }
+    },
+    "network": {
+      "architecture": "mlp",
+      "actor_hidden_dims": [
+        256,
+        256
+      ],
+      "critic_hidden_dims": [
+        512,
+        512
+      ],
+      "activation": "leaky_relu",
+      "encoder": "identity",
+      "actor": {
+        "architecture": "mlp",
+        "distribution": "tanh_normal",
+        "parameter_sharing": "independent"
+      },
+      "critic": {
+        "architecture": "mlp",
+        "input_type": "local_observation",
+        "parameter_sharing": "independent"
+      }
+    },
+    "checkpoint": {
+      "resume": null,
+      "every_steps": 1024000,
+      "every_updates": null
+    },
+    "adaptation": {
+      "mode": "scratch",
+      "checkpoint": null,
+      "load_scope": "actor_and_critic",
+      "actor_sharing": "independent",
+      "observation_extension": null,
+      "lora": null
+    },
+    "environment": {
+      "vehicle_params": {
+        "model": "combined_slip_st",
+        "model_version": 2,
+        "tire_model": "mf61_planar",
+        "tire_id": "synthetic-mf61-planar-v2",
+        "drivetrain": "shared_speed_awd",
+        "calibration": {
+          "id": "f1tenth-gym-chassis-mf61-v1",
+          "status": "uncalibrated",
+          "source": "Chassis, footprint and nominal mu from F1TENTH Gym defaults: https://github.com/f1tenth/f1tenth_gym/blob/4fdb9c7e6fb7c701290f4dc18377d07c1681724f/gym/f110_gym/envs/f110_env.py MF6.1 effective-axle tire coefficients remain synthetic, not hardware fitted."
+        },
+        "m": 3.47,
+        "I": 0.04712,
+        "lf": 0.15875,
+        "lr": 0.17145,
+        "h": 0.074,
+        "mu": 1.0489,
+        "slip_speed_floor": 0.5,
+        "max_integration_step": 0.0025,
+        "length": 0.5,
+        "width": 0.27,
+        "wheel_actuators": {
+          "version": 1,
+          "calibration": {
+            "id": "f1tenth-gym-steering-wheel-v1",
+            "status": "uncalibrated",
+            "source": "Steering angle/rate bounds from F1TENTH Gym defaults: https://github.com/f1tenth/f1tenth_gym/blob/4fdb9c7e6fb7c701290f4dc18377d07c1681724f/gym/f110_gym/envs/f110_env.py Radius, time constants and wheel speed/rate bounds remain provisional."
+          },
+          "wheel_radius": 0.058,
+          "steering_time_constant": 0.5,
+          "wheel_speed_time_constant": 0.15,
+          "steering_min": -0.523599,
+          "steering_max": 0.523599,
+          "steering_rate_min": -3.2,
+          "steering_rate_max": 3.2,
+          "wheel_speed_min": -400.0,
+          "wheel_speed_max": 137.9310344827586,
+          "wheel_rate_min": -10000.0,
+          "wheel_rate_max": 10000.0
+        },
+        "front_tire": {
+          "FNOMIN": 19.050265385,
+          "PCX1": 1.65,
+          "PDX1": 1.0,
+          "PDX2": -0.08,
+          "PEX1": 0.5,
+          "PEX2": 0.0,
+          "PEX3": 0.0,
+          "PEX4": 0.0,
+          "PKX1": 12.0,
+          "PKX2": 0.0,
+          "PKX3": 0.0,
+          "PHX1": 0.0,
+          "PHX2": 0.0,
+          "PVX1": 0.0,
+          "PVX2": 0.0,
+          "PCY1": 1.3,
+          "PDY1": 1.0,
+          "PDY2": -0.08,
+          "PEY1": -0.5,
+          "PEY2": 0.0,
+          "PEY3": 0.0,
+          "PKY1": -10.0,
+          "PKY2": 1.5,
+          "PKY4": 2.0,
+          "PHY1": 0.0,
+          "PHY2": 0.0,
+          "PVY1": 0.0,
+          "PVY2": 0.0,
+          "RBX1": 10.0,
+          "RBX2": 0.0,
+          "RCX1": 1.0,
+          "REX1": 0.0,
+          "REX2": 0.0,
+          "RHX1": 0.0,
+          "RBY1": 10.0,
+          "RBY2": 0.0,
+          "RBY3": 0.0,
+          "RCY1": 1.0,
+          "REY1": 0.0,
+          "REY2": 0.0,
+          "RHY1": 0.0,
+          "RHY2": 0.0,
+          "RVY1": 0.0,
+          "RVY2": 0.0,
+          "RVY4": 0.0,
+          "RVY5": 0.0,
+          "RVY6": 0.0
+        },
+        "rear_tire": {
+          "FNOMIN": 17.639134615,
+          "PCX1": 1.65,
+          "PDX1": 1.0,
+          "PDX2": -0.08,
+          "PEX1": 0.5,
+          "PEX2": 0.0,
+          "PEX3": 0.0,
+          "PEX4": 0.0,
+          "PKX1": 12.0,
+          "PKX2": 0.0,
+          "PKX3": 0.0,
+          "PHX1": 0.0,
+          "PHX2": 0.0,
+          "PVX1": 0.0,
+          "PVX2": 0.0,
+          "PCY1": 1.3,
+          "PDY1": 1.0,
+          "PDY2": -0.08,
+          "PEY1": -0.5,
+          "PEY2": 0.0,
+          "PEY3": 0.0,
+          "PKY1": -10.0,
+          "PKY2": 1.5,
+          "PKY4": 2.0,
+          "PHY1": 0.0,
+          "PHY2": 0.0,
+          "PVY1": 0.0,
+          "PVY2": 0.0,
+          "RBX1": 10.0,
+          "RBX2": 0.0,
+          "RCX1": 1.0,
+          "REX1": 0.0,
+          "REX2": 0.0,
+          "RHX1": 0.0,
+          "RBY1": 10.0,
+          "RBY2": 0.0,
+          "RBY3": 0.0,
+          "RCY1": 1.0,
+          "REY1": 0.0,
+          "REY2": 0.0,
+          "RHY1": 0.0,
+          "RHY2": 0.0,
+          "RVY1": 0.0,
+          "RVY2": 0.0,
+          "RVY4": 0.0,
+          "RVY5": 0.0,
+          "RVY6": 0.0
+        }
+      },
+      "timestep": 0.05,
+      "lidar_beams": 108,
+      "lidar_range": 10.0,
+      "lidar_dist": 0.10355,
+      "render": false,
+      "centerline_autoload": true,
+      "walls_autoload": true,
+      "track_preview": {
+        "points": 20,
+        "spacing": 0.3
+      },
+      "action_repeat": 1,
+      "centerline_features": true,
+      "friction": {
+        "version": 1,
+        "scope": "shared",
+        "train": {
+          "mode": "gaussian",
+          "relative_std": 0.02
+        },
+        "eval": {
+          "mode": "fixed",
+          "mu": 1.0489
+        }
+      },
+      "max_speed": 8.0,
+      "episode_termination": {
+        "mode": "any_agent",
+        "lap_completion": true
+      },
+      "terminal_agents": {
+        "remain_collidable": true,
+        "crashed_behavior": "stationary",
+        "finished_behavior": "coast_then_stop",
+        "finish_clearance_steps": 200
+      },
+      "target_laps": 1,
+      "lap_counting": {
+        "require_finish_line": true,
+        "count_initial_crossing_as_lap": false
+      },
+      "max_steps": 80000,
+      "centerline_render": true,
+      "track_limits": {
+        "enabled": true,
+        "terminate": false
+      },
+      "terminate_on_collision": true,
+      "random_spawn": {
+        "enabled": true,
+        "allow_reuse": true
+      },
+      "spawn": {
+        "policy": "centerline_relative",
+        "centerline": {
+          "mode": "random",
+          "min_progress": 0.0,
+          "max_progress": 1.0,
+          "avoid_finish": false
+        },
+        "offsets": {
+          "s_offset": 0.0,
+          "d_offset": 0.0
+        },
+        "ego": {
+          "speed": 0.0
+        }
+      },
+      "map_dir": "/home/ahoop004/marl_race/maps",
+      "map_bundles": [
+        "circle_map"
+      ],
+      "map_bundles_train": [
+        "circle_map"
+      ],
+      "map_bundles_eval": [
+        "circle_map"
+      ],
+      "map_cycle": "per_episode",
+      "map_pick": "round_robin"
+    },
+    "observation": {
+      "observation": {
+        "lidar": {
+          "enabled": true,
+          "normalize": true
+        },
+        "frenet_vehicle_track": {
+          "enabled": true,
+          "points": 20,
+          "wheel_radius": 0.058,
+          "clip": false,
+          "maxima": {
+            "vx": 20.0,
+            "vy": 20.0,
+            "u": 3.141592653589793,
+            "n": 5.0,
+            "r": 10.0,
+            "delta": 0.5,
+            "delta_ref": 0.5,
+            "omega_ref_dot": 100.0,
+            "omega_ref": 400.0,
+            "omega": 400.0
+          },
+          "wheel_speed_source": "simulated_v1",
+          "track_maxima": {
+            "curvature": 1.0,
+            "width": 1.0
+          }
+        }
+      }
+    },
+    "reward": {
+      "task": {
+        "name": "lap_completion_normalized_progress",
+        "description": "Lap completion using signed normalized Frenet progress."
+      },
+      "reward": {
+        "progress_delta_bonus": {
+          "enabled": true,
+          "weight": 1.0,
+          "units": "lap_fraction",
+          "positive_only": false,
+          "max_delta": 0.025,
+          "boundary_penalty": -0.05,
+          "collision_penalty": -2.0
+        },
+        "timeout_penalty": {
+          "enabled": true,
+          "penalty": -1.0
+        },
+        "lap_completion": {
+          "enabled": true,
+          "bonus": 2.0,
+          "require_clean": true
+        },
+        "step_time_penalty": {
+          "enabled": true,
+          "per_second": -0.00025,
+          "apply_on_terminal": true
+        }
+      }
+    },
+    "agents": {
+      "car_0": {
+        "algorithm": "ppo",
+        "trainable": true,
+        "role": "racer",
+        "observation": {
+          "observation": {
+            "lidar": {
+              "enabled": true,
+              "normalize": true
+            },
+            "frenet_vehicle_track": {
+              "enabled": true,
+              "points": 20,
+              "wheel_radius": 0.058,
+              "clip": false,
+              "maxima": {
+                "vx": 20.0,
+                "vy": 20.0,
+                "u": 3.141592653589793,
+                "n": 5.0,
+                "r": 10.0,
+                "delta": 0.5,
+                "delta_ref": 0.5,
+                "omega_ref_dot": 100.0,
+                "omega_ref": 400.0,
+                "omega": 400.0
+              },
+              "wheel_speed_source": "simulated_v1",
+              "track_maxima": {
+                "curvature": 1.0,
+                "width": 1.0
+              }
+            }
+          }
+        },
+        "reward": {
+          "task": {
+            "name": "lap_completion_normalized_progress",
+            "description": "Lap completion using signed normalized Frenet progress."
+          },
+          "reward": {
+            "progress_delta_bonus": {
+              "enabled": true,
+              "weight": 1.0,
+              "units": "lap_fraction",
+              "positive_only": false,
+              "max_delta": 0.025,
+              "boundary_penalty": -0.05,
+              "collision_penalty": -2.0
+            },
+            "timeout_penalty": {
+              "enabled": true,
+              "penalty": -1.0
+            },
+            "lap_completion": {
+              "enabled": true,
+              "bonus": 2.0,
+              "require_clean": true
+            },
+            "step_time_penalty": {
+              "enabled": true,
+              "per_second": -0.00025,
+              "apply_on_terminal": true
+            }
+          }
+        },
+        "params": {},
+        "action_constraints": {
+          "speed_control": "wheel_acceleration",
+          "max_wheel_acceleration": 100.0,
+          "max_wheel_deceleration": 100.0,
+          "prevent_reverse": true,
+          "speed_index": 1
+        }
+      }
+    },
+    "maps": {
+      "available": [
+        "circle_map"
+      ],
+      "train": [
+        "circle_map"
+      ],
+      "selection": [
+        "circle_map"
+      ],
+      "final_test": [
+        "circle_map"
+      ],
+      "cycle": "per_episode",
+      "pick": "round_robin",
+      "root": "/home/ahoop004/marl_race/maps"
+    },
+    "evaluation": {
+      "enabled": true,
+      "every_steps": 4096000,
+      "episodes": 10,
+      "target_laps": 1,
+      "max_steps": 80000,
+      "episode_termination_mode": "any_agent",
+      "lap_completion": true,
+      "terminate_on_collision": true,
+      "terminate_on_track_limit": false,
+      "seed": 10042,
+      "selection_strategy": "completion_progress",
+      "final_test": {
+        "episodes": 20,
+        "seed": 20042
+      }
+    },
+    "execution": {
+      "experiment": {
+        "total_steps": 120000000,
+        "seed": 42,
+        "torch_threads": 1
+      },
+      "params": {
+        "device": "cuda",
+        "collection_device": "cpu"
+      },
+      "checkpoint_every_steps": 4096000
+    },
+    "controllers": {
+      "name": "hybrid_pp_ftg",
+      "params": {
+        "max_speed": 8.0,
+        "lookahead_base": 1.0,
+        "lookahead_time": 0.3,
+        "lookahead_max": 3.0,
+        "lateral_acceleration": 4.0,
+        "acceleration": 3.0,
+        "braking": 5.0,
+        "reaction_time": 0.55,
+        "margin": 0.12,
+        "min_gap_distance": 1.0,
+        "gap_fov": 2.4,
+        "gap_speed": 3.0,
+        "clear_steps": 5,
+        "exit_margin": 0.35,
+        "steering_time_constant": 0.08,
+        "steering_rate": 2.5,
+        "curvature_spacing": 0.5,
+        "path_spacing": 0.2
+      },
+      "hybrid_pp_ftg": {
+        "max_speed": 8.0,
+        "lookahead_base": 1.0,
+        "lookahead_time": 0.3,
+        "lookahead_max": 3.0,
+        "lateral_acceleration": 4.0,
+        "acceleration": 3.0,
+        "braking": 5.0,
+        "reaction_time": 0.55,
+        "margin": 0.12,
+        "min_gap_distance": 1.0,
+        "gap_fov": 2.4,
+        "gap_speed": 3.0,
+        "clear_steps": 5,
+        "exit_margin": 0.35,
+        "steering_time_constant": 0.08,
+        "steering_rate": 2.5,
+        "curvature_spacing": 0.5,
+        "path_spacing": 0.2
+      }
+    },
+    "paths": {
+      "project_root": "/home/ahoop004/marl_race",
+      "config_root": "/home/ahoop004/marl_race/configs",
+      "source_root": "/home/ahoop004/marl_race/src",
+      "scenario_root": "/home/ahoop004/marl_race/scenarios",
+      "output_root": "/home/ahoop004/marl_race/outputs",
+      "pretrained_checkpoint": "/home/ahoop004/marl_race/outputs/pretrain/best.pt"
+    },
+    "experiment": {
+      "seed": 42,
+      "torch_threads": 1,
+      "name": "ppo_circle_pretrain_20k",
+      "parallel_envs": 64,
+      "distributed": false,
+      "envs_per_worker": 8,
+      "measure_stages": false,
+      "measure_services": false,
+      "measure_collector_startup": true,
+      "measure_mpc": false,
+      "measure_hybrid": false,
+      "episodes": 20000,
+      "ppo_backend": "torchrl"
+    },
+    "training_defaults": {
+      "progress_unit": "environment_steps",
+      "update_version": "torchrl-ppo-v1",
+      "n_steps": 409600,
+      "n_epochs": 10,
+      "gae_lambda": 0.95,
+      "clip_range": 0.2,
+      "ent_coef": 0.01,
+      "vf_coef": 0.5,
+      "max_grad_norm": 0.5,
+      "batch_size": 1024,
+      "learning_rate": 0.001,
+      "gamma": 0.99,
+      "lr_schedule": "linear",
+      "lr_scheduler_kwargs": {},
+      "learning_rate_end": 0.0001,
+      "log_std_init": 0.0,
+      "target_kl": null,
+      "frames_per_batch": 4096,
+      "device": "cuda",
+      "collection_device": "cpu"
+    },
+    "wandb": {
+      "logging": {
+        "profile": "auto",
+        "groups": {
+          "train": true,
+          "eval": true,
+          "performance": true
+        }
+      },
+      "enabled": true,
+      "project": "marl-f110-complete",
+      "entity": "ahoop004-old-dominion-university",
+      "name": null,
+      "group": "ppo-lap-completion-pretrain",
+      "job_type": "actor-pretraining",
+      "tags": [
+        "ppo",
+        "torchrl",
+        "single-agent",
+        "time-trial",
+        "actor-pretraining",
+        "mf61-planar",
+        "f1tenth-gym-reference",
+        "uncalibrated"
+      ],
+      "notes": "Fresh circle-track PPO under current physics; 20,000 completed training episodes, seed 42, standard historical PPO optimization, 108-beam observations, one-lap episodes, and the unchanged historical PPO collection setup (64 workers x 8 environments).",
+      "mode": "online"
+    },
+    "_configuration": {
+      "source": "/home/ahoop004/marl_race/scenarios/ppo_circle_pretrain_20k.yaml",
+      "choices": {
+        "training": "historical_ppo",
+        "controllers": "hybrid_pp_ftg",
+        "execution": "ppo_pretrain",
+        "evaluation": "solo_pretrain",
+        "maps": "solo_pretrain",
+        "scenario": "solo_lap_completion",
+        "reward": "solo_completion",
+        "observation": "solo",
+        "simulation": "default",
+        "vehicle": "combined_slip",
+        "adaptation": "scratch",
+        "checkpoint": "default",
+        "network": "mlp",
+        "algorithm": "ppo"
+      },
+      "overrides": [],
+      "hydra_version": "1.3.7",
+      "cli": {
+        "resolve_config": false,
+        "wandb": false,
+        "no_wandb": false,
+        "render": false,
+        "no_render": true,
+        "seed": 42,
+        "episodes": 20000,
+        "eval": false,
+        "quiet": false,
+        "output_dir": "/home/ahoop004/marl_race/pretrained_models/circle_ppo_seed42_20k"
+      }
+    }
+  }
+}

@@ -1,0 +1,544 @@
+algorithm:
+  name: ppo
+  backend: torchrl
+  loss: clip_ppo
+  optimizer: adam
+  optimizer_kwargs: {}
+  advantage_estimator: gae
+  critic_loss: l2
+  observation_extension: null
+  critic_input: local_observation
+  critic_sharing: independent
+  transfer_scope: actor_and_critic
+  params:
+    progress_unit: environment_steps
+    update_version: torchrl-ppo-v1
+    n_steps: 409600
+    n_epochs: 10
+    gae_lambda: 0.95
+    clip_range: 0.2
+    ent_coef: 0.01
+    vf_coef: 0.5
+    max_grad_norm: 0.5
+    batch_size: 1024
+    learning_rate: 0.001
+    gamma: 0.99
+    lr_schedule: linear
+    lr_scheduler_kwargs: {}
+    learning_rate_end: 0.0001
+    log_std_init: 0.0
+    target_kl: null
+    frames_per_batch: 4096
+network:
+  architecture: mlp
+  actor_hidden_dims:
+  - 256
+  - 256
+  critic_hidden_dims:
+  - 512
+  - 512
+  activation: leaky_relu
+  encoder: identity
+  actor:
+    architecture: mlp
+    distribution: tanh_normal
+    parameter_sharing: independent
+  critic:
+    architecture: mlp
+    input_type: local_observation
+    parameter_sharing: independent
+checkpoint:
+  resume: null
+  every_steps: 1024000
+  every_updates: null
+adaptation:
+  mode: scratch
+  checkpoint: null
+  load_scope: actor_and_critic
+  actor_sharing: independent
+  observation_extension: null
+  lora: null
+environment:
+  vehicle_params:
+    model: combined_slip_st
+    model_version: 2
+    tire_model: mf61_planar
+    tire_id: synthetic-mf61-planar-v2
+    drivetrain: shared_speed_awd
+    calibration:
+      id: f1tenth-gym-chassis-mf61-v1
+      status: uncalibrated
+      source: 'Chassis, footprint and nominal mu from F1TENTH Gym defaults: https://github.com/f1tenth/f1tenth_gym/blob/4fdb9c7e6fb7c701290f4dc18377d07c1681724f/gym/f110_gym/envs/f110_env.py
+        MF6.1 effective-axle tire coefficients remain synthetic, not hardware fitted.'
+    m: 3.47
+    I: 0.04712
+    lf: 0.15875
+    lr: 0.17145
+    h: 0.074
+    mu: 1.0489
+    slip_speed_floor: 0.5
+    max_integration_step: 0.0025
+    length: 0.5
+    width: 0.27
+    wheel_actuators:
+      version: 1
+      calibration:
+        id: f1tenth-gym-steering-wheel-v1
+        status: uncalibrated
+        source: 'Steering angle/rate bounds from F1TENTH Gym defaults: https://github.com/f1tenth/f1tenth_gym/blob/4fdb9c7e6fb7c701290f4dc18377d07c1681724f/gym/f110_gym/envs/f110_env.py
+          Radius, time constants and wheel speed/rate bounds remain provisional.'
+      wheel_radius: 0.058
+      steering_time_constant: 0.5
+      wheel_speed_time_constant: 0.15
+      steering_min: -0.523599
+      steering_max: 0.523599
+      steering_rate_min: -3.2
+      steering_rate_max: 3.2
+      wheel_speed_min: -400.0
+      wheel_speed_max: 137.9310344827586
+      wheel_rate_min: -10000.0
+      wheel_rate_max: 10000.0
+    front_tire:
+      FNOMIN: 19.050265385
+      PCX1: 1.65
+      PDX1: 1.0
+      PDX2: -0.08
+      PEX1: 0.5
+      PEX2: 0.0
+      PEX3: 0.0
+      PEX4: 0.0
+      PKX1: 12.0
+      PKX2: 0.0
+      PKX3: 0.0
+      PHX1: 0.0
+      PHX2: 0.0
+      PVX1: 0.0
+      PVX2: 0.0
+      PCY1: 1.3
+      PDY1: 1.0
+      PDY2: -0.08
+      PEY1: -0.5
+      PEY2: 0.0
+      PEY3: 0.0
+      PKY1: -10.0
+      PKY2: 1.5
+      PKY4: 2.0
+      PHY1: 0.0
+      PHY2: 0.0
+      PVY1: 0.0
+      PVY2: 0.0
+      RBX1: 10.0
+      RBX2: 0.0
+      RCX1: 1.0
+      REX1: 0.0
+      REX2: 0.0
+      RHX1: 0.0
+      RBY1: 10.0
+      RBY2: 0.0
+      RBY3: 0.0
+      RCY1: 1.0
+      REY1: 0.0
+      REY2: 0.0
+      RHY1: 0.0
+      RHY2: 0.0
+      RVY1: 0.0
+      RVY2: 0.0
+      RVY4: 0.0
+      RVY5: 0.0
+      RVY6: 0.0
+    rear_tire:
+      FNOMIN: 17.639134615
+      PCX1: 1.65
+      PDX1: 1.0
+      PDX2: -0.08
+      PEX1: 0.5
+      PEX2: 0.0
+      PEX3: 0.0
+      PEX4: 0.0
+      PKX1: 12.0
+      PKX2: 0.0
+      PKX3: 0.0
+      PHX1: 0.0
+      PHX2: 0.0
+      PVX1: 0.0
+      PVX2: 0.0
+      PCY1: 1.3
+      PDY1: 1.0
+      PDY2: -0.08
+      PEY1: -0.5
+      PEY2: 0.0
+      PEY3: 0.0
+      PKY1: -10.0
+      PKY2: 1.5
+      PKY4: 2.0
+      PHY1: 0.0
+      PHY2: 0.0
+      PVY1: 0.0
+      PVY2: 0.0
+      RBX1: 10.0
+      RBX2: 0.0
+      RCX1: 1.0
+      REX1: 0.0
+      REX2: 0.0
+      RHX1: 0.0
+      RBY1: 10.0
+      RBY2: 0.0
+      RBY3: 0.0
+      RCY1: 1.0
+      REY1: 0.0
+      REY2: 0.0
+      RHY1: 0.0
+      RHY2: 0.0
+      RVY1: 0.0
+      RVY2: 0.0
+      RVY4: 0.0
+      RVY5: 0.0
+      RVY6: 0.0
+  timestep: 0.05
+  lidar_beams: 108
+  lidar_range: 10.0
+  lidar_dist: 0.10355
+  render: false
+  centerline_autoload: true
+  walls_autoload: true
+  track_preview:
+    points: 20
+    spacing: 0.3
+  action_repeat: 1
+  centerline_features: true
+  friction:
+    version: 1
+    scope: shared
+    train:
+      mode: gaussian
+      relative_std: 0.02
+    eval:
+      mode: fixed
+      mu: 1.0489
+  max_speed: 8.0
+  episode_termination:
+    mode: any_agent
+    lap_completion: true
+  terminal_agents:
+    remain_collidable: true
+    crashed_behavior: stationary
+    finished_behavior: coast_then_stop
+    finish_clearance_steps: 200
+  target_laps: 1
+  lap_counting:
+    require_finish_line: true
+    count_initial_crossing_as_lap: false
+  max_steps: 80000
+  centerline_render: true
+  track_limits:
+    enabled: true
+    terminate: false
+  terminate_on_collision: true
+  random_spawn:
+    enabled: true
+    allow_reuse: true
+  spawn:
+    policy: centerline_relative
+    centerline:
+      mode: random
+      min_progress: 0.0
+      max_progress: 1.0
+      avoid_finish: false
+    offsets:
+      s_offset: 0.0
+      d_offset: 0.0
+    ego:
+      speed: 0.0
+  map_dir: /home/ahoop004/marl_race/maps
+  map_bundles:
+  - circle_map
+  map_bundles_train:
+  - circle_map
+  map_bundles_eval:
+  - circle_map
+  map_cycle: per_episode
+  map_pick: round_robin
+observation:
+  observation:
+    lidar:
+      enabled: true
+      normalize: true
+    frenet_vehicle_track:
+      enabled: true
+      points: 20
+      wheel_radius: 0.058
+      clip: false
+      maxima:
+        vx: 20.0
+        vy: 20.0
+        u: 3.141592653589793
+        'n': 5.0
+        r: 10.0
+        delta: 0.5
+        delta_ref: 0.5
+        omega_ref_dot: 100.0
+        omega_ref: 400.0
+        omega: 400.0
+      wheel_speed_source: simulated_v1
+      track_maxima:
+        curvature: 1.0
+        width: 1.0
+reward:
+  task:
+    name: lap_completion_normalized_progress
+    description: Lap completion using signed normalized Frenet progress.
+  reward:
+    progress_delta_bonus:
+      enabled: true
+      weight: 1.0
+      units: lap_fraction
+      positive_only: false
+      max_delta: 0.025
+      boundary_penalty: -0.05
+      collision_penalty: -2.0
+    timeout_penalty:
+      enabled: true
+      penalty: -1.0
+    lap_completion:
+      enabled: true
+      bonus: 2.0
+      require_clean: true
+    step_time_penalty:
+      enabled: true
+      per_second: -0.00025
+      apply_on_terminal: true
+agents:
+  car_0:
+    algorithm: ppo
+    trainable: true
+    role: racer
+    observation:
+      observation:
+        lidar:
+          enabled: true
+          normalize: true
+        frenet_vehicle_track:
+          enabled: true
+          points: 20
+          wheel_radius: 0.058
+          clip: false
+          maxima:
+            vx: 20.0
+            vy: 20.0
+            u: 3.141592653589793
+            'n': 5.0
+            r: 10.0
+            delta: 0.5
+            delta_ref: 0.5
+            omega_ref_dot: 100.0
+            omega_ref: 400.0
+            omega: 400.0
+          wheel_speed_source: simulated_v1
+          track_maxima:
+            curvature: 1.0
+            width: 1.0
+    reward:
+      task:
+        name: lap_completion_normalized_progress
+        description: Lap completion using signed normalized Frenet progress.
+      reward:
+        progress_delta_bonus:
+          enabled: true
+          weight: 1.0
+          units: lap_fraction
+          positive_only: false
+          max_delta: 0.025
+          boundary_penalty: -0.05
+          collision_penalty: -2.0
+        timeout_penalty:
+          enabled: true
+          penalty: -1.0
+        lap_completion:
+          enabled: true
+          bonus: 2.0
+          require_clean: true
+        step_time_penalty:
+          enabled: true
+          per_second: -0.00025
+          apply_on_terminal: true
+    params: {}
+    action_constraints:
+      speed_control: wheel_acceleration
+      max_wheel_acceleration: 100.0
+      max_wheel_deceleration: 100.0
+      prevent_reverse: true
+      speed_index: 1
+maps:
+  available:
+  - circle_map
+  train:
+  - circle_map
+  selection:
+  - circle_map
+  final_test:
+  - circle_map
+  cycle: per_episode
+  pick: round_robin
+  root: /home/ahoop004/marl_race/maps
+evaluation:
+  enabled: true
+  every_steps: 4096000
+  episodes: 10
+  target_laps: 1
+  max_steps: 80000
+  episode_termination_mode: any_agent
+  lap_completion: true
+  terminate_on_collision: true
+  terminate_on_track_limit: false
+  seed: 10042
+  selection_strategy: completion_progress
+  final_test:
+    episodes: 20
+    seed: 20042
+execution:
+  experiment:
+    total_steps: 120000000
+    seed: 42
+    torch_threads: 1
+  params:
+    device: cuda
+    collection_device: cpu
+  checkpoint_every_steps: 4096000
+controllers:
+  name: hybrid_pp_ftg
+  params:
+    max_speed: 8.0
+    lookahead_base: 1.0
+    lookahead_time: 0.3
+    lookahead_max: 3.0
+    lateral_acceleration: 4.0
+    acceleration: 3.0
+    braking: 5.0
+    reaction_time: 0.55
+    margin: 0.12
+    min_gap_distance: 1.0
+    gap_fov: 2.4
+    gap_speed: 3.0
+    clear_steps: 5
+    exit_margin: 0.35
+    steering_time_constant: 0.08
+    steering_rate: 2.5
+    curvature_spacing: 0.5
+    path_spacing: 0.2
+  hybrid_pp_ftg:
+    max_speed: 8.0
+    lookahead_base: 1.0
+    lookahead_time: 0.3
+    lookahead_max: 3.0
+    lateral_acceleration: 4.0
+    acceleration: 3.0
+    braking: 5.0
+    reaction_time: 0.55
+    margin: 0.12
+    min_gap_distance: 1.0
+    gap_fov: 2.4
+    gap_speed: 3.0
+    clear_steps: 5
+    exit_margin: 0.35
+    steering_time_constant: 0.08
+    steering_rate: 2.5
+    curvature_spacing: 0.5
+    path_spacing: 0.2
+paths:
+  project_root: /home/ahoop004/marl_race
+  config_root: /home/ahoop004/marl_race/configs
+  source_root: /home/ahoop004/marl_race/src
+  scenario_root: /home/ahoop004/marl_race/scenarios
+  output_root: /home/ahoop004/marl_race/outputs
+  pretrained_checkpoint: /home/ahoop004/marl_race/outputs/pretrain/best.pt
+experiment:
+  seed: 42
+  torch_threads: 1
+  name: ppo_circle_pretrain_20k
+  parallel_envs: 64
+  distributed: false
+  envs_per_worker: 8
+  measure_stages: false
+  measure_services: false
+  measure_collector_startup: true
+  measure_mpc: false
+  measure_hybrid: false
+  episodes: 20000
+  ppo_backend: torchrl
+training_defaults:
+  progress_unit: environment_steps
+  update_version: torchrl-ppo-v1
+  n_steps: 409600
+  n_epochs: 10
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  batch_size: 1024
+  learning_rate: 0.001
+  gamma: 0.99
+  lr_schedule: linear
+  lr_scheduler_kwargs: {}
+  learning_rate_end: 0.0001
+  log_std_init: 0.0
+  target_kl: null
+  frames_per_batch: 4096
+  device: cuda
+  collection_device: cpu
+wandb:
+  logging:
+    profile: auto
+    groups:
+      train: true
+      eval: true
+      performance: true
+  enabled: true
+  project: marl-f110-complete
+  entity: ahoop004-old-dominion-university
+  name: null
+  group: ppo-lap-completion-pretrain
+  job_type: actor-pretraining
+  tags:
+  - ppo
+  - torchrl
+  - single-agent
+  - time-trial
+  - actor-pretraining
+  - mf61-planar
+  - f1tenth-gym-reference
+  - uncalibrated
+  notes: Fresh circle-track PPO under current physics; 20,000 completed training episodes,
+    seed 42, standard historical PPO optimization, 108-beam observations, one-lap
+    episodes, and the unchanged historical PPO collection setup (64 workers x 8 environments).
+  mode: online
+_configuration:
+  source: /home/ahoop004/marl_race/scenarios/ppo_circle_pretrain_20k.yaml
+  choices:
+    training: historical_ppo
+    controllers: hybrid_pp_ftg
+    execution: ppo_pretrain
+    evaluation: solo_pretrain
+    maps: solo_pretrain
+    scenario: solo_lap_completion
+    reward: solo_completion
+    observation: solo
+    simulation: default
+    vehicle: combined_slip
+    adaptation: scratch
+    checkpoint: default
+    network: mlp
+    algorithm: ppo
+  overrides: []
+  hydra_version: 1.3.7
+  cli:
+    resolve_config: false
+    wandb: false
+    no_wandb: false
+    render: false
+    no_render: true
+    seed: 42
+    episodes: 20000
+    eval: false
+    quiet: false
+    output_dir: /home/ahoop004/marl_race/pretrained_models/circle_ppo_seed42_20k
