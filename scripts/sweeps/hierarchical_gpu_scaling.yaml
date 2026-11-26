@@ -1,0 +1,44 @@
+name: Hierarchical GPU scaling
+experiment_id: hierarchical-gpu-scaling-v1
+algorithm: ppo
+scenario: scenarios/ppo_hierarchical.yaml
+
+total_steps: 262144
+seeds: [42]
+sweep_seed: 2026
+
+search:
+  method: grid
+  parameters:
+    experiment.parallel_envs:
+      type: choice
+      values: [8, 16, 24]
+    experiment.envs_per_worker:
+      type: choice
+      values: [1, 4, 8]
+
+max_concurrent_trials: 5
+
+resources_per_trial:
+  cpu: 30
+  gpu: 1
+
+fixed_overrides:
+- hierarchical.interval=5
+- hierarchical.preview.enabled=false
+- experiment.async_evaluation=true
+- experiment.torch_threads=1
+- algorithm.params.n_steps=1024
+- algorithm.params.frames_per_batch=256
+- algorithm.params.batch_size=128
+- algorithm.params.n_epochs=4
+
+evaluation:
+  seed: 10042
+  episodes: 3
+  every_steps: 131072
+  max_steps: 8000
+
+wandb:
+  mode: online
+  group: hierarchical-gpu-scaling
