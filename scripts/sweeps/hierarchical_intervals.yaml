@@ -2,6 +2,7 @@ name: Hierarchical PPO decision-interval pilot
 experiment_id: hierarchical-intervals-v1
 algorithm: ppo
 scenario: scenarios/ppo_hierarchical.yaml
+# Fixed HL samples: LL interactions per update increase with K (short macros vary).
 # Primary budget always counts LL decisions, independent of K.
 total_steps: 4096000
 seeds: [42]

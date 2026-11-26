@@ -1,0 +1,31 @@
+name: Hierarchical PPO LL-matched K5
+experiment_id: hierarchical-ll-matched-k5-v1
+algorithm: ppo
+scenario: scenarios/ppo_hierarchical.yaml
+# Approximately 2560 LL decisions per update; terminal macros and batch rounding vary.
+# Primary budget always counts LL decisions, independent of K.
+total_steps: 4096000
+seeds: [42]
+sweep_seed: 2026
+search:
+  method: grid
+  parameters:
+    hierarchical.interval:
+      type: choice
+      values: [5]
+max_concurrent_trials: 1
+resources_per_trial: {cpu: 6, gpu: 0}
+fixed_overrides:
+- experiment.parallel_envs=2
+- experiment.envs_per_worker=1
+- algorithm.params.n_steps=512
+- algorithm.params.frames_per_batch=128
+- algorithm.params.batch_size=128
+- algorithm.params.n_epochs=4
+evaluation:
+  seed: 10042
+  episodes: 3
+  every_steps: 409600
+  max_steps: 8000
+wandb:
+  mode: disabled

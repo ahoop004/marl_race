@@ -1,0 +1,31 @@
+name: Hierarchical Ray runtime smoke
+experiment_id: hierarchical-ray-smoke-v1
+algorithm: ppo
+scenario: scenarios/ppo_hierarchical.yaml
+# Approximately 2560 LL decisions per update; terminal macros and batch rounding vary.
+# Primary budget always counts LL decisions, independent of K.
+total_steps: 20
+seeds: [42]
+sweep_seed: 2026
+search:
+  method: grid
+  parameters:
+    hierarchical.interval:
+      type: choice
+      values: [1]
+max_concurrent_trials: 1
+resources_per_trial: {cpu: 6, gpu: 0}
+fixed_overrides:
+- experiment.parallel_envs=2
+- experiment.envs_per_worker=1
+- algorithm.params.n_steps=4
+- algorithm.params.frames_per_batch=4
+- algorithm.params.batch_size=4
+- algorithm.params.n_epochs=1
+evaluation:
+  seed: 10042
+  episodes: 1
+  every_steps: 5
+  max_steps: 7
+wandb:
+  mode: disabled

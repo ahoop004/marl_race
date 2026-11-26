@@ -45,7 +45,36 @@ bootstrap without inventing episode endings. LL decisions remain the primary
 budget; `n_steps` and rollout/minibatch sizes count HL samples. Batched collection
 can overshoot the LL budget; compare recorded actual decisions and overshoot.
 
-### Implemented but awaiting HPC validation
+### Newly modified and awaiting HPC validation
+
+The v2 HL observation replaces raw dwell counts with `tanh(elapsed_seconds / scale)`
+(default scale 1 s), measured from actual task durations. It optionally appends
+signed curvature then width samples at an independently configured spacing using
+cached LL preview geometry. The LL observation is unchanged. V1 HL checkpoints
+are incompatible even when dimensions agree. Raw counts and durations remain
+available for diagnostics. Preview defaults off; enabled scales default to the
+existing physical 1/m and m normalizers of 1.0.
+
+PPO still receives internally discounted macro rewards and duration-aware GAE.
+Historical `episode/reward`, `training_return`, evaluation `mean_episode_reward`,
+reward components and agent reward fields remain sums of those macro rewards for
+hierarchical runs. Use `hierarchical/return_ll_undiscounted` (or evaluation
+`mean_return_ll_undiscounted`) for conventional PPO/LoRA comparisons. Also record
+`return_macro_discounted_sum` and `return_ll_globally_discounted`; discounting is
+in LL-decision units. Existing `distance_m` diagnostics are legacy aliases for
+positive centerline progress, not physical distance. New metrics explicitly
+report net progress, accumulated forward progress and sampled-physics polyline
+distance in metres. Physical distance is a numerical path-length approximation.
+
+Selector streams are independent of map/spawn streams and derive from each
+environment seed. Geometry fallback reasons, actual switch windows, elapsed
+simulation time, inference timings and bank tensor storage are reported.
+Update CSV rows contain actual LL decisions per PPO update and a JSON array of
+actual LL decisions for each collection batch leading to that update. Batch
+rounding, short terminal macros and the final budget can change these values.
+These corrections and focused tests have not been runtime validated.
+
+### Implemented but not experimentally validated
 
 Final configuration/provenance corrections, conventional composite baseline
 presets, sequence-selector switch studies, extended offline reports, and the
@@ -60,8 +89,8 @@ Ray execution remain deferred. Their results are not established by smoke tests.
   CUDA ranks. Independent Ray trials can span nodes; that is a different workload.
   There is no valid shared multi-node HRL command to provide without extending
   that backend. This limitation is not presented as a completed HPC check.
-- No separate longer HL preview; the unchanged LL signed curvature/width preview
-  is reused. The initial three HL observation extensions have a fixed contract.
+- Optional learned-policy categorical probabilities are not recorded; adding them
+  without duplicated inference requires evaluator policy-output interface work.
 - No exact simulator-state restoration. Switch-pair studies use identical seeded
   starts/spawn schedules. The sequence selector runs an approach and then holds
   its final skill; follow-up measurements are limited to recorded LL decisions.
@@ -293,9 +322,11 @@ Single-node profiling/scaling: run each command in an HPC allocation, preserving
 LL budgets. These are requested deferred checks, not laptop benchmarks.
 
 ```bash
-for workers in 1 2 4 8; do
-  python run.py "${COMMON[@]}" --total-steps 65536 \
-    --set experiment.parallel_envs="$workers" --set experiment.measure_stages=true \
+for workers in 1 2 4 8 16 32; do
+  # Choose one candidate after inspecting the allocation; do not run a full matrix.
+  envs=1; threads=1
+  python run.py --scenario "$SCENARIO" --no-wandb --no-render --total-steps 65536 \
+    --set experiment.parallel_envs="$workers" --set experiment.envs_per_worker="$envs" --torch-threads "$threads" --set experiment.measure_stages=true \
     --set experiment.measure_services=true --set evaluation.enabled=false \
     --set algorithm.params.n_steps=1024 --set algorithm.params.batch_size=128 \
     --set algorithm.params.frames_per_batch=256 \
@@ -308,13 +339,6 @@ python run.py "${COMMON[@]}" --total-steps 65536 --set execution.params.device=c
   --set algorithm.params.n_steps=1024 --set algorithm.params.batch_size=128 \
   --set algorithm.params.frames_per_batch=256 --set evaluation.enabled=false \
   --output-dir outputs/hrl/gpu-learner
-# Existing two-GPU, single-node DDP path; must be checked on the HPC.
-python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=2 run.py \
-  "${COMMON[@]}" --total-steps 65536 --set experiment.distributed=true \
-  --set experiment.parallel_envs=4 --set execution.params.device=cuda \
-  --set algorithm.params.n_steps=1024 --set algorithm.params.batch_size=128 \
-  --set algorithm.params.frames_per_batch=256 --set evaluation.enabled=false \
-  --output-dir outputs/hrl/ddp-single-node
 ```
 
 Ray interval pilot: all four trials use 4,096,000 LL decisions. The YAML controls
@@ -355,3 +379,124 @@ TorchRL ClipPPOLoss, optimizers, minibatching and gradient clipping; existing
 collectors, CPU/thread controls, asynchronous ranking and recovery; Hydra groups;
 experiment launcher, Ray trial isolation and SLURM entry points. No runtime
 dependency or alternate training/distributed framework was added.
+
+## Final correction handoff: staged commands
+
+All commands below are for the HPC after allocation and environment activation;
+none were run as part of the final corrections. The historical 228-test result
+above applies only to the earlier commit. The earlier snippets are retained as
+concrete Stage C/D/G examples; use fresh directories for each run.
+
+### A. Software, immutable inputs and regression gate
+
+```bash
+python --version
+python -m pip check
+sha256sum pretrained_models/circle_ppo_seed42_20k/best.pt pretrained_models/straight_best.pt pretrained_models/sweep_best.pt pretrained_models/hairpin_best.pt pretrained_models/chicane_best.pt pretrained_models/s_best.pt
+cat configs/hierarchical/bank.yaml
+python run.py --scenario scenarios/ppo_hierarchical.yaml --resolve-config
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q \
+  tests/test_hierarchical.py tests/test_torchrl_ppo.py tests/test_torchrl_mappo.py \
+  tests/test_ppo_lora.py tests/test_native_torchrl_env.py tests/test_checkpoints.py \
+  tests/test_observation_contract.py tests/test_race_task.py tests/test_task_evaluation.py \
+  tests/test_episode_reporting.py tests/test_on_policy_pipeline.py \
+  tests/test_experiment_launcher.py tests/test_ray_tune_sweeps.py tests/test_ray_tune_trials.py
+```
+
+Compare all six SHA-256 values to the pinned bank manifest. The hierarchical
+suite includes bank reconstruction/parity, categorical PPO, macro transitions,
+duration-aware GAE, normalized dwell, return partition invariance, seeding and
+preview contract checks. Validate checkpoint/resume and full suite results on HPC.
+
+### B. Runtime correctness
+
+In addition to the serial/process, asynchronous and resume commands above:
+
+```bash
+python run.py "${COMMON[@]}" "${SMOKE[@]}" --set experiment.parallel_envs=2 \
+  --set experiment.envs_per_worker=2 --set evaluation.enabled=false \
+  --output-dir outputs/hrl/smoke-multi-env
+python run.py "${COMMON[@]}" --eval --checkpoint outputs/hrl/smoke-serial/final.pt \
+  --eval-protocol selection --set hierarchical.record_trajectory=true \
+  --output-dir outputs/hrl/smoke-learned-eval
+python scripts/ray_tune_trials.py --sweep-spec scripts/sweeps/hierarchical_ray_smoke.yaml \
+  --root outputs/hrl/ray-smoke --trial-timeout 0
+```
+
+### C and D. Specialization and switch compatibility
+
+Run the six-policy, eight-validation-track matrix and 30 directed sequence
+commands in the earlier blocks. Each policy uses the same seeds and spawn
+schedule. Separate processes may be scheduled concurrently with unique output
+directories; resource allocation is the operator's responsibility. The report
+commands create per-map rows and skill/transition summaries; retain source JSON
+for aggregate analysis. Approach trajectories are reproducible, not restored
+from an identical simulator snapshot. No test map participates in selection.
+
+### E. CPU scaling
+
+Inspect available partitions and resources first:
+
+```bash
+sinfo -o '%P %a %l %D %c %m %G'
+scontrol show partition
+```
+
+Use the preceding bounded scaling command as a template and choose workers from
+`1 2 4 8 16 32`, envs per worker from `1 2 4 8`, thread count, `n_steps` and
+`frames_per_batch` based on the allocation; do not run their Cartesian product.
+Request CPUs for the learner, each collector, optional evaluation and Ray
+head/worker overhead; actual topology and memory are cluster-specific. Compare
+collection-only and end-to-end wall-time throughput separately, aggregate worker
+CPU time separately from per-worker rates, and process RSS separately from the
+bank tensor-storage bytes. The GPU learner command above is optional and later.
+
+### F. Decision interval and preview experiments
+
+The original `hierarchical_intervals.yaml` holds HL n_steps=1024, collection
+batch=256, minibatch=128 and four epochs fixed. Increasing K increases LL
+interactions per update; this is not LL-frequency control. The four
+`hierarchical_ll_matched_k*.yaml` specifications couple `(K, n_steps, batch
+frames)` as `(1,2560,640)`, `(5,512,128)`, `(10,256,64)`, `(20,128,32)`
+with minibatch 128 and four epochs. They approximate 2560 LL decisions per
+update, but vary HL samples and optimizer steps. Neither design controls all
+optimization variables. Each has seed 42 and budget 4,096,000 LL decisions.
+The latter are four independent one-trial Tune experiments rather than a
+Cartesian product; modify resources and concurrency in the YAML as needed.
+
+```bash
+python scripts/ray_tune_trials.py --sweep-spec scripts/sweeps/hierarchical_intervals.yaml --root outputs/hrl/ray-fixed-hl --trial-timeout 0
+for k in 1 5 10 20; do
+  python scripts/ray_tune_trials.py --sweep-spec "scripts/sweeps/hierarchical_ll_matched_k${k}.yaml" --root "outputs/hrl/ray-ll-matched-k${k}" --trial-timeout 0
+done
+# After selecting K, edit the single interval value consistently in all three files.
+for preview in ll 12m 18m; do
+  python scripts/ray_tune_trials.py --sweep-spec "scripts/sweeps/hierarchical_preview_${preview}.yaml" --root "outputs/hrl/ray-preview-${preview}" --trial-timeout 0
+done
+```
+
+For independent parallel trials across nodes use the existing `scripts/hpc/ray_tune.sbatch`
+and shared filesystem as shown above. The launcher rejects dirty tracked source and
+untracked files under `scripts`; put edited sweep copies under an output/config
+directory outside those trees and reference the copies, or commit the edits first. Tune `resources_per_trial` and
+`max_concurrent_trials` in the YAML before launch. Resume a failed experiment
+with the same spec/root and `--restore`; retain frozen input configs, bank hashes,
+run identities and each trial's native latest checkpoint. Each LL-matched and
+preview file uses its own experiment root; concurrency between those invocations
+must be arranged by the HPC scheduler. For a sweep W&B run, change its YAML
+`wandb.mode` from `disabled` to `online` (or `offline`) and set `project`,
+`entity` and a purpose/bank/sweep group there before launching. W&B receives
+resolved config and trial identity, including K, preview, execution and seed;
+choose group names for purpose and bank and use config filters for the rest.
+For direct training omit `--no-wandb` and add `--wandb --set wandb.mode=online
+--set wandb.group=<purpose-bank-sweep>`; use the existing project/entity settings.
+No probability trajectories are sent to W&B.
+
+### G. Final research experiments
+
+Run multiple seeds for the chosen HL configuration, and the fixed, random,
+geometry, pretrained base, direct PPO and composite LoRA baselines described
+above. Rank the fixed adapter on composite validation only. Keep common seeds,
+spawn schedules and LL budgets, and reserve held-out composite and external
+maps until model and configuration selection are complete. No results or
+performance claims are established by preparation alone.
