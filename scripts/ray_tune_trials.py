@@ -317,7 +317,10 @@ def trainer_command(settings, identity, out):
     # Preserve historical T5 collector settings; architecture sweeps inherit the
     # scenario's execution settings unless the specification explicitly overrides.
     architecture_sweep = uses_model_groups(settings.get("sweep"))
-    collectors = [] if architecture_sweep else ["experiment.parallel_envs=2", "experiment.envs_per_worker=1"]
+    overridden = {value.lstrip("+").split("=", 1)[0] for value in settings["overrides"]}
+    collectors = [] if architecture_sweep else [
+        f"{path}={value}" for path, value in (("experiment.parallel_envs", 2), ("experiment.envs_per_worker", 1))
+        if path not in overridden]
     overrides = [*collectors, "experiment.distributed=false", *smoke,
                  f"checkpoint.every_steps={settings['checkpoint_every_steps']}",
                  f"checkpoint.every_updates={settings['checkpoint_every_updates'] or 'null'}",

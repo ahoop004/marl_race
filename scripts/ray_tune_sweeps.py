@@ -12,6 +12,8 @@ import yaml
 
 from ray_tune_sources import (NETWORKS, ADAPTATIONS, configuration_digest, read_sources, verify_source, inspect_model)
 
+COLLECTOR_SEARCH_PATHS = {"experiment.parallel_envs", "experiment.envs_per_worker"}
+
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
@@ -104,10 +106,15 @@ def read_spec(path, repo):
         positive(search.get("num_samples"), "search.num_samples")
     # Fail before importing Ray or connecting to the cluster.
     for path, domain in search["parameters"].items():
-        if (not isinstance(path, str) or not (path in {"network", "adaptation", "hierarchical.interval"} or re.fullmatch(r"(?:algorithm|network|adaptation\.lora)\.[A-Za-z_][A-Za-z0-9_.]*", path))
+        if (not isinstance(path, str) or not (path in {"network", "adaptation", "hierarchical.interval"} | COLLECTOR_SEARCH_PATHS or re.fullmatch(r"(?:algorithm|network|adaptation\.lora)\.[A-Za-z_][A-Za-z0-9_.]*", path))
                 or path in {"algorithm.name", "algorithm.backend", "algorithm.params.progress_unit", "algorithm.params.update_version"}):
-            raise ValueError(f"Search paths must name existing algorithm/network hyperparameters: {path!r}")
+            raise ValueError(f"Unsupported search path: {path!r}")
         domain_description(domain, search["method"], spec["allow_duplicates"])
+        if path in COLLECTOR_SEARCH_PATHS:
+            if domain["type"] not in {"choice", "int"}:
+                raise ValueError(f"{path} requires positive integer choices or an integer range")
+            for value in domain.get("values", [domain.get("low")]):
+                positive(value, path)
         if path in {"network", "adaptation"}:
             allowed = NETWORKS if path == "network" else ADAPTATIONS
             if domain["type"] != "choice" or any(not isinstance(v, str) or v not in allowed for v in domain.get("values", [])):
@@ -312,8 +319,8 @@ def validate_search_effect(config, parameters):
         params = resolve_training_params(agent, config)
         network = resolve_network_config(params, default_hidden_dims=[256, 256])
         for path, value in parameters.items():
-            if path == "hierarchical.interval":
-                actual = config["hierarchical"]["interval"]
+            if path == "hierarchical.interval" or path in COLLECTOR_SEARCH_PATHS:
+                actual = select_path(config, path)
             elif path.startswith("algorithm.params."):
                 actual = select_path(params, path.removeprefix("algorithm.params."))
             elif path.startswith("adaptation.lora."):
@@ -357,6 +364,7 @@ def preflight(settings, command_builder, repo):
     from training.configuration import PROFILING_DEFAULTS
     from omegaconf import OmegaConf
     from hydra.core.override_parser.overrides_parser import OverridesParser
+    from launch_experiment import resolve_collectors
 
     inputs = Path(settings["root"]) / "sweep_inputs"
     if (Path(settings["root"]) / "experiment.json").exists():
@@ -465,6 +473,7 @@ def preflight(settings, command_builder, repo):
         protocols = {"selection": selection, "final": final, "evaluation": config["evaluation"]}
         if not config["evaluation"]["enabled"] or config["experiment"].get("distributed"):
             raise ValueError("Sweeps require selection evaluation and independent, non-DDP trainers")
+        resolve_collectors(config, spec["resources_per_trial"]["cpu"], frozen=True)
         # Architectures/arms may vary; observation, reward, maps and opponents
         # must stay controlled. Training seeds are replicated independently.
         common = {"environment": config["environment"], "maps": config["maps"],
