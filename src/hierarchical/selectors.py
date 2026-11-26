@@ -48,7 +48,8 @@ class SequenceSelector:
         self.position = 0
 
     def select(self, **context):
-        skill = self.sequence[self.position % len(self.sequence)]
+        # Execute the approach once, then retain the final skill for measuring stability.
+        skill = self.sequence[min(self.position, len(self.sequence) - 1)]
         self.position += 1
         return skill
 

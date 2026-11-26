@@ -251,9 +251,13 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
     provenance["algorithm_implementation"] = {
         "backend": "torchrl",
         "loss": "torchrl.ClipPPOLoss" if algorithm == "ppo" else "torchrl.MAPPOLoss",
-        "advantage_estimator": "torchrl.GAE" if algorithm == "ppo" else "torchrl.MultiAgentGAE",
+        "advantage_estimator": ("hierarchical.DurationGAE" if getattr(learner, "hierarchical", None)
+                                else "torchrl.GAE" if algorithm == "ppo" else "torchrl.MultiAgentGAE"),
         "update_version": params.get("update_version"),
     }
+    if getattr(task, "hierarchical", False):
+        provenance["hierarchical"] = {"contract": learner.hierarchy_contract,
+                                      "frozen_bank": task.bank.accounting(), "budget_unit": "ll_decisions"}
     provenance["collector"] = {
         "implementation": "torchrl.collectors.Collector",
         "backend": "process" if process_collection and not centralized else "direct",

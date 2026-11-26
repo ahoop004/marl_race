@@ -40,7 +40,7 @@ class RaceTrainingReports:
         self.environment_seed = metadata.environment_seed
         self.spawn_context = metadata.spawn_configuration
         self.start_policy = t._updates
-        self.steps = self.physics_steps = 0
+        self.steps = self.physics_steps = self.ll_steps = 0
         self.reward = 0.0
         self.rewards = dict.fromkeys(self.ids, 0.0)
         self.individual_rewards = dict(self.rewards)
@@ -103,6 +103,7 @@ class RaceTrainingReports:
                 for hook in self.transition_hooks:
                     t.call_hook(hook, "on_step", record)
         self.steps += 1
+        self.ll_steps += result.ll_decisions
         t._environment_steps += result.ll_decisions
         if t.measure_mpc:
             phase = t._timing_phase
@@ -121,7 +122,7 @@ class RaceTrainingReports:
         info["outcome"] = determine_outcome(info, truncated=self.truncated[t.focal_id]).value
         info.setdefault("map_bundle", self.map_id)
         metrics = dict(
-            episode_steps=self.steps, episode_id=self.episode_id,
+            episode_steps=self.ll_steps, episode_id=self.episode_id,
             environment_id=self.environment_id,
             environment_episode=(self.environment_episode if self.episode_stride > 1
                                  or getattr(t.env, "environment_id", None) is not None else self.episode))
@@ -149,7 +150,7 @@ class RaceTrainingReports:
             "environment_episode": metrics["environment_episode"],
             "map_id": self.map_id,
             "environment_seed": self.environment_seed, "spawn_ids": self.spawn_ids,
-            "spawn_configuration": self.spawn_context, "environment_decisions": self.steps,
+            "spawn_configuration": self.spawn_context, "environment_decisions": self.ll_steps,
             "environment_decisions_total": t._environment_steps,
             "action_repeat": self.task.action_repeat,
             "policy_version_start": self.start_policy, "policy_version_end": t._updates,

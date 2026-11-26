@@ -19,6 +19,9 @@ environment:
   max_steps: 8000
   render: false
 evaluation:
+  episodes: 3
+  final_test:
+    episodes: 7
   selection_strategy: completion_progress
 wandb:
   enabled: false

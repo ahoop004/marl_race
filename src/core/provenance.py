@@ -211,8 +211,10 @@ def build_run_provenance(
             "net_finish_line_crossings": "2.0",
             "resolved_simulation_state": "2.0",
             "completion_progress_finish_time_selection": "1.0",
-            "policy_likelihood": "stored_pre_tanh_v1",
-            "policy_entropy": "squashed_gaussian_quadrature32_v1",
+            "policy_likelihood": ("categorical_skill_v1" if scenario.get("hierarchical", {}).get("enabled", False)
+                                  else "stored_pre_tanh_v1"),
+            "policy_entropy": ("categorical_exact_v1" if scenario.get("hierarchical", {}).get("enabled", False)
+                               else "squashed_gaussian_quadrature32_v1"),
             "ppo_fragment_pooling": "1.0",
         },
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
