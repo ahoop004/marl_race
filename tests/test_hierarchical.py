@@ -65,3 +65,40 @@ def test_selectors_and_independent_execution(bank):
     assert g.select(metadata=metadata, s=9.5) == 3
     metadata['maneuvers'][0]['type'] = 'corner'
     assert g.select(metadata=metadata, s=9.5) == 0
+
+
+def test_macro_trajectory_and_specs(bank):
+    import numpy as np
+    from core.task_builder import create_race_task
+    from core.scenario import load_and_expand_scenario
+    from hierarchical.task import HierarchicalTask
+    from adapters.native_torchrl import NativeRaceTorchRLEnv
+    from torchrl.envs.utils import check_env_specs
+    scenario = load_and_expand_scenario('scenarios/ppo_circle_pretrain_20k.yaml')
+    scenario['environment']['max_steps'] = 7
+    task = create_race_task(scenario)
+    wrapper = HierarchicalTask(task, bank, {'interval': 5, 'gamma': .99})
+    plain = create_race_task(scenario)
+    try:
+        initial = wrapper.reset(seed=42)
+        plain.reset(seed=42)
+        assert initial.observations['car_0'].shape == (bank.obs_dim + 9,)
+        rewards = []
+        state = plain.reset(seed=42)
+        for _ in range(5):
+            action = bank(state.observations['car_0'][None], torch.tensor([1]))[0].numpy()
+            step = plain.step({'car_0': action})
+            rewards.append(step.decisions['car_0'].individual_reward)
+            state = step.after
+        macro = wrapper.step({'car_0': np.array([1], dtype=np.int64)})
+        assert macro.ll_decisions == 5 and macro.physics_steps == 5
+        assert macro.decisions['car_0'].individual_reward == pytest.approx(sum(.99**i*r for i,r in enumerate(rewards)))
+        assert np.array_equal(macro.after.observations['car_0'][:bank.obs_dim], state.observations['car_0'])
+        macro = wrapper.step({'car_0': np.array([2], dtype=np.int64)})
+        assert macro.ll_decisions == 2 and macro.decisions['car_0'].truncated
+        assert wrapper.total_ll == 7 and wrapper.total_hl == 2
+        env = NativeRaceTorchRLEnv(wrapper)
+        check_env_specs(env)
+    finally:
+        task.close()
+        plain.close()

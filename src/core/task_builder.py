@@ -45,10 +45,17 @@ def create_race_task(scenario, *, scenario_dir=None, mode="train", render_mode=N
                 decision_dt=env.timestep * repeat,
             ) for aid in ids
         }
-        return RaceTask(
+        task = RaceTask(
             env, policy_agents=ids, fixed_controllers=controllers, obs_composers=obs,
             reward_composers=rewards, action_composers=actions, action_repeat=repeat,
         )
+        if scenario.get("hierarchical", {}).get("enabled", False):
+            from hierarchical.bank import AdapterBank
+            from hierarchical.task import HierarchicalTask
+            config = scenario["hierarchical"]
+            bank = AdapterBank(config["bank"], spec=task.spec, device="cpu")
+            task = HierarchicalTask(task, bank, config)
+        return task
     except BaseException:
         env.close()
         raise

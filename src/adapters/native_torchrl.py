@@ -52,9 +52,10 @@ class NativeRaceTorchRLEnv(EnvBase):
         widths = {task.observation_space(aid).shape for aid in self.agent_ids}
         if any(len(width) != 1 for width in widths):
             raise ValueError("The agents group requires vector observations")
+        self.hierarchical = getattr(task, "hierarchical", False)
         for aid in self.agent_ids:
             spec = task.action_space(aid)
-            if spec.shape != (2,) or not (np.all(spec.low == -1) and np.all(spec.high == 1)):
+            if not self.hierarchical and (spec.shape != (2,) or not (np.all(spec.low == -1) and np.all(spec.high == 1))):
                 raise ValueError("Policy actions must be normalized float32 vectors of shape (2,)")
         self.group_map = {"agents": list(self.agent_ids)}
         self.reward_mapping = RewardMapping(reward_mode, team_reward_reduction)
@@ -104,6 +105,11 @@ class NativeRaceTorchRLEnv(EnvBase):
         self.action_spec = Composite(agents=Composite(
             action=Bounded(-1, 1, shape=(n, 2), dtype=torch.float32, device=self.device),
             shape=(n,), device=self.device), device=self.device)
+        if self.hierarchical:
+            self.action_spec = Composite(agents=Composite(
+                action=Categorical(task.n_skills, shape=(n, 1), dtype=torch.int64, device=self.device),
+                shape=(n,), device=self.device), device=self.device)
+            self.observation_spec["steps_to_next_obs"] = count((1,))
         if environment_id is not None:
             self.observation_spec["environment_id"] = count((1,))
             self.observation_spec["environment_episode"] = count((1,))
@@ -152,6 +158,8 @@ class NativeRaceTorchRLEnv(EnvBase):
             self.on_reset(snapshot)
         if self.render_mode == "human":
             self.task.render()
+        if self.hierarchical:
+            output["steps_to_next_obs"] = self._tensor([self.task.last_duration], torch.int64)
         return output
 
     def _on_physics_step(self, substep):
@@ -164,9 +172,9 @@ class NativeRaceTorchRLEnv(EnvBase):
         if self.is_closed or self.snapshot is None or self.snapshot.episode_done:
             raise RuntimeError("Reset an open environment before stepping a new race")
         action = tensordict.get(("agents", "action"), None)
-        if not isinstance(action, torch.Tensor) or action.shape != (len(self.agent_ids), 2):
+        if not isinstance(action, torch.Tensor) or action.shape != (len(self.agent_ids), 1 if self.hierarchical else 2):
             raise ValueError("agents.action must have shape (number of policy agents, 2)")
-        if action.dtype != torch.float32:
+        if action.dtype != (torch.int64 if self.hierarchical else torch.float32):
             raise ValueError("agents.action must have dtype float32")
         active = set(self.snapshot.agents)
         def policy_actions():
@@ -194,6 +202,8 @@ class NativeRaceTorchRLEnv(EnvBase):
         if self.environment_id is not None and not self.batch_reports:
             output["race_events"] = NonTensorData(self.report_events)
             self.report_events = []
+        if self.hierarchical:
+            output["steps_to_next_obs"] = self._tensor([self.task.last_duration], torch.int64)
         return output
 
     @staticmethod

@@ -206,6 +206,7 @@ class TaskStep:
     team_reward: float
     team_reward_components: Mapping[str, float]
     substeps: Tuple[TaskSubstep, ...]
+    ll_decisions: int = 1
 
     @property
     def agent_steps(self) -> int:
