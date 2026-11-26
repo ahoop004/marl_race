@@ -388,7 +388,23 @@ def initialize_from_checkpoint(policy, path, *, scope, observation_extension=Non
         raise ValueError("Transfer requires a fresh learner; use resume_training to continue an existing experiment")
     checkpoint = read_checkpoint(path)
     stored, expected = checkpoint["metadata"], _plain(policy_metadata(policy))
-    if stored["algorithm"] != "ppo" or stored["adaptation"]["lora"] is not None:
+    if stored["adaptation"]["lora"] is not None:
+        if (stored["algorithm"] != "ppo" or policy.algorithm != "ppo"
+                or not getattr(policy, "lora_config", None) or observation_extension is not None):
+            raise ValueError("Adapter warm start requires matching PPO LoRA and no observation extension")
+        # Validate both complete models before mutating either. Preserve the
+        # original frozen PPO base identity, and separately record the adapter
+        # from which this new optimizer/run begins.
+        _validate_models(policy, checkpoint, critic=True)
+        policy.actor.load_state_dict(checkpoint["models"]["actor"], strict=True)
+        policy.critic.load_state_dict(checkpoint["models"]["critic"], strict=True)
+        policy.source_checkpoint = stored["adaptation"]["source_checkpoint"]
+        policy.adapter_warm_start = checkpoint["_identity"]
+        policy._lora_ready = True
+        if policy.optimizer is not None:
+            policy.set_training_progress(0)
+        return
+    if stored["algorithm"] != "ppo":
         raise ValueError("Transfer requires a complete PPO source policy")
     from agents.common.ppo_policy import PPOPolicy
     from agents.common.networks import resolve_network_config
@@ -544,6 +560,8 @@ def resume_training(policy, path):
         policy.scheduler.load_state_dict(scheduler_state)
     policy.set_training_progress(state["schedule_progress"])
     policy.source_checkpoint = checkpoint["metadata"]["adaptation"]["source_checkpoint"]
+    if checkpoint["metadata"].get("provenance", {}).get("adapter_warm_start"):
+        policy.adapter_warm_start = checkpoint["metadata"]["provenance"]["adapter_warm_start"]
     if hasattr(policy, "_lora_ready"):
         policy._lora_ready = True
     # Restore RNG after task/collector construction, which may consume draws.

@@ -174,3 +174,36 @@ def test_ppo_lora_transfer_rejects_actor_only_scope(tmp_path):
     learner = agent(hidden_dims=[8], lora=LORA)
     with pytest.raises(ValueError, match="actor_and_critic"):
         learner.initialize_from_checkpoint(tmp_path / "unused.pt", scope="actor_only")
+
+
+def test_ppo_lora_warm_start_preserves_actor_critic_and_base_provenance(tmp_path):
+    _, trained = initialized(tmp_path)
+    trained.update(rollout(trained.policy, [0, 1, 2, 3]))
+    path = tmp_path / "adapter.pt"
+    trained.save_checkpoint(path)
+    resumed = agent(hidden_dims=[8], lora=LORA)
+    resumed.initialize_from_checkpoint(path, scope="actor_and_critic")
+    for old, new in ((trained.actor, resumed.actor), (trained.critic, resumed.critic)):
+        for key, value in old.state_dict().items():
+            torch.testing.assert_close(new.state_dict()[key], value, rtol=0, atol=0)
+    assert not resumed.optimizer.state
+    assert resumed.source_checkpoint["sha256"] == trained.source_checkpoint["sha256"]
+    assert resumed.adapter_warm_start == read_checkpoint(path)["_identity"]
+    assert all(not p.requires_grad for p in resumed.actor.net.parameters())
+    saved = tmp_path / "continued.pt"
+    resumed.save_checkpoint(saved, provenance={"adapter_warm_start": resumed.adapter_warm_start})
+    assert read_checkpoint(saved)["metadata"]["provenance"]["adapter_warm_start"]["sha256"] == resumed.adapter_warm_start["sha256"]
+
+
+def test_ppo_lora_warm_start_rejects_incompatible_adapter_without_mutation(tmp_path):
+    _, trained = initialized(tmp_path)
+    path = tmp_path / "adapter.pt"
+    trained.save_checkpoint(path)
+    target = agent(hidden_dims=[8], lora={**LORA, "rank": 2})
+    actor, critic = deepcopy(target.actor.state_dict()), deepcopy(target.critic.state_dict())
+    with pytest.raises(ValueError, match="Incompatible"):
+        target.initialize_from_checkpoint(path, scope="actor_and_critic")
+    for model, before in ((target.actor, actor), (target.critic, critic)):
+        for key, value in before.items():
+            torch.testing.assert_close(model.state_dict()[key], value, rtol=0, atol=0)
+    assert target.source_checkpoint is None

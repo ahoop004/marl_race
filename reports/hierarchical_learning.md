@@ -500,3 +500,43 @@ above. Rank the fixed adapter on composite validation only. Keep common seeds,
 spawn schedules and LL budgets, and reserve held-out composite and external
 maps until model and configuration selection are complete. No results or
 performance claims are established by preparation alone.
+
+## Continuing the hairpin adapter on the HPC
+
+The saved `pretrained_models/hairpin_best.pt` is a model-only LoRA checkpoint.
+A fresh run can initialize its full actor (including the trained adapter and
+frozen base) and critic using `--checkpoint`; its optimizer, scheduler, RNG,
+episode counters, and evaluation selection history start fresh. The checkpoint
+provenance records both the original base identity and the adapter warm-start
+file/hash. Matching network, observation, action, physics, and LoRA contracts are
+required. `--resume` is instead recovery from a compatible `latest.pt`, retains
+optimizer state, and requires the same original training budget; it cannot
+extend a completed run's budget. Do not use `--resume` on `hairpin_best.pt`.
+
+Choose an additional episode budget and an HPC execution configuration; this
+example adds 60,000 episodes and keeps the one-lap family task and validation
+split. It is an example budget, not an experimentally selected value. Run only
+on an appropriate allocation, after the focused checks and configuration
+resolution; this has not been executed locally.
+
+```bash
+python -m pytest -q tests/test_ppo_lora.py tests/test_checkpoints.py
+python run.py --scenario scenarios/ppo_lora_families.yaml --set maps=generated_hairpin \
+  --checkpoint pretrained_models/hairpin_best.pt --episodes 60000 \
+  --no-wandb --no-render --output-dir outputs/hairpin-continued --resolve-config
+python run.py --scenario scenarios/ppo_lora_families.yaml --set maps=generated_hairpin \
+  --checkpoint pretrained_models/hairpin_best.pt --episodes 60000 \
+  --no-wandb --no-render --output-dir outputs/hairpin-continued
+# If interrupted, use the same scenario, map, budget, and output directory.
+python run.py --scenario scenarios/ppo_lora_families.yaml --set maps=generated_hairpin \
+  --episodes 60000 --no-wandb --no-render --resume outputs/hairpin-continued/latest.pt \
+  --output-dir outputs/hairpin-continued
+```
+
+Configure workers, devices, W&B and CPU allocation for the machine before
+launch; preserve the same settings on recovery where required. Compare the new
+validation-selected checkpoint against the old one before choosing it. Keep the
+original checkpoint and bank manifest unchanged during this run. A later bank
+replacement requires an explicit update of the pinned path/hash and a new HL
+run or compatible new provenance; previously trained HL checkpoints bind to the
+old bank identity.

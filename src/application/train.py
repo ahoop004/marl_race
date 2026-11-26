@@ -180,7 +180,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
     elif initial_checkpoint is not None:
         learner.initialize_from_checkpoint(initial_checkpoint, scope=scenario["adaptation"]["load_scope"],
             observation_extension=params.get("pretrained_observation_extension"))
-        console.print_info(f"Initialized PPO actor and critic from {initial_checkpoint}; fresh optimizer and schedule.")
+        kind = "PPO LoRA adapter" if getattr(learner, "adapter_warm_start", None) else "PPO"
+        console.print_info(f"Initialized {kind} actor and critic from {initial_checkpoint}; fresh optimizer and schedule.")
     elif pretrained_actor_path is not None:
         learner.initialize_from_checkpoint(pretrained_actor_path, scope=scenario["adaptation"]["load_scope"],
             observation_extension=params.get("pretrained_actor_observation_extension"))
@@ -211,6 +212,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
     )
     if learner.source_checkpoint:
         provenance["pretrained_source"] = learner.source_checkpoint
+    if getattr(learner, "adapter_warm_start", None):
+        provenance["adapter_warm_start"] = learner.adapter_warm_start
     if resume_payload:
         provenance["recovery_source"] = resume_payload["_identity"]
     if wandb_logger:
