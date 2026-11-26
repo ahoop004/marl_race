@@ -117,10 +117,10 @@ paths recorded in checkpoint metadata.
 |---|---|---|
 | 0 | base | `pretrained_models/circle_ppo_seed42_20k/best.pt` |
 | 1 | straight | `pretrained_models/straight_best.pt` |
-| 2 | sweeper | `pretrained_models/sweep_best.pt` |
+| 2 | sweeper | `pretrained_models/sweeper_best.pt` |
 | 3 | hairpin | `pretrained_models/hairpin_best.pt` |
 | 4 | chicane | `pretrained_models/chicane_best.pt` |
-| 5 | s_curve | `pretrained_models/s_best.pt` |
+| 5 | s_curve | `pretrained_models/s_curve_best.pt` |
 
 All five source identities reference base hash
 `8665b07cd09fd5d306fbf0a74d18067a49aafd6c09e5b48a17e68c995a0118cc`.
@@ -392,7 +392,7 @@ concrete Stage C/D/G examples; use fresh directories for each run.
 ```bash
 python --version
 python -m pip check
-sha256sum pretrained_models/circle_ppo_seed42_20k/best.pt pretrained_models/straight_best.pt pretrained_models/sweep_best.pt pretrained_models/hairpin_best.pt pretrained_models/chicane_best.pt pretrained_models/s_best.pt
+sha256sum pretrained_models/circle_ppo_seed42_20k/best.pt pretrained_models/straight_best.pt pretrained_models/sweeper_best.pt pretrained_models/hairpin_best.pt pretrained_models/chicane_best.pt pretrained_models/s_curve_best.pt
 cat configs/hierarchical/bank.yaml
 python run.py --scenario scenarios/ppo_hierarchical.yaml --resolve-config
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q \
@@ -571,10 +571,10 @@ ENVS_PER_WORKER=1
 
 declare -A adapter=(
   [straight]=pretrained_models/straight_best.pt
-  [sweeper]=pretrained_models/sweep_best.pt
+  [sweeper]=pretrained_models/sweeper_best.pt
   [hairpin]=pretrained_models/hairpin_best.pt
   [chicane]=pretrained_models/chicane_best.pt
-  [s_curve]=pretrained_models/s_best.pt
+  [s_curve]=pretrained_models/s_curve_best.pt
 )
 
 # Validate first; no training in the following two commands.

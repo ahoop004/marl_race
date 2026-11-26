@@ -21,8 +21,7 @@ later_sweeps:
   algorithm.params.learning_rate: [0.0001, 0.0003, 0.001]
   algorithm.params.ent_coef: [0.0, 0.005, 0.01, 0.02]
   network.actor_hidden_dims: [[64, 64], [128, 128], [256, 256]]
-# Independent longer HL preview is not implemented; the original signed
-# curvature/width preview remains available to both policies unchanged.
+# The optional HL preview is independent of the low-level policy's preview.
 switching:
   starting_conditions: identical evaluation seeds and spawn schedules
   exact_state_restoration: false
