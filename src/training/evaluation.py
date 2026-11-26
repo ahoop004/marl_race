@@ -90,7 +90,8 @@ def run_evaluation_episode(task, actions_fn, *, episode, seed,
     if getattr(task, "hierarchical", False):
         record['hierarchical'] = {'metrics': task.metrics(), 'skills': task.bank.manifest,
             'transition_counts': task.transitions.tolist(),
-            'dwell_ll_decisions': task.dwell_times + [task.executor.state.since_change]}
+            'dwell_ll_decisions': task.dwell_times + [task.executor.state.since_change],
+            'dwell_seconds': task.dwell_durations + [task.dwell_seconds]}
         if task.config.get('record_trajectory', False):
             record['hierarchical']['trajectory'] = task.trace
     if include_rewards:
@@ -102,3 +103,13 @@ def run_evaluation_episode(task, actions_fn, *, episode, seed,
     physics = snapshot.infos.get(task.possible_agents[0], {}).get("physics")
     return EvaluationEpisode(facts, snapshot, map_id, spawn, record, physics,
                              team_return, team_components)
+
+
+def hierarchical_return_means(records):
+    """Explicit LL-comparable return summaries; legacy reward fields retain their meaning."""
+    rows = [r['hierarchical']['metrics'] for r in records if 'hierarchical' in r]
+    if not rows:
+        return {}
+    return {f'mean_{key}': sum(row[f'hierarchical/{key}'] for row in rows) / len(rows)
+            for key in ('return_ll_undiscounted', 'return_macro_discounted_sum',
+                        'return_ll_globally_discounted')}

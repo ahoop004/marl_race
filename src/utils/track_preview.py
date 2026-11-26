@@ -218,6 +218,7 @@ class TrackPreviewGeometry:
         count: int,
         *,
         start_index: Optional[int] = None,
+        spacing: Optional[float] = None,
     ) -> dict[str, np.ndarray | float]:
         """Return *count* samples beginning one interval ahead of the vehicle."""
         count = max(int(count), 1)
@@ -229,7 +230,7 @@ class TrackPreviewGeometry:
         )
         # The first sample is exactly one configured interval ahead of the
         # continuous vehicle projection, rather than one waypoint ahead.
-        distances = projection.arc_length + self.spacing * np.arange(
+        distances = projection.arc_length + (self.spacing if spacing is None else spacing) * np.arange(
             1, count + 1, dtype=np.float32
         )
         if self.closed:

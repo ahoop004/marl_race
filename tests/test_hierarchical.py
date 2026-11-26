@@ -268,3 +268,68 @@ def test_early_terminal_and_reset_ownership(bank, monkeypatch):
         assert wrapper.executor.last_action.tolist() == [0., 0.]
     finally:
         wrapper.close()
+
+
+def test_dwell_returns_and_selector_reset_stream(bank):
+    import numpy as np
+    from core.task_builder import create_race_task
+    from core.scenario import load_and_expand_scenario
+    from hierarchical.task import HierarchicalTask
+    scenario = load_and_expand_scenario('scenarios/ppo_circle_pretrain_20k.yaml')
+    scenario['environment']['max_steps'] = 12
+    scenario['environment']['action_repeat'] = 2
+    task = HierarchicalTask(create_race_task(scenario), bank,
+        {'interval': 2, 'gamma': .9, 'selector': {'type': 'random'}, 'dwell_time_scale_seconds': 1.0})
+    try:
+        start = task.reset(seed=42)
+        dwell_index = bank.obs_dim + len(bank.actors)
+        assert start.observations['car_0'][dwell_index] == 0
+        first = task.selector.rng.integers(2**32, size=8)
+        task.reset(seed=42)
+        assert np.array_equal(first, task.selector.rng.integers(2**32, size=8))
+        task.reset()
+        assert not np.array_equal(first, task.selector.rng.integers(2**32, size=8))
+        task.config['selector'] = {'type': 'learned'}
+        task.reset(seed=43)
+        for skill in (0, 0, 1):
+            previous_elapsed = task.elapsed
+            task.step({'car_0': np.array([skill], dtype=np.int64)})
+            if skill == 1:
+                assert task.dwell_seconds == pytest.approx(task.elapsed - previous_elapsed)
+            else:
+                assert task.dwell_seconds == pytest.approx(task.elapsed)
+        # Identical fixed-skill trajectory under different macro partitions.
+        outputs = []
+        for interval in (1, 2, 5):
+            task.config['selector'] = {'type': 'fixed', 'skill': 0}
+            task.executor.interval = interval
+            task.reset(seed=43)
+            while not task.episode_done:
+                result = task.step({'car_0': np.array([0], dtype=np.int64)})
+                assert task.dwell_seconds == pytest.approx(task.elapsed)
+                if result.after.observations:
+                    assert result.after.observations['car_0'][dwell_index] == pytest.approx(np.tanh(task.elapsed))
+            outputs.append(task.metrics())
+        for name in ('return_ll_undiscounted', 'return_ll_globally_discounted'):
+            assert [row['hierarchical/' + name] for row in outputs] == pytest.approx([outputs[0]['hierarchical/' + name]] * 3)
+    finally:
+        task.close()
+
+
+def test_extended_preview_contract_and_invalid_scales(bank):
+    import numpy as np
+    from core.task_builder import create_race_task
+    from core.scenario import load_and_expand_scenario
+    from hierarchical.task import HierarchicalTask
+    scenario = load_and_expand_scenario('scenarios/ppo_circle_pretrain_20k.yaml')
+    task = create_race_task(scenario)
+    try:
+        with pytest.raises(ValueError, match='dwell_time_scale_seconds'):
+            HierarchicalTask(task, bank, {'dwell_time_scale_seconds': 0})
+        extended = HierarchicalTask(task, bank, {'preview': {'enabled': True, 'samples': 20, 'spacing_m': .6}})
+        initial = extended.reset(seed=42)
+        assert initial.observations['car_0'].shape == (bank.obs_dim + 9 + 40,)
+        assert extended.spec.observation_contracts['car_0']['version'] == 2
+        assert np.isfinite(initial.observations['car_0']).all()
+    finally:
+        task.close()

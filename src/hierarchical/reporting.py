@@ -46,8 +46,12 @@ def summarize(paths):
                     switches.append({'method': method, 'map': record['map_id'], **row,
                         'post_switch_crash_20ll': int(any(r.get('collision', False) for r in future)),
                         'post_switch_max_lateral_error_20ll': max(abs(r['lateral_error']) for r in future),
-                        'post_switch_distance_20ll': future[-1].get('distance_m', 0.) - row.get('distance_m', 0.),
-                        'observed_post_switch_ll': len(future)})
+                        'post_switch_forward_centerline_progress_m': (future[-1]['forward_centerline_progress_m'] - row['before_forward_centerline_progress_m']
+                            if 'before_forward_centerline_progress_m' in row else None),
+                        'observed_post_switch_ll': len(future),
+                        'observed_post_switch_seconds': sum(r.get('decision_dt', 0.) for r in future),
+                        'post_switch_window_complete': len(future) == 20,
+                        'post_switch_window_ended_episode': bool(len(future) < 20 and (future[-1].get('terminated') or future[-1].get('truncated')))})
                 key = row.get('maneuver_id', 'unknown')
                 if not visits or visits[-1][0] != key:
                     visits.append((key, []))

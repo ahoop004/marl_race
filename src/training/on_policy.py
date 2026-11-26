@@ -1,5 +1,6 @@
 """Synchronous TorchRL collection and the shared PPO/MAPPO update loop."""
 import time
+import json
 import math
 import sys
 import logging
@@ -92,6 +93,8 @@ class OnPolicyTrainer:
         self._process_placement = cpu_placement()
         self._process_placement.pop("cpu_topology")
         self._collection_batches = self._last_collection_batch_frames = 0
+        self._batch_ll_since_update = []
+        self._last_batch_ll_decisions = 0
         self.collection_device = resolve_collection_device(
             collection_device, agent.device, parallel_envs, envs_per_worker, collection_backend,
             distributed=distributed is not None)
@@ -1226,6 +1229,9 @@ class OnPolicyTrainer:
                     **self.performance_metrics(),
                     "train/update_environment_steps": decisions - update_environment_steps,
                     "train/update_physics_steps": physics - update_physics_steps,
+                    **({"hierarchical/last_collection_batch_ll_decisions": self._last_batch_ll_decisions,
+                        "hierarchical/collection_batch_ll_decisions": json.dumps(self._batch_ll_since_update)}
+                       if getattr(self.agent, "hierarchical", None) else {}),
                     "train/update_agent_samples": samples - update_agent_steps,
                     "perf/update_seconds": time.perf_counter() - update_started,
                     "perf/collection_seconds": max(0.0, update_started - collection_started - (
@@ -1253,6 +1259,7 @@ class OnPolicyTrainer:
                     updated.update(self.rank_metrics)
                 for hook in self.hooks:
                     self.call_hook(hook, "on_update", updated)
+                self._batch_ll_since_update.clear()
                 collection_started = time.perf_counter()
                 collection_service_seconds = sum(self.service_seconds.values())
             return updated
@@ -1434,6 +1441,7 @@ class OnPolicyTrainer:
                 iterator = iter(collector)
                 while True:
                     try:
+                        batch_ll_start = self._rate_counters()[0]
                         batch_started = time.perf_counter()
                         if self.measure_collector_startup and not self._collection_batches:
                             self.collector_startup["first_collection_begin_seconds"] = batch_started - startup_started
@@ -1484,6 +1492,9 @@ class OnPolicyTrainer:
                                 self.record_workload("fragment_count")
                     self._record_boundary("aggregation", aggregation_started)
                     self._synchronize_progress()
+                    if getattr(self.agent, "hierarchical", None):
+                        self._last_batch_ll_decisions = self._rate_counters()[0] - batch_ll_start
+                        self._batch_ll_since_update.append(self._last_batch_ll_decisions)
                     ready = ((self._global_pending_steps if self.distributed else self._pending_learning_steps)
                              >= self.agent.n_steps or self.collection_budget_reached())
                     if ready and (pending or self.distributed):

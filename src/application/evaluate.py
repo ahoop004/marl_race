@@ -268,6 +268,8 @@ def _run_evaluation(
         opponent_agent_id=opponent_agent_id,
         timestep=float(env.timestep),
     )
+    from training.evaluation import hierarchical_return_means
+    summary.update(hierarchical_return_means(list(eval_records.values())))
     summary["strict_clean_finish_count"] = sum(record["strict_clean_finish"] for record in eval_records.values())
     summary["strict_clean_completion_rate"] = summary["strict_clean_finish_count"] / eval_episodes
     if not opponent_ids and len(trainable_ids) > 1:
@@ -348,6 +350,9 @@ def _run_evaluation(
             for facts in eval_episodes_facts
         ],
     }
+    for map_name, row in report["per_map"].items():
+        row.update(hierarchical_return_means([record for record in eval_records.values()
+                                             if record["map_id"] == map_name]))
     report_path = output_dir / "evaluation_report.json"
     # An interrupted write must never masquerade as a completed final evaluation.
     import os

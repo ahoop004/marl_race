@@ -64,11 +64,14 @@ class GeometrySelector:
         self.ids = {entry['name']: entry['id'] for entry in skills}
         self.anticipation = float(anticipation)
         self.fallback = int(fallback)
+        self.last_fallback_reason = None
         if self.anticipation < 0:
             raise ValueError('anticipation must be nonnegative')
 
     def select(self, *, metadata=None, s=0.0, **context):
-        if not metadata or metadata.get('schema_version') != '2.0.0':
+        self.last_fallback_reason = None
+        if not metadata or metadata.get('schema_version') != '2.0.0' or not metadata.get('measured', {}).get('length_m'):
+            self.last_fallback_reason = 'missing_metadata'
             return self.fallback
         length = metadata['measured']['length_m']
         query = (s + self.anticipation) % length
@@ -77,10 +80,21 @@ class GeometrySelector:
             start, end = maneuver['s_start_m'], maneuver['s_end_m']
             inside = (query >= start or query < end) if maneuver['wraps_seam'] else start <= query < end
             if inside:
-                family = maneuver['type']
-                role = maneuver.get('requested', {}).get('composition_role')
-                matches.append(self.ids.get(family, self.fallback) if role == 'primary' else self.fallback)
-        return matches[0] if len(matches) == 1 else self.fallback
+                matches.append(maneuver)
+        if len(matches) != 1:
+            self.last_fallback_reason = 'ambiguous_annotation' if matches else 'no_matching_maneuver'
+        else:
+            maneuver = matches[0]
+            family = maneuver['type']
+            role = maneuver.get('requested', {}).get('composition_role')
+            if role != 'primary':
+                self.last_fallback_reason = 'transition_region' if role in {'transition', 'distributed_gap'} else 'supporting_maneuver'
+            elif family not in self.ids:
+                self.last_fallback_reason = 'unsupported_geometry_family'
+            else:
+                return self.ids[family]
+        return self.fallback
+
 
 
 def make_selector(config, skills, seed=0):

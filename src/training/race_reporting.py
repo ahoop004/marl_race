@@ -156,6 +156,8 @@ class RaceTrainingReports:
             "policy_version_start": self.start_policy, "policy_version_end": t._updates,
             "reported_at_environment_steps": t._environment_steps,
             "team_reward_components": dict(self.team_components), "training_return": self.reward}
+        if getattr(self.task, "hierarchical", False):
+            metrics["race_record"]["hierarchical"] = {"metrics": self.task.metrics()}
         if (t.algorithm == "ppo" and self.episode_stride == 1
                 and getattr(t.env, "environment_id", None) is None):
             # Preserve PPO's existing episode CSV path and metric contract.

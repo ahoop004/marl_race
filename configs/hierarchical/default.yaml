@@ -4,6 +4,13 @@ defaults:
 enabled: true
 interval: 5
 gamma: ${algorithm.params.gamma}
+dwell_time_scale_seconds: 1.0
+preview:
+  enabled: false
+  samples: 20
+  spacing_m: 0.6
+  curvature_scale: 1.0
+  width_scale: 1.0
 selector:
   type: learned
   skill: 0

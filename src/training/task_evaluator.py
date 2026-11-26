@@ -1,7 +1,7 @@
 """Shared checkpoint-evaluation reporting around the task episode runner."""
 from adapters.rewards import RewardMapping
 from metrics.racing_eval import aggregate_eval_episodes
-from training.evaluation import run_evaluation_episode
+from training.evaluation import run_evaluation_episode, hierarchical_return_means
 from training.runtime import evaluation_mode
 
 
@@ -63,6 +63,10 @@ class TaskEvaluator:
         summary = aggregate_eval_episodes(results, **kwargs)
         summary["per_map"] = {name: aggregate_eval_episodes(rows, **kwargs)
                               for name, rows in by_map.items()}
+        summary.update(hierarchical_return_means(records))
+        for name, row in summary["per_map"].items():
+            row.update(hierarchical_return_means([record for record in records
+                       if str(record["map_id"] or "unknown") == name]))
         summary["episode_results"], summary["evaluation_protocol"] = records, protocol
         for row in [summary, *summary["per_map"].values()]:
             # Selection is fact-based, although rewards follow the same task path.

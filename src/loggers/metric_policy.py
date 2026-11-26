@@ -17,7 +17,7 @@ CORE = (
     "episode/environment_id", "episode/environment_episode", "episode/environment_steps",
     "episode/reward", "episode/steps", "episode/lap_count", "episode/lap_time_s",
     "episode/completed", "episode/failed", "episode/timeout", "episode/net_progress_laps",
-    "episode/reward/*", "episode/individual_reward/*",
+    "episode/reward/*", "episode/individual_reward/*", "episode/hierarchical/*",
     "episode/team/completion_rate", "episode/team/all_finished",
     "episode/team/failure_rate", "episode/team/timeout_rate",
     "episode/team/first_place", "episode/team/sweep", "episode/team/rank_score",
@@ -33,6 +33,8 @@ CORE = (
     "eval/completion_rate", "eval/learner_failure_rate", "eval/timeout_rate",
     "eval/collision_rate", "eval/team_collision_rate",
     "eval/mean_net_progress", "eval/mean_clean_finish_time_s", "eval/clean_finish_count",
+    "eval/mean_return_ll_undiscounted", "eval/mean_return_macro_discounted_sum",
+    "eval/mean_return_ll_globally_discounted",
     "eval/race_count", "eval/evaluation_seconds", "eval/map/*/clean_completion_rate",
 )
 RACING = (
