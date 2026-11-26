@@ -146,6 +146,7 @@ def _run_evaluation(
         if checkpoint_hash != task.bank.manifest[0]["sha256"]:
             raise ValueError("Baseline selectors require the manifest's original PPO base checkpoint")
         agent = SimpleNamespace(actor=torch.nn.Identity(), device=torch.device("cpu"),
+            identity={"selector": task.config["selector"], "skills": task.bank.manifest},
             evaluation_actions=lambda ids, observations: {aid: np.array([0], dtype=np.int64) for aid in ids})
     elif solo_actor:
         from agents.common.checkpoints import solo_evaluation_actor

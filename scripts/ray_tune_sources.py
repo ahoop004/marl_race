@@ -125,8 +125,12 @@ def inspect_model(config, source=None):
                     observation_extension=config["adaptation"]["observation_extension"])
                 if learner.source_checkpoint["sha256"] != source["sha256"]:
                     raise ValueError("Loaded PPO source SHA-256 changed during validation")
+            if getattr(task, "hierarchical", False):
+                learner.frozen_bank_accounting = task.bank.accounting()
             counts = learner_parameter_counts(learner)
-            return {"resolved_network": learner.network_config,
+            return {**({"hierarchy": learner.hierarchy_contract, "frozen_bank": task.bank.accounting()}
+                       if getattr(learner, "hierarchical", None) else {}),
+                    "resolved_network": learner.network_config,
                     "encoder_type": model_spec(learner.network_config, "actor")["encoder"]["type"],
                     "actor_head": model_spec(learner.network_config, "actor")["architecture"],
                     "critic_head": model_spec(learner.network_config, "critic")["architecture"],

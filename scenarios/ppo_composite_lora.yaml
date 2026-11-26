@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+- ppo_composite_scratch
+- override /adaptation: ppo_lora
+- _self_
+experiment:
+  name: ppo_composite_lora
+paths:
+  pretrained_checkpoint: ${paths.project_root}/pretrained_models/circle_ppo_seed42_20k/best.pt

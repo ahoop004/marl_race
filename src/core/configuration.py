@@ -152,8 +152,12 @@ def validate_configuration(config):
         raise ScenarioError(str(exc)) from exc
     actor = network.get("actor", {})
     critic = network.get("critic", {})
-    if actor and actor.get("distribution", "tanh_normal") != "tanh_normal":
-        raise ScenarioError("Only an actor with a tanh_normal distribution is implemented")
+    hierarchical = config.get("hierarchical", {}).get("enabled", False)
+    expected_distribution = "categorical" if hierarchical else "tanh_normal"
+    if hierarchical and (algorithm["name"] != "ppo" or adaptation["mode"] != "scratch"):
+        raise ScenarioError("Hierarchical training requires PPO with a fresh categorical selector")
+    if actor and actor.get("distribution", "tanh_normal") != expected_distribution:
+        raise ScenarioError(f"This actor requires distribution={expected_distribution}")
     expected_input = "local_observation" if algorithm["name"] == "ppo" else "global_state"
     expected_sharing = "independent" if algorithm["name"] == "ppo" else "shared_team"
     if critic and (critic.get("input_type") != expected_input

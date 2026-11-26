@@ -14,6 +14,8 @@ experiment:
   total_steps: 4096000
   torch_threads: 1
 network:
+  actor:
+    distribution: categorical
   actor_hidden_dims: [128, 128]
   critic_hidden_dims: [128, 128]
 algorithm:
@@ -26,9 +28,6 @@ algorithm:
     gae_lambda: 0.95
     clip_range: 0.2
     ent_coef: 0.01
-training_defaults:
-  device: cpu
-  collection_device: cpu
 environment:
   max_steps: 8000
   target_laps: 1

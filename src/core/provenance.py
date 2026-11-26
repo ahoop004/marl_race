@@ -35,6 +35,11 @@ def learner_parameter_counts(policy):
             p.numel() for actor in actors.values() for name, p in actor.named_parameters()
             if p.requires_grad and name == "log_std")
     counts["learner_trainable"] = counts["actor_trainable"] + counts["critic_trainable"]
+    bank = getattr(policy, "frozen_bank_accounting", None)
+    if bank:
+        counts["frozen_skill_bank_total"] = bank["parameters"]
+        counts["frozen_skill_bank_tensor_bytes"] = bank["tensor_bytes"]
+        counts["total_with_frozen_skill_bank"] = counts["actor_total"] + counts["critic_trainable"] + bank["parameters"]
     return counts
 
 

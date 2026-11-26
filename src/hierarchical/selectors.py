@@ -41,6 +41,18 @@ class RandomSelector:
         return int(self.rng.integers(self.n_skills))
 
 
+class SequenceSelector:
+    """Reproducible switch-pair approaches for offline compatibility studies."""
+    def __init__(self, sequence):
+        self.sequence = tuple(sequence)
+        self.position = 0
+
+    def select(self, **context):
+        skill = self.sequence[self.position % len(self.sequence)]
+        self.position += 1
+        return skill
+
+
 class GeometrySelector:
     """Phase5 V2 arc-length annotations; unsupported corners/support/transition use fallback.
 
@@ -81,8 +93,16 @@ def make_selector(config, skills, seed=0):
         return selector
     if kind == 'random':
         return RandomSelector(len(skills), seed)
+    if kind == 'sequence':
+        sequence = config.get('sequence', [])
+        if not sequence or any(type(skill) is not int or not 0 <= skill < len(skills) for skill in sequence):
+            raise ValueError('Sequence selector requires a nonempty list of valid skill IDs')
+        return SequenceSelector(sequence)
     if kind == 'geometry':
-        return GeometrySelector(skills, config.get('anticipation', 1.0), config.get('fallback', 0))
+        fallback = config.get('fallback', 0)
+        if type(fallback) is not int or not 0 <= fallback < len(skills):
+            raise ValueError('Invalid geometry fallback skill')
+        return GeometrySelector(skills, config.get('anticipation', 1.0), fallback)
     raise ValueError(f'Unknown hierarchical selector: {kind}')
 
 
@@ -101,7 +121,7 @@ class SkillExecutor:
     def action(self, observation, skill=None):
         import torch
         if skill is not None:
-            if not 0 <= skill < len(self.bank.actors):
+            if isinstance(skill, bool) or not isinstance(skill, (int, np.integer)) or not 0 <= skill < len(self.bank.actors):
                 raise ValueError('Unknown skill ID')
             self.state.select(skill)
         if self.state.active < 0:
@@ -110,3 +130,23 @@ class SkillExecutor:
             torch.tensor([self.state.active], dtype=torch.long))[0].cpu().numpy()
         self.state.advance()
         return self.last_action.copy()
+
+
+def geometry_annotation(metadata, s, skill_name=None):
+    """Diagnostic labels only; shared by offline trajectory reports."""
+    if not metadata:
+        return {'geometry': 'unknown', 'maneuver_id': 'unknown', 'composition_role': 'unknown'}
+    length = metadata['measured']['length_m']
+    s %= length
+    relevant = [m for m in metadata.get('maneuvers', []) if m['type'] == skill_name
+                and m.get('requested', {}).get('composition_role') == 'primary']
+    entry_distance = min(((m['s_start_m'] - s) % length for m in relevant), default=None)
+    for m in metadata.get('maneuvers', []):
+        inside = ((s >= m['s_start_m'] or s < m['s_end_m']) if m['wraps_seam']
+                  else m['s_start_m'] <= s < m['s_end_m'])
+        if inside:
+            return {'geometry': m['type'], 'maneuver_id': m['id'],
+                'composition_role': m.get('requested', {}).get('composition_role', 'unknown'),
+                'distance_since_entry_m': (s - m['s_start_m']) % length,
+                'selection_distance_to_skill_entry_m': entry_distance}
+    return {'geometry': 'unknown', 'maneuver_id': 'unknown', 'composition_role': 'unknown'}

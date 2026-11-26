@@ -109,6 +109,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
     task = create_race_task(scenario, scenario_dir=scenario_dir, roles=roles,
                             render_mode="human" if render else None)
     resources.callback(task.close)
+    if getattr(task, "hierarchical", False) and task.selector is not None:
+        raise ValueError("Baseline hierarchical selectors are evaluation-only; train with hierarchical.selector.type=learned")
     spec = task.spec
     params = learner_params(scenario, spec, algorithm)
     if distributed:
@@ -156,6 +158,8 @@ def _run_training(scenario, args, console, scenario_dir, roles, resources, distr
     )
 
     learner = create_learner(algorithm, spec, params)
+    if getattr(task, "hierarchical", False):
+        learner.frozen_bank_accounting = task.bank.accounting()
     workers = exp_cfg.get("parallel_envs", 1)
     envs_per_worker = exp_cfg.get("envs_per_worker", 1)
     if distributed:

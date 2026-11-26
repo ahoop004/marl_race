@@ -1,0 +1,31 @@
+# Planning inventory; selectors are evaluated with run.py, not launched as learners.
+dataset: maps_generated/manifest.json
+maps: composite
+budget_unit: ll_environment_decisions
+upstream_cost: Report base pretraining plus all five specialist training costs separately from incremental HL cost.
+methods:
+  B0: {selector: fixed, skill: 0}
+  B1: {selector: fixed, skill: 1}
+  B2: {selector: fixed, skill: 2}
+  B3: {selector: fixed, skill: 3}
+  B4: {selector: fixed, skill: 4}
+  B5: {selector: fixed, skill: 5}
+  B6: {selector: fixed, skill: validation_selected, selection: completion_progress}
+  B7: {selector: random}
+  B8: {selector: geometry, privileged: true}
+  B9: {scenario: scenarios/ppo_composite_scratch.yaml}
+  B10: {scenario: scenarios/ppo_composite_lora.yaml}
+  H1: {scenario: scenarios/ppo_hierarchical.yaml}
+primary_sweep: scripts/sweeps/hierarchical_intervals.yaml
+later_sweeps:
+  algorithm.params.learning_rate: [0.0001, 0.0003, 0.001]
+  algorithm.params.ent_coef: [0.0, 0.005, 0.01, 0.02]
+  network.actor_hidden_dims: [[64, 64], [128, 128], [256, 256]]
+# Independent longer HL preview is not implemented; the original signed
+# curvature/width preview remains available to both policies unchanged.
+switching:
+  starting_conditions: identical evaluation seeds and spawn schedules
+  exact_state_restoration: false
+  record_trajectory: true
+  selector: sequence
+  sequence: [0, 1]

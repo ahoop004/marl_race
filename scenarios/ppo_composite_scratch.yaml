@@ -1,0 +1,24 @@
+# @package _global_
+defaults:
+- ppo_generated_finetune
+- override /adaptation: scratch
+- override /maps: composite
+- override /execution: hierarchical_cpu
+- override /reward: generated_one_lap
+- _self_
+experiment:
+  name: ppo_composite_scratch
+  total_steps: 4096000
+  parallel_envs: 1
+  envs_per_worker: 1
+network:
+  actor_hidden_dims: [256, 256]
+  critic_hidden_dims: [512, 512]
+environment:
+  target_laps: 1
+  max_steps: 8000
+  render: false
+evaluation:
+  selection_strategy: completion_progress
+wandb:
+  enabled: false

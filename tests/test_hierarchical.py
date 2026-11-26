@@ -207,3 +207,64 @@ def test_real_selector_evaluation(selector):
         assert task.annotations and task.annotations['schema_version'] == '2.0.0'
     finally:
         task.close()
+
+
+def test_offline_reporting(tmp_path):
+    import json
+    from hierarchical.reporting import write_reports
+    path = tmp_path / 'evaluation_report.json'
+    trace = [{'timestamp': i*.05, 'x': float(i), 'y': 0., 'skill': i,
+              'switched': bool(i), 'speed': 1., 'lateral_error': .1, 'command_jump': .2}
+             for i in range(2)]
+    record = {'map_id': 'validation_composite_01', 'seed': 42, 'duration_s': .1,
+        'strict_clean_finish': False, 'mean_net_progress_laps': .1, 'any_learner_collision_dnf': False,
+        'hierarchical': {'skills': [{'sha256': 'a'*64}], 'trajectory': trace, 'transition_counts': [[1]]}}
+    path.write_text(json.dumps({'episode_results': [{'race_record': record}]}))
+    result = write_reports([path], tmp_path / 'reports')
+    assert result['matrix'] and result['segments'] and result['switches']
+    assert (tmp_path / 'reports/trajectory_0_0.svg').exists()
+    record['hierarchical']['skills'][0]['sha256'] = 'b'*64
+    other = tmp_path / 'other.json'
+    other.write_text(json.dumps({'episode_results': [{'race_record': record}]}))
+    with pytest.raises(ValueError, match='different adapter banks'):
+        write_reports([path, other], tmp_path / 'mixed')
+
+
+def test_categorical_likelihood_and_entropy():
+    from hierarchical.policy import SkillDistribution
+    logits = torch.tensor([[[0., 1., -1.]], [[2., 0., 0.]]])
+    dist = SkillDistribution(logits)
+    sampled = dist.sample()
+    assert sampled.shape == (2, 1) and sampled.dtype == torch.long
+    reference = torch.distributions.Categorical(logits=logits.squeeze(-2))
+    assert torch.equal(dist.mode.squeeze(-1), logits.squeeze(-2).argmax(-1))
+    assert torch.allclose(dist.log_prob(sampled), reference.log_prob(sampled.squeeze(-1)))
+    assert torch.allclose(dist.entropy(), reference.entropy())
+
+
+def test_early_terminal_and_reset_ownership(bank, monkeypatch):
+    import numpy as np
+    from dataclasses import replace
+    from core.task_builder import create_race_task
+    from core.scenario import load_and_expand_scenario
+    from hierarchical.task import HierarchicalTask
+    scenario = load_and_expand_scenario('scenarios/ppo_circle_pretrain_20k.yaml')
+    task = create_race_task(scenario)
+    wrapper = HierarchicalTask(task, bank, {'interval': 20, 'gamma': .99})
+    original = task.step
+    def terminate(actions, **kwargs):
+        step = original(actions, **kwargs)
+        return replace(step, decisions={'car_0': replace(step.decisions['car_0'], terminated=True)},
+            after=replace(step.after, episode_done=True, agents=(), observations={}))
+    monkeypatch.setattr(task, 'step', terminate)
+    try:
+        wrapper.reset(seed=42)
+        step = wrapper.step({'car_0': np.array([3], dtype=np.int64)})
+        assert step.ll_decisions == 1 and step.decisions['car_0'].terminated
+        assert len(step.decisions['car_0'].next_observation) == wrapper.dim
+        wrapper.reset(seed=43)
+        assert wrapper.executor.state.active == -1
+        assert wrapper.executor.state.switches == 0
+        assert wrapper.executor.last_action.tolist() == [0., 0.]
+    finally:
+        wrapper.close()

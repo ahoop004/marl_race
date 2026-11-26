@@ -6,7 +6,7 @@ import numpy as np
 
 from env.spaces import SpaceSpec
 from tasks.contracts import TaskStep
-from hierarchical.selectors import SkillExecutor, make_selector
+from hierarchical.selectors import SkillExecutor, make_selector, geometry_annotation
 
 
 class HierarchicalTask:
@@ -70,6 +70,7 @@ class HierarchicalTask:
         self.executor.reset()
         self.last_duration = 0
         self.trace = []
+        self.previous_physical_action = None
         self.dwell_times = []
         self.skill_distance = np.zeros(self.n_skills)
         self.episode_ll = self.episode_hl = 0
@@ -80,7 +81,7 @@ class HierarchicalTask:
         self.episodes += 1
         self.selector = make_selector(self.config.get('selector', {}), self.bank.manifest, seed or 0)
         self.annotations = None
-        if self.selector is not None:
+        if self.selector is not None or self.config.get('record_trajectory', False):
             path = self.task.env.yaml_path.with_name(self.task.env.yaml_path.stem + '_metadata.json')
             if path.exists():
                 self.annotations = json.loads(path.read_text())
@@ -101,34 +102,47 @@ class HierarchicalTask:
                 s=self._snapshot.infos[self.aid].get('centerline', {}).get('s', 0.0))
         before = self.snapshot(self._snapshot)
         old = self.executor.state.active
+        old_dwell = self.executor.state.since_change
         self.executor.state.select(skill)
         self.selection_counts[skill] += 1
         if old >= 0 and old != skill:
-            self.dwell_times.append(before.observations[self.aid][-self.bank.action_dim-1].item())
+            self.dwell_times.append(old_dwell)
         if old >= 0:
             self.transitions[old, skill] += 1
         reward, components, substeps = 0., {}, []
         for i in range(self.executor.interval):
+            previous_action = self.executor.last_action.copy()
             inference_started = time.perf_counter()
             ll_action = self.executor.action(self._snapshot.observations[self.aid])
             self.ll_inference_seconds += time.perf_counter() - inference_started
-            previous_action = (self.trace[-1]["action"] if self.trace else ll_action.tolist())
             result = self.task.step({self.aid: ll_action}, on_physics_step=on_physics_step)
             decision = result.decisions[self.aid]
+            physical = np.asarray(decision.action_physical)
+            physical_previous = physical if self.previous_physical_action is None else self.previous_physical_action
             self.elapsed += result.elapsed_seconds
             self.episode_ll += 1
-            distance = max(0., decision.info.get('centerline', {}).get('progress_delta', 0.) * self.task.env.centerline_track_length)
+            distance = sum(max(0., substep.facts.info[self.aid].get('centerline', {}).get('progress_delta', 0.))
+                           for substep in result.substeps) * self.task.env.centerline_track_length
             self.distance += distance
             self.skill_distance[skill] += distance
             if self.config.get('record_trajectory', False):
                 state = result.substeps[-1].facts.agent_states[self.aid]
-                self.trace.append({'timestamp': self.elapsed, 'x': float(state.pose[0]), 'y': float(state.pose[1]),
+                self.trace.append({**geometry_annotation(self.annotations, decision.info.get('centerline', {}).get('s', 0.), self.bank.manifest[skill]['name']),
+                    'timestamp': self.elapsed, 'decision_dt': result.elapsed_seconds, 'distance_m': self.distance, 'x': float(state.pose[0]), 'y': float(state.pose[1]),
                     'skill': skill, 'action': ll_action.tolist(),
+                    'physical_action': physical.tolist(),
+                    'physical_steering_command_jump': float(abs(physical[0] - physical_previous[0])),
+                    'physical_speed_command_jump': float(abs(physical[1] - physical_previous[1])),
                     'command_jump': float(np.linalg.norm(ll_action - previous_action)),
+                    'steering_jump': float(abs(ll_action[0] - previous_action[0])),
+                    'speed_command_jump': float(abs(ll_action[1] - previous_action[1])),
+                    'collision': bool(decision.info.get('collision', False)),
+                    'terminated': bool(decision.terminated), 'truncated': bool(decision.truncated),
                     's': float(decision.info.get('centerline', {}).get('s', 0.)),
                     'lateral_error': float(decision.info.get('centerline', {}).get('d', 0.)),
                     'speed': float(np.linalg.norm(state.velocity)),
                     'switched': old >= 0 and old != skill and i == 0})
+            self.previous_physical_action = physical.copy()
             reward += self.gamma ** i * decision.individual_reward
             for name, value in decision.reward_components.items():
                 components[name] = components.get(name, 0.) + self.gamma ** i * value

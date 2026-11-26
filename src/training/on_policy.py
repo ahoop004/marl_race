@@ -859,7 +859,8 @@ class OnPolicyTrainer:
         if getattr(self.agent, "hierarchical", None):
             metrics.update({"hierarchical/ll_decisions": progress["environment_steps"],
                             "hierarchical/hl_decisions": progress["agent_steps"],
-                            "hierarchical/hl_learner_samples": progress["agent_steps"]})
+                            "hierarchical/hl_learner_samples": progress["agent_steps"],
+                            "hierarchical/simulated_seconds": progress["physics_steps"] * self.task.timestep})
         metrics["train/optimizer_steps_total"] = self._optimizer_steps
         if self.continual is not None:
             metrics.update(self.continual.progress_metrics())

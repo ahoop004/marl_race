@@ -18,7 +18,8 @@ class AdapterBank(nn.Module):
         super().__init__()
         started = time.perf_counter()
         entries = manifest["skills"]
-        if ([e["id"] for e in entries] != list(range(len(entries)))
+        if (any(type(e["id"]) is not int for e in entries)
+                or [e["id"] for e in entries] != list(range(len(entries)))
                 or len({e["name"] for e in entries}) != len(entries)
                 or not entries or entries[0]["name"] != "base"):
             raise ValueError("Skills require ordered contiguous IDs starting with base=0 and unique names")
