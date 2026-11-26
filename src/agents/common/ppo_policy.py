@@ -29,6 +29,7 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         params: Dict,
         *, training: bool = False,
     ) -> None:
+        self.hierarchical = params.get("hierarchical")
         self.agent_ids = list(params.get("_agent_ids", ["policy"]))
         from agents.common.lora import resolve_lora_config
         self.lora_config = resolve_lora_config(params.get("lora"))
@@ -66,13 +67,28 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         device_str = str(params.get("device", "cpu"))
         self.device = resolve_device([device_str])
 
-        self.actor = build_actor(
-            obs_dim, self.action_dim, self.network_config,
-            log_std_init=float(params.get("log_std_init", 0.0)),
-            observation_contract=self.observation_contract,
-        ).to(self.device)
+        if self.hierarchical:
+            if self.lora_config:
+                raise ValueError("HL PPO cannot adapt the frozen driving skills")
+            from hierarchical.policy import CategoricalActor
+            self.actor = CategoricalActor(obs_dim, len(self.hierarchical["bank"]["skills"]), self.network_config).to(self.device)
+            # References and hashes only: the task owns the frozen actors.
+            from hierarchical.bank import PROJECT_ROOT
+            from agents.common.checkpoints import checkpoint_sha256
+            from pathlib import Path
+            self.hierarchy_contract = {**self.hierarchical,
+                "discount_convention": "gamma_ll**k; trace=(gamma_ll*lambda_ll)**k",
+                "skills": [{**entry, "sha256": checkpoint_sha256(
+                    Path(entry["checkpoint"]) if Path(entry["checkpoint"]).is_absolute()
+                    else PROJECT_ROOT / entry["checkpoint"])} for entry in self.hierarchical["bank"]["skills"]]}
+        else:
+            self.actor = build_actor(
+                obs_dim, self.action_dim, self.network_config,
+                log_std_init=float(params.get("log_std_init", 0.0)),
+                observation_contract=self.observation_contract,
+            ).to(self.device)
         self.critic = build_critic(obs_dim, self.network_config,
-                                   observation_contract=self.observation_contract).to(self.device)
+                                   observation_contract=None if self.hierarchical else self.observation_contract).to(self.device)
         # Initialize the critic before adapters to preserve seeded controls.
         self.lora_contract = None
         if self.lora_config is not None:
@@ -130,7 +146,7 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         values = self.critic(obs_t)
         # One device-to-host transfer for all environments and policy outputs.
         outputs = torch.cat((actions, raw_actions, log_probs[:, None], values[:, None]), dim=1).cpu().numpy()
-        return PolicyOutput(outputs[:, :self.action_dim], outputs[:, -2],
+        return PolicyOutput(outputs[:, :self.action_dim].astype(np.int64) if self.hierarchical else outputs[:, :self.action_dim], outputs[:, -2],
                             outputs[:, self.action_dim:2 * self.action_dim].copy(), outputs[:, -1])
 
     def act_batch(self, observations, deterministic=False):

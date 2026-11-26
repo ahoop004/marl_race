@@ -23,6 +23,8 @@ class _PolicyParameters(torch.nn.Module):
         self.actor = actor
 
     def forward(self, observation):
+        if getattr(self.actor, "categorical", False):
+            return self.actor(observation)[0]
         mean, scale = self.actor(observation)
         return mean, scale.expand_as(mean)
 
@@ -63,6 +65,8 @@ class TorchRLPPOAgent(PPOPolicy):
                 if value is not None:
                     # Physical race closure can follow the learner's retirement.
                     data["next", name] = value.squeeze(-2)
+        if self.hierarchical:
+            data["steps_to_next_obs"] = rollout["next", "steps_to_next_obs"]
         return data
 
     def __init__(self, obs_dim, action_low, action_high, params):
@@ -71,16 +75,17 @@ class TorchRLPPOAgent(PPOPolicy):
         if min(self.n_steps, self.n_epochs, self.batch_size, self.frames_per_batch) < 1:
             raise ValueError("PPO rollout size, epochs, and batch size must be positive")
         parameters = TensorDictModule(
-            _PolicyParameters(self.actor), in_keys=["observation"], out_keys=["loc", "scale"],
+            _PolicyParameters(self.actor), in_keys=["observation"], out_keys=["logits"] if self.hierarchical else ["loc", "scale"],
         )
+        from hierarchical.policy import SkillDistribution
         self.probabilistic_actor = ProbabilisticActor(
-            parameters, in_keys=["loc", "scale"], out_keys=["raw_action"],
-            distribution_class=IndependentNormal,
+            parameters, in_keys=["logits"] if self.hierarchical else ["loc", "scale"], out_keys=["raw_action"],
+            distribution_class=SkillDistribution if self.hierarchical else IndependentNormal,
             return_log_prob=True, log_prob_key="raw_log_prob",
         )
         self.policy = TensorDictSequential(
             self.probabilistic_actor,
-            TensorDictModule(torch.tanh, in_keys=["raw_action"], out_keys=["action"]),
+            TensorDictModule((lambda x: x.clone()) if self.hierarchical else torch.tanh, in_keys=["raw_action"], out_keys=["action"]),
         )
         # Native environments keep the singleton learner in an agents group.
         self.collection_policy = TensorDictSequential(
@@ -108,6 +113,9 @@ class TorchRLPPOAgent(PPOPolicy):
             # TorchRL's equivalent sequential value calls preserve GAE maths.
             deactivate_vmap=self.compilation_config["critic"],
         )
+        if self.hierarchical:
+            from hierarchical.policy import DurationGAE
+            self.gae = DurationGAE(self.critic, self.gamma, self.gae_lambda)
         self._pending_batches = []
         self._pending_steps = 0
         self._pending_environment_steps = 0
@@ -124,7 +132,7 @@ class TorchRLPPOAgent(PPOPolicy):
             self.policy(data)
         outputs = torch.cat((data["action"], data["raw_action"], data["raw_log_prob"][:, None],
                              self.critic(observation)[:, None]), dim=1).cpu().numpy()
-        return PolicyOutput(outputs[:, :self.action_dim], outputs[:, -2],
+        return PolicyOutput(outputs[:, :self.action_dim].astype("int64") if self.hierarchical else outputs[:, :self.action_dim], outputs[:, -2],
                             outputs[:, self.action_dim:2 * self.action_dim].copy(), outputs[:, -1])
 
     def update_rollouts(self, rollouts):
@@ -143,7 +151,7 @@ class TorchRLPPOAgent(PPOPolicy):
         with region("rollout_preparation") if region else nullcontext():
             for group in rollout_groups(self, rollouts):
                 data, all_active = transfer_rollout_group(self, group)
-                environment_steps = data.numel()
+                environment_steps = (int(data["steps_to_next_obs"].sum()) if self.hierarchical else data.numel())
                 batch_gae(self, data, len(group))
                 with region("post_gae_flatten_mask") if region else nullcontext():
                     active = data.get(("agents", "active"), None)

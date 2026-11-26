@@ -47,6 +47,8 @@ def select_algorithm(scenario, policy_agents):
 def learner_params(scenario, spec, algorithm):
     focal = spec.agent_ids[0]
     params = resolve_training_params(scenario["agents"][focal], scenario)
+    if scenario.get("hierarchical", {}).get("enabled", False):
+        params["hierarchical"] = scenario["hierarchical"]
     params["_agent_ids"] = list(spec.agent_ids)
     params["_observation_contract"] = spec.observation_contracts[focal]
     if algorithm == "mappo":

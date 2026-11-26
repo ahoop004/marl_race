@@ -39,7 +39,7 @@ def mean_update_metrics(rows, *, profile=None):
 @torch.no_grad()
 def _approx_kl(agent, batch, key, parameters=None):
     current = batch.clone(False)
-    if parameters is None:
+    if parameters is None or getattr(agent, "hierarchical", None):
         dist = agent.probabilistic_actor.get_dist(current)
     else:
         # Match the PPO/MAPPO parameter modules' expansion and agent shape,
@@ -195,7 +195,13 @@ def optimize_ppo(agent, data, *, group=None):
             "train/rollout_steps": local_samples, "train/optimizer_steps": len(rows),
             "train/kl_early_stop": float(early_stop), "train/last_checked_kl": float(last_kl),
             "train/action_saturation": saturation_mean,
-            "train/action_std": float(torch.cat(log_stds).clamp(agent.actor.LOG_STD_MIN, agent.actor.LOG_STD_MAX).exp().mean()),
+            "train/action_std": float(torch.cat(log_stds).clamp(agent.actor.LOG_STD_MIN, agent.actor.LOG_STD_MAX).exp().mean()) if log_stds else 0.0,
         })
     agent.step_update_scheduler(len(rows))
+    if getattr(agent, "hierarchical", None):
+        metrics.pop("train/action_std", None)
+        metrics.pop("train/action_saturation", None)
+        metrics.update({"hierarchical/" + key.removeprefix("train/"): value
+                        for key, value in list(metrics.items())
+                        if key in {"train/policy_loss", "train/value_loss", "train/entropy", "train/approx_kl"}})
     return metrics

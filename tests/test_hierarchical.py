@@ -102,3 +102,67 @@ def test_macro_trajectory_and_specs(bank):
     finally:
         task.close()
         plain.close()
+
+
+@pytest.mark.parametrize('k', [1, 5, 10, 20])
+def test_duration_gae(k):
+    from hierarchical.policy import DurationGAE
+    from tensordict import TensorDict
+    class Value(torch.nn.Module):
+        def forward(self, x):
+            return x[..., 0]
+    data = TensorDict({'observation': torch.tensor([[2.], [3.], [5.]]),
+        'steps_to_next_obs': torch.full((3, 1), k),
+        'next': {'observation': torch.tensor([[3.], [7.], [11.]]),
+                 'reward': torch.ones(3, 1), 'done': torch.tensor([[False], [True], [True]]),
+                 'terminated': torch.tensor([[False], [False], [True]])}}, [3])
+    DurationGAE(Value(), .9, .8)(data)
+    second = 1 + .9 ** k * 7 - 3
+    assert data['advantage'][:, 0].tolist() == pytest.approx([
+        1 + .9 ** k * 3 - 2 + (.9 * .8) ** k * second, second, 1 - 5], abs=1e-6)
+
+
+def test_categorical_training_checkpoint_resume(bank, tmp_path):
+    import numpy as np
+    from core.task_builder import create_race_task
+    from core.scenario import load_and_expand_scenario
+    from hierarchical.task import HierarchicalTask
+    from adapters.native_torchrl import NativeRaceTorchRLEnv
+    from agents.torchrl_ppo import TorchRLPPOAgent
+    from agents.common.checkpoints import capture_rng, RESUME_BOUNDARY, optimization_contract
+    from torchrl.envs.utils import set_exploration_type, ExplorationType
+    scenario = load_and_expand_scenario('scenarios/ppo_circle_pretrain_20k.yaml')
+    scenario['environment']['max_steps'] = 11
+    config = {'enabled': True, 'interval': 5, 'gamma': .99,
+              'bank': {'skills': [{k:v for k,v in e.items() if k != 'sha256'} for e in bank.manifest]}}
+    task = HierarchicalTask(create_race_task(scenario), bank, config)
+    params = {'device': 'cpu', '_agent_ids': ['car_0'], 'hierarchical': config,
+        'network': {'actor_hidden_dims': [128, 128], 'critic_hidden_dims': [128, 128]},
+        'n_steps': 4, 'n_epochs': 1, 'batch_size': 4, '_observation_contract': task.spec.observation_contracts['car_0']}
+    agent = TorchRLPPOAgent(task.dim, np.array([0]), np.array([5]), params)
+    env = NativeRaceTorchRLEnv(task)
+    before = {k:v.clone() for k,v in bank.state_dict().items()}
+    try:
+        with torch.no_grad():
+            rollout = env.rollout(4, agent.collection_policy, break_when_any_done=False)
+        metrics = agent.update(rollout)
+        assert metrics and all(np.isfinite(v) for v in metrics.values())
+        assert sum(p.grad.abs().sum() for p in agent.actor.parameters() if p.grad is not None) > 0
+        assert sum(p.grad.abs().sum() for p in agent.critic.parameters() if p.grad is not None) > 0
+        assert all(p.grad is None for p in bank.parameters())
+        assert all(torch.equal(v,before[k]) for k,v in bank.state_dict().items())
+        obs = rollout['agents', 'observation'][0, 0].numpy()
+        assert agent.predict(obs).dtype == np.int64
+        state = {'boundary': RESUME_BOUNDARY, 'optimizer': agent.optimizer.state_dict(),
+            'optimization_contract': optimization_contract(agent), 'scheduler': None,
+            'schedule_progress': 0., 'progress': {}, 'budget': {}, 'rng': capture_rng(),
+            'hooks': {}, 'recovery_seed': 42}
+        path = tmp_path / 'latest.pt'
+        agent.save_checkpoint(path, training_state=state)
+        restored = TorchRLPPOAgent(task.dim, np.array([0]), np.array([5]), params)
+        restored.resume_training(path)
+        assert np.array_equal(agent.predict(obs), restored.predict(obs))
+        assert restored.update(rollout)
+        print(metrics)
+    finally:
+        env.close()
