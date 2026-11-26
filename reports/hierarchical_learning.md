@@ -540,3 +540,101 @@ original checkpoint and bank manifest unchanged during this run. A later bank
 replacement requires an explicit update of the pinned path/hash and a new HL
 run or compatible new provenance; previously trained HL checkpoints bind to the
 old bank identity.
+
+## Continue all five specialist adapters on the HPC
+
+Each continuation starts from its own validation-selected LoRA checkpoint and
+keeps the same PPO base, one-lap task, family training maps, and family
+validation map. The five sources have the same pinned base SHA-256 and contain
+rank-4 adapters. They are model-only: this starts five new optimizers, not the
+original optimizer states. `base` is the pretrained PPO policy, not a specialist
+adapter, and is not retrained by this procedure. No file in `pretrained_models/`
+is overwritten or copied by these commands.
+
+The existing independent-work-item launcher freezes one common source per root,
+so use separate direct `run.py` processes for these five different sources.
+These commands are **for an HPC allocation**, not this laptop. They are examples
+using 60,000 additional episodes per family, one seed and serial execution;
+choose the budget and resources for the allocation. The scenario defaults to a
+CUDA learner and CPU collection. Adjust the learner device, worker count,
+environments per worker, thread count, and output root before launching. Do not
+oversubscribe the allocation; run individual family commands on independent
+allocations when concurrent execution is desired. W&B remains disabled here.
+
+```bash
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export PYGLET_HEADLESS=true
+RUN_ROOT=outputs/adapter-continuation
+EPISODES=60000
+WORKERS=4
+ENVS_PER_WORKER=1
+
+declare -A adapter=(
+  [straight]=pretrained_models/straight_best.pt
+  [sweeper]=pretrained_models/sweep_best.pt
+  [hairpin]=pretrained_models/hairpin_best.pt
+  [chicane]=pretrained_models/chicane_best.pt
+  [s_curve]=pretrained_models/s_best.pt
+)
+
+# Validate first; no training in the following two commands.
+python -m pytest -q tests/test_ppo_lora.py tests/test_checkpoints.py
+for family in straight sweeper hairpin chicane s_curve; do
+  python run.py --scenario scenarios/ppo_lora_families.yaml \
+    --set "maps=generated_${family}" --checkpoint "${adapter[$family]}" \
+    --episodes "$EPISODES" --set experiment.parallel_envs="$WORKERS" \
+    --set experiment.envs_per_worker="$ENVS_PER_WORKER" --torch-threads 1 \
+    --no-wandb --no-render --output-dir "$RUN_ROOT/$family" --resolve-config
+done
+
+# Actual training: run only after selecting an allocation and budget.
+for family in straight sweeper hairpin chicane s_curve; do
+  python run.py --scenario scenarios/ppo_lora_families.yaml \
+    --set "maps=generated_${family}" --checkpoint "${adapter[$family]}" \
+    --episodes "$EPISODES" --set experiment.parallel_envs="$WORKERS" \
+    --set experiment.envs_per_worker="$ENVS_PER_WORKER" --torch-threads 1 \
+    --no-wandb --no-render --output-dir "$RUN_ROOT/$family" || break
+done
+```
+
+For an interrupted family, retain its original budget, scenario, resources,
+output path, and tracking settings; set `family` to that family and run:
+
+```bash
+family=hairpin
+python run.py --scenario scenarios/ppo_lora_families.yaml \
+  --set "maps=generated_${family}" --episodes "$EPISODES" \
+  --set experiment.parallel_envs="$WORKERS" \
+  --set experiment.envs_per_worker="$ENVS_PER_WORKER" --torch-threads 1 \
+  --no-wandb --no-render --resume "$RUN_ROOT/$family/latest.pt" \
+  --output-dir "$RUN_ROOT/$family"
+```
+
+For every family, compare the original checkpoint with the newly selected
+`best.pt` on the **same family validation protocol**, seeds, spawns and metrics.
+These evaluations are independent and may be scheduled concurrently on the
+HPC with sufficient resources. Do not use held-out test tracks to select a
+checkpoint.
+
+```bash
+for family in straight sweeper hairpin chicane s_curve; do
+  for version in original continued; do
+    checkpoint="${adapter[$family]}"
+    if [ "$version" = continued ]; then checkpoint="$RUN_ROOT/$family/best.pt"; fi
+    python run.py --scenario scenarios/ppo_lora_families.yaml \
+      --set "maps=generated_${family}" --eval --eval-protocol selection \
+      --checkpoint "$checkpoint" --no-wandb --no-render \
+      --output-dir "$RUN_ROOT/comparison/$family/$version" || break 2
+  done
+done
+```
+
+Inspect `evaluation_history.jsonl` over training and the paired
+`evaluation_report.json` outputs for completion, collisions, progress and clean
+lap time. A long flat validation curve is evidence to investigate, not proof of
+convergence: eight evaluations on one validation map are limited, and a best
+checkpoint can be selected due to noise. Repeat continuations with distinct
+training seeds and fresh output roots when resources permit, keeping paired
+validation seeds fixed; consider additional validation maps before selecting a
+final bank. Preserve all source hashes and selected outputs. Update the bank
+manifest only after selection; existing HL checkpoints bind to the old hashes.
