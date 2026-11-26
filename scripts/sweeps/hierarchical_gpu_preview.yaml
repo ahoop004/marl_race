@@ -1,0 +1,44 @@
+name: Hierarchical GPU extended preview
+experiment_id: hierarchical-gpu-preview-v1
+algorithm: ppo
+scenario: scenarios/ppo_hierarchical.yaml
+
+total_steps: 4096000
+seeds: [42]
+sweep_seed: 2026
+
+search:
+  method: grid
+  parameters:
+    algorithm.params.ent_coef:
+      type: choice
+      values: [0.01, 0.02, 0.05]
+
+max_concurrent_trials: 3
+
+resources_per_trial:
+  cpu: 15
+  gpu: 1
+
+fixed_overrides:
+- experiment.parallel_envs=8
+- experiment.envs_per_worker=4
+- experiment.async_evaluation=true
+- hierarchical.interval=5
+- hierarchical.preview.enabled=true
+- hierarchical.preview.samples=20
+- hierarchical.preview.spacing_m=0.6
+- algorithm.params.n_steps=1024
+- algorithm.params.frames_per_batch=256
+- algorithm.params.batch_size=128
+- algorithm.params.n_epochs=4
+
+evaluation:
+  seed: 10042
+  episodes: 9
+  every_steps: 409600
+  max_steps: 8000
+
+wandb:
+  mode: online
+  group: hierarchical-gpu-preview
