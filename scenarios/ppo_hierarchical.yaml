@@ -1,0 +1,41 @@
+# @package _global_
+defaults:
+- ppo_generated_finetune
+- /hierarchical: default
+- override /adaptation: scratch
+- override /maps: composite
+- override /execution: hierarchical_cpu
+- override /reward: generated_one_lap
+- _self_
+experiment:
+  name: ppo_hierarchical
+  parallel_envs: 1
+  envs_per_worker: 1
+  total_steps: 4096000
+  torch_threads: 1
+network:
+  actor_hidden_dims: [128, 128]
+  critic_hidden_dims: [128, 128]
+algorithm:
+  params:
+    frames_per_batch: 256
+    learning_rate: 0.0003
+    learning_rate_end: null
+    lr_schedule: constant
+    gamma: 0.99
+    gae_lambda: 0.95
+    clip_range: 0.2
+    ent_coef: 0.01
+training_defaults:
+  device: cpu
+  collection_device: cpu
+environment:
+  max_steps: 8000
+  target_laps: 1
+  render: false
+wandb:
+  enabled: false
+  group: hierarchical
+  job_type: hierarchical
+evaluation:
+  selection_strategy: completion_progress

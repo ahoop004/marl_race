@@ -66,7 +66,7 @@ class TorchRLPPOAgent(PPOPolicy):
                     # Physical race closure can follow the learner's retirement.
                     data["next", name] = value.squeeze(-2)
         if self.hierarchical:
-            data["steps_to_next_obs"] = rollout["next", "steps_to_next_obs"]
+            data["steps_to_next_obs"] = rollout.get(("next", "steps_to_next_obs"), rollout.get("steps_to_next_obs"))
         return data
 
     def __init__(self, obs_dim, action_low, action_high, params):

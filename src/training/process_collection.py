@@ -140,7 +140,7 @@ def pre_collect_profile():
     reset_inference_profile()
     for reports in _worker_reports.values():
         reports.batch_events = []
-        reports.batch_start = reports.trainer._environment_steps
+        reports.batch_start = (reports.trainer._agent_steps if getattr(reports.env.task, "hierarchical", False) else reports.trainer._environment_steps)
         if reports.profiler is not None:
             reports.profiler._timing_phase = "steady"
     _cuda_profile = CudaCollectionProfile(any(
@@ -265,7 +265,7 @@ class _WorkerReports:
         self.reports.decision(result)
         self.reports.dispatch({}, parent=False)
         if self.env.batch_reports and self.env.report_events:
-            index = self.trainer._environment_steps - self.batch_start - 1
+            index = self.trainer._agent_steps - self.batch_start - 1 if getattr(self.env.task, "hierarchical", False) else self.trainer._environment_steps - self.batch_start - 1
             self.batch_events.append((index, self.env.report_events))
             self.env.report_events = []
 

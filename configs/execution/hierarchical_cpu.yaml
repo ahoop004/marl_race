@@ -1,0 +1,12 @@
+defaults:
+- ppo_transfer
+- _self_
+experiment:
+  torch_threads: 1
+params:
+  device: cpu
+  collection_device: cpu
+collector:
+  workers: 1
+  reserved_cpus: 2
+  envs_per_worker: 1

@@ -49,6 +49,8 @@ def learner_params(scenario, spec, algorithm):
     params = resolve_training_params(scenario["agents"][focal], scenario)
     if scenario.get("hierarchical", {}).get("enabled", False):
         params["hierarchical"] = scenario["hierarchical"]
+        params["_action_contract"] = {"type": "categorical_skill_v1",
+            "skills": [entry["name"] for entry in scenario["hierarchical"]["bank"]["skills"]]}
     params["_agent_ids"] = list(spec.agent_ids)
     params["_observation_contract"] = spec.observation_contracts[focal]
     if algorithm == "mappo":

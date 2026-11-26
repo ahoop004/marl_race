@@ -28,6 +28,8 @@ class AdapterBank(nn.Module):
         for entry in entries:
             path = Path(entry["checkpoint"])
             checkpoint = read_checkpoint(path if path.is_absolute() else Path(root) / path)
+            if entry.get("sha256", checkpoint["_identity"]["sha256"]) != checkpoint["_identity"]["sha256"]:
+                raise ValueError(f"{entry['name']}: checkpoint content hash changed")
             metadata = checkpoint["metadata"]
             if metadata["algorithm"] != "ppo":
                 raise ValueError(f"{entry['name']}: expected a single-agent PPO checkpoint")
@@ -54,7 +56,7 @@ class AdapterBank(nn.Module):
                     raise ValueError(f"{entry['name']}: adapter source hash differs from configured base")
                 # Exploration log_std can be trained; every deterministic base tensor must match.
                 for name, value in base["models"]["actor"].items():
-                    if name != "log_std" and not torch.equal(value, checkpoint["models"]["actor"].get(name)):
+                    if name != "log_std" and (name not in checkpoint["models"]["actor"] or not torch.equal(value, checkpoint["models"]["actor"][name])):
                         raise ValueError(f"{entry['name']}: frozen base tensor differs: {name}")
                 family = entry.get("family", entry["name"])
                 split = metadata["provenance"].get("map_split", {})
@@ -92,3 +94,25 @@ class AdapterBank(nn.Module):
                     trainable=sum(p.numel() for p in self.parameters() if p.requires_grad),
                     tensor_bytes=sum(t.numel() * t.element_size() for t in (*self.parameters(), *self.buffers())),
                     initialization_seconds=self.initialization_seconds)
+
+
+# Weak ownership avoids retaining banks after all environments have closed.
+# Each process has its own cache; mutable skill selection never lives here.
+import json
+import weakref
+_BANKS = weakref.WeakValueDictionary()
+
+
+def shared_adapter_bank(manifest, *, spec, device='cpu'):
+    key = json.dumps({'manifest': manifest, 'device': str(device)}, sort_keys=True)
+    bank = _BANKS.get(key)
+    if bank is None:
+        bank = AdapterBank(manifest, spec=spec, device=device)
+        _BANKS[key] = bank
+    else:
+        aid = bank.agent_id
+        validate_checkpoint_compatibility(bank.metadata['contracts']['observations'][aid],
+            {'dim': spec.observation_dims[aid], 'contract': spec.observation_contracts[aid]})
+        validate_checkpoint_compatibility(bank.metadata['contracts']['actions'],
+            {'low': spec.action_lows[aid], 'high': spec.action_highs[aid]})
+    return bank

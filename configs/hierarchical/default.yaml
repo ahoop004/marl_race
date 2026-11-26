@@ -1,0 +1,12 @@
+defaults:
+- bank@bank
+- _self_
+enabled: true
+interval: 5
+gamma: ${algorithm.params.gamma}
+selector:
+  type: learned
+  skill: 0
+  anticipation: 1.0
+  fallback: 0
+record_trajectory: false

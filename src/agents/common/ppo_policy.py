@@ -68,6 +68,8 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         self.device = resolve_device([device_str])
 
         if self.hierarchical:
+            if self.hierarchical["gamma"] != self.gamma:
+                raise ValueError("HL and macro-task must use the same LL gamma")
             if self.lora_config:
                 raise ValueError("HL PPO cannot adapt the frozen driving skills")
             from hierarchical.policy import CategoricalActor
@@ -76,11 +78,15 @@ class PPOPolicy(OnPolicyOptimizationSettings):
             from hierarchical.bank import PROJECT_ROOT
             from agents.common.checkpoints import checkpoint_sha256
             from pathlib import Path
-            self.hierarchy_contract = {**self.hierarchical,
+            self.hierarchy_contract = {"interval": self.hierarchical["interval"], "gamma_ll": self.gamma, "lambda_ll": self.gae_lambda,
                 "discount_convention": "gamma_ll**k; trace=(gamma_ll*lambda_ll)**k",
                 "skills": [{**entry, "sha256": checkpoint_sha256(
                     Path(entry["checkpoint"]) if Path(entry["checkpoint"]).is_absolute()
                     else PROJECT_ROOT / entry["checkpoint"])} for entry in self.hierarchical["bank"]["skills"]]}
+            for entry in self.hierarchy_contract["skills"]:
+                expected = self.hierarchical["bank"]["skills"][entry["id"]].get("sha256")
+                if expected and expected != entry["sha256"]:
+                    raise ValueError(f"Skill {entry['name']}: checkpoint content hash changed")
         else:
             self.actor = build_actor(
                 obs_dim, self.action_dim, self.network_config,

@@ -856,6 +856,10 @@ class OnPolicyTrainer:
         progress = self.checkpoint_progress()
         metrics = {"train/" + key: progress[key] for key in (
             "environment_steps", "physics_steps", "agent_steps", "completed_episodes", "updates")}
+        if getattr(self.agent, "hierarchical", None):
+            metrics.update({"hierarchical/ll_decisions": progress["environment_steps"],
+                            "hierarchical/hl_decisions": progress["agent_steps"],
+                            "hierarchical/hl_learner_samples": progress["agent_steps"]})
         metrics["train/optimizer_steps_total"] = self._optimizer_steps
         if self.continual is not None:
             metrics.update(self.continual.progress_metrics())
@@ -1019,6 +1023,9 @@ class OnPolicyTrainer:
             counters = torch.stack((
                 batch["next", "decision_physics_steps"].reshape(self.total_envs, steps),
                 batch["next", "agent_steps"].reshape(self.total_envs, steps)), dim=-1).cumsum(dim=1)
+        ll_durations = batch.get(("next", "steps_to_next_obs"), None)
+        ll_prefix = (ll_durations.reshape(self.total_envs, steps).cumsum(dim=1).tolist()
+                     if getattr(self.agent, "hierarchical", None) else None)
         profiles = batch.get("worker_profile")
         legacy_events = batch.get(("next", "race_events"), None)
         durations = []
@@ -1059,7 +1066,9 @@ class OnPolicyTrainer:
                     key = environment, local_episode
                     self._worker_policy_starts.setdefault(key, self._updates)
                     decisions = index - previous_index
-                    self._environment_steps += decisions
+                    ll_decisions = (ll_prefix[environment][index] - (ll_prefix[environment][previous_index] if previous_index >= 0 else 0)
+                                    if ll_prefix is not None else decisions)
+                    self._environment_steps += ll_decisions
                     self._physics_steps += physics - previous_physics
                     self._agent_steps += samples_count - previous_samples
                     self._pending_learning_steps += samples_count - previous_samples

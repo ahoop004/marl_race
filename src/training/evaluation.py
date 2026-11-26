@@ -87,6 +87,12 @@ def run_evaluation_episode(task, actions_fn, *, episode, seed,
         "collision_observed": any(contacts.values()),
         "boundary_violation_observed": any(boundary_violations.values()),
     }
+    if getattr(task, "hierarchical", False):
+        record['hierarchical'] = {'metrics': task.metrics(), 'skills': task.bank.manifest,
+            'transition_counts': task.transitions.tolist(),
+            'dwell_ll_decisions': task.dwell_times + [task.executor.state.since_change]}
+        if task.config.get('record_trajectory', False):
+            record['hierarchical']['trajectory'] = task.trace
     if include_rewards:
         record.update(reward_mode=reward_mapping.mode,
                       team_reward_reduction=reward_mapping.reduction,

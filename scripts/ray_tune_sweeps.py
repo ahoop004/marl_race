@@ -104,7 +104,7 @@ def read_spec(path, repo):
         positive(search.get("num_samples"), "search.num_samples")
     # Fail before importing Ray or connecting to the cluster.
     for path, domain in search["parameters"].items():
-        if (not isinstance(path, str) or not (path in {"network", "adaptation"} or re.fullmatch(r"(?:algorithm|network|adaptation\.lora)\.[A-Za-z_][A-Za-z0-9_.]*", path))
+        if (not isinstance(path, str) or not (path in {"network", "adaptation", "hierarchical.interval"} or re.fullmatch(r"(?:algorithm|network|adaptation\.lora)\.[A-Za-z_][A-Za-z0-9_.]*", path))
                 or path in {"algorithm.name", "algorithm.backend", "algorithm.params.progress_unit", "algorithm.params.update_version"}):
             raise ValueError(f"Search paths must name existing algorithm/network hyperparameters: {path!r}")
         domain_description(domain, search["method"], spec["allow_duplicates"])
@@ -312,7 +312,9 @@ def validate_search_effect(config, parameters):
         params = resolve_training_params(agent, config)
         network = resolve_network_config(params, default_hidden_dims=[256, 256])
         for path, value in parameters.items():
-            if path.startswith("algorithm.params."):
+            if path == "hierarchical.interval":
+                actual = config["hierarchical"]["interval"]
+            elif path.startswith("algorithm.params."):
                 actual = select_path(params, path.removeprefix("algorithm.params."))
             elif path.startswith("adaptation.lora."):
                 actual = select_path(params, path.removeprefix("adaptation."))
@@ -468,7 +470,7 @@ def preflight(settings, command_builder, repo):
         common = {"environment": config["environment"], "maps": config["maps"],
                   "agents": {aid: {k: v for k, v in agent.items() if k != "params"}
                              for aid, agent in config["agents"].items()}, "total_steps": config["experiment"]["total_steps"]}
-        model_key = digest({"network": config["network"], "adaptation": config["adaptation"], "common": common})
+        model_key = digest({"network": config["network"], "adaptation": config["adaptation"], "common": common, "hierarchical": config.get("hierarchical")})
         if model_key not in model_cache:
             model_cache[model_key] = inspect_model(config, entry.get("source"))
         return config, protocols, common, model_cache[model_key]

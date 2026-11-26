@@ -1,6 +1,7 @@
 """Single-agent categorical macro decisions around the unchanged RaceTask."""
 from dataclasses import replace
 import json
+import time
 import numpy as np
 
 from env.spaces import SpaceSpec
@@ -30,6 +31,7 @@ class HierarchicalTask:
         self.execution_counts = np.zeros(self.n_skills, dtype=np.int64)
         self.transitions = np.zeros((self.n_skills, self.n_skills), dtype=np.int64)
         self.annotations = None
+        self.ll_inference_seconds = 0.
 
     def __getattr__(self, name):
         if name == 'task':
@@ -67,6 +69,14 @@ class HierarchicalTask:
         snapshot = self.task.reset(seed=seed, options=options)
         self.executor.reset()
         self.last_duration = 0
+        self.trace = []
+        self.dwell_times = []
+        self.skill_distance = np.zeros(self.n_skills)
+        self.episode_ll = self.episode_hl = 0
+        self.selection_counts.fill(0)
+        self.execution_counts.fill(0)
+        self.transitions.fill(0)
+        self.elapsed = self.distance = 0.
         self.episodes += 1
         self.selector = make_selector(self.config.get('selector', {}), self.bank.manifest, seed or 0)
         self.annotations = None
@@ -93,13 +103,32 @@ class HierarchicalTask:
         old = self.executor.state.active
         self.executor.state.select(skill)
         self.selection_counts[skill] += 1
+        if old >= 0 and old != skill:
+            self.dwell_times.append(before.observations[self.aid][-self.bank.action_dim-1].item())
         if old >= 0:
             self.transitions[old, skill] += 1
         reward, components, substeps = 0., {}, []
         for i in range(self.executor.interval):
+            inference_started = time.perf_counter()
             ll_action = self.executor.action(self._snapshot.observations[self.aid])
+            self.ll_inference_seconds += time.perf_counter() - inference_started
+            previous_action = (self.trace[-1]["action"] if self.trace else ll_action.tolist())
             result = self.task.step({self.aid: ll_action}, on_physics_step=on_physics_step)
             decision = result.decisions[self.aid]
+            self.elapsed += result.elapsed_seconds
+            self.episode_ll += 1
+            distance = max(0., decision.info.get('centerline', {}).get('progress_delta', 0.) * self.task.env.centerline_track_length)
+            self.distance += distance
+            self.skill_distance[skill] += distance
+            if self.config.get('record_trajectory', False):
+                state = result.substeps[-1].facts.agent_states[self.aid]
+                self.trace.append({'timestamp': self.elapsed, 'x': float(state.pose[0]), 'y': float(state.pose[1]),
+                    'skill': skill, 'action': ll_action.tolist(),
+                    'command_jump': float(np.linalg.norm(ll_action - previous_action)),
+                    's': float(decision.info.get('centerline', {}).get('s', 0.)),
+                    'lateral_error': float(decision.info.get('centerline', {}).get('d', 0.)),
+                    'speed': float(np.linalg.norm(state.velocity)),
+                    'switched': old >= 0 and old != skill and i == 0})
             reward += self.gamma ** i * decision.individual_reward
             for name, value in decision.reward_components.items():
                 components[name] = components.get(name, 0.) + self.gamma ** i * value
@@ -111,6 +140,7 @@ class HierarchicalTask:
         self.last_duration = k
         self.total_ll += k
         self.total_hl += 1
+        self.episode_hl += 1
         self.execution_counts[skill] += k
         self.total_seconds += sum(s.timestep for s in substeps)
         final = replace(decision, observation=before.observations[self.aid],
@@ -119,3 +149,20 @@ class HierarchicalTask:
             info={**decision.info, 'hierarchical': {'skill': skill, 'duration': k,
                 'discount': self.gamma ** k, 'switches': self.executor.state.switches}})
         return TaskStep(before, self.snapshot(result.after), {self.aid: final}, 0., {}, tuple(substeps), ll_decisions=k)
+
+    def metrics(self):
+        state = self.executor.state
+        metrics = {'hierarchical/ll_decisions': self.episode_ll,
+            'hierarchical/hl_decisions': self.episode_hl,
+            'hierarchical/switches': state.switches,
+            'hierarchical/switches_per_metre': state.switches / max(self.distance, 1e-8),
+            'hierarchical/switches_per_second': state.switches / max(self.elapsed, 1e-8),
+            'hierarchical/mean_dwell_ll_decisions': float(np.mean(self.dwell_times + [state.since_change])),
+            'hierarchical/ll_inference_seconds_total': self.ll_inference_seconds,
+            'hierarchical/bank_initialization_seconds': self.bank.initialization_seconds}
+        for entry in self.bank.manifest:
+            i, name = entry['id'], entry['name']
+            metrics[f'hierarchical/selection_fraction/{name}'] = float(self.selection_counts[i] / max(self.episode_hl, 1))
+            metrics[f'hierarchical/execution_ll_decisions/{name}'] = int(self.execution_counts[i])
+            metrics[f'hierarchical/distance_m/{name}'] = float(self.skill_distance[i])
+        return metrics

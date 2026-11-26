@@ -139,7 +139,15 @@ def _run_evaluation(
     checkpoint_steps = metadata["progress"].get("environment_steps")
     stored_provenance = metadata["provenance"]
     params.update(evaluation_routing(checkpoint_payload))
-    if solo_actor:
+    if getattr(task, "hierarchical", False) and task.selector is not None:
+        from types import SimpleNamespace
+        import torch
+        import numpy as np
+        if checkpoint_hash != task.bank.manifest[0]["sha256"]:
+            raise ValueError("Baseline selectors require the manifest's original PPO base checkpoint")
+        agent = SimpleNamespace(actor=torch.nn.Identity(), device=torch.device("cpu"),
+            evaluation_actions=lambda ids, observations: {aid: np.array([0], dtype=np.int64) for aid in ids})
+    elif solo_actor:
         from agents.common.checkpoints import solo_evaluation_actor
         agent = solo_evaluation_actor(checkpoint_payload, spec, params, solo_actor)
     else:

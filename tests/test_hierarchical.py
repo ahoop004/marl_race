@@ -166,3 +166,44 @@ def test_categorical_training_checkpoint_resume(bank, tmp_path):
         print(metrics)
     finally:
         env.close()
+
+
+def test_standalone_checkpoint_parity(bank):
+    import numpy as np
+    from agents.common.ppo_policy import PPOPolicy
+    obs = torch.randn(3, bank.obs_dim, generator=torch.Generator().manual_seed(23))
+    for skill, entry in enumerate(bank.manifest):
+        checkpoint = read_checkpoint(PROJECT_ROOT / entry['checkpoint'])
+        metadata = checkpoint['metadata']
+        params = {'device': 'cpu', '_agent_ids': [bank.agent_id], 'network': metadata['network'],
+            '_observation_contract': metadata['contracts']['observations'][bank.agent_id]['contract'],
+            '_physics_contract': metadata['contracts']['physics'],
+            '_action_contract': metadata['contracts']['actions']['contract'],
+            'lora': metadata['adaptation']['lora'] and {key:metadata['adaptation']['lora'][key]
+                for key in ('mode', 'rank', 'alpha', 'train_log_std')}}
+        policy = PPOPolicy(bank.obs_dim, metadata['contracts']['actions']['low'], metadata['contracts']['actions']['high'], params)
+        policy.load_for_evaluation(checkpoint)
+        expected = np.stack([policy.predict(row.numpy()) for row in obs])
+        assert np.allclose(bank(obs, torch.full((3,), skill)).numpy(), expected, atol=2e-6, rtol=2e-6)
+
+
+@pytest.mark.parametrize('selector', ['fixed', 'random', 'geometry'])
+def test_real_selector_evaluation(selector):
+    import numpy as np
+    from core.task_builder import create_race_task
+    from core.scenario import load_and_expand_scenario
+    from training.evaluation import run_evaluation_episode
+    scenario = load_and_expand_scenario('scenarios/ppo_hierarchical.yaml')
+    scenario['environment']['max_steps'] = scenario['evaluation']['max_steps'] = 7
+    scenario['hierarchical']['record_trajectory'] = True
+    scenario['hierarchical']['selector']['type'] = selector
+    task = create_race_task(scenario, mode='eval')
+    try:
+        result = run_evaluation_episode(task, lambda ids, obs: {'car_0': np.array([0], dtype=np.int64)}, episode=0, seed=42)
+        diagnostic = result.record['hierarchical']
+        assert len(diagnostic['trajectory']) == 7
+        assert diagnostic['metrics']['hierarchical/ll_decisions'] == 7
+        assert diagnostic['metrics']['hierarchical/hl_decisions'] == 2
+        assert task.annotations and task.annotations['schema_version'] == '2.0.0'
+    finally:
+        task.close()
