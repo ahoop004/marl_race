@@ -455,7 +455,8 @@ class ContinualHook(TrainingHook):
                 for skill, value in diagnostics.get("selection_proportions", {}).items()}, **{
                 f"eval/cl/{name}/hierarchical/{key}": value for key, value in diagnostics.items()
                 if type(value) in (int, float)}, **{
-                f"eval/cl/{name}/composition/{key}": value for key, value in summary.get('composition_diagnostics', {}).items()})
+                f"eval/cl/{name}/composition/{key}": value for key, value in summary.get('composition_diagnostics', {}).items()
+                if type(value) in (int, float)}})
         return summary
 
     def _record_curve(self, results, *, task_steps=None, task_index=None, global_steps=None, policy_version=None):
