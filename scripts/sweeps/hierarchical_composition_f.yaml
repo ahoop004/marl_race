@@ -13,10 +13,10 @@ search:
       type: choice
       values: [1536]
 max_concurrent_trials: 1
-resources_per_trial: {cpu: 30, gpu: 1}
+resources_per_trial: {cpu: 38, gpu: 1}
 fixed_overrides:
-- experiment.parallel_envs=24
-- experiment.envs_per_worker=8
+- experiment.parallel_envs=32
+- experiment.envs_per_worker=6
 - hierarchical.interval=20
 - hierarchical.composition.distribution=positive_gaussian
 - hierarchical.composition.sampled_action=gaussian_latent
