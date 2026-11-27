@@ -1,0 +1,34 @@
+name: Hierarchical composition H2-D
+experiment_id: hierarchical-composition-d
+algorithm: ppo
+scenario: scenarios/ppo_hierarchical_composition.yaml
+continual: true
+total_steps: 57344000
+seeds: [42]
+sweep_seed: 2026
+search:
+  method: grid
+  parameters:
+    algorithm.params.n_steps:
+      type: choice
+      values: [1536]
+max_concurrent_trials: 1
+resources_per_trial: {cpu: 30, gpu: 1}
+fixed_overrides:
+- experiment.parallel_envs=24
+- experiment.envs_per_worker=8
+- hierarchical.interval=20
+- hierarchical.composition.distribution=logistic_normal
+- hierarchical.composition.sampled_action=gaussian_latent
+- hierarchical.composition.coefficient_constraint=convex
+- hierarchical.composition.backend=shared_residual
+- hierarchical.composition.entropy_convention=latent_gaussian
+- hierarchical.composition.initial_mean=0.0
+- hierarchical.composition.initial_std=1.0
+- algorithm.params.frames_per_batch=384
+- algorithm.params.batch_size=192
+evaluation: {seed: 10042, episodes: 10, max_steps: 8000}
+wandb:
+  mode: online
+  group: hierarchical-composition
+  tags: [logistic_normal, convex, K20, H2-D]

@@ -212,8 +212,14 @@ def build_run_provenance(
             "resolved_simulation_state": "2.0",
             "completion_progress_finish_time_selection": "1.0",
             "policy_likelihood": ("categorical_skill_v1" if scenario.get("hierarchical", {}).get("enabled", False)
-                                  else "stored_pre_tanh_v1"),
+                                  and scenario["hierarchical"].get("composition", {}).get("distribution", "categorical") == "categorical"
+                                  else "composition_joint_" + ("dirichlet" if scenario["hierarchical"]["composition"]["distribution"] == "dirichlet" else "latent_gaussian")
+                                  if scenario.get("hierarchical", {}).get("enabled", False) else "stored_pre_tanh_v1"),
             "policy_entropy": ("categorical_exact_v1" if scenario.get("hierarchical", {}).get("enabled", False)
+                               and scenario["hierarchical"].get("composition", {}).get("distribution", "categorical") == "categorical"
+                               else "dirichlet_differential_v1" if scenario.get("hierarchical", {}).get("enabled", False)
+                               and scenario["hierarchical"]["composition"]["distribution"] == "dirichlet"
+                               else "latent_gaussian_v1" if scenario.get("hierarchical", {}).get("enabled", False)
                                else "squashed_gaussian_quadrature32_v1"),
             "ppo_fragment_pooling": "1.0",
         },

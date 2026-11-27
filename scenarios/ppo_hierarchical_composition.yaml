@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+- ppo_hierarchical_continual
+- _self_
+network:
+  actor:
+    distribution: composition
+hierarchical:
+  composition:
+    distribution: dirichlet
+    sampled_action: simplex
+    coefficient_constraint: convex
+    backend: shared_residual
+    entropy_convention: dirichlet_differential
+  preview:
+    enabled: true
+    samples: 20
+    spacing_m: 0.6

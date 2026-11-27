@@ -22,6 +22,7 @@ CORE = (
     "episode/team/failure_rate", "episode/team/timeout_rate",
     "episode/team/first_place", "episode/team/sweep", "episode/team/rank_score",
     "train/policy_loss", "train/value_loss", "train/entropy", "train/approx_kl",
+    "train/distribution_entropy", "train/clip_fraction", "train/composition/*", "episode/composition/*",
     "train/*/policy_loss", "train/*/value_loss", "train/*/entropy", "train/*/approx_kl",
     "train/learning_rate", "train/*/learning_rate", "train/kl_early_stop",
     "train/agent_steps", "train/update_agent_samples", "train/rollout_agent_samples",

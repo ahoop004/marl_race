@@ -4,6 +4,21 @@ defaults:
 enabled: true
 interval: 5
 gamma: ${algorithm.params.gamma}
+composition:
+  distribution: categorical
+  sampled_action: categorical
+  coefficient_constraint: hard_selection
+  backend: categorical_bank
+  entropy_convention: categorical_exact
+  coefficient_bound: 1.0
+  initial_concentration: 0.3
+  initial_mean: null
+  initial_std: null
+  temperature: 1.0
+  inference_strategy: representative
+  inference_samples: 32
+  inference_top_k: null
+  inference_temperature: null
 dwell_time_scale_seconds: 1.0
 preview:
   enabled: false

@@ -38,6 +38,8 @@ def summarize(paths):
                 for j, count in enumerate(row):
                     transitions[(method, i, j)] += count
             trace = hierarchy.get('trajectory', [])
+            if trace and 'dominant_option' in trace[0]:
+                raise ValueError('Hard-skill trajectory reports do not apply to continuous composition')
             visits = []
             for position, row in enumerate(trace):
                 usage[(method, row.get('geometry', 'unknown'), row['skill'])] += 1

@@ -22,7 +22,7 @@ class _LossForward(torch.nn.Module):
             # An exhausted rank must still enter backward. No fake actor row is
             # introduced; globally unused grads are restored to None afterwards.
             zero = sum(p.sum() * 0 for p in self.parameters() if p.requires_grad)
-            return zero, zero.detach().new_zeros(4)
+            return zero, zero.detach().new_zeros(5)
         from agents.torchrl_updates import loss_forward
         return loss_forward(self.agent, batch, group=group, detail=detail)
 

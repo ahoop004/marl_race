@@ -414,7 +414,9 @@ class ContinualHook(TrainingHook):
         hierarchy = [row["hierarchical"] for row in records if "hierarchical" in row]
         if hierarchy:
             names = [entry["name"] for entry in hierarchy[0]["skills"]]
-            counts = {skill: sum(row["metrics"][f"hierarchical/selection_count/{skill}"]
+            composition = 'composition/dominant_selection_count/' + names[0] in hierarchy[0]['metrics']
+            prefix = 'composition/dominant_' if composition else 'hierarchical/'
+            counts = {skill: sum(row["metrics"][f"{prefix}selection_count/{skill}"]
                                  for row in hierarchy) for skill in names}
             total = sum(counts.values())
             proportions = {skill: count / total if total else 0.0 for skill, count in counts.items()}
@@ -424,9 +426,20 @@ class ContinualHook(TrainingHook):
                 selection_proportions=proportions,
                 selection_entropy=-sum(p * math.log(p) for p in proportions.values() if p),
                 transitions=transitions, skill_order=names,
-                mean_dwell_ll_decisions=sum(row["metrics"]["hierarchical/mean_dwell_ll_decisions"]
-                                            for row in hierarchy) / len(hierarchy),
-                mean_switches=sum(row["metrics"]["hierarchical/switches"] for row in hierarchy) / len(hierarchy))
+                mean_dwell_ll_decisions=sum(row["metrics"][f"{prefix}mean_dwell_ll_decisions"]
+                                            for row in hierarchy) / len(hierarchy))
+            if composition:
+                summary['hierarchical_diagnostics']['mean_dominant_transitions'] = sum(
+                    row['metrics']['composition/dominant_transitions'] for row in hierarchy) / len(hierarchy)
+                keys = [key for key in hierarchy[0]['metrics'] if key.startswith('composition/')]
+                summary['composition_diagnostics'] = {key.removeprefix('composition/'): sum(
+                    row['metrics'][key] for row in hierarchy) / len(hierarchy) for key in keys}
+                summary['hierarchical_diagnostics']['dominant_option_counts'] = summary['hierarchical_diagnostics'].pop('selection_counts')
+                summary['hierarchical_diagnostics']['dominant_option_proportions'] = summary['hierarchical_diagnostics'].pop('selection_proportions')
+                summary['hierarchical_diagnostics']['dominant_option_entropy'] = summary['hierarchical_diagnostics'].pop('selection_entropy')
+            else:
+                summary['hierarchical_diagnostics']['mean_switches'] = sum(
+                    row['metrics']['hierarchical/switches'] for row in hierarchy) / len(hierarchy)
         job = job or {"policy_version": self._trainer.checkpoint_progress()["updates"],
                       "task_index": self.index + 1 if not self.complete else len(self.tasks),
                       "global_steps": self._trainer.collected_steps}
@@ -441,7 +454,8 @@ class ContinualHook(TrainingHook):
                 f"eval/cl/{name}/skill_proportion/{skill}": value
                 for skill, value in diagnostics.get("selection_proportions", {}).items()}, **{
                 f"eval/cl/{name}/hierarchical/{key}": value for key, value in diagnostics.items()
-                if type(value) in (int, float)}})
+                if type(value) in (int, float)}, **{
+                f"eval/cl/{name}/composition/{key}": value for key, value in summary.get('composition_diagnostics', {}).items()})
         return summary
 
     def _record_curve(self, results, *, task_steps=None, task_index=None, global_steps=None, policy_version=None):

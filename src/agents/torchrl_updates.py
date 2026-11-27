@@ -25,7 +25,7 @@ MAPPO_OPTIMIZATION_KEYS = tuple(("agents", key) for key in PPO_OPTIMIZATION_KEYS
 
 def mean_update_metrics(rows, *, profile=None):
     """Transfer averaged optimizer metrics to the CPU once."""
-    names = ("train/policy_loss", "train/value_loss", "train/entropy", "train/approx_kl")
+    names = ("train/policy_loss", "train/value_loss", "train/entropy", "train/approx_kl", "train/clip_fraction")
     if rows:
         means = torch.stack(rows).mean(dim=0)
         cpu = (profile("metrics_device_to_cpu", means.cpu, device=means.device)
@@ -81,7 +81,14 @@ def loss_forward(agent, batch, *, group=None, detail=None):
         else:
             values = agent.value_module(batch.clone(False))[key("state_value")]
             value_loss = distance_loss(values, batch[key("value_target")], agent.critic_loss).mean()
-    row = torch.stack((losses["loss_objective"].detach(), value_loss.detach(), entropy.detach(), kl))
+    clip_fraction = losses.get('clip_fraction', None)
+    if clip_fraction is None:
+        with torch.no_grad():
+            distribution = agent.probabilistic_actor.get_dist(batch.clone(False))
+            ratio = (distribution.log_prob(batch[key('raw_action')]) - batch[key('raw_log_prob')]).exp()
+            clip_fraction = ((ratio - 1).abs() > agent.clip_range).float().mean()
+    clip_fraction = clip_fraction.detach().mean()
+    row = torch.stack((losses["loss_objective"].detach(), value_loss.detach(), entropy.detach(), kl, clip_fraction))
     return loss, row
 
 
@@ -94,6 +101,36 @@ def optimize_ppo(agent, data, *, group=None):
     total_samples = int(execution.sum(local_samples)) if execution else local_samples
     if not total_samples:
         return {}
+    composition_stats = {}
+    if local_samples and getattr(agent.actor, 'kind', None):
+        with torch.no_grad():
+            actions = data[key('raw_action')]
+            old_log_prob = data[key('raw_log_prob')]
+            if not torch.isfinite(actions).all() or not torch.isfinite(old_log_prob).all():
+                raise ValueError('Nonfinite composition action or rollout likelihood')
+            parameters = agent.actor(data[key('observation')][:min(local_samples, 1024)])
+            coefficient = agent.actor.coefficients(actions)
+            composition_stats = {'train/distribution_entropy': float(agent.actor.entropy_from_parameters(*parameters).mean()),
+                'train/composition/log_probability_mean': float(old_log_prob.mean()),
+                'train/composition/log_probability_std': float(old_log_prob.std(correction=0)),
+                'train/composition/coefficient_mean': float(coefficient.mean()),
+                'train/composition/coefficient_std': float(coefficient.std(correction=0))}
+            names = [entry['name'] for entry in agent.hierarchical['bank']['skills']]
+            if agent.actor.kind in ('positive_gaussian', 'signed_gaussian'):
+                names = names[1:]
+            for i, name in enumerate(names):
+                composition_stats[f'train/composition/mean/{name}'] = float(coefficient[..., i].mean())
+                composition_stats[f'train/composition/std/{name}'] = float(coefficient[..., i].std(correction=0))
+            if agent.actor.kind == 'dirichlet':
+                composition_stats['train/composition/concentration_mean'] = float(parameters[0].mean())
+                for i, name in enumerate(names):
+                    composition_stats[f'train/composition/concentration/{name}'] = float(parameters[0][..., i].mean())
+            else:
+                composition_stats['train/composition/latent_mean'] = float(parameters[0].mean())
+                composition_stats['train/composition/latent_std'] = float(parameters[1].mean())
+                for i in range(agent.actor.action_dim):
+                    composition_stats[f'train/composition/latent_mean/{i}'] = float(parameters[0][..., i].mean())
+                    composition_stats[f'train/composition/latent_std/{i}'] = float(parameters[1][..., i].mean())
     region = getattr(agent, "profile_region", None)
     count = getattr(agent, "profile_count", None)
     with region("advantage_normalization") if region else nullcontext():
@@ -198,6 +235,7 @@ def optimize_ppo(agent, data, *, group=None):
             "train/action_std": float(torch.cat(log_stds).clamp(agent.actor.LOG_STD_MIN, agent.actor.LOG_STD_MAX).exp().mean()) if log_stds else 0.0,
         })
     agent.step_update_scheduler(len(rows))
+    metrics.update(composition_stats)
     if getattr(agent, "hierarchical", None):
         metrics.pop("train/action_std", None)
         metrics.pop("train/action_saturation", None)

@@ -5,6 +5,7 @@ and entropy. The logistic-normal reference logit is the last skill, so its five
 learned logits correspond to skills 0 through 4 in manifest order.
 """
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -14,7 +15,16 @@ from torch.distributions import Dirichlet, Independent, Normal
 from agents.common.networks import build_head, model_spec
 
 
+@dataclass(frozen=True)
+class CompositionExecution:
+    """Evaluation-only execution coefficients, distinct from PPO actions."""
+    coefficients: object
+
+
 class CompositionActor(nn.Module):
+    LOG_STD_MIN = -5.0
+    LOG_STD_MAX = 2.0
+
     def __init__(self, obs_dim, n_skills, network, config):
         super().__init__()
         if n_skills != 6:
@@ -24,6 +34,17 @@ class CompositionActor(nn.Module):
                     'positive_gaussian': (-1., 0.5), 'signed_gaussian': (0., 0.5)}
         if self.kind not in defaults:
             raise ValueError('Unknown composition distribution')
+        expected = {
+            'dirichlet': ('simplex', 'convex', 'dirichlet_differential'),
+            'logistic_normal': ('gaussian_latent', 'convex', 'latent_gaussian'),
+            'positive_gaussian': ('gaussian_latent', 'independent_positive', 'latent_gaussian'),
+            'signed_gaussian': ('gaussian_latent', 'signed', 'latent_gaussian'),
+        }[self.kind]
+        actual = tuple(config.get(key) for key in ('sampled_action', 'coefficient_constraint', 'entropy_convention'))
+        if actual != expected or config.get('backend') != 'shared_residual':
+            raise ValueError('Composition distribution, action, constraint, entropy and backend contract disagree')
+        if config.get('coefficient_bound', 1.) != 1.:
+            raise ValueError('Composition coefficient bound must be 1.0')
         self.temperature = float(config.get('temperature', 1.))
         if not math.isfinite(self.temperature) or self.temperature <= 0:
             raise ValueError('Composition temperature must be finite and positive')
@@ -39,12 +60,14 @@ class CompositionActor(nn.Module):
             if not math.isfinite(initial) or not 1e-4 < initial < 100.:
                 raise ValueError('Initial concentration must lie in (1e-4, 100)')
             bias = math.log(math.expm1(initial - 1e-4))
+            self.initialization = {'concentration': initial}
         else:
-            bias = float(config.get('initial_mean', initial))
-            std = float(config.get('initial_std', std))
+            bias = float(initial if config.get('initial_mean') is None else config['initial_mean'])
+            std = float(std if config.get('initial_std') is None else config['initial_std'])
             if not math.isfinite(bias) or not math.isfinite(std) or not math.exp(-5) <= std <= math.exp(2):
                 raise ValueError('Invalid initial Gaussian parameters')
             self.log_std = nn.Parameter(torch.full((self.action_dim,), math.log(std)))
+            self.initialization = {'latent_mean': bias, 'latent_std': std}
         nn.init.constant_(output.bias, bias)
 
     def forward(self, observation):

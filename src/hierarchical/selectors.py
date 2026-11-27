@@ -147,6 +147,29 @@ class SkillExecutor:
         return self.last_action.copy()
 
 
+class CompositionExecutor:
+    """Per-environment macro state; the shared residual bank remains immutable."""
+    def __init__(self, bank, interval=5):
+        if type(interval) is not int or interval < 1:
+            raise ValueError('selection interval must be a positive LL decision count')
+        self.bank, self.interval = bank, interval
+        self.reset()
+
+    def reset(self):
+        self.state = SkillState()
+        self.coefficients = np.zeros(len(self.bank.manifest), dtype=np.float32)
+        self.last_action = np.zeros(self.bank.action_dim, dtype=np.float32)
+
+    def action(self, observation, *, collect_influence=False):
+        if self.state.active < 0:
+            raise RuntimeError('Select composition before driving')
+        result = self.bank(np.asarray(observation)[None], self.coefficients[None, 1:], collect_influence=collect_influence)
+        action, self.last_influence = result if collect_influence else (result, None)
+        self.last_action = action[0].cpu().numpy()
+        self.state.advance()
+        return self.last_action.copy()
+
+
 def geometry_annotation(metadata, s, skill_name=None):
     """Diagnostic labels only; shared by offline trajectory reports."""
     if not metadata:

@@ -369,6 +369,8 @@ def trainer_command(settings, identity, out):
                                      if architecture_sweep else settings["experiment_id"]),
           "job_type": identity["algorithm"], "tune": metadata}
     wb.update({key: wandb[key] for key in ("project", "entity") if wandb[key] is not None})
+    if "tags" in wandb:
+        wb["tags"] = wandb["tags"]
     overrides.extend(f"++wandb.{key}={json.dumps(value)}" for key, value in wb.items() if key != "tune")
     # Dot-containing parameter paths are values inside a JSON string, so Hydra
     # does not mistake them for nested override keys.

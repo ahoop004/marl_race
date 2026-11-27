@@ -53,6 +53,8 @@ class NativeRaceTorchRLEnv(EnvBase):
         if any(len(width) != 1 for width in widths):
             raise ValueError("The agents group requires vector observations")
         self.hierarchical = getattr(task, "hierarchical", False)
+        self.categorical = self.hierarchical and getattr(task, "categorical", True)
+        self.action_width = task.action_space(self.agent_ids[0]).shape[0]
         for aid in self.agent_ids:
             spec = task.action_space(aid)
             if not self.hierarchical and (spec.shape != (2,) or not (np.all(spec.low == -1) and np.all(spec.high == 1))):
@@ -106,8 +108,12 @@ class NativeRaceTorchRLEnv(EnvBase):
             action=Bounded(-1, 1, shape=(n, 2), dtype=torch.float32, device=self.device),
             shape=(n,), device=self.device), device=self.device)
         if self.hierarchical:
+            action_spec = (Categorical(task.n_skills, shape=(n, 1), dtype=torch.int64, device=self.device)
+                if self.categorical else
+                Bounded(0, 1, shape=(n, self.action_width), dtype=torch.float32, device=self.device)
+                if task.distribution == 'dirichlet' else real((n, self.action_width)))
             self.action_spec = Composite(agents=Composite(
-                action=Categorical(task.n_skills, shape=(n, 1), dtype=torch.int64, device=self.device),
+                action=action_spec,
                 shape=(n,), device=self.device), device=self.device)
             self.observation_spec["steps_to_next_obs"] = count((1,))
         if environment_id is not None:
@@ -172,10 +178,10 @@ class NativeRaceTorchRLEnv(EnvBase):
         if self.is_closed or self.snapshot is None or self.snapshot.episode_done:
             raise RuntimeError("Reset an open environment before stepping a new race")
         action = tensordict.get(("agents", "action"), None)
-        if not isinstance(action, torch.Tensor) or action.shape != (len(self.agent_ids), 1 if self.hierarchical else 2):
-            raise ValueError("agents.action must have shape (number of policy agents, 2)")
-        if action.dtype != (torch.int64 if self.hierarchical else torch.float32):
-            raise ValueError("agents.action must have dtype float32")
+        if not isinstance(action, torch.Tensor) or action.shape != (len(self.agent_ids), self.action_width):
+            raise ValueError("agents.action has an incompatible shape")
+        if action.dtype != (torch.int64 if self.categorical else torch.float32):
+            raise ValueError("agents.action has an incompatible dtype")
         active = set(self.snapshot.agents)
         def policy_actions():
             if not active:

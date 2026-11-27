@@ -48,6 +48,10 @@ class TaskEvaluator:
             max_steps=self.task.episode_limits.max_steps, timestep_s=self.task.timestep,
             target_laps=self.task.episode_limits.target_laps, action_repeat=self.action_repeat,
             completion=self.completion)
+        if getattr(self.task, 'hierarchical', False) and not getattr(self.task, 'categorical', True):
+            config = self.agent.hierarchical.get('composition', {})
+            protocol['composition_inference'] = {key: config.get(key) for key in (
+                'inference_strategy', 'inference_samples', 'inference_top_k', 'inference_temperature')}
         by_map, physics, records, results = {}, [], [], []
         with evaluation_mode(self.agent, preserve_rng=preserve_rng):
             for episode in range(self.episodes):

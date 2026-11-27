@@ -104,6 +104,12 @@ def _run_evaluation(
             scenario["environment"]["map_bundles_eval"] = protocol["map_bundles"]
         if "target_laps" in protocol:
             scenario["evaluation"]["target_laps"] = protocol["target_laps"]
+    composition_final = (protocol_name == 'final' and scenario.get('hierarchical', {}).get('enabled', False)
+                         and scenario['hierarchical'].get('composition', {}).get('distribution', 'categorical') != 'categorical')
+    if composition_final:
+        # The separate held-out protocol specifies episodes per map, not a
+        # total spread over the seven maps. Keep routine CL evaluation unchanged.
+        scenario['environment'].update(map_cycle='per_episode', map_pick='round_robin', epoch_shuffle=False)
     exp_cfg = scenario.get("experiment", {})
     env_cfg = scenario.get("environment", {})
     eval_episodes = (
@@ -112,6 +118,8 @@ def _run_evaluation(
         else int(exp_cfg.get("episodes", 1))
     )
     eval_episodes = max(1, int(eval_episodes))
+    if composition_final:
+        eval_episodes *= len(protocol['map_bundles'])
     base_seed = int(exp_cfg.get("seed", 0) or 0)
     render = bool(env_cfg.get("render", False))
     action_repeat = int(env_cfg.get("action_repeat", 1))
@@ -315,6 +323,10 @@ def _run_evaluation(
         "provenance_mismatches": mismatches,
         "evaluation_provenance": evaluation_provenance,
         "protocol": protocol_name or "custom",
+        **({'episodes_per_map': protocol['episodes']} if composition_final else {}),
+        **({"composition_inference": {key: scenario["hierarchical"]["composition"].get(key) for key in (
+            "inference_strategy", "inference_samples", "inference_top_k", "inference_temperature")}}
+           if getattr(task, "hierarchical", False) and not getattr(task, "categorical", True) else {}),
         "environment_steps": checkpoint_steps,
         "seeds": list(range(base_seed, base_seed + eval_episodes)),
         "max_steps": env.max_steps,

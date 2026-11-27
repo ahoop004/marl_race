@@ -73,7 +73,11 @@ class PPOPolicy(OnPolicyOptimizationSettings):
             if self.lora_config:
                 raise ValueError("HL PPO cannot adapt the frozen driving skills")
             from hierarchical.policy import CategoricalActor
-            self.actor = CategoricalActor(obs_dim, len(self.hierarchical["bank"]["skills"]), self.network_config).to(self.device)
+            from hierarchical.composition import CompositionActor
+            composition = self.hierarchical.get("composition", {})
+            kind = composition.get("distribution", "categorical")
+            self.actor = (CategoricalActor(obs_dim, len(self.hierarchical["bank"]["skills"]), self.network_config)
+                          if kind == "categorical" else CompositionActor(obs_dim, len(self.hierarchical["bank"]["skills"]), self.network_config, composition)).to(self.device)
             # References and hashes only: the task owns the frozen actors.
             from hierarchical.bank import PROJECT_ROOT
             from agents.common.checkpoints import checkpoint_sha256
@@ -87,6 +91,12 @@ class PPOPolicy(OnPolicyOptimizationSettings):
                 expected = self.hierarchical["bank"]["skills"][entry["id"]].get("sha256")
                 if expected and expected != entry["sha256"]:
                     raise ValueError(f"Skill {entry['name']}: checkpoint content hash changed")
+            if kind != "categorical":
+                self.hierarchy_contract["composition"] = {key: value for key, value in composition.items() if not key.startswith("inference_")}
+                self.hierarchy_contract["sampled_action"] = "simplex" if kind == "dirichlet" else "gaussian_latent"
+                self.hierarchy_contract["initialization"] = self.actor.initialization
+                self.hierarchy_contract["entropy_convention"] = "dirichlet_differential" if kind == "dirichlet" else "latent_gaussian"
+                self.hierarchy_contract["residual_layers"] = self.observation_contract["residual_layers"]
         else:
             self.actor = build_actor(
                 obs_dim, self.action_dim, self.network_config,
@@ -152,7 +162,7 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         values = self.critic(obs_t)
         # One device-to-host transfer for all environments and policy outputs.
         outputs = torch.cat((actions, raw_actions, log_probs[:, None], values[:, None]), dim=1).cpu().numpy()
-        return PolicyOutput(outputs[:, :self.action_dim].astype(np.int64) if self.hierarchical else outputs[:, :self.action_dim], outputs[:, -2],
+        return PolicyOutput(outputs[:, :self.action_dim].astype(np.int64) if getattr(self.actor, "categorical", False) else outputs[:, :self.action_dim], outputs[:, -2],
                             outputs[:, self.action_dim:2 * self.action_dim].copy(), outputs[:, -1])
 
     def act_batch(self, observations, deterministic=False):
@@ -163,6 +173,17 @@ class PPOPolicy(OnPolicyOptimizationSettings):
         if len(agent_ids) != 1:
             raise ValueError("PPO inference requires one active policy agent")
         aid = agent_ids[0]
+        if self.hierarchical and not getattr(self.actor, "categorical", False):
+            from hierarchical.composition import CompositionExecution
+            config = self.hierarchical.get("composition", {})
+            obs = torch.as_tensor(np.asarray(observations[aid])[None], dtype=torch.float32, device=self.device)
+            coefficients = self.actor.inference_coefficients(obs,
+                strategy=config.get("inference_strategy", "representative"),
+                samples=config.get("inference_samples", 32), top_k=config.get("inference_top_k"),
+                temperature=config.get("inference_temperature"))[0].cpu().numpy()
+            if self.actor.kind in ("positive_gaussian", "signed_gaussian"):
+                coefficients = np.concatenate((np.zeros(1, dtype=np.float32), coefficients))
+            return {aid: CompositionExecution(coefficients)}
         return {aid: self.predict(observations[aid])}
 
     save_checkpoint = save_checkpoint

@@ -92,12 +92,15 @@ def read_spec(path, repo):
     spec.setdefault("evaluation", {})
     keys(spec["evaluation"], {"seed", "episodes", "every_steps", "max_steps"}, where="evaluation")
     spec.setdefault("wandb", {})
-    keys(spec["wandb"], {"mode", "project", "entity", "group"}, where="wandb")
+    keys(spec["wandb"], {"mode", "project", "entity", "group", "tags"}, where="wandb")
     if spec["wandb"].get("mode", "online") not in {"online", "offline", "disabled"}:
         raise ValueError("wandb.mode must be online, offline or disabled")
     for key in ("project", "entity", "group"):
         if key in spec["wandb"] and (not isinstance(spec["wandb"][key], str) or not spec["wandb"][key]):
             raise ValueError(f"wandb.{key} must be a nonempty string")
+    if 'tags' in spec['wandb'] and (not isinstance(spec['wandb']['tags'], list)
+            or any(not isinstance(tag, str) or not tag for tag in spec['wandb']['tags'])):
+        raise ValueError('wandb.tags must be a list of nonempty strings')
     search = spec["search"]
     keys(search, {"method", "parameters", "num_samples"}, {"method", "parameters"}, "search")
     if search["method"] not in {"grid", "random"} or not isinstance(search["parameters"], dict) or not search["parameters"]:

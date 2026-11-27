@@ -164,26 +164,37 @@ class ResidualBank(nn.Module):
                 torch.tensor([r.A.shape[0] for r in factors], device=self.device)))
             self._factor_names[name] = (a_name, b_name, index_name)
             self.layer_contract.append({'layer': name, 'ranks': [r.A.shape[0] for r in factors],
+                                        'alphas': [r.scale * r.A.shape[0] for r in factors],
                                         'scales': [r.scale for r in factors]})
         self.requires_grad_(False).eval()
         self.initialization_seconds = time.perf_counter() - started
 
-    def _layer(self, name, layer, inputs, weights):
+    def _layer(self, name, layer, inputs, weights, diagnostics=None):
         output = layer(inputs)
         if name in self._factor_names:
             a, b, owners = (getattr(self, key) for key in self._factor_names[name])
             low_rank = F.linear(inputs, a) * weights.index_select(-1, owners)
-            output = output + F.linear(low_rank, b)
+            residual = F.linear(low_rank, b)
+            if diagnostics is not None:
+                diagnostics[f'{name}/combined_norm'] = float(residual.norm(dim=-1).mean())
+                diagnostics[f'{name}/relative_norm'] = float((residual.norm(dim=-1) / output.norm(dim=-1).clamp_min(1e-8)).mean())
+                offset = 0
+                for i, entry in enumerate(self.manifest[1:]):
+                    rank = int((owners == i).sum())
+                    value = F.linear(low_rank[..., offset:offset + rank], b[:, offset:offset + rank])
+                    diagnostics[f'{name}/weighted_norm/{entry["name"]}'] = float(value.norm(dim=-1).mean())
+                    offset += rank
+            output = output + residual
         return output
 
-    def _sequence(self, sequence, inputs, weights, prefix=''):
+    def _sequence(self, sequence, inputs, weights, prefix='', diagnostics=None):
         for name, layer in sequence.named_children():
             path = f'{prefix}.{name}' if prefix else name
-            inputs = self._layer(path, layer, inputs, weights)
+            inputs = self._layer(path, layer, inputs, weights, diagnostics)
         return inputs
 
     @torch.no_grad()
-    def forward(self, observations, coefficients):
+    def forward(self, observations, coefficients, *, collect_influence=False):
         from agents.common.networks import ResidualMLP
 
         obs = torch.as_tensor(observations, dtype=torch.float32, device=self.device)
@@ -193,14 +204,16 @@ class ResidualBank(nn.Module):
         if not torch.isfinite(weights).all() or torch.any(weights.abs() > 1):
             raise ValueError('Residual coefficients must be finite and within [-1, 1]')
         x = self.base.encoder(obs)
+        diagnostics = {} if collect_influence else None
         if isinstance(self.base.net, nn.Sequential):
-            x = self._sequence(self.base.net, x, weights)
+            x = self._sequence(self.base.net, x, weights, diagnostics=diagnostics)
         elif isinstance(self.base.net, ResidualMLP):
-            x = self._sequence(self.base.net.input_projection, x, weights, 'input_projection')
+            x = self._sequence(self.base.net.input_projection, x, weights, 'input_projection', diagnostics)
             for index, block in enumerate(self.base.net.blocks):
-                x = x + self._sequence(block.branch, x, weights, f'blocks.{index}.branch')
+                x = x + self._sequence(block.branch, x, weights, f'blocks.{index}.branch', diagnostics)
             x = self.base.net.output(x)
-        return torch.tanh(x)
+        action = torch.tanh(x)
+        return (action, diagnostics) if collect_influence else action
 
     def accounting(self):
         base = sum(p.numel() for p in self.base.parameters())

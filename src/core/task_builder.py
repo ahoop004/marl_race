@@ -50,10 +50,11 @@ def create_race_task(scenario, *, scenario_dir=None, mode="train", render_mode=N
             reward_composers=rewards, action_composers=actions, action_repeat=repeat,
         )
         if scenario.get("hierarchical", {}).get("enabled", False):
-            from hierarchical.bank import shared_adapter_bank
+            from hierarchical.bank import shared_adapter_bank, shared_residual_bank
             from hierarchical.task import HierarchicalTask
             config = scenario["hierarchical"]
-            bank = shared_adapter_bank(config["bank"], spec=task.spec, device="cpu")
+            composition = config.get("composition", {}).get("distribution", "categorical") != "categorical"
+            bank = (shared_residual_bank if composition else shared_adapter_bank)(config["bank"], spec=task.spec, device="cpu")
             from training.algorithms import resolve_training_params
             from utils.torch_io import validate_checkpoint_compatibility
             ll_params = resolve_training_params(scenario["agents"][ids[0]], scenario)

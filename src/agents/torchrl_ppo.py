@@ -23,7 +23,7 @@ class _PolicyParameters(torch.nn.Module):
         self.actor = actor
 
     def forward(self, observation):
-        if getattr(self.actor, "categorical", False):
+        if getattr(self.actor, "categorical", False) or getattr(self.actor, "kind", None) == "dirichlet":
             return self.actor(observation)[0]
         mean, scale = self.actor(observation)
         return mean, scale.expand_as(mean)
@@ -74,13 +74,15 @@ class TorchRLPPOAgent(PPOPolicy):
         self.frames_per_batch = int(params.get("frames_per_batch", 256))
         if min(self.n_steps, self.n_epochs, self.batch_size, self.frames_per_batch) < 1:
             raise ValueError("PPO rollout size, epochs, and batch size must be positive")
-        parameters = TensorDictModule(
-            _PolicyParameters(self.actor), in_keys=["observation"], out_keys=["logits"] if self.hierarchical else ["loc", "scale"],
-        )
+        categorical = getattr(self.actor, "categorical", False)
+        dirichlet = getattr(self.actor, "kind", None) == "dirichlet"
+        keys = ["logits"] if categorical else ["concentration"] if dirichlet else ["loc", "scale"]
+        parameters = TensorDictModule(_PolicyParameters(self.actor), in_keys=["observation"], out_keys=keys)
         from hierarchical.policy import SkillDistribution
+        from torch.distributions import Dirichlet
         self.probabilistic_actor = ProbabilisticActor(
-            parameters, in_keys=["logits"] if self.hierarchical else ["loc", "scale"], out_keys=["raw_action"],
-            distribution_class=SkillDistribution if self.hierarchical else IndependentNormal,
+            parameters, in_keys=keys, out_keys=["raw_action"],
+            distribution_class=SkillDistribution if categorical else Dirichlet if dirichlet else IndependentNormal,
             return_log_prob=True, log_prob_key="raw_log_prob",
         )
         self.policy = TensorDictSequential(
@@ -132,7 +134,7 @@ class TorchRLPPOAgent(PPOPolicy):
             self.policy(data)
         outputs = torch.cat((data["action"], data["raw_action"], data["raw_log_prob"][:, None],
                              self.critic(observation)[:, None]), dim=1).cpu().numpy()
-        return PolicyOutput(outputs[:, :self.action_dim].astype("int64") if self.hierarchical else outputs[:, :self.action_dim], outputs[:, -2],
+        return PolicyOutput(outputs[:, :self.action_dim].astype("int64") if getattr(self.actor, "categorical", False) else outputs[:, :self.action_dim], outputs[:, -2],
                             outputs[:, self.action_dim:2 * self.action_dim].copy(), outputs[:, -1])
 
     def update_rollouts(self, rollouts):

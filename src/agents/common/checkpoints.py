@@ -55,7 +55,8 @@ def policy_metadata(policy):
         "structure": {
             "encoder": encoders if convolutional else "identity",
             **({"observation_segments": segments} if convolutional else {}),
-            "distribution": "categorical_skill_v1" if getattr(policy, "hierarchical", None) else "squashed_gaussian_pre_tanh_v1",
+            "distribution": ("categorical_skill_v1" if getattr(policy.actor, "categorical", False) else
+                "composition_" + policy.actor.kind + "_v1" if getattr(policy, "hierarchical", None) else "squashed_gaussian_pre_tanh_v1"),
             **({"hierarchy": policy.hierarchy_contract} if getattr(policy, "hierarchical", None) else {}),
             "actor_mode": getattr(policy, "actor_mode", "independent"),
             "critic_mode": getattr(policy, "critic_mode", "local_observation"),

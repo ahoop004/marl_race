@@ -31,6 +31,9 @@ def run_evaluation_episode(task, actions_fn, *, episode, seed,
     """
     if completion not in {"race", "policy"}:
         raise ValueError("Evaluation completion must be race or policy")
+    if getattr(task, 'hierarchical', False) and not getattr(task, 'categorical', True):
+        import torch
+        torch.manual_seed(seed)
     snapshot = task.reset(seed=seed, options={"map_episode_index": episode,
                                            "spawn_episode_index": episode})
     spawn = task.episode_metadata.spawn_configuration
