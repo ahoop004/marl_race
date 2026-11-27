@@ -1,0 +1,46 @@
+# @package _global_
+defaults:
+- ppo_hierarchical
+- /continual: generated_to_f110
+- override /execution: single_node_gpu
+- _self_
+experiment:
+  name: ppo_hierarchical_continual
+  total_steps: 57344000
+  parallel_envs: 24
+  envs_per_worker: 8
+  collection_backend: process
+  torch_threads: 1
+  measure_services: true
+  measure_stages: true
+  measure_collector_startup: true
+network:
+  actor_hidden_dims: [256, 256]
+  critic_hidden_dims: [256, 256]
+algorithm:
+  params:
+    n_steps: 6144
+    frames_per_batch: 1536
+    batch_size: 768
+    n_epochs: 4
+execution:
+  params:
+    collection_device: cpu
+hierarchical:
+  interval: 5
+  preview:
+    enabled: false
+    samples: 20
+    spacing_m: 0.6
+evaluation:
+  enabled: false
+  seed: 10042
+  episodes: 10
+  final_test:
+    seed: 20042
+    episodes: 20
+wandb:
+  enabled: true
+  mode: online
+  group: hierarchical-continual
+  job_type: hierarchical-continual

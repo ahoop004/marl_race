@@ -53,9 +53,11 @@ def read_spec(path, repo):
     spec = yaml.load(Path(path).read_text(), Loader=UniqueLoader)
     keys(spec, {"name", "experiment_id", "algorithm", "scenario", "total_steps", "seeds", "sweep_seed",
                 "fixed_overrides", "search", "max_concurrent_trials", "resources_per_trial", "evaluation",
-                "wandb", "allow_duplicates", "source_manifest", "pretraining_seeds"},
+                "wandb", "allow_duplicates", "source_manifest", "pretraining_seeds", "continual"},
          {"name", "experiment_id", "algorithm", "scenario", "total_steps", "seeds", "sweep_seed", "search"})
     identifier(spec["experiment_id"])
+    if type(spec.get("continual", False)) is not bool:
+        raise ValueError("continual must be boolean")
     if not isinstance(spec["name"], str) or not spec["name"].strip():
         raise ValueError("name must be a nonempty string")
     if spec["algorithm"] not in {"ppo", "mappo"}:
@@ -364,7 +366,7 @@ def preflight(settings, command_builder, repo):
     from training.configuration import PROFILING_DEFAULTS
     from omegaconf import OmegaConf
     from hydra.core.override_parser.overrides_parser import OverridesParser
-    from launch_experiment import resolve_collectors
+    from launch_experiment import batch_error, resolve_collectors
 
     inputs = Path(settings["root"]) / "sweep_inputs"
     if (Path(settings["root"]) / "experiment.json").exists():
@@ -471,9 +473,26 @@ def preflight(settings, command_builder, repo):
         selection = resolve_evaluation_protocol(config, "selection")
         final = resolve_evaluation_protocol(config, "final")
         protocols = {"selection": selection, "final": final, "evaluation": config["evaluation"]}
-        if not config["evaluation"]["enabled"] or config["experiment"].get("distributed"):
-            raise ValueError("Sweeps require selection evaluation and independent, non-DDP trainers")
+        if bool(config.get("continual")) != spec.get("continual", False):
+            raise ValueError("Sweep continual mode must agree with its scenario")
+        if (config["evaluation"]["enabled"] == spec.get("continual", False)
+                or config["experiment"].get("distributed")):
+            raise ValueError("Sweeps require independent trainers and the appropriate evaluation owner")
         resolve_collectors(config, spec["resources_per_trial"]["cpu"], frozen=True)
+        if spec.get("continual", False):
+            if "tasks" in config["continual"]:
+                from training.continual import map_tasks
+                map_tasks(config["continual"], config)
+            error = batch_error(config, config["experiment"]["parallel_envs"],
+                                config["experiment"]["envs_per_worker"])
+            if error:
+                raise ValueError(error)
+            from training.algorithms import resolve_training_params
+            agent = next(agent for agent in config["agents"].values() if agent.get("trainable"))
+            actual = resolve_training_params(agent, config)
+            for key in ("n_steps", "frames_per_batch", "batch_size", "n_epochs"):
+                if actual.get(key) != config["algorithm"]["params"][key]:
+                    raise ValueError(f"algorithm.params.{key} is shadowed in the learner configuration")
         # Architectures/arms may vary; observation, reward, maps and opponents
         # must stay controlled. Training seeds are replicated independently.
         common = {"environment": config["environment"], "maps": config["maps"],

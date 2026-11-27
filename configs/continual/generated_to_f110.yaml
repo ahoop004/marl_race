@@ -1,0 +1,22 @@
+generated_manifest: maps_generated/manifest.json
+tasks:
+- {name: train_composite_03, generated_slot: train_composite_03, domain: generated, complexity: 4}
+- {name: train_composite_09, generated_slot: train_composite_09, domain: generated, complexity: 4}
+- {name: train_composite_14, generated_slot: train_composite_14, domain: generated, complexity: 4}
+- {name: train_composite_06, generated_slot: train_composite_06, domain: generated, complexity: 5}
+- {name: train_composite_11, generated_slot: train_composite_11, domain: generated, complexity: 5}
+- {name: train_composite_17, generated_slot: train_composite_17, domain: generated, complexity: 5}
+- {name: Spielberg_map, map: maps/Spielberg_map/Spielberg_map.yaml, domain: f110}
+- {name: Silverstone_map, map: maps/Silverstone_map/Silverstone_map.yaml, domain: f110}
+- {name: Montreal_map, map: maps/Montreal_map/Montreal_map.yaml, domain: f110}
+- {name: Melbourne_map, map: maps/Melbourne_map/Melbourne_map.yaml, domain: f110}
+- {name: Shanghai_map, map: maps/Shanghai_map/Shanghai_map.yaml, domain: f110}
+- {name: Hockenheim_map, map: maps/Hockenheim_map/Hockenheim_map.yaml, domain: f110}
+- {name: Budapest_map, map: maps/Budapest_map/Budapest_map.yaml, domain: f110}
+- {name: Spa_map, map: maps/Spa_map/Spa_map.yaml, domain: f110}
+steps_per_task: 4096000
+evaluate_every_steps: 409600
+stop_after_task: null
+thresholds:
+  clean_completion_rate: [0.5, 0.8]
+  earned_normalized_progress: [0.5, 0.8]

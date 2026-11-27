@@ -1,0 +1,22 @@
+name: Hierarchical continual CL-A
+experiment_id: hierarchical-continual-a
+algorithm: ppo
+scenario: scenarios/ppo_hierarchical_continual.yaml
+continual: true
+total_steps: 57344000
+seeds: [42]
+sweep_seed: 2026
+search:
+  method: grid
+  parameters:
+    algorithm.params.n_steps:
+      type: choice
+      values: [6144]
+max_concurrent_trials: 1
+resources_per_trial: {cpu: 30, gpu: 1}
+fixed_overrides:
+- experiment.parallel_envs=24
+- experiment.envs_per_worker=8
+- hierarchical.preview.enabled=false
+evaluation: {seed: 10042, episodes: 10, max_steps: 8000}
+wandb: {mode: online, group: hierarchical-continual}

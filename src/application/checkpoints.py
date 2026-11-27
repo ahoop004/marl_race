@@ -46,7 +46,13 @@ def validate_resume_experiment(metadata, scenario):
     if bool(stored.get("continual")) != bool(scenario.get("continual")):
         raise ValueError("Recovery must retain continual-learning mode; use transfer for a new experiment")
     fields = ("algorithm", "network", "environment", "agents", "controllers", "maps", "evaluation", "mappo", "continual")
-    validate_checkpoint_compatibility(stored, {key: scenario[key] for key in fields if key in scenario})
+    expected = {key: deepcopy(scenario[key]) for key in fields if key in scenario}
+    if scenario.get("continual"):
+        # This execution limit may change after a task-boundary pilot; the
+        # ordered task protocol and every learning parameter remain immutable.
+        stored["continual"].pop("stop_after_task", None)
+        expected["continual"].pop("stop_after_task", None)
+    validate_checkpoint_compatibility(stored, expected)
     validate_checkpoint_compatibility(stored["experiment"], {"seed": scenario["experiment"].get("seed")})
     if scenario.get("continual"):
         validate_checkpoint_compatibility(stored["experiment"], {

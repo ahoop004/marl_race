@@ -281,7 +281,15 @@ def restore_native(checkpoint, out, attempt, identity):
         if (out / "started.json").exists():
             raise RuntimeError(f"Trial already started but has no recovery checkpoint: {out}")
         return None
-    return max(candidates, key=lambda item: item[1]["training"]["progress"]["environment_steps"])[0]
+    # A boundary checkpoint has the same decision count as the preceding PPO
+    # checkpoint but commits an additional completed task and evaluation row.
+    # On a tie prefer the shared native checkpoint, which is written later.
+    def recovery_order(item):
+        index, (_, payload) = item
+        state = payload["training"]
+        task_index = state.get("hooks", {}).get("ContinualHook", {}).get("task_index", 0)
+        return state["progress"]["environment_steps"], task_index, index
+    return max(enumerate(candidates), key=recovery_order)[1][0]
 
 
 def verify_native_completion(out, identity):
@@ -292,6 +300,10 @@ def verify_native_completion(out, identity):
     final = read_checkpoint(out / "final.pt")["metadata"]
     entry = identity["settings"]["sweep_trial"]
     budget = identity["settings"]["total_steps"]
+    if identity["settings"].get("sweep", {}).get("continual", False):
+        state = latest["training"]["hooks"]["ContinualHook"]
+        if state["task_index"] != len(state["task_protocol"]):
+            raise ValueError(f"Continual protocol is incomplete: {out}")
     if (summary["environment_steps"] < budget or latest["training"]["progress"]["environment_steps"] < budget
             or final["progress"]["environment_steps"] < budget):
         raise ValueError(f"Actual native budget not reached: {out}")
@@ -321,10 +333,11 @@ def trainer_command(settings, identity, out):
     collectors = [] if architecture_sweep else [
         f"{path}={value}" for path, value in (("experiment.parallel_envs", 2), ("experiment.envs_per_worker", 1))
         if path not in overridden]
+    continual = bool(settings.get("sweep", {}).get("continual", False))
     overrides = [*collectors, "experiment.distributed=false", *smoke,
                  f"checkpoint.every_steps={settings['checkpoint_every_steps']}",
                  f"checkpoint.every_updates={settings['checkpoint_every_updates'] or 'null'}",
-                 f"evaluation.enabled={str(settings['evaluation']).lower()}",
+                 f"evaluation.enabled={str(settings['evaluation'] and not continual).lower()}",
                  f"execution.params.device={device}", "execution.params.collection_device=cpu", *settings["overrides"]]
     if entry.get("input_path"):
         # Frozen files have no Hydra defaults. Never reapply group selections or
@@ -333,7 +346,7 @@ def trainer_command(settings, identity, out):
     if settings.get("sweep") and not entry.get("input_path"):
         spec = settings["sweep"]
         strategy = "completion_progress" if identity["algorithm"] == "ppo" else "team_completion"
-        evaluation = {"enabled": True, "selection_strategy": strategy, **spec["evaluation"]}
+        evaluation = {"enabled": not continual, "selection_strategy": strategy, **spec["evaluation"]}
         overrides.extend(f"++evaluation.{key}={json.dumps(value)}" for key, value in evaluation.items())
         overrides.append(f"++experiment.name={json.dumps(spec['name'])}")
     wandb = settings["wandb"]
@@ -575,6 +588,13 @@ def trial(config):
                     report()
                     raise RuntimeError(f"{label} trainer exited {process.returncode}; inspect {attempt / 'train.log'}")
                 summary = json.loads((out / "run_summary.json").read_text())
+                if settings.get("sweep", {}).get("continual", False):
+                    latest = checkpoint_payload(out / "latest.pt", identity)
+                    state = latest["training"]["hooks"]["ContinualHook"]
+                    if state["task_index"] != len(state["task_protocol"]):
+                        report()
+                        raise RuntimeError(f"{label}: continual run stopped at task {state['task_index']}; "
+                                           "restore the experiment to continue from latest.pt")
                 if summary["environment_steps"] < settings["total_steps"] or not (out / "final.pt").is_file():
                     report()
                     raise RuntimeError(f"{label}: original training budget not reached; inspect {attempt / 'train.log'}")
@@ -879,7 +899,7 @@ def main():
                                total_steps=settings["total_steps"], last_attempt_training_seconds=metrics.get("perf/elapsed_seconds"))
                 results.append(row)
             atomic_json(root / "results.json", results)
-            if "trial_plan" in settings:
+            if "trial_plan" in settings and not settings.get("sweep", {}).get("continual", False):
                 sys.path.insert(0, str(REPO / "src"))
                 atomic_json(root / "ranked_summary.json", {"experiment_id": settings["experiment_id"],
                                                           "evaluation_protocol": settings["evaluation_protocol"], **ranking(results)})

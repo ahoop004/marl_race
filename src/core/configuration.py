@@ -56,7 +56,8 @@ def materialize_configuration(config):
     config["experiment"] = OmegaConf.to_container(OmegaConf.merge(
         execution["experiment"], config.get("experiment", {})), resolve=True)
     if config.get("continual") and config["experiment"].get("total_steps") is None:
-        config["experiment"]["total_steps"] = (len(config["continual"]["families"])
+        tasks = config["continual"].get("tasks", config["continual"].get("families", []))
+        config["experiment"]["total_steps"] = (len(tasks)
                                                 * config["continual"]["steps_per_task"])
     name = algorithm["name"]
     config["experiment"][f"{name}_backend"] = algorithm["backend"]

@@ -227,8 +227,11 @@ class HierarchicalTask:
 
     def metrics(self):
         state = self.executor.state
+        probabilities = self.selection_counts / max(self.episode_hl, 1)
+        positive = probabilities[probabilities > 0]
         metrics = {'hierarchical/ll_decisions': self.episode_ll,
             'hierarchical/hl_decisions': self.episode_hl,
+            'hierarchical/selection_entropy': float(-np.sum(positive * np.log(positive))),
             'hierarchical/switches': state.switches,
             'hierarchical/switches_per_metre': state.switches / max(self.distance, 1e-8),
             'hierarchical/switches_per_second': state.switches / max(self.elapsed, 1e-8),
@@ -251,6 +254,7 @@ class HierarchicalTask:
         metrics['hierarchical/bank_tensor_storage_bytes'] = self.bank.accounting()['tensor_bytes']
         for entry in self.bank.manifest:
             i, name = entry['id'], entry['name']
+            metrics[f'hierarchical/selection_count/{name}'] = int(self.selection_counts[i])
             metrics[f'hierarchical/selection_fraction/{name}'] = float(self.selection_counts[i] / max(self.episode_hl, 1))
             metrics[f'hierarchical/execution_ll_decisions/{name}'] = int(self.execution_counts[i])
             metrics[f'hierarchical/forward_centerline_progress_m/{name}'] = float(self.skill_distance[i])
