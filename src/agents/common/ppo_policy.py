@@ -73,11 +73,12 @@ class PPOPolicy(OnPolicyOptimizationSettings):
             if self.lora_config:
                 raise ValueError("HL PPO cannot adapt the frozen driving skills")
             from hierarchical.policy import CategoricalActor
-            from hierarchical.composition import CompositionActor
+            from hierarchical.composition import CompositionActor, composition_spec
             composition = self.hierarchical.get("composition", {})
-            kind = composition.get("distribution", "categorical")
+            distribution = composition_spec(composition)
             self.actor = (CategoricalActor(obs_dim, len(self.hierarchical["bank"]["skills"]), self.network_config)
-                          if kind == "categorical" else CompositionActor(obs_dim, len(self.hierarchical["bank"]["skills"]), self.network_config, composition)).to(self.device)
+                          if distribution.categorical else CompositionActor(
+                              obs_dim, len(self.hierarchical["bank"]["skills"]), self.network_config, composition)).to(self.device)
             # References and hashes only: the task owns the frozen actors.
             from hierarchical.bank import PROJECT_ROOT
             from agents.common.checkpoints import checkpoint_sha256
@@ -91,11 +92,15 @@ class PPOPolicy(OnPolicyOptimizationSettings):
                 expected = self.hierarchical["bank"]["skills"][entry["id"]].get("sha256")
                 if expected and expected != entry["sha256"]:
                     raise ValueError(f"Skill {entry['name']}: checkpoint content hash changed")
-            if kind != "categorical":
-                self.hierarchy_contract["composition"] = {key: value for key, value in composition.items() if not key.startswith("inference_")}
-                self.hierarchy_contract["sampled_action"] = "simplex" if kind == "dirichlet" else "gaussian_latent"
+            if not distribution.categorical:
+                self.hierarchy_contract["composition"] = {
+                    **{key: value for key, value in composition.items()
+                       if not key.startswith("inference_") and key != "influence_every"},
+                    **distribution.contract,
+                }
+                self.hierarchy_contract["sampled_action"] = distribution.sampled_action
                 self.hierarchy_contract["initialization"] = self.actor.initialization
-                self.hierarchy_contract["entropy_convention"] = "dirichlet_differential" if kind == "dirichlet" else "latent_gaussian"
+                self.hierarchy_contract["entropy_convention"] = distribution.entropy_convention
                 self.hierarchy_contract["residual_layers"] = self.observation_contract["residual_layers"]
         else:
             self.actor = build_actor(
@@ -181,7 +186,7 @@ class PPOPolicy(OnPolicyOptimizationSettings):
                 strategy=config.get("inference_strategy", "representative"),
                 samples=config.get("inference_samples", 32), top_k=config.get("inference_top_k"),
                 temperature=config.get("inference_temperature"))[0].cpu().numpy()
-            if self.actor.kind in ("positive_gaussian", "signed_gaussian"):
+            if not self.actor.spec.convex:
                 coefficients = np.concatenate((np.zeros(1, dtype=np.float32), coefficients))
             return {aid: CompositionExecution(coefficients)}
         return {aid: self.predict(observations[aid])}

@@ -22,6 +22,11 @@ def summarize(paths):
         report = json.loads(Path(path).read_text())
         for record in records(report):
             hierarchy = record.get('hierarchical', {})
+            trace = hierarchy.get('trajectory', [])
+            if (hierarchy.get('routing_type') == 'composition'
+                    or any(key.startswith('composition/') for key in hierarchy.get('metrics', {}))
+                    or (trace and 'dominant_option' in trace[0])):
+                raise ValueError('Hard-skill transition reports require categorical routing')
             bank = tuple(entry['sha256'] for entry in hierarchy.get('skills', []))
             if bank:
                 if expected_bank is not None and bank != expected_bank:
@@ -37,9 +42,6 @@ def summarize(paths):
             for i, row in enumerate(hierarchy.get('transition_counts', [])):
                 for j, count in enumerate(row):
                     transitions[(method, i, j)] += count
-            trace = hierarchy.get('trajectory', [])
-            if trace and 'dominant_option' in trace[0]:
-                raise ValueError('Hard-skill trajectory reports do not apply to continuous composition')
             visits = []
             for position, row in enumerate(trace):
                 usage[(method, row.get('geometry', 'unknown'), row['skill'])] += 1

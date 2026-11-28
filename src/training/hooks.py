@@ -189,7 +189,7 @@ class WandbHook(TrainingHook):
                     if facts["team"] == "trainable"}
         log = {"episode/reward": reward, "episode/number": episode}
         log.update({f"episode/{key}": value for key, value in metrics.items()
-                    if key.startswith("hierarchical/") and isinstance(value, (int, float))})
+                    if key.startswith(("hierarchical/", "composition/")) and isinstance(value, (int, float))})
         if "episode/completion_index" in metrics:
             log["episode/completion_index"] = metrics["episode/completion_index"]
         for key in ("episode_id", "environment_id", "environment_episode"):

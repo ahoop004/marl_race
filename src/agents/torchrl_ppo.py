@@ -15,6 +15,7 @@ from agents.common.optimization import make_objective
 from agents.torchrl_rollouts import rollout_groups, transfer_rollout_group, batch_gae
 from agents.torchrl_updates import (PPO_OPTIMIZATION_KEYS, PPO_OPTIONAL_OPTIMIZATION_KEYS,
                                    optimize_ppo)
+from hierarchical.composition import CompositionDirichlet
 
 
 class _PolicyParameters(torch.nn.Module):
@@ -23,7 +24,7 @@ class _PolicyParameters(torch.nn.Module):
         self.actor = actor
 
     def forward(self, observation):
-        if getattr(self.actor, "categorical", False) or getattr(self.actor, "kind", None) == "dirichlet":
+        if getattr(self.actor, "categorical", False) or getattr(getattr(self.actor, "spec", None), "simplex", False):
             return self.actor(observation)[0]
         mean, scale = self.actor(observation)
         return mean, scale.expand_as(mean)
@@ -75,14 +76,13 @@ class TorchRLPPOAgent(PPOPolicy):
         if min(self.n_steps, self.n_epochs, self.batch_size, self.frames_per_batch) < 1:
             raise ValueError("PPO rollout size, epochs, and batch size must be positive")
         categorical = getattr(self.actor, "categorical", False)
-        dirichlet = getattr(self.actor, "kind", None) == "dirichlet"
+        dirichlet = getattr(getattr(self.actor, "spec", None), "simplex", False)
         keys = ["logits"] if categorical else ["concentration"] if dirichlet else ["loc", "scale"]
         parameters = TensorDictModule(_PolicyParameters(self.actor), in_keys=["observation"], out_keys=keys)
         from hierarchical.policy import SkillDistribution
-        from torch.distributions import Dirichlet
         self.probabilistic_actor = ProbabilisticActor(
             parameters, in_keys=keys, out_keys=["raw_action"],
-            distribution_class=SkillDistribution if categorical else Dirichlet if dirichlet else IndependentNormal,
+            distribution_class=SkillDistribution if categorical else CompositionDirichlet if dirichlet else IndependentNormal,
             return_log_prob=True, log_prob_key="raw_log_prob",
         )
         self.policy = TensorDictSequential(

@@ -136,7 +136,8 @@ class RaceTrainingReports:
             agent_finish_positions={aid: self.last_info[aid].get("finish_position") for aid in self.ids},
             agent_lap_counts={aid: int(self.last_info[aid].get("lap_count", 0)) for aid in self.ids})
         if getattr(self.task, "hierarchical", False):
-            metrics.update(self.task.metrics())
+            hierarchy_metrics = self.task.metrics()
+            metrics.update(hierarchy_metrics)
         if t.algorithm == "mappo":
             metrics.update(reward_mode=self.agent.reward_mode,
                            team_reward_reduction=self.agent.team_reward_reduction,
@@ -157,7 +158,10 @@ class RaceTrainingReports:
             "reported_at_environment_steps": t._environment_steps,
             "team_reward_components": dict(self.team_components), "training_return": self.reward}
         if getattr(self.task, "hierarchical", False):
-            metrics["race_record"]["hierarchical"] = {"metrics": self.task.metrics()}
+            metrics["race_record"]["hierarchical"] = {
+                "metrics": hierarchy_metrics,
+                "routing_type": "categorical" if getattr(self.task, "categorical", True) else "composition",
+            }
         if (t.algorithm == "ppo" and self.episode_stride == 1
                 and getattr(t.env, "environment_id", None) is None):
             # Preserve PPO's existing episode CSV path and metric contract.

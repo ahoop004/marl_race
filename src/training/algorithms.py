@@ -48,13 +48,14 @@ def learner_params(scenario, spec, algorithm):
     focal = spec.agent_ids[0]
     params = resolve_training_params(scenario["agents"][focal], scenario)
     if scenario.get("hierarchical", {}).get("enabled", False):
+        from hierarchical.composition import composition_spec
         params["hierarchical"] = scenario["hierarchical"]
         composition = scenario["hierarchical"].get("composition", {})
-        kind = composition.get("distribution", "categorical")
-        params["_action_contract"] = {"type": "categorical_skill_v1" if kind == "categorical" else "residual_composition_v1",
+        distribution = composition_spec(composition)
+        params["_action_contract"] = {"type": distribution.likelihood if distribution.categorical else "residual_composition_v1",
             "skills": [entry["name"] for entry in scenario["hierarchical"]["bank"]["skills"]]}
-        if kind != "categorical":
-            params["_action_contract"].update(distribution=kind, sampled_action="simplex" if kind == "dirichlet" else "gaussian_latent")
+        if not distribution.categorical:
+            params["_action_contract"].update(distribution=composition["distribution"], sampled_action=distribution.sampled_action)
     params["_agent_ids"] = list(spec.agent_ids)
     params["_observation_contract"] = spec.observation_contracts[focal]
     if algorithm == "mappo":

@@ -154,8 +154,14 @@ def validate_configuration(config):
     actor = network.get("actor", {})
     critic = network.get("critic", {})
     hierarchical = config.get("hierarchical", {}).get("enabled", False)
-    expected_distribution = ("categorical" if config["hierarchical"].get("composition", {}).get("distribution", "categorical") == "categorical"
-                             else "composition") if hierarchical else "tanh_normal"
+    expected_distribution = "tanh_normal"
+    if hierarchical:
+        from hierarchical.composition import composition_spec
+        try:
+            distribution = composition_spec(config["hierarchical"].get("composition", {}))
+        except ValueError as exc:
+            raise ScenarioError(str(exc)) from exc
+        expected_distribution = "categorical" if distribution.categorical else "composition"
     if hierarchical and (algorithm["name"] != "ppo" or adaptation["mode"] != "scratch"):
         raise ScenarioError("Hierarchical training requires PPO with a fresh high-level selector")
     if actor and actor.get("distribution", "tanh_normal") != expected_distribution:

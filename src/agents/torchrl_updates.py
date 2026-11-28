@@ -102,35 +102,41 @@ def optimize_ppo(agent, data, *, group=None):
     if not total_samples:
         return {}
     composition_stats = {}
-    if local_samples and getattr(agent.actor, 'kind', None):
+    distribution = getattr(agent.actor, 'spec', None)
+    if local_samples and distribution is not None:
+        from hierarchical.composition import coefficient_transform
         with torch.no_grad():
             actions = data[key('raw_action')]
             old_log_prob = data[key('raw_log_prob')]
-            if not torch.isfinite(actions).all() or not torch.isfinite(old_log_prob).all():
-                raise ValueError('Nonfinite composition action or rollout likelihood')
             parameters = agent.actor(data[key('observation')][:min(local_samples, 1024)])
-            coefficient = agent.actor.coefficients(actions)
-            composition_stats = {'train/distribution_entropy': float(agent.actor.entropy_from_parameters(*parameters).mean()),
-                'train/composition/log_probability_mean': float(old_log_prob.mean()),
-                'train/composition/log_probability_std': float(old_log_prob.std(correction=0)),
-                'train/composition/coefficient_mean': float(coefficient.mean()),
-                'train/composition/coefficient_std': float(coefficient.std(correction=0))}
+            valid = agent.actor.valid_action(actions) & old_log_prob.isfinite().all()
+            coefficient = coefficient_transform(actions, distribution, agent.actor.temperature)
             names = [entry['name'] for entry in agent.hierarchical['bank']['skills']]
-            if agent.actor.kind in ('positive_gaussian', 'signed_gaussian'):
+            if not distribution.convex:
                 names = names[1:]
-            for i, name in enumerate(names):
-                composition_stats[f'train/composition/mean/{name}'] = float(coefficient[..., i].mean())
-                composition_stats[f'train/composition/std/{name}'] = float(coefficient[..., i].std(correction=0))
-            if agent.actor.kind == 'dirichlet':
-                composition_stats['train/composition/concentration_mean'] = float(parameters[0].mean())
-                for i, name in enumerate(names):
-                    composition_stats[f'train/composition/concentration/{name}'] = float(parameters[0][..., i].mean())
+            metric_keys = ['distribution_entropy', 'composition/log_probability_mean',
+                           'composition/log_probability_std', 'composition/coefficient_mean',
+                           'composition/coefficient_std']
+            overall = torch.stack((
+                agent.actor.entropy_from_parameters(*parameters).mean(),
+                old_log_prob.mean(), old_log_prob.std(correction=0),
+                coefficient.mean(), coefficient.std(correction=0),
+            ))
+            values = [overall, coefficient.mean(dim=0), coefficient.std(dim=0, correction=0)]
+            metric_keys += [f'composition/{stat}/{name}' for stat in ('mean', 'std') for name in names]
+            if distribution.simplex:
+                metric_keys += ['composition/concentration_mean']
+                metric_keys += [f'composition/concentration/{name}' for name in names]
+                values += [parameters[0].mean().reshape(1), parameters[0].mean(dim=0)]
             else:
-                composition_stats['train/composition/latent_mean'] = float(parameters[0].mean())
-                composition_stats['train/composition/latent_std'] = float(parameters[1].mean())
-                for i in range(agent.actor.action_dim):
-                    composition_stats[f'train/composition/latent_mean/{i}'] = float(parameters[0][..., i].mean())
-                    composition_stats[f'train/composition/latent_std/{i}'] = float(parameters[1][..., i].mean())
+                for stat, parameter in zip(('latent_mean', 'latent_std'), parameters):
+                    metric_keys += [f'composition/{stat}']
+                    metric_keys += [f'composition/{stat}/{i}' for i in range(agent.actor.action_dim)]
+                    values += [parameter.mean().reshape(1), parameter.mean(dim=0)]
+            packed = torch.cat([valid.reshape(1), *values]).cpu().tolist()
+            if not packed[0]:
+                raise ValueError('Invalid composition action or nonfinite rollout likelihood')
+            composition_stats = {f'train/{name}': value for name, value in zip(metric_keys, packed[1:])}
     region = getattr(agent, "profile_region", None)
     count = getattr(agent, "profile_count", None)
     with region("advantage_normalization") if region else nullcontext():

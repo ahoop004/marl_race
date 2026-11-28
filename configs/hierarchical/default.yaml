@@ -6,10 +6,11 @@ interval: 5
 gamma: ${algorithm.params.gamma}
 composition:
   distribution: categorical
-  sampled_action: categorical
-  coefficient_constraint: hard_selection
-  backend: categorical_bank
-  entropy_convention: categorical_exact
+  # Optional compatibility assertions for legacy overrides.
+  sampled_action: null
+  coefficient_constraint: null
+  backend: null
+  entropy_convention: null
   coefficient_bound: 1.0
   initial_concentration: 0.3
   initial_mean: null
@@ -19,6 +20,8 @@ composition:
   inference_samples: 32
   inference_top_k: null
   inference_temperature: null
+  # Sample layer influence every N high-level decisions. Zero disables sampling.
+  influence_every: 0
 dwell_time_scale_seconds: 1.0
 preview:
   enabled: false

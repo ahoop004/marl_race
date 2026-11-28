@@ -1,32 +1,34 @@
-"""Preloaded, independently routed frozen actors; no inference-time disk access."""
+"""Preloaded frozen driving skills for hard selection and residual composition."""
+from itertools import accumulate
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import time
+import weakref
 
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from agents.common.checkpoints import read_checkpoint, solo_evaluation_actor
+from agents.common.checkpoints import read_checkpoint, solo_evaluation_actor, validate_solo_actor_checkpoint
+from agents.common.networks import ResidualMLP
 from utils.torch_io import validate_checkpoint_compatibility
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-class AdapterBank(nn.Module):
-    def __init__(self, manifest, *, spec=None, device="cpu", root=PROJECT_ROOT):
-        super().__init__()
-        started = time.perf_counter()
+class _FrozenBank(nn.Module):
+    def _checkpoints(self, manifest, spec, device, root):
         entries = manifest["skills"]
         if (any(type(e["id"]) is not int for e in entries)
                 or [e["id"] for e in entries] != list(range(len(entries)))
                 or len({e["name"] for e in entries}) != len(entries)
                 or not entries or entries[0]["name"] != "base"):
             raise ValueError("Skills require ordered contiguous IDs starting with base=0 and unique names")
-        self.actors = nn.ModuleList()
         self.manifest = []
-        base = None
+        self.device = torch.device(device)
+        base_state = None
         for entry in entries:
             path = Path(entry["checkpoint"])
             checkpoint = read_checkpoint(path if path.is_absolute() else Path(root) / path)
@@ -35,8 +37,9 @@ class AdapterBank(nn.Module):
             metadata = checkpoint["metadata"]
             if metadata["algorithm"] != "ppo":
                 raise ValueError(f"{entry['name']}: expected a single-agent PPO checkpoint")
-            if base is None:
-                base = checkpoint
+            if base_state is None:
+                base_state = checkpoint["models"]["actor"]
+                base_hash = checkpoint["_identity"]["sha256"]
                 if metadata["adaptation"]["lora"] is not None:
                     raise ValueError("Skill 0 must be the unadapted pretrained base")
                 self.metadata = metadata
@@ -54,10 +57,10 @@ class AdapterBank(nn.Module):
                     key: self.metadata[key] for key in ("network", "contracts", "structure", "implementation")})
                 adaptation = metadata["adaptation"]
                 source = adaptation["source_checkpoint"]
-                if not adaptation["lora"] or not source or source["sha256"] != base["_identity"]["sha256"]:
+                if not adaptation["lora"] or not source or source["sha256"] != base_hash:
                     raise ValueError(f"{entry['name']}: adapter source hash differs from configured base")
                 # Exploration log_std can be trained; every deterministic base tensor must match.
-                for name, value in base["models"]["actor"].items():
+                for name, value in base_state.items():
                     if name != "log_std" and (name not in checkpoint["models"]["actor"] or not torch.equal(value, checkpoint["models"]["actor"][name])):
                         raise ValueError(f"{entry['name']}: frozen base tensor differs: {name}")
                 family = entry.get("family", entry["name"])
@@ -70,10 +73,18 @@ class AdapterBank(nn.Module):
             params = {"network": metadata["network"], "device": device,
                       "_physics_contract": self.metadata["contracts"]["physics"],
                       "_action_contract": self.metadata["contracts"]["actions"]["contract"]}
-            actor = solo_evaluation_actor(checkpoint, spec or stored_spec, params, self.agent_id).actor
-            self.actors.append(actor.requires_grad_(False).eval())
             self.manifest.append({**entry, "sha256": checkpoint["_identity"]["sha256"]})
-        self.device = torch.device(device)
+            yield checkpoint, spec or stored_spec, params
+
+
+class AdapterBank(_FrozenBank):
+    def __init__(self, manifest, *, spec=None, device="cpu", root=PROJECT_ROOT):
+        super().__init__()
+        started = time.perf_counter()
+        self.actors = nn.ModuleList(
+            solo_evaluation_actor(checkpoint, skill_spec, params, self.agent_id).actor
+            for checkpoint, skill_spec, params in self._checkpoints(manifest, spec, device, root)
+        )
         self.initialization_seconds = time.perf_counter() - started
 
     @torch.no_grad()
@@ -100,19 +111,19 @@ class AdapterBank(nn.Module):
 
 # Weak ownership avoids retaining banks after all environments have closed.
 # Each process has its own cache; mutable skill selection never lives here.
-import json
-import weakref
 _BANKS = weakref.WeakValueDictionary()
 
 
-def shared_adapter_bank(manifest, *, spec, device='cpu'):
-    key = json.dumps({'manifest': manifest, 'device': str(device)}, sort_keys=True)
+def _shared_bank(factory, manifest, spec, device):
+    key = (factory, json.dumps(manifest, sort_keys=True), torch.device(device))
     bank = _BANKS.get(key)
     if bank is None:
-        bank = AdapterBank(manifest, spec=spec, device=device)
+        bank = factory(manifest, spec=spec, device=device)
         _BANKS[key] = bank
     else:
         aid = bank.agent_id
+        if list(spec.agent_ids) != [aid]:
+            raise ValueError("Solo evaluation requires the selected original vehicle identity")
         validate_checkpoint_compatibility(bank.metadata['contracts']['observations'][aid],
             {'dim': spec.observation_dims[aid], 'contract': spec.observation_contracts[aid]})
         validate_checkpoint_compatibility(bank.metadata['contracts']['actions'],
@@ -120,52 +131,54 @@ def shared_adapter_bank(manifest, *, spec, device='cpu'):
     return bank
 
 
-class ResidualBank(nn.Module):
-    """One frozen base and stacked LoRA factors; coefficients belong to callers.
+def shared_adapter_bank(manifest, *, spec, device='cpu'):
+    return _shared_bank(AdapterBank, manifest, spec, device)
 
-    Construction deliberately goes through AdapterBank's checkpoint and
-    provenance checks. The temporary specialist actors are then discarded;
-    no dense per-environment effective weights are constructed.
-    """
+
+class ResidualBank(_FrozenBank):
+    """One materialized frozen base and stacked LoRA factors."""
     def __init__(self, manifest, *, spec=None, device='cpu', root=PROJECT_ROOT):
         super().__init__()
         from agents.common.lora import LoRAActor, head_adapter_targets
-        from agents.common.networks import ResidualMLP
 
         started = time.perf_counter()
-        checked = AdapterBank(manifest, spec=spec, device=device, root=root)
-        self.base = checked.actors[0]
-        self.manifest, self.metadata = checked.manifest, checked.metadata
-        self.agent_id, self.obs_dim, self.action_dim = checked.agent_id, checked.obs_dim, checked.action_dim
-        self.device = torch.device(device)
-        specialists = list(checked.actors[1:])
-        if not specialists or not all(isinstance(actor, LoRAActor) and actor.config['mode'] == 'shared'
-                                      and len(actor.adapters) == 1 for actor in specialists):
-            raise ValueError('Residual composition requires shared specialist LoRA actors')
+        checkpoints = self._checkpoints(manifest, spec, device, root)
+        checkpoint, skill_spec, params = next(checkpoints)
+        self.base = solo_evaluation_actor(checkpoint, skill_spec, params, self.agent_id).actor
         targets = head_adapter_targets(self.base.net)
-        if not targets or not isinstance(self.base.net, (nn.Sequential, ResidualMLP)):
+        if not targets:
             raise ValueError('Unsupported residual composition actor head')
+        layer_factors = {name: [] for name in targets}
+        for checkpoint, skill_spec, params in checkpoints:
+            template, _, _, _, lora = validate_solo_actor_checkpoint(checkpoint, skill_spec, params, self.agent_id)
+            if not isinstance(template, LoRAActor) or lora['mode'] != 'shared' or len(template.adapters) != 1:
+                raise ValueError('Residual composition requires shared specialist LoRA actors')
+            if set(template._adapter_keys) != set(targets):
+                raise ValueError('Specialist adapted layer mappings differ')
+            state = checkpoint["models"]["actor"]
+            for name, key in template._adapter_keys.items():
+                prefix = f'adapters.0.{key}'
+                layer_factors[name].append((state[f'{prefix}.A'], state[f'{prefix}.B'], template.adapters[0][key].scale))
+        if len(self.manifest) < 2:
+            raise ValueError('Residual composition requires shared specialist LoRA actors')
         self.layer_contract = []
         self._factor_names = {}
-        for index, (name, layer) in enumerate(targets.items()):
-            factors = []
-            for actor in specialists:
-                if set(actor._adapter_keys) != set(targets):
-                    raise ValueError('Specialist adapted layer mappings differ')
-                residual = actor.adapters[0][actor._adapter_keys[name]]
-                if residual.A.shape[1] != layer.in_features or residual.B.shape[0] != layer.out_features:
-                    raise ValueError(f'Incompatible residual dimensions at {name}')
-                factors.append(residual)
+        self._factor_slices = {}
+        for index, (name, factors) in enumerate(layer_factors.items()):
+            ranks = [a.shape[0] for a, _, _ in factors]
+            scales = [scale for _, _, scale in factors]
             a_name, b_name, index_name = f'a_{index}', f'b_{index}', f'owners_{index}'
-            self.register_buffer(a_name, torch.cat([r.A.detach() for r in factors], dim=0))
-            self.register_buffer(b_name, torch.cat([r.B.detach() * r.scale for r in factors], dim=1))
+            self.register_buffer(a_name, torch.cat([a.detach() for a, _, _ in factors], dim=0).to(self.device))
+            self.register_buffer(b_name, torch.cat([b.detach() * scale for _, b, scale in factors], dim=1).to(self.device))
             self.register_buffer(index_name, torch.repeat_interleave(
                 torch.arange(len(factors), device=self.device),
-                torch.tensor([r.A.shape[0] for r in factors], device=self.device)))
+                torch.tensor(ranks, device=self.device)))
+            offsets = list(accumulate(ranks, initial=0))
+            self._factor_slices[name] = [slice(start, end) for start, end in zip(offsets, offsets[1:])]
             self._factor_names[name] = (a_name, b_name, index_name)
-            self.layer_contract.append({'layer': name, 'ranks': [r.A.shape[0] for r in factors],
-                                        'alphas': [r.scale * r.A.shape[0] for r in factors],
-                                        'scales': [r.scale for r in factors]})
+            self.layer_contract.append({'layer': name, 'ranks': ranks,
+                                        'alphas': [scale * rank for scale, rank in zip(scales, ranks)],
+                                        'scales': scales})
         self.requires_grad_(False).eval()
         self.initialization_seconds = time.perf_counter() - started
 
@@ -176,14 +189,12 @@ class ResidualBank(nn.Module):
             low_rank = F.linear(inputs, a) * weights.index_select(-1, owners)
             residual = F.linear(low_rank, b)
             if diagnostics is not None:
-                diagnostics[f'{name}/combined_norm'] = float(residual.norm(dim=-1).mean())
-                diagnostics[f'{name}/relative_norm'] = float((residual.norm(dim=-1) / output.norm(dim=-1).clamp_min(1e-8)).mean())
-                offset = 0
-                for i, entry in enumerate(self.manifest[1:]):
-                    rank = int((owners == i).sum())
-                    value = F.linear(low_rank[..., offset:offset + rank], b[:, offset:offset + rank])
-                    diagnostics[f'{name}/weighted_norm/{entry["name"]}'] = float(value.norm(dim=-1).mean())
-                    offset += rank
+                norm = residual.norm(dim=-1)
+                diagnostics[f'{name}/combined_norm'] = norm.mean()
+                diagnostics[f'{name}/relative_norm'] = (norm / output.norm(dim=-1).clamp_min(1e-8)).mean()
+                for entry, columns in zip(self.manifest[1:], self._factor_slices[name]):
+                    value = F.linear(low_rank[..., columns], b[:, columns])
+                    diagnostics[f'{name}/weighted_norm/{entry["name"]}'] = value.norm(dim=-1).mean()
             output = output + residual
         return output
 
@@ -195,8 +206,6 @@ class ResidualBank(nn.Module):
 
     @torch.no_grad()
     def forward(self, observations, coefficients, *, collect_influence=False):
-        from agents.common.networks import ResidualMLP
-
         obs = torch.as_tensor(observations, dtype=torch.float32, device=self.device)
         weights = torch.as_tensor(coefficients, dtype=torch.float32, device=self.device)
         if obs.ndim != 2 or obs.shape[1] != self.obs_dim or weights.shape != (len(obs), len(self.manifest) - 1):
@@ -213,7 +222,10 @@ class ResidualBank(nn.Module):
                 x = x + self._sequence(block.branch, x, weights, f'blocks.{index}.branch', diagnostics)
             x = self.base.net.output(x)
         action = torch.tanh(x)
-        return (action, diagnostics) if collect_influence else action
+        if diagnostics is not None:
+            values = torch.stack(tuple(diagnostics.values())).cpu().tolist()
+            return action, dict(zip(diagnostics, values))
+        return action
 
     def accounting(self):
         base = sum(p.numel() for p in self.base.parameters())
@@ -224,15 +236,4 @@ class ResidualBank(nn.Module):
 
 
 def shared_residual_bank(manifest, *, spec, device='cpu'):
-    key = json.dumps({'backend': 'residual', 'manifest': manifest, 'device': str(device)}, sort_keys=True)
-    bank = _BANKS.get(key)
-    if bank is None:
-        bank = ResidualBank(manifest, spec=spec, device=device)
-        _BANKS[key] = bank
-    else:
-        aid = bank.agent_id
-        validate_checkpoint_compatibility(bank.metadata['contracts']['observations'][aid],
-            {'dim': spec.observation_dims[aid], 'contract': spec.observation_contracts[aid]})
-        validate_checkpoint_compatibility(bank.metadata['contracts']['actions'],
-            {'low': spec.action_lows[aid], 'high': spec.action_highs[aid]})
-    return bank
+    return _shared_bank(ResidualBank, manifest, spec, device)

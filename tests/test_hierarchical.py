@@ -42,6 +42,103 @@ def test_changed_base_rejected(bank, monkeypatch):
         AdapterBank({'skills': [{k: v for k, v in e.items() if k != 'sha256'} for e in bank.manifest]})
 
 
+def test_residual_bank_materializes_only_base_and_preserves_one_hot_actions(bank, monkeypatch):
+    from hierarchical.bank import ResidualBank
+
+    def load_base_only(checkpoint, *args):
+        assert checkpoint['metadata']['adaptation']['lora'] is None
+        return solo_evaluation_actor(checkpoint, *args)
+
+    monkeypatch.setattr('hierarchical.bank.solo_evaluation_actor', load_base_only)
+    residual = ResidualBank({'skills': bank.manifest})
+    obs = torch.randn(6, bank.obs_dim, generator=torch.Generator().manual_seed(13))
+    weights = torch.eye(6)[:, 1:]
+    actions, influence = residual(obs, weights, collect_influence=True)
+    torch.testing.assert_close(actions, bank(obs, torch.arange(6)), atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(actions, residual(obs, weights))
+    assert influence
+    assert residual.accounting()['tensor_bytes'] < bank.accounting()['tensor_bytes']
+
+
+def test_dirichlet_native_spec_and_deterministic_sampling():
+    from adapters.native_torchrl import NativeRaceTorchRLEnv
+    from core.scenario import load_and_expand_scenario
+    from core.task_builder import create_race_task
+    from torchrl.envs.utils import check_env_specs
+    from training.algorithms import create_learner, learner_params
+
+    scenario = load_and_expand_scenario('scenarios/ppo_hierarchical_composition.yaml')
+    scenario['environment']['max_steps'] = 8
+    task = create_race_task(scenario)
+    env = NativeRaceTorchRLEnv(task)
+    try:
+        params = learner_params(scenario, task.spec, 'ppo')
+        agent = create_learner('ppo', task.spec, {**params, 'device': 'cpu'})
+        check_env_specs(env, seed=42)
+        observation = task.reset(seed=42).observations['car_0']
+        sample = agent.sample_batch(observation[None], deterministic=True)
+        executed = agent.evaluation_actions(['car_0'], {'car_0': observation})
+        torch.testing.assert_close(torch.from_numpy(sample.actions[0]),
+                                   torch.from_numpy(executed['car_0'].coefficients))
+        assert torch.from_numpy(sample.log_probs).isfinite().all()
+        task.step(executed)
+        assert task.metrics()['composition/influence_samples'] == 0
+        task.influence_every = 1
+        task.step(executed)
+        assert task.metrics()['composition/influence_samples'] == 1
+    finally:
+        env.close()
+
+
+def test_final_protocol_uses_expanded_seed_range_for_categorical_and_composition():
+    from core.scenario import ScenarioError, load_and_expand_scenario
+    from training.evaluation_config import resolve_evaluation_protocol
+
+    protocols = []
+    for scenario_name in ('ppo_hierarchical_continual', 'ppo_hierarchical_composition'):
+        scenario = load_and_expand_scenario(f'scenarios/{scenario_name}.yaml')
+        scenario['evaluation'].update(seed=110, episodes=1)
+        scenario['evaluation']['final_test'].update(seed=106, episodes=1)
+        with pytest.raises(ScenarioError, match='seed ranges must be disjoint'):
+            resolve_evaluation_protocol(scenario, 'selection')
+        scenario['evaluation']['final_test']['seed'] = 111
+        protocols.append(resolve_evaluation_protocol(scenario, 'final'))
+
+    assert protocols[0] == protocols[1]
+    assert protocols[0]['episodes'] == 7
+    assert protocols[0]['episodes_per_map'] == 1
+    scenario['evaluation']['final_test'].pop('per_map')
+    assert resolve_evaluation_protocol(scenario, 'final') == protocols[1]
+    scenario['evaluation']['final_test']['seed'] = 2**32 - 6
+    with pytest.raises(ScenarioError, match='exceed the NumPy seed range'):
+        resolve_evaluation_protocol(scenario, 'final')
+
+
+@pytest.mark.parametrize('hierarchy', [
+    {'routing_type': 'composition'},
+    {'metrics': {'composition/routing_entropy': .5}},
+])
+def test_hard_skill_report_rejects_composition_without_a_trajectory(tmp_path, hierarchy):
+    import json
+    from hierarchical.reporting import summarize
+
+    path = tmp_path / 'evaluation_report.json'
+    path.write_text(json.dumps({'episode_results': [{'race_record': {'hierarchical': hierarchy}}]}))
+    with pytest.raises(ValueError, match='require categorical routing'):
+        summarize([path])
+
+
+def test_episode_hook_forwards_composition_metrics():
+    from types import SimpleNamespace
+    from training.hooks import WandbHook
+
+    logged = []
+    WandbHook(SimpleNamespace(log_metrics=logged.append)).on_episode_end(
+        1, 0., {}, {'composition/routing_entropy': .5, 'train/environment_steps': 15})
+    assert logged[0]['episode/composition/routing_entropy'] == .5
+    assert logged[0]['episode/environment_steps'] == 15
+
+
 def test_selectors_and_independent_execution(bank):
     from hierarchical.selectors import SkillExecutor, FixedSelector, RandomSelector, GeometrySelector
     a, b = SkillExecutor(bank), SkillExecutor(bank)

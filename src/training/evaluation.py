@@ -92,6 +92,7 @@ def run_evaluation_episode(task, actions_fn, *, episode, seed,
     }
     if getattr(task, "hierarchical", False):
         record['hierarchical'] = {'metrics': task.metrics(), 'skills': task.bank.manifest,
+            'routing_type': 'categorical' if getattr(task, 'categorical', True) else 'composition',
             'transition_counts': task.transitions.tolist(),
             'dwell_ll_decisions': task.dwell_times + [task.executor.state.since_change],
             'dwell_seconds': task.dwell_durations + [task.dwell_seconds]}

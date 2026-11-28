@@ -179,17 +179,10 @@ def evaluation_routing(checkpoint):
                 "mode", "rank", "alpha", "train_log_std", "per_agent_log_std", "target"}} if lora else None)}
 
 
-def solo_evaluation_actor(checkpoint, spec, params, agent_id):
-    """Strictly extract one decentralized actor; never construct a critic.
-
-    Validate the complete actor tensor layout on meta storage, then materialize
-    only the chosen actor/base and adapter bank. Empty neighbors are supplied by
-    the unchanged observation composer in the one-vehicle task.
-    """
-    from types import SimpleNamespace
+def validate_solo_actor_checkpoint(checkpoint, spec, params, agent_id):
+    """Validate the complete actor tensor layout and routing on meta storage."""
     from agents.common.networks import build_actor, route_actor, resolve_network_config, model_spec
     from agents.common.observations import observation_segments
-    from utils.torch_io import resolve_device
 
     stored = checkpoint["metadata"]
     algorithm = stored["algorithm"]
@@ -248,6 +241,18 @@ def solo_evaluation_actor(checkpoint, spec, params, agent_id):
                 or not isinstance(source.get("sha256"), str) or len(source["sha256"]) != 64
                 or any(c not in "0123456789abcdef" for c in source["sha256"])):
             raise ValueError("LoRA solo evaluation requires a valid PPO source identity")
+    return template, network, observation, mode, lora
+
+
+def solo_evaluation_actor(checkpoint, spec, params, agent_id):
+    """Extract and materialize one decentralized actor without a critic."""
+    from types import SimpleNamespace
+    from agents.common.networks import build_actor, route_actor
+    from utils.torch_io import resolve_device
+
+    _, network, observation, mode, lora = validate_solo_actor_checkpoint(checkpoint, spec, params, agent_id)
+    stored = checkpoint["metadata"]
+    algorithm, contracts = stored["algorithm"], stored["contracts"]
     actor = build_actor(observation["dim"], contracts["actions"]["dim"], network,
                         observation_contract=observation["contract"])
     state = checkpoint["models"]["actor"]

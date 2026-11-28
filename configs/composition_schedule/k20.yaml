@@ -1,0 +1,11 @@
+# @package _global_
+experiment:
+  parallel_envs: 32
+  envs_per_worker: 6
+hierarchical:
+  interval: 20
+algorithm:
+  params:
+    n_steps: 1536
+    frames_per_batch: 384
+    batch_size: 192

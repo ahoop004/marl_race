@@ -1,14 +1,40 @@
 """Native TorchRL translation of RaceTask with fixed learner slots."""
 from __future__ import annotations
 
+from abc import ABCMeta
+
 import numpy as np
 import torch
 from tensordict import NonTensorData, TensorDict, TensorDictBase
 from torchrl.data import Bounded, Categorical, Composite, NonTensor, Unbounded
+from torchrl.data.tensor_specs import BoundedContinuous
 from torchrl.envs import EnvBase
 
 from adapters.rewards import RewardMapping
 from tasks import RaceTaskProtocol, TaskSnapshot, TaskStep
+
+
+class _SimplexMeta(type(Bounded)):
+    # Bounded's factory normally replaces subclasses with BoundedContinuous.
+    __call__ = ABCMeta.__call__
+
+
+class _Simplex(BoundedContinuous, metaclass=_SimplexMeta):
+    def rand(self, shape=None):
+        return torch.distributions.Dirichlet(super().zero().add_(1)).sample(
+            torch.Size() if shape is None else shape)
+
+    def zero(self, shape=None):
+        return super().zero(shape).fill_(1 / self.shape[-1])
+
+    def is_in(self, value):
+        return super().is_in(value) and torch.allclose(
+            value.sum(-1), torch.ones_like(value[..., 0]), atol=1e-5, rtol=1e-5)
+
+    def _project(self, value):
+        value = super()._project(value.nan_to_num())
+        total = value.sum(dim=-1, keepdim=True)
+        return torch.where(total > 0, value / total, 1 / self.shape[-1])
 
 
 class NativeRaceTorchRLEnv(EnvBase):
@@ -104,17 +130,17 @@ class NativeRaceTorchRLEnv(EnvBase):
             decision_physics_steps=count((1,)), agent_steps=count((1,)),
             elapsed_seconds=real((1,)), device=self.device,
         )
+        action_shape = (n, self.action_width)
+        if self.categorical:
+            action_spec = Categorical(task.n_skills, shape=action_shape, dtype=torch.int64, device=self.device)
+        elif self.hierarchical:
+            action_spec = (_Simplex(0, 1, shape=action_shape, dtype=torch.float32, device=self.device)
+                           if task.action_contract.simplex else real(action_shape))
+        else:
+            action_spec = Bounded(-1, 1, shape=action_shape, dtype=torch.float32, device=self.device)
         self.action_spec = Composite(agents=Composite(
-            action=Bounded(-1, 1, shape=(n, 2), dtype=torch.float32, device=self.device),
-            shape=(n,), device=self.device), device=self.device)
+            action=action_spec, shape=(n,), device=self.device), device=self.device)
         if self.hierarchical:
-            action_spec = (Categorical(task.n_skills, shape=(n, 1), dtype=torch.int64, device=self.device)
-                if self.categorical else
-                Bounded(0, 1, shape=(n, self.action_width), dtype=torch.float32, device=self.device)
-                if task.distribution == 'dirichlet' else real((n, self.action_width)))
-            self.action_spec = Composite(agents=Composite(
-                action=action_spec,
-                shape=(n,), device=self.device), device=self.device)
             self.observation_spec["steps_to_next_obs"] = count((1,))
         if environment_id is not None:
             self.observation_spec["environment_id"] = count((1,))

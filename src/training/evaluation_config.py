@@ -35,8 +35,8 @@ def resolve_evaluation_protocol(scenario: Dict[str, Any], protocol: str) -> Dict
     final = evaluation.get("final_test")
     if final is not None and (not isinstance(final, dict) or not {"seed", "episodes"} <= final.keys()):
         raise ScenarioError("'evaluation.final_test' requires explicit seed and episodes.")
-    if final is not None and set(final) - {"seed", "episodes", "target_laps", "max_steps"}:
-        raise ScenarioError("'evaluation.final_test' accepts seed, episodes, target_laps and max_steps.")
+    if final is not None and set(final) - {"seed", "episodes", "target_laps", "max_steps", "per_map"}:
+        raise ScenarioError("'evaluation.final_test' accepts seed, episodes, target_laps, max_steps and per_map.")
     for key in ("target_laps", "max_steps"):
         value = (final or {}).get(key)
         minimum = 0 if key == "max_steps" else 1
@@ -49,7 +49,26 @@ def resolve_evaluation_protocol(scenario: Dict[str, Any], protocol: str) -> Dict
             value = config[key]
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
                 raise ScenarioError(f"Evaluation {name} {key} must be an integer >= {minimum}.")
-        if config["seed"] + config["episodes"] > 2**32:
+    map_lists = scenario.get("maps", {})
+    episodes_per_map = None
+    if final is not None:
+        per_map = final.get("per_map")
+        if "per_map" in final and type(per_map) is not bool:
+            raise ScenarioError("evaluation.final_test.per_map must be boolean")
+        if per_map is None:
+            # Older frozen composition scenarios already used episodes per map.
+            hierarchy = scenario.get("hierarchical", {})
+            if hierarchy.get("enabled", False):
+                from hierarchical.composition import composition_spec
+                per_map = not composition_spec(hierarchy.get("composition", {})).categorical
+        if per_map:
+            bundles = map_lists.get("final_test", [])
+            if not bundles or len(set(bundles)) != len(bundles):
+                raise ScenarioError("Final evaluation per map requires a nonempty list of unique map bundles")
+            episodes_per_map = final["episodes"]
+            final = {**final, "episodes": episodes_per_map * len(bundles)}
+    for name, config in (("selection", selection), ("final", final)):
+        if config is not None and config["seed"] + config["episodes"] > 2**32:
             raise ScenarioError(f"Evaluation {name} seeds exceed the NumPy seed range.")
     if final is not None and max(selection["seed"], final["seed"]) < min(
         selection["seed"] + selection["episodes"], final["seed"] + final["episodes"]
@@ -77,8 +96,10 @@ def resolve_evaluation_protocol(scenario: Dict[str, Any], protocol: str) -> Dict
               "terminate_on_collision": evaluation.get("terminate_on_collision", environment.get("terminate_on_collision", True)),
               "terminate_on_track_limit": evaluation.get("terminate_on_track_limit", environment.get("track_limits", {}).get("terminate", False))}
     if "maps" in scenario:
-        result["map_bundles"] = list(scenario["maps"][
+        result["map_bundles"] = list(map_lists[
             "selection" if protocol == "selection" else "final_test"])
+    if protocol == "final" and episodes_per_map is not None:
+        result["episodes_per_map"] = episodes_per_map
     return result
 
 

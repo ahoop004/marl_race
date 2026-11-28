@@ -15,16 +15,8 @@ search:
 max_concurrent_trials: 1
 resources_per_trial: {cpu: 30, gpu: 1}
 fixed_overrides:
-- experiment.parallel_envs=24
-- experiment.envs_per_worker=8
-- hierarchical.interval=5
-- hierarchical.composition.distribution=dirichlet
-- hierarchical.composition.sampled_action=simplex
-- hierarchical.composition.coefficient_constraint=convex
-- hierarchical.composition.backend=shared_residual
-- hierarchical.composition.entropy_convention=dirichlet_differential
-- algorithm.params.frames_per_batch=1536
-- algorithm.params.batch_size=768
+- composition_distribution=dirichlet
+- composition_schedule=k5
 evaluation: {seed: 10042, episodes: 10, max_steps: 8000}
 wandb:
   mode: online

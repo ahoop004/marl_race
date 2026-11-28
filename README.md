@@ -67,6 +67,9 @@ by the cluster. Checkpoints and logs are saved in
 `pretrained_models/circle_ppo_seed42_20k/`. On successful completion, the selected
 `best.pt` is atomically copied to `pretrained_models/mlp_base_ppo_seed42_best.pt`.
 The run's `final.pt` and resumable `latest.pt` remain in its directory.
+The archived race and physics episode logs are available in Git at commit
+`d7f5484`. To restore the historical logs for a resumed run, use
+`git restore --source=d7f5484 -- pretrained_models/circle_ppo_seed42_20k/{race_metrics,physics_episodes}.jsonl`.
 
 To recover the same run after a walltime limit or interruption:
 

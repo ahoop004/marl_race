@@ -379,7 +379,7 @@ def preflight(settings, command_builder, repo):
     optional = set()
     for override in OverridesParser.create().parse_overrides(settings["overrides"]):
         path = override.key_or_group
-        if path in {"network", "adaptation"} or path.startswith(("network.", "adaptation.")):
+        if path in original.get("_configuration", {}).get("choices", {}) or path.startswith(("network.", "adaptation.")):
             continue  # Checked against the selected Hydra preset below.
         profile_key = path.removeprefix("experiment.") if path.startswith("experiment.") else None
         try:

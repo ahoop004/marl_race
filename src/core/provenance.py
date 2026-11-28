@@ -161,6 +161,12 @@ def build_run_provenance(
     source = Path(scenario_path).expanduser().resolve()
     environment = scenario.get("environment", {}) or {}
     experiment = scenario.get("experiment", {}) or {}
+    likelihood, entropy = "stored_pre_tanh_v1", "squashed_gaussian_quadrature32_v1"
+    hierarchy = scenario.get("hierarchical", {})
+    if hierarchy.get("enabled", False):
+        from hierarchical.composition import composition_spec
+        distribution = composition_spec(hierarchy.get("composition", {}))
+        likelihood, entropy = distribution.likelihood, distribution.entropy
     repo_root = Path(__file__).resolve().parents[2]
     from physics.collision_models import GEOMETRY_COLLISION_VERSION, SWEPT_COLLISION_VERSION
     from physics.laser_models import MAP_LIDAR_VERSION
@@ -211,16 +217,8 @@ def build_run_provenance(
             "net_finish_line_crossings": "2.0",
             "resolved_simulation_state": "2.0",
             "completion_progress_finish_time_selection": "1.0",
-            "policy_likelihood": ("categorical_skill_v1" if scenario.get("hierarchical", {}).get("enabled", False)
-                                  and scenario["hierarchical"].get("composition", {}).get("distribution", "categorical") == "categorical"
-                                  else "composition_joint_" + ("dirichlet" if scenario["hierarchical"]["composition"]["distribution"] == "dirichlet" else "latent_gaussian")
-                                  if scenario.get("hierarchical", {}).get("enabled", False) else "stored_pre_tanh_v1"),
-            "policy_entropy": ("categorical_exact_v1" if scenario.get("hierarchical", {}).get("enabled", False)
-                               and scenario["hierarchical"].get("composition", {}).get("distribution", "categorical") == "categorical"
-                               else "dirichlet_differential_v1" if scenario.get("hierarchical", {}).get("enabled", False)
-                               and scenario["hierarchical"]["composition"]["distribution"] == "dirichlet"
-                               else "latent_gaussian_v1" if scenario.get("hierarchical", {}).get("enabled", False)
-                               else "squashed_gaussian_quadrature32_v1"),
+            "policy_likelihood": likelihood,
+            "policy_entropy": entropy,
             "ppo_fragment_pooling": "1.0",
         },
         "created_at_utc": datetime.now(timezone.utc).isoformat(),

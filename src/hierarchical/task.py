@@ -1,4 +1,4 @@
-"""Single-agent categorical macro decisions around the unchanged RaceTask."""
+"""Single-agent macro decisions around RaceTask."""
 from dataclasses import replace
 import json
 import time
@@ -7,7 +7,7 @@ import numpy as np
 from env.spaces import SpaceSpec
 from tasks.contracts import TaskStep
 from hierarchical.selectors import SkillExecutor, CompositionExecutor, make_selector, geometry_annotation
-from hierarchical.composition import CompositionExecution
+from hierarchical.composition import CompositionExecution, coefficient_transform, composition_spec
 
 
 class HierarchicalTask:
@@ -20,9 +20,14 @@ class HierarchicalTask:
         self.aid = task.possible_agents[0]
         self.composition = config.get('composition', {})
         self.distribution = self.composition.get('distribution', 'categorical')
-        self.categorical = self.distribution == 'categorical'
-        if self.distribution not in {'categorical', 'dirichlet', 'logistic_normal', 'positive_gaussian', 'signed_gaussian'}:
-            raise ValueError('Unknown hierarchical action distribution')
+        self.action_contract = composition_spec(self.composition)
+        self.categorical = self.action_contract.categorical
+        self.temperature = float(self.composition.get('temperature', 1.))
+        if not np.isfinite(self.temperature) or self.temperature <= 0:
+            raise ValueError('Composition temperature must be finite and positive')
+        self.influence_every = self.composition.get('influence_every', 0)
+        if type(self.influence_every) is not int or self.influence_every < 0:
+            raise ValueError('Composition influence_every must be a nonnegative macro decision count')
         self.executor = (SkillExecutor if self.categorical else CompositionExecutor)(bank, config.get('interval', 5))
         self.gamma = float(config.get('gamma', .99))
         if not 0 < self.gamma <= 1:
@@ -45,7 +50,7 @@ class HierarchicalTask:
                 self.preview[key] = float(value)
             self.preview['samples'] = count
         self.n_skills = len(bank.manifest)
-        self.action_dim = 1 if self.categorical else 6 if self.distribution == 'dirichlet' else 5
+        self.action_dim = self.action_contract.action_dim
         self.selector = make_selector(config.get('selector', {}), bank.manifest)
         if not self.categorical and self.selector is not None:
             raise ValueError('Composition requires the learned selector')
@@ -90,8 +95,8 @@ class HierarchicalTask:
     def action_space(self, agent):
         if self.categorical:
             return SpaceSpec((1,), 0, self.n_skills - 1, dtype=np.int64)
-        return SpaceSpec((self.action_dim,), 0 if self.distribution == 'dirichlet' else -np.inf,
-                         1 if self.distribution == 'dirichlet' else np.inf)
+        return SpaceSpec((self.action_dim,), 0 if self.action_contract.simplex else -np.inf,
+                         1 if self.action_contract.simplex else np.inf)
 
     def observation(self, ll):
         state = self.executor.state
@@ -172,29 +177,26 @@ class HierarchicalTask:
             if evaluation_coefficients is not None:
                 if action.shape != (self.n_skills,) or not np.isfinite(action).all() or np.any(np.abs(action) > 1):
                     raise ValueError('Invalid evaluation composition coefficients')
-                if self.distribution in ('dirichlet', 'logistic_normal'):
+                if self.action_contract.convex:
                     if np.any(action < 0) or not np.isclose(action.sum(), 1., atol=1e-5):
                         raise ValueError('Convex evaluation coefficients must lie on the simplex')
-                elif action[0] != 0 or (self.distribution == 'positive_gaussian' and np.any(action < 0)):
+                elif action[0] != 0 or (self.action_contract.coefficient_constraint == 'independent_positive'
+                                        and np.any(action < 0)):
                     raise ValueError('Invalid independent residual coefficients')
                 coefficients = action.astype(np.float32, copy=True)
                 # The evaluation runner does not optimize this synthetic action.
-                action = coefficients if self.distribution == 'dirichlet' else coefficients[1:]
+                action = coefficients if self.action_contract.simplex else coefficients[1:]
             elif action.shape != (self.action_dim,) or not np.isfinite(action).all():
                 raise ValueError('Invalid composition action')
-            elif self.distribution == 'dirichlet':
+            elif self.action_contract.simplex:
                 if np.any(action < 0) or not np.isclose(action.sum(), 1., atol=1e-5):
                     raise ValueError('Dirichlet action must lie on the simplex')
                 coefficients = action.astype(np.float32, copy=True)
-            elif self.distribution == 'logistic_normal':
-                logits = np.r_[action, 0.] / float(self.composition.get('temperature', 1.))
-                logits -= logits.max()
-                coefficients = (np.exp(logits) / np.exp(logits).sum()).astype(np.float32)
             else:
-                residual = np.tanh(action)
-                if self.distribution == 'positive_gaussian':
-                    residual = (residual + 1.) / 2.
-                coefficients = np.r_[0., residual].astype(np.float32)
+                coefficients = coefficient_transform(
+                    action, self.action_contract, self.temperature).astype(np.float32, copy=False)
+                if not self.action_contract.convex:
+                    coefficients = np.concatenate((np.zeros(1, dtype=np.float32), coefficients))
             skill = int(np.argmax(np.abs(coefficients)))
             self._record_composition(coefficients)
         if self.selector is not None:
@@ -222,7 +224,7 @@ class HierarchicalTask:
         for i in range(self.executor.interval):
             previous_action = self.executor.last_action.copy()
             inference_started = time.perf_counter()
-            if not self.categorical and i == 0 and self.episode_hl % 32 == 0:
+            if not self.categorical and self.influence_every and i == 0 and self.episode_hl % self.influence_every == 0:
                 ll_action = self.executor.action(self._snapshot.observations[self.aid], collect_influence=True)
                 self.influence_count += 1
                 for name, value in self.executor.last_influence.items():
