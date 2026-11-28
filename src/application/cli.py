@@ -36,9 +36,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="PyTorch CPU threads for training and evaluation")
     p.add_argument("--eval", action="store_true", help="Run evaluation instead of training")
     p.add_argument("--checkpoint", type=str, default=None,
-                   help="Checkpoint file or run directory (best.pt): evaluate with --eval, "
-                        "or initialize PPO training weights with a fresh optimizer; "
-                        "overrides experiment.checkpoint in the scenario")
+                   help="Checkpoint file or run directory. Evaluation prefers best.pt and falls back "
+                        "to final.pt. PPO transfer from a directory requires best.pt. "
+                        "Overrides experiment.checkpoint in the scenario")
     p.add_argument("--resume", type=str, default=None,
                    help="Recover training from latest.pt or a run directory; restart a fresh episode")
     p.add_argument("--pretrained-actor", type=str, default=None,

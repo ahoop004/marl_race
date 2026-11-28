@@ -326,14 +326,14 @@ def trainer_command(settings, identity, out):
     smoke = [] if settings.get("sweep") else ["algorithm.params.n_steps=1024", "algorithm.params.frames_per_batch=256",
                                             "algorithm.params.batch_size=128", "algorithm.params.n_epochs=2"]
     device = "cuda" if settings.get("resources_per_trial", {}).get("gpu", 1) else "cpu"
-    # Preserve historical T5 collector settings; architecture sweeps inherit the
-    # scenario's execution settings unless the specification explicitly overrides.
+    # Architecture and continual sweeps inherit collector settings from the resolved
+    # scenario. Legacy smoke trials keep the historical two-worker fallback.
     architecture_sweep = uses_model_groups(settings.get("sweep"))
+    continual = bool(settings.get("sweep", {}).get("continual", False))
     overridden = {value.lstrip("+").split("=", 1)[0] for value in settings["overrides"]}
-    collectors = [] if architecture_sweep else [
+    collectors = [] if architecture_sweep or continual else [
         f"{path}={value}" for path, value in (("experiment.parallel_envs", 2), ("experiment.envs_per_worker", 1))
         if path not in overridden]
-    continual = bool(settings.get("sweep", {}).get("continual", False))
     overrides = [*collectors, "experiment.distributed=false", *smoke,
                  f"checkpoint.every_steps={settings['checkpoint_every_steps']}",
                  f"checkpoint.every_updates={settings['checkpoint_every_updates'] or 'null'}",

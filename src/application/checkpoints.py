@@ -9,10 +9,10 @@ def resolve_scenario_relative_path(value: str, scenario_dir: Path) -> Path:
 
 
 def resolve_checkpoint_path(value: str, *, operation="evaluation", base_dir=None) -> Path:
-    """Directories select best.pt, or latest.pt for recovery.
+    """Evaluation prefers best.pt and falls back to final.pt.
 
-    CLI callers pass canonical paths. Configured relative paths may name their
-    declaring scenario directory; standalone callers retain cwd semantics.
+    Directory-based transfer requires best.pt. Recovery selects latest.pt.
+    Relative paths use base_dir when supplied and the current directory otherwise.
     """
     if operation not in {"evaluation", "transfer", "resume"}:
         raise ValueError(f"Unsupported checkpoint operation: {operation!r}")
@@ -21,7 +21,12 @@ def resolve_checkpoint_path(value: str, *, operation="evaluation", base_dir=None
         path = Path(base_dir) / path
     path = path.resolve()
     if path.is_dir():
-        path = path / ("latest.pt" if operation == "resume" else "best.pt")
+        directory = path
+        path = directory / ("latest.pt" if operation == "resume" else "best.pt")
+        if operation == "evaluation" and not path.is_file():
+            final = directory / "final.pt"
+            if final.is_file():
+                path = final
     if not path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     return path
@@ -47,6 +52,17 @@ def validate_resume_experiment(metadata, scenario):
         raise ValueError("Recovery must retain continual-learning mode; use transfer for a new experiment")
     fields = ("algorithm", "network", "environment", "agents", "controllers", "maps", "evaluation", "mappo", "continual")
     expected = {key: deepcopy(scenario[key]) for key in fields if key in scenario}
+    saved_evaluation = stored.get("evaluation", {})
+    current_evaluation = expected.get("evaluation", {})
+    if (isinstance(saved_evaluation, dict) and isinstance(current_evaluation, dict)
+            and saved_evaluation.get("final_test") is not None
+            and current_evaluation.get("final_test") is not None
+            and saved_evaluation["final_test"] != current_evaluation["final_test"]):
+        from training.evaluation_config import resolve_evaluation_protocol
+
+        # Legacy composition checkpoints used per-map evaluation implicitly.
+        saved_evaluation["final_test"] = resolve_evaluation_protocol(stored, "final")
+        current_evaluation["final_test"] = resolve_evaluation_protocol(scenario, "final")
     if scenario.get("continual"):
         # This execution limit may change after a task-boundary pilot; the
         # ordered task protocol and every learning parameter remain immutable.

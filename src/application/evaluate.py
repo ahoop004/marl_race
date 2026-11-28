@@ -145,7 +145,6 @@ def _run_evaluation(
     if getattr(task, "hierarchical", False) and task.selector is not None:
         from types import SimpleNamespace
         import torch
-        import numpy as np
         if checkpoint_hash != task.bank.manifest[0]["sha256"]:
             raise ValueError("Baseline selectors require the manifest's original PPO base checkpoint")
         agent = SimpleNamespace(actor=torch.nn.Identity(), device=torch.device("cpu"),

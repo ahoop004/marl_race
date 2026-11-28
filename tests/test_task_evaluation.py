@@ -1,5 +1,6 @@
 """Reward parity, episode completion and inference isolation across callers."""
 from copy import deepcopy
+import json
 from pathlib import Path
 import random
 from types import SimpleNamespace
@@ -22,6 +23,38 @@ from wrappers.observations.ego import LidarComponent
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_standalone_team_evaluation_writes_summary_from_final_checkpoint_directory(tmp_path, monkeypatch):
+    from application.evaluate import run_evaluation
+    from core.scenario import load_and_expand_scenario
+    from core.task_builder import create_race_task
+    from loggers.console import ConsoleLogger
+    from training.algorithms import create_learner, learner_params
+
+    monkeypatch.setenv("PYGLET_HEADLESS", "true")
+    source = ROOT / "scenarios/mappo_2v2_completion_scratch.yaml"
+    scenario = load_and_expand_scenario(str(source), overrides=["execution.params.device=cpu"])
+    scenario["evaluation"]["max_steps"] = 1
+    checkpoint_dir = tmp_path / "run"
+    checkpoint_dir.mkdir()
+    checkpoint = checkpoint_dir / "final.pt"
+    task = create_race_task(scenario)
+    try:
+        spec = task.spec
+        policy = create_learner("mappo", spec, learner_params(scenario, spec, "mappo"), training=False)
+        policy.save_checkpoint(checkpoint)
+    finally:
+        task.close()
+
+    output = tmp_path / "evaluation"
+    args = SimpleNamespace(checkpoint=str(checkpoint_dir), eval_episodes=1, run_id="test",
+                           output_dir=str(output), scenario=str(source))
+    run_evaluation(scenario, args, ConsoleLogger(verbose=False), source.parent)
+    report = json.loads((output / "evaluation_report.json").read_text())
+    assert report["checkpoint"] == str(checkpoint)
+    assert report["summary"]["race_count"] == 1
+    assert report["summary"]["team_result_means"] == report["summary"]["team_results_by_episode"][0]
 
 
 @pytest.mark.parametrize("adaptation", ["ppo", "scratch", "full_finetune", "lora"])

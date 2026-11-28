@@ -44,8 +44,9 @@ the original 120M-decision learning-rate schedule.
 
 Use `--resume RUN_DIR` to continue from `latest.pt`. For checkpoint evaluation,
 pass `--eval --eval-protocol final --checkpoint RUN_DIR` with the training
-scenario and its task overrides. The directory selects `best.pt`. The
-selection and final protocols use the scenario’s configured maps and seeds.
+scenario and its task overrides. Evaluation prefers `best.pt` and falls back
+to `final.pt` for completed runs without a selection checkpoint. The selection
+and final protocols use the scenario’s configured maps and seeds.
 
 ## Circle PPO pretraining for 20,000 episodes on HPC
 

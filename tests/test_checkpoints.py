@@ -16,7 +16,7 @@ from test_torchrl_ppo import Capture, agent, trainer, rollout
 from utils.torch_io import atomic_save, safe_load
 
 
-def test_checkpoint_directories_select_best_for_transfer_and_latest_for_resume(tmp_path, monkeypatch):
+def test_checkpoint_directories_select_files_by_operation(tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
     for name in ("best.pt", "latest.pt", "final.pt"):
@@ -27,8 +27,12 @@ def test_checkpoint_directories_select_best_for_transfer_and_latest_for_resume(t
         assert resolve_checkpoint_path("source", operation=operation, base_dir=tmp_path) == source / expected
     assert resolve_checkpoint_path(str(source / "final.pt"), operation="transfer") == source / "final.pt"
     (source / "best.pt").unlink()
+    assert resolve_checkpoint_path(str(source)) == source / "final.pt"
     with pytest.raises(FileNotFoundError, match="best.pt"):
         resolve_checkpoint_path(str(source), operation="transfer")
+    (source / "final.pt").unlink()
+    with pytest.raises(FileNotFoundError, match="best.pt"):
+        resolve_checkpoint_path(str(source))
 
 
 @pytest.mark.parametrize("field", ["schema", "implementation", "network", "observation", "physics", "routing", "tensor"])
@@ -175,6 +179,26 @@ def test_old_provenance_recovers_with_its_existing_yaml_checks():
         details.pop("assets")
     validate_resume_experiment({"configuration": scenario, "provenance": {
         "version": "1.0", "map_protocols": maps}}, scenario)
+
+
+def test_application_recovery_accepts_equivalent_legacy_composition_final_protocol():
+    from core.provenance import collect_map_protocols
+    from core.scenario import load_and_expand_scenario
+
+    scenario = load_and_expand_scenario("scenarios/ppo_hierarchical_composition.yaml")
+    legacy = deepcopy(scenario)
+    del legacy["evaluation"]["final_test"]["per_map"]
+    metadata = {"configuration": legacy, "provenance": {
+        "map_protocols": collect_map_protocols(scenario["environment"])}}
+
+    validate_resume_experiment(metadata, scenario)
+    assert "per_map" not in legacy["evaluation"]["final_test"]
+    assert scenario["evaluation"]["final_test"]["per_map"] is True
+
+    changed = deepcopy(scenario)
+    changed["evaluation"]["final_test"]["per_map"] = False
+    with pytest.raises(ValueError, match=r"evaluation\.final_test"):
+        validate_resume_experiment(metadata, changed)
 
 
 def test_explicit_ppo_transfer_restores_models_with_fresh_optimizer_and_schedule(tmp_path):

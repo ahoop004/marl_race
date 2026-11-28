@@ -674,6 +674,24 @@ def test_production_preflight_preserves_historical_training_and_fixed_1080_beams
     assert len({e["config_digest"] for e in cfg["trial_plan"]}) == 12
 
 
+@pytest.mark.parametrize("name,layout", [
+    ("hierarchical_composition_a", (24, 8)),
+    ("hierarchical_composition_d", (32, 6)),
+    ("hierarchical_continual_d", (24, 8)),
+])
+def test_continual_preflight_freezes_configured_collectors(tmp_path, tune, name, layout):
+    from test_ray_tune_trials import settings
+
+    spec = sweeps.read_spec(adapter.REPO / "scripts/sweeps" / f"{name}.yaml", adapter.REPO)
+    cfg = settings(tmp_path, "disabled")
+    cfg.update(sweep=spec, mode="ppo", total_steps=spec["total_steps"], overrides=spec["fixed_overrides"],
+               trial_plan=sweeps.generate_plan(spec, tune), scenarios={"ppo": spec["scenario"]}, evaluation=True,
+               resources_per_trial=spec["resources_per_trial"])
+    sweeps.preflight(cfg, adapter.trainer_command, adapter.REPO)
+    experiment = yaml.safe_load(Path(cfg["trial_plan"][0]["input_path"]).read_text())["experiment"]
+    assert (experiment["parallel_envs"], experiment["envs_per_worker"]) == layout
+
+
 def test_default_scenario_adaptation_preserves_pretraining_seed_axis(tmp_path, tune):
     manifest, _ = make_sources(tmp_path, ["mlp_base"], seeds=(7, 8))
     cfg = architecture_settings(tmp_path, tune, algorithm="mappo", parameters={"network": choice(["mlp_base"])},
