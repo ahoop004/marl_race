@@ -91,13 +91,20 @@ def run_evaluation_episode(task, actions_fn, *, episode, seed,
         "boundary_violation_observed": any(boundary_violations.values()),
     }
     if getattr(task, "hierarchical", False):
+        categorical = getattr(task, 'categorical', True)
         record['hierarchical'] = {'metrics': task.metrics(), 'skills': task.bank.manifest,
-            'routing_type': 'categorical' if getattr(task, 'categorical', True) else 'composition',
+            'routing_type': 'categorical' if categorical else 'composition',
             'transition_counts': task.transitions.tolist(),
             'dwell_ll_decisions': task.dwell_times + [task.executor.state.since_change],
             'dwell_seconds': task.dwell_durations + [task.dwell_seconds]}
+        if not categorical:
+            record['hierarchical'].update(distribution=task.distribution,
+                coefficient_constraint=task.action_contract.coefficient_constraint,
+                influence_every=task.influence_every)
         if task.config.get('record_trajectory', False):
             record['hierarchical']['trajectory'] = task.trace
+            if not categorical:
+                record['hierarchical']['composition_trajectory'] = task.composition_trace
     if include_rewards:
         record.update(reward_mode=reward_mapping.mode,
                       team_reward_reduction=reward_mapping.reduction,

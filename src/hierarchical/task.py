@@ -124,6 +124,8 @@ class HierarchicalTask:
         self.executor.reset()
         self.last_duration = 0
         self.trace = []
+        if not self.categorical and self.config.get('record_trajectory', False):
+            self.composition_trace = []
         self.composition_count = 0
         self.composition_sum = np.zeros(self.n_skills)
         self.composition_abs_sum = np.zeros(self.n_skills)
@@ -167,6 +169,7 @@ class HierarchicalTask:
         if set(actions) != {self.aid}:
             raise ValueError('Supply exactly the active solo skill action')
         selected = actions[self.aid]
+        record_trajectory = self.config.get('record_trajectory', False)
         evaluation_coefficients = selected.coefficients if isinstance(selected, CompositionExecution) else None
         action = np.asarray(evaluation_coefficients if evaluation_coefficients is not None else selected)
         if self.categorical:
@@ -198,7 +201,7 @@ class HierarchicalTask:
                 if not self.action_contract.convex:
                     coefficients = np.concatenate((np.zeros(1, dtype=np.float32), coefficients))
             skill = int(np.argmax(np.abs(coefficients)))
-            self._record_composition(coefficients)
+            self._record_composition(coefficients, skill, record_trajectory)
         if self.selector is not None:
             skill = self.selector.select(metadata=self.annotations,
                 s=self._snapshot.infos[self.aid].get('centerline', {}).get('s', 0.0))
@@ -255,18 +258,20 @@ class HierarchicalTask:
                 self.last_position = position.copy()
             self.distance += distance
             self.skill_distance[skill] += distance
-            if self.config.get('record_trajectory', False):
+            if record_trajectory:
                 state = result.substeps[-1].facts.agent_states[self.aid]
                 self.trace.append({**geometry_annotation(self.annotations, decision.info.get('centerline', {}).get('s', 0.), self.bank.manifest[skill]['name']),
                     'timestamp': self.elapsed, 'decision_dt': result.elapsed_seconds, 'distance_m': self.distance, 'forward_centerline_progress_m': self.distance, 'before_forward_centerline_progress_m': before_distance, 'x': float(state.pose[0]), 'y': float(state.pose[1]),
-                    **({'skill': skill} if self.categorical else {'dominant_option': skill}), 'action': ll_action.tolist(),
+                    **({'skill': skill} if self.categorical else
+                       {'dominant_option': skill, 'hl_decision_index': self.episode_hl}), 'action': ll_action.tolist(),
                     'physical_action': physical.tolist(),
                     'physical_steering_command_jump': float(abs(physical[0] - physical_previous[0])),
                     'physical_speed_command_jump': float(abs(physical[1] - physical_previous[1])),
                     'command_jump': float(np.linalg.norm(ll_action - previous_action)),
                     'steering_jump': float(abs(ll_action[0] - previous_action[0])),
                     'speed_command_jump': float(abs(ll_action[1] - previous_action[1])),
-                    'collision': bool(decision.info.get('collision', False)),
+                    'collision': (bool(decision.info.get('collision', False)) if self.categorical else
+                                  any(s.facts.info[self.aid].get('collision', False) for s in result.substeps)),
                     'terminated': bool(decision.terminated), 'truncated': bool(decision.truncated),
                     's': float(decision.info.get('centerline', {}).get('s', 0.)),
                     'lateral_error': float(decision.info.get('centerline', {}).get('d', 0.)),
@@ -282,6 +287,10 @@ class HierarchicalTask:
             if decision.terminated or decision.truncated or result.after.episode_done:
                 break
         k = i + 1
+        if record_trajectory and not self.categorical:
+            macro = self.composition_trace[-1]
+            macro.update(duration_ll_decisions=k, duration_seconds=self.elapsed - macro['timestamp'],
+                         end_forward_centerline_progress_m=self.distance)
         self.episode_macro_return += reward
         self.last_duration = k
         self.total_ll += k
@@ -297,10 +306,12 @@ class HierarchicalTask:
             info={**decision.info, 'hierarchical': {**transition_info, 'duration': k, 'discount': self.gamma ** k}})
         return TaskStep(before, self.snapshot(result.after), {self.aid: final}, 0., {}, tuple(substeps), ll_decisions=k)
 
-    def _record_composition(self, coefficients):
+    def _record_composition(self, coefficients, skill, record_trajectory):
         c = np.asarray(coefficients, dtype=np.float64)
+        change = None
         if self.composition_count:
-            self.composition_change += float(np.abs(c - self.executor.coefficients).sum())
+            change = float(np.abs(c - self.executor.coefficients).sum())
+            self.composition_change += change
         self.composition_count += 1
         self.composition_sum += c
         self.composition_abs_sum += np.abs(c)
@@ -317,10 +328,21 @@ class HierarchicalTask:
         residual = entropy(c[1:])
         self.residual_entropy += residual
         self.composition_entropy += entropy(c)
+        effective = 0.
         if np.abs(c[1:]).sum() == 0:
             self.zero_residual += 1
         else:
-            self.composition_effective += np.exp(residual)
+            effective = np.exp(residual)
+            self.composition_effective += effective
+        if record_trajectory:
+            previous = self.executor.state.active
+            self.composition_trace.append({
+                'hl_decision_index': self.episode_hl, 'coefficients': coefficients.tolist(),
+                'start_forward_centerline_progress_m': self.distance, 'timestamp': self.elapsed,
+                'coefficient_l1_change': change, 'effective_residual_adapters': float(effective),
+                'dominant_option': skill, 'previous_dominant_option': previous if previous >= 0 else None,
+                'dominant_changed': previous >= 0 and previous != skill,
+            })
 
     def metrics(self):
         state = self.executor.state

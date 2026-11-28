@@ -60,12 +60,14 @@ def test_residual_bank_materializes_only_base_and_preserves_one_hot_actions(bank
     assert residual.accounting()['tensor_bytes'] < bank.accounting()['tensor_bytes']
 
 
-def test_dirichlet_native_spec_and_deterministic_sampling():
+def test_dirichlet_native_spec_and_deterministic_sampling(tmp_path):
+    import numpy as np
     from adapters.native_torchrl import NativeRaceTorchRLEnv
     from core.scenario import load_and_expand_scenario
     from core.task_builder import create_race_task
     from torchrl.envs.utils import check_env_specs
     from training.algorithms import create_learner, learner_params
+    from training.evaluation import run_evaluation_episode
 
     scenario = load_and_expand_scenario('scenarios/ppo_hierarchical_composition.yaml')
     scenario['environment']['max_steps'] = 8
@@ -83,11 +85,38 @@ def test_dirichlet_native_spec_and_deterministic_sampling():
         assert torch.from_numpy(sample.log_probs).isfinite().all()
         task.step(executed)
         assert task.metrics()['composition/influence_samples'] == 0
-        task.influence_every = 1
-        task.step(executed)
-        assert task.metrics()['composition/influence_samples'] == 1
+        assert not hasattr(task, 'composition_trace')
+        checkpoint = tmp_path / 'composition.pt'
+        agent.save_checkpoint(checkpoint)
     finally:
         env.close()
+
+    scenario['hierarchical']['record_trajectory'] = True
+    scenario['hierarchical']['composition']['influence_every'] = 1
+    scenario['evaluation']['max_steps'] = 8
+    task = create_race_task(scenario, mode='eval')
+    try:
+        params = learner_params(scenario, task.spec, 'ppo')
+        policy = create_learner('ppo', task.spec, {**params, 'device': 'cpu'}, training=False)
+        policy.load_for_evaluation(checkpoint)
+        actions = iter((np.array([.6, .4, 0, 0, 0, 0]), np.array([0, 0, .75, .25, 0, 0])))
+        diagnostic = run_evaluation_episode(task, lambda ids, obs: {'car_0': next(actions)},
+                                            episode=0, seed=42).record['hierarchical']
+        macros, trace = diagnostic['composition_trajectory'], diagnostic['trajectory']
+        assert diagnostic['metrics']['composition/influence_samples'] == 2
+        assert [row['duration_ll_decisions'] for row in macros] == [5, 3]
+        assert macros[1]['duration_seconds'] == pytest.approx(sum(row['decision_dt'] for row in trace[-3:]))
+        assert [row['hl_decision_index'] for row in trace] == [0]*5 + [1]*3
+        assert all('coefficients' not in row for row in trace)
+        assert macros[1]['coefficients'] == pytest.approx([0, 0, .75, .25, 0, 0])
+        assert macros[0]['coefficient_l1_change'] is None
+        assert macros[1]['coefficient_l1_change'] == pytest.approx(2.)
+        assert macros[1]['previous_dominant_option'] == 0
+        assert macros[1]['dominant_option'] == 2 and macros[1]['dominant_changed']
+        assert 1 < macros[1]['effective_residual_adapters'] < 2
+        assert 'geometry' in trace[-1] and 'speed' in trace[-1]
+    finally:
+        task.close()
 
 
 def test_final_protocol_uses_expanded_seed_range_for_categorical_and_composition():
@@ -114,18 +143,73 @@ def test_final_protocol_uses_expanded_seed_range_for_categorical_and_composition
         resolve_evaluation_protocol(scenario, 'final')
 
 
-@pytest.mark.parametrize('hierarchy', [
-    {'routing_type': 'composition'},
-    {'metrics': {'composition/routing_entropy': .5}},
-])
-def test_hard_skill_report_rejects_composition_without_a_trajectory(tmp_path, hierarchy):
+def test_composition_reports_preserve_signed_values_and_use_available_diagnostics(tmp_path):
     import json
-    from hierarchical.reporting import summarize
+    import numpy as np
+    from hierarchical.reporting import write_reports
 
+    names = ('base', 'straight', 'hairpin')
+    skills = [{'name': name, 'sha256': name} for name in names]
+    def recorded_metrics(vectors):
+        x = np.asarray(vectors)
+        covariance = np.cov(x, rowvar=False, bias=True)
+        return {
+            'hierarchical/hl_decisions': len(x),
+            **{f'composition/mean/{name}': x[:, i].mean() for i, name in enumerate(names)},
+            **{f'composition/mean_absolute/{name}': np.abs(x[:, i]).mean() for i, name in enumerate(names)},
+            **{f'composition/covariance/{a}/{b}': covariance[i, j]
+               for i, a in enumerate(names) for j, b in enumerate(names)},
+        }
+
+    vectors = [[0., -.8, .2], [0., .2, .9], [0., 0., .9]]
+    trajectory = [
+        dict(hl_decision_index=hl, maneuver_id=maneuver, geometry=geometry, collision=i == 3,
+             x=float(i), y=0., forward_centerline_progress_m=float(i))
+        for i, (hl, maneuver, geometry) in enumerate(((0, 'a', 'straight'), (0, 'b', 'hairpin'),
+                                                      (1, 'b', 'hairpin'), (2, 'b', 'hairpin')))
+    ]
+    macros = [dict(hl_decision_index=i, coefficients=values, start_forward_centerline_progress_m=start,
+                   end_forward_centerline_progress_m=end, coefficient_l1_change=change)
+              for i, (values, start, end, change) in enumerate(zip(vectors, (0, 2, 3), (2, 3, 4), (None, 1.7, .2)))]
+    metrics = recorded_metrics(vectors)
+    metrics.update({'composition/influence_samples': 2, 'composition/influence/0/weighted_norm/straight': .4,
+                    'composition/negative_fraction': 1/6})
+    hierarchy = dict(skills=skills, distribution='signed_gaussian', coefficient_constraint='signed',
+                     routing_type='composition', composition_trajectory=macros, trajectory=trajectory,
+                     metrics=metrics, transition_counts=[[0, 0, 0], [0, 0, 1], [0, 0, 1]])
+    common = dict(seed=42, duration_s=.2, strict_clean_finish=False, mean_net_progress_laps=.1,
+                  any_learner_collision_dnf=False)
+    legacy = dict(skills=skills, distribution='signed_gaussian',
+                  metrics=recorded_metrics([[0., 1., 1.], [0., 1., 1.]]))
+    report = {'episode_results': [
+        {'race_record': dict(common, map_id='tracks/test_composite_01/research_abcd.yaml', hierarchical=hierarchy)},
+        {'race_record': dict(common, map_id='Spielberg_map', hierarchical=legacy)},
+    ]}
     path = tmp_path / 'evaluation_report.json'
-    path.write_text(json.dumps({'episode_results': [{'race_record': {'hierarchical': hierarchy}}]}))
-    with pytest.raises(ValueError, match='require categorical routing'):
-        summarize([path])
+    path.write_text(json.dumps(report))
+    output = tmp_path / 'report'
+    result = write_reports([path], output)
+    assert not result['transitions']
+    assert {row['domain'] for row in result['composition_domains']} == {'generated', 'f110'}
+    generated = next(row for row in result['composition_coefficients']
+                     if row['scope'] == 'domain' and row['domain'] == 'generated' and row['adapter'] == 'straight')
+    assert generated['mean'] == pytest.approx(-.2)
+    f110 = next(row for row in result['composition_coefficients']
+               if row['scope'] == 'map' and row['map'] == 'Spielberg_map' and row['adapter'] == 'straight')
+    assert f110['mean'] == 1 and f110['active_fraction'] is None
+    covariance = next(row for row in result['composition_covariance']
+                      if row['scope'] == 'method' and (row['source'], row['target']) == ('straight', 'hairpin'))
+    assert covariance['covariance'] == pytest.approx(
+        np.cov(np.array([*vectors, [0, 1, 1], [0, 1, 1]]), rowvar=False, bias=True)[1, 2])
+    pair = next(row for row in result['composition_coactivation']
+                if row['scope'] == 'method' and (row['source'], row['target']) == ('straight', 'hairpin'))
+    assert pair['coactivation_fraction'] == pytest.approx(2/3)
+    assert result['composition_maneuver_transitions'][0]['l1_change_at_next_hl'] == 1.7
+    assert result['composition_collisions'][0]['mean_pre_collision_l1_change'] == 1.7
+    assert result['composition_pre_collision_utilization'][1]['mean_coefficient'] == pytest.approx(-1.4/3)
+    assert {p.name for p in output.glob('*.svg')} == {
+        'composition_progress_0_0.svg', 'composition_track_0_0.svg', 'composition_geometry_0.svg',
+        'composition_covariance_0.svg', 'composition_layer_influence_0.svg'}
 
 
 def test_episode_hook_forwards_composition_metrics():
